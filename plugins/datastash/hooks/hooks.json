@@ -1,32 +1,92 @@
 {
-  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive; the person's typed \"datastash main\" makes that session the person's main session.",
+  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive; the person's typed \"datastash main\" makes that session the person's main session; any datastash connector call or agent action records the session as an agent, which can never become main.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "check"], "timeout": 10 },
-          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "listen"], "async": true, "asyncRewake": true, "timeout": 86400 }
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
+              "check"
+            ],
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
+              "listen"
+            ],
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 86400
+          }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "prompt"], "timeout": 10 }
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
+              "prompt"
+            ],
+            "timeout": 10
+          }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "listen"], "async": true, "asyncRewake": true, "timeout": 86400 }
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
+              "listen"
+            ],
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 86400
+          }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "end"], "timeout": 5 }
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
+              "end"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__.*datastash.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
+              "agent-tool"
+            ],
+            "timeout": 5
+          }
         ]
       }
     ]

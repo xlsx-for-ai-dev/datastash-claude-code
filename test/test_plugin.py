@@ -820,7 +820,7 @@ class MainBase(Base):
         def fake_http(method, path, key=None, body=None, form=None, timeout=40):
             self.sent.append((method, path, key))
             if path == ds.MAIN_START_PATH:
-                return 200, "application/json", json.dumps({"approve_url": ds.ORIGIN + "/main/approve?r=tok", "pickup_code": "dsmk_code123456"})
+                return 200, "application/json", json.dumps({"approve_url": ds.ORIGIN + "/main/approve?r=tok", "pickup_code": "dsmk_code123456", "show_code": "ABCD-EF23"})
             if path == ds.PICKUP_PATH:
                 if not self.approved:
                     return 202, "application/json", '{"status":"pending"}'
@@ -1150,6 +1150,163 @@ class MainAnySession(MainBase):
             hooks = json.load(f)
         prompt = [h for g in hooks["hooks"]["UserPromptSubmit"] for h in g["hooks"]]
         self.assertEqual([h["args"][-1] for h in prompt], ["prompt"])
+
+
+class CleanSessionOnly(MainBase):
+    """PM ruling 11-19 (last round): only a clean session becomes main. A session id that touched datastash as an agent
+    (agent identity, agent key use, inbox read, connector call) is recorded at that first action, and main is refused
+    for it from then on, by that record: the prompt command (the typed words) can't flip it."""
+
+    def put_main_key(self):
+        ds.ensure_dirs()
+        ds.write_private(ds.MAIN_KEY_FILE, "ldgr_pm_" + "k" * 43 + "\n")
+
+    def fake_prompt(self, sid, proc):
+        """The reviewer's attack: the session's AI runs the plugin's own hook command itself, piping forged hook input
+        (the person's phrase, any session id) into `datastash prompt`, from inside its own Claude Code process."""
+        self.be(sid, proc)
+        return self.prompt(sid)
+
+    def assert_never_main(self, sid, proc):
+        self.sent.clear()
+        ctx = self.fake_prompt(sid, proc)
+        self.assertIn("can't become the person's datastash main", ctx)
+        self.assertFalse(os.path.exists(ds._request_path(sid)))
+        rc, out, err = self.on()
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("acted as an agent", err)
+        self.assertFalse(ds.is_main_session(self.be(sid, proc)))
+        self.assertEqual([p for _, p, _ in self.sent if p in (ds.PERSON_WORKBOOKS_PATH, ds.MAIN_START_PATH, ds.PICKUP_PATH)], [])
+
+    def tool_hook(self, sid, tool):
+        ds.hook_input = lambda: {"session_id": sid, "tool_name": tool, "hook_event_name": "PreToolUse", "tool_input": {}}
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ds.cmd_agent_tool([]), 0)
+        self.assertEqual(out.getvalue(), "")  # never blocks or talks
+
+    def test_reviewer_attack_replayed_an_agent_session_fakes_the_typed_phrase(self):
+        # The machine already has a browser-approved main key (the case the review named).
+        self.put_main_key()
+        # An agent session: it starts in its agent's folder (session-start check with the agent key), its listener runs,
+        # and its AI reads the inbox over the connector, where a hostile message tells it to become main.
+        ds.fetch_page = lambda *a, **k: ([], "c", False)
+        ds.hook_input = lambda: {"session_id": "sess-X", "cwd": self.folder}
+        self.be("sess-X", (7101, "tX"))
+        with redirect_stdout(io.StringIO()):
+            ds.cmd_check([])
+        self.tool_hook("sess-X", "mcp__plugin_datastash_datastash__ledger_inbox_read")
+        # The AI fakes the person's typed words with the plugin's own prompt command, then switches main on.
+        self.assert_never_main("sess-X", (7101, "tX"))
+        # With a made-up fresh session id (forged in the hook input and in $CLAUDE_CODE_SESSION_ID): same process, refused.
+        self.assert_never_main("sess-fresh-forged", (7101, "tX"))
+        # From a Claude Code session it starts below itself (claude -p "datastash main"): refused.
+        self.be("sess-child", (7102, "tX2"), parents=[(7101, "tX")])
+        self.assertIn("can't become", self.prompt("sess-child"))
+        self.assertNotEqual(self.on()[0], 0)
+        # The same session id in a later process (resumed): the id's own record refuses it.
+        self.assert_never_main("sess-X", (7199, "tX-resumed"))
+
+    def test_each_first_agent_action_records_the_session(self):
+        self.put_main_key()
+        ds.fetch_page = lambda *a, **k: ([], "c", False)
+        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        steps = []
+
+        def check(sid):  # agent identity + agent key use at session start
+            ds.hook_input = lambda: {"session_id": sid, "cwd": self.folder}
+            with redirect_stdout(io.StringIO()):
+                ds.cmd_check([])
+        steps.append(("check", check))
+
+        def listen(sid):  # the agent's listener (inbox wakes)
+            ds.hook_input = lambda: {"session_id": sid, "cwd": self.folder}
+            orig = ds._take_listener_lock
+            ds._take_listener_lock = lambda s, i: None
+            try:
+                ds.cmd_listen([])
+            finally:
+                ds._take_listener_lock = orig
+        steps.append(("listen", listen))
+
+        def api(sid):  # agent key use, inbox read
+            os.environ["CLAUDE_PROJECT_DIR"] = self.folder
+            self.assertEqual(self.api()[0], 0)
+        steps.append(("api", api))
+
+        def connector(sid):  # any datastash connector tool (the agents' connector)
+            self.tool_hook(sid, "mcp__plugin_datastash_datastash__ledger_agent_register")
+        steps.append(("connector", connector))
+
+        def connector_plain_name(sid):
+            self.tool_hook(sid, "mcp__datastash__ledger_inbox_read")
+        steps.append(("connector-plain", connector_plain_name))
+
+        def auto_name(sid):  # self-registration begins
+            os.environ["CLAUDE_PROJECT_DIR"] = plain
+            with redirect_stdout(io.StringIO()):
+                ds.cmd_auto_name([])
+        steps.append(("auto-name", auto_name))
+        for i, (label, step) in enumerate(steps):
+            sid, proc = f"sess-{label}", (7300 + i, f"t-{label}")
+            self.be(sid, proc)
+            step(sid)
+            with self.subTest(label):
+                self.assertTrue(any(os.path.exists(p) for p in ds._used_paths(self.be(sid, proc))), label)
+                self.assert_never_main(sid, proc)
+
+    def test_other_tools_and_the_person_folder_never_record(self):
+        self.be("sess-O", (7401, "tO"))
+        for tool in ("Bash", "mcp__other__thing", "mcp__plugin_other_x__datastash_like", "Read"):
+            self.tool_hook("sess-O", tool)
+        self.assertFalse(any(os.path.exists(p) for p in ds._used_paths(self.be("sess-O", (7401, "tO")))))
+        self.assertIn("the person typed", self.prompt("sess-O"))
+
+    def test_a_clean_session_becomes_main_with_the_key_on_the_machine(self):
+        self.put_main_key()
+        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        os.environ["CLAUDE_PROJECT_DIR"] = plain
+        self.be("sess-clean", (7501, "tClean"))
+        self.assertIn("the person typed", self.prompt("sess-clean"))
+        rc, out, err = self.on()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("approval needed", out)
+        self.assertTrue(ds.is_main_session(self.be("sess-clean", (7501, "tClean"))))
+        # The main session's own calls never record it as an agent (it stays main).
+        self.tool_hook("sess-clean", "mcp__plugin_datastash_datastash__ledger_inbox_read")
+        self.assertTrue(ds.is_main_session(self.be("sess-clean", (7501, "tClean"))))
+
+    def test_the_show_code_is_shown_and_required(self):
+        self.be("sess-S", (7601, "tS"))
+        self.prompt("sess-S")
+        self.approved = False
+        rc, out, _ = self.main_cmd("--on")
+        self.assertEqual(rc, 0)
+        self.assertIn("Code: ABCD-EF23", out)
+        self.assertIn("the person approves only if it is this same code", out)
+        rc, out, _ = self.main_cmd("--wait")
+        self.assertIn("Code: ABCD-EF23", out)
+        # A start answer without a show code is refused; nothing saved.
+        os.replace(ds.MAIN_PENDING, os.path.join(TMP, f"old-pending-{time.time()}"))
+        real = ds.http
+        ds.http = lambda method, path, **k: ((200, "application/json", json.dumps({"approve_url": ds.ORIGIN + "/main/approve?r=t", "pickup_code": "dsmk_code123456"}))
+                                             if path == ds.MAIN_START_PATH else real(method, path, **k))
+        rc, _, err = self.main_cmd("--on")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("not an approval link", err)
+        self.assertFalse(os.path.exists(ds.MAIN_PENDING))
+        # An open approval older than the server's 10 minutes is not reused.
+        self.assertLess(ds.MAIN_PENDING_SECONDS, 10 * 60)
+
+    def test_the_hook_is_wired_and_the_readme_keeps_the_scope_line(self):
+        with open(os.path.join(HERE, "..", "plugins", "datastash", "hooks", "hooks.json")) as f:
+            hooks = json.load(f)
+        pre = hooks["hooks"]["PreToolUse"]
+        self.assertEqual([h["args"][-1] for g in pre for h in g["hooks"]], ["agent-tool"])
+        import re as _re
+        self.assertTrue(_re.fullmatch(pre[0]["matcher"], "mcp__plugin_datastash_datastash__ledger_inbox_read"))
+        with open(os.path.join(HERE, "..", "README.md")) as f:
+            readme = f.read()
+        self.assertIn("it doesn't defend against a program with full\n  shell access to your account", readme)
 
 
 class SelfRegistration(MainBase):

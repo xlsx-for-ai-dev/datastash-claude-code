@@ -11,8 +11,8 @@
 # IDLE seconds (default 60); the agent sends the person an ask over the REST door. PASS when the person listener logs a
 # wake and the session answers the plugin's note (it was told to say PERSON-WOKE) within 120 s, and the note carried
 # no message text.
-# ANYWHERE=1 MAIN_KEY_FILE=<file> (owner 11-19: "datastash main" in any session): the folder is linked to an agent instead,
-# nothing is linked as the person's. MAIN_KEY_FILE is a main key of the test account, approved once in the browser
+# ANYWHERE=1 MAIN_KEY_FILE=<file> (owner 11-19: "datastash main" in any clean session): the folder is linked to nobody
+# (PM 11-19: only a session that never acted as an agent becomes main), nothing is linked as the person's. MAIN_KEY_FILE is a main key of the test account, approved once in the browser
 # (copied into the throwaway config folder, never printed). In the session the person types "datastash main" (the
 # prompt hook records it for that session), then "datastash main --on" runs inside that very session (Claude Code's "!"
 # shell). PASS needs the same wake as the person, and a second plain process using that session's id is not the person.
@@ -42,7 +42,7 @@ PROJ="$(mktemp -d)"
 export DATASTASH_CONFIG_DIR="$(mktemp -d)"
 # The "datastash main" folder the plugin makes and links: a throwaway one here (never the real one in the home folder).
 export DATASTASH_MAIN_DIR="$PROJ"
-# ANYWHERE: no "datastash main" folder at all (a path that never exists); the session's folder belongs to an agent.
+# ANYWHERE: no "datastash main" folder at all (a path that never exists); the session's folder is linked to nobody.
 [[ "$ANYWHERE" == 1 ]] && export DATASTASH_MAIN_DIR="$DATASTASH_CONFIG_DIR/no-main-folder"
 # Each person session has its own listener log (agent-@person-<session id>.log).
 plog() { cat "$DATASTASH_CONFIG_DIR"/state/agent-@person*.log 2>/dev/null; }
@@ -56,8 +56,7 @@ trap cleanup EXIT
 
 CODE="$(call ledger_person_watch "{\"workbook_id\":\"$WID\",\"action\":\"key\"}" | field answer.pickup_code)" || { echo "FAIL: no watch pickup code"; exit 1; }
 if [[ "$ANYWHERE" == 1 ]]; then
-  # The folder belongs to an agent; the person's main key is the browser-approved one (never printed).
-  ( cd "$PROJ" && python3 "$PLUGIN/bin/datastash" link "CC plugin anywhere" --workbook "$WID" --project "$PROJ" >/dev/null ) || { echo "FAIL: link"; exit 1; }
+  # A clean folder (no link); the person's main key is the browser-approved one (never printed).
   ( umask 077; cp "$MAIN_KEY_FILE" "$DATASTASH_CONFIG_DIR/main.key" )
   # The throwaway workbook is the one this main watches (the account may hold others).
   ( umask 077; printf '{"workbook_id": "%s", "projects": []}\n' "$WID" > "$DATASTASH_CONFIG_DIR/person.json" )
