@@ -1706,16 +1706,122 @@ def cmd_auto_name(args):
     return 0
 
 
-DATASTASH_TOOL_RE = re.compile(r"mcp__(?:plugin_datastash_)?datastash__.+")
+# The tool-call recorder (PM ruling 11-19): any tool call that could carry datastash content records the session as an
+# agent, never main. It never guesses names: (a) an MCP server whose name contains "datastash" (any case); (b) an MCP
+# server whose configured URL host is getdatastash.com or a subdomain (user and project MCP configs); (c) a Bash call
+# that runs this plugin's datastash command or touches its files, except the person's own "datastash main" steps; (d) a
+# WebFetch to getdatastash.com. Default-deny: when it can't tell (unreadable input, an MCP server it can't find in any
+# config, such as a claude.ai connector), it records the session as an agent.
+DATASTASH_HOST = "getdatastash.com"
+# The person's own switch-on steps, run in a clean session before it is main: only these exact one-command forms.
+MAIN_STEP_RE = re.compile(r"\s*(?:python3\s+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/datastash\"|['\"]?[^\s'\";&|`$()<>{}]*datastash['\"]?)\s+main"
+                          r"(?:\s+--on|\s+--wait|\s+--workbook\s+[0-9a-fA-F\-]{36})?\s*(?:2>&1)?\s*")
+CLAUDE_USER_CONFIG = os.path.join(HOME, ".claude.json")  # Claude Code's user (and per-project) MCP servers
+FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Grep", "Glob")
+
+
+def _host_is_datastash(url):
+    try:
+        host = (urllib.parse.urlsplit(str(url).strip()).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return host == DATASTASH_HOST or host.endswith("." + DATASTASH_HOST)
+
+
+def _mcp_configs(inp):
+    """{server name: config} from the user and project MCP configs Claude Code reads, and this plugin's own (as
+    plugin_datastash_<name>). Unreadable files are skipped (the caller then can't find the server and records)."""
+    out = {}
+    project = os.path.realpath(inp.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    user = read_json(CLAUDE_USER_CONFIG, {})
+    if isinstance(user, dict):
+        for k, v in (user.get("mcpServers") or {}).items() if isinstance(user.get("mcpServers"), dict) else ():
+            out[k] = v
+        projects = user.get("projects") if isinstance(user.get("projects"), dict) else {}
+        for path, pc in projects.items():
+            if isinstance(pc, dict) and isinstance(pc.get("mcpServers"), dict) and _within(project, os.path.realpath(path)):
+                out.update(pc["mcpServers"])
+    for d in {project, os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or project)}:
+        pj = read_json(os.path.join(d, ".mcp.json"), {})
+        if isinstance(pj, dict) and isinstance(pj.get("mcpServers"), dict):
+            out.update(pj["mcpServers"])
+    mine = read_json(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), ".mcp.json"), {})
+    if isinstance(mine, dict) and isinstance(mine.get("mcpServers"), dict):
+        for k, v in mine["mcpServers"].items():
+            out[f"plugin_datastash_{k}"] = v
+    return out
+
+
+def _server_carries_datastash(cfg):
+    """True when an MCP server's config reaches getdatastash.com (its URL, or a URL in its command line)."""
+    if not isinstance(cfg, dict):
+        return True  # can't tell
+    if cfg.get("url") is not None:
+        return _host_is_datastash(cfg.get("url"))
+    words = [str(cfg.get("command") or "")] + [str(a) for a in (cfg.get("args") or [])]
+    return any(DATASTASH_HOST in w.lower() or "datastash" in w.lower() for w in words)
+
+
+def _touches_datastash_text(text):
+    t = str(text).lower()
+    return "datastash" in t or "ldgr_" in t or os.path.realpath(CONF).lower() in t
+
+
+def tool_carries_datastash(inp):
+    """(record?, why) for one hook input. Default-deny: anything it can't read records."""
+    if not isinstance(inp, dict):
+        return True, "unreadable"
+    name, args = inp.get("tool_name"), inp.get("tool_input")
+    if not isinstance(name, str) or not name:
+        return True, "unreadable"
+    args = args if isinstance(args, dict) else {}
+    if name.startswith("mcp__"):
+        server = name[5:].split("__", 1)[0]
+        if not server or "__" not in name[5:]:
+            return True, "unreadable mcp name"
+        if "datastash" in server.lower():
+            return True, "connector"
+        cfgs = _mcp_configs(inp)
+        if server not in cfgs:
+            return True, "unknown mcp server"
+        return (True, "connector url") if _server_carries_datastash(cfgs[server]) else (False, "")
+    if name == "Bash":
+        cmd = args.get("command")
+        if not isinstance(cmd, str):
+            return True, "unreadable bash"
+        if not _touches_datastash_text(cmd):
+            return False, ""
+        return (False, "") if MAIN_STEP_RE.fullmatch(cmd) else (True, "bash")
+    if name == "WebFetch":
+        url = args.get("url")
+        if not isinstance(url, str):
+            return True, "unreadable webfetch"
+        return (True, "webfetch") if _host_is_datastash(url) or "datastash" in url.lower() else (False, "")
+    if name in FILE_TOOLS:
+        return (True, "files") if _touches_datastash_text(json.dumps(args)) else (False, "")
+    return False, ""
 
 
 def cmd_agent_tool(_args):
-    """PreToolUse hook (datastash connector tools): the connector is the agents', so a call to it records this session
-    as an agent (never main). Never blocks the call and prints nothing."""
+    """PreToolUse and PostToolUse hook, every tool: a call that could carry datastash content records this session as an
+    agent (never main; see tool_carries_datastash). Never blocks the call and prints nothing. The session id's mark is
+    written first, before the process walk, so a slow box can't skip it; the person's main session is never marked."""
     inp = hook_input()
-    name = inp.get("tool_name")
-    if isinstance(name, str) and DATASTASH_TOOL_RE.fullmatch(name):
-        mark_agent_use(this_session(inp), "connector")
+    try:
+        record, why = tool_carries_datastash(inp)
+    except Exception:  # default-deny
+        record, why = True, "error"
+    if not record:
+        return 0
+    sid = inp.get("session_id") if isinstance(inp, dict) else None
+    sid = sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None
+    if sid and not os.path.exists(_main_path(sid)):
+        try:
+            ensure_dirs()
+            write_private(os.path.join(STATE, f"agent-used-sid-{sid}"), json.dumps({"why": why, "at": int(time.time())}))
+        except OSError:
+            pass
+    mark_agent_use(this_session(inp if isinstance(inp, dict) else {}), why)
     return 0
 
 
@@ -1893,6 +1999,9 @@ def _main_key_works(key):
 
 def _main_finish(me, key):
     """Mark this session as the person's main and pick the agent workbook it watches."""
+    why = main_refusal(me)  # it may have acted as an agent while waiting for the approval
+    if why is not None:
+        die(f"this session can't become the person's datastash main: {why}")
     try:
         _status, _ctype, text = http("GET", PERSON_WORKBOOKS_PATH, key=key, timeout=30)
         books = json.loads(text).get("agent_workbooks")

@@ -1,5 +1,5 @@
 {
-  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive; the person's typed \"datastash main\" makes that session the person's main session; any datastash connector call or agent action records the session as an agent, which can never become main.",
+  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive; the person's typed \"datastash main\" makes that session the person's main session; any tool call that could carry datastash content (a datastash connector by name or URL, the datastash command or its files, a fetch from getdatastash.com, or anything it can't tell) records the session as an agent, which can never become main.",
   "hooks": {
     "SessionStart": [
       {
@@ -76,7 +76,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__.*datastash.*",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -85,7 +85,23 @@
               "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
               "agent-tool"
             ],
-            "timeout": 5
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
+              "agent-tool"
+            ],
+            "timeout": 15
           }
         ]
       }

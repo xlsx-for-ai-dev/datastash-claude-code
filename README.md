@@ -85,7 +85,10 @@ Who the main session is:
   button; datastash refuses it on every agent route and every MCP connector).
 - Only a clean session becomes main: one that never touched datastash as an agent. The first agent action in a session
   (an agent identity at session start or in its listener, `DATASTASH_AGENT`, an agent key or inbox use, an agent
-  fetched, linked or named, or any call to the `datastash` connector, seen by a PreToolUse hook) records that session id
+  fetched, linked or named, or any tool call that could carry datastash content, seen by a hook on every tool call:
+  an MCP server named datastash in any case or whose configured URL is on getdatastash.com, a shell command that runs
+  `datastash` or touches its files (except the person's own `datastash main` steps), a fetch from getdatastash.com, or
+  anything the hook can't tell, such as a connector it finds in no MCP config) records that session id
   and its Claude Code process as an agent, and main is refused for it from then on, by that record: replaying the typed
   phrase through the plugin's own `prompt` command changes nothing. A session started from such a session is refused
   too. Inbox text is the only way datastash text reaches an AI, and it never reaches a clean session. So type
