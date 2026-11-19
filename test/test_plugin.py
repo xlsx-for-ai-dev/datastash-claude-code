@@ -542,6 +542,30 @@ class PersonSession(Base):
             else:
                 os.environ["CLAUDE_PROJECT_DIR"] = old_env
 
+    def test_an_agent_linked_above_the_main_folder_never_takes_it_over(self):
+        ds.agent_for = self.saved["agent_for"]
+        home = os.path.join(TMP, "home")
+        os.makedirs(MAIN, exist_ok=True)
+        ds.write_private(ds.conf_path("researcher"), json.dumps({"name": "Researcher", "workbook_id": "wb9", "projects": [home]}))
+        ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps(dict(PERSON, projects=[os.path.realpath(MAIN)])))
+        try:
+            self.assertEqual(ds.session_for(MAIN)["slug"], ds.PERSON_SLUG)
+            self.assertEqual(ds.session_for(home)["slug"], "researcher")
+            # An agent session never sends as the person.
+            old_env = os.environ.get("CLAUDE_PROJECT_DIR")
+            os.environ["CLAUDE_PROJECT_DIR"] = home
+            try:
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    ds._person_post({"to": "Beta", "message": "x"})
+            finally:
+                if old_env is None:
+                    os.environ.pop("CLAUDE_PROJECT_DIR", None)
+                else:
+                    os.environ["CLAUDE_PROJECT_DIR"] = old_env
+        finally:
+            os.replace(ds.conf_path("researcher"), os.path.join(TMP, "old-researcher-" + str(time.time())))
+            ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps(PERSON))
+
     def test_skill_names_both_word_orders_of_both_phrases(self):
         with open(os.path.join(HERE, "..", "plugins", "datastash", "skills", "datastash-agent", "SKILL.md")) as f:
             text = f.read()

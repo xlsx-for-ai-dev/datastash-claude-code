@@ -286,13 +286,18 @@ def all_agents():
 
 def agent_for(project_dir):
     """The agent this session acts as: $DATASTASH_AGENT, else the agent linked to this folder or a parent of it."""
+    return _agent_match(project_dir)[0]
+
+
+def _agent_match(project_dir):
+    """(agent, length of the linked folder it matched by; -1 when none or when $DATASTASH_AGENT chose it)."""
     agents = all_agents()
     want = os.environ.get("DATASTASH_AGENT", "").strip()
     if want:
         s = slug(want)
-        return next((a for a in agents if a["slug"] == s), None)
+        return next((a for a in agents if a["slug"] == s), None), -1
     if not project_dir:
-        return None
+        return None, -1
     here = os.path.realpath(project_dir)
     best, best_len = None, -1
     for a in agents:
@@ -300,6 +305,16 @@ def agent_for(project_dir):
             rp = os.path.realpath(p)
             if (here == rp or here.startswith(rp.rstrip("/") + "/")) and len(rp) > best_len:
                 best, best_len = a, len(rp)
+    return best, best_len
+
+
+def _person_match_len(c, project_dir):
+    here = os.path.realpath(project_dir)
+    best = -1
+    for p in c.get("projects") or []:
+        rp = os.path.realpath(p)
+        if (here == rp or here.startswith(rp.rstrip("/") + "/")) and len(rp) > best:
+            best = len(rp)
     return best
 
 
@@ -312,20 +327,20 @@ def person_for(project_dir):
     c["name"] = "datastash main"
     if project_dir is None:
         return c
-    here = os.path.realpath(project_dir)
-    for p in c.get("projects") or []:
-        rp = os.path.realpath(p)
-        if here == rp or here.startswith(rp.rstrip("/") + "/"):
-            return c
-    return None
+    return c if _person_match_len(c, project_dir) >= 0 else None
 
 
 def session_for(project_dir):
-    """What this session is: the agent linked to this folder, else the person's own session linked here, else None."""
+    """What this session is: $DATASTASH_AGENT's agent; else whichever link is the closer folder, the agent's or the
+    person's (an agent linked to a parent such as the home folder never takes over the "datastash main" folder)."""
+    if os.environ.get("DATASTASH_AGENT", "").strip():
+        return agent_for(project_dir)
     a = agent_for(project_dir)
-    if a is not None or os.environ.get("DATASTASH_AGENT", "").strip():
-        return a
-    return person_for(project_dir)
+    a_len = _agent_match(project_dir)[1] if a is not None else -1
+    p = person_for(project_dir)
+    if p is not None and (a is None or (a_len >= 0 and _person_match_len(p, project_dir) > a_len)):
+        return p
+    return a
 
 
 def watch_spec(agent):
@@ -1257,7 +1272,10 @@ def person_setup(args):
 
 def make_main_dir():
     """The "datastash main" folder in the home folder, made if missing. Returns its real path."""
-    os.makedirs(MAIN_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.makedirs(MAIN_DIR, mode=0o700, exist_ok=True)
+    except OSError:
+        die(f'could not make the folder "{MAIN_DIR}" (a file of that name may be in the way)')
     return os.path.realpath(MAIN_DIR)
 
 
@@ -1275,7 +1293,8 @@ def cmd_main(args):
         c["projects"] = list(c.get("projects") or []) + [main_dir]
         write_private(conf_path(PERSON_SLUG), json.dumps(c, indent=2))
     in_main = here == main_dir or here.startswith(main_dir.rstrip("/") + "/")
-    agent_here = agent_for(here)
+    sess = session_for(here)
+    agent_here = sess if sess is not None and not is_person(sess) else None
     print(f"folder: {main_dir}")
     print(f"person watch set up: {'yes, agent workbook ' + disp(c['workbook_id']) if set_up else 'no'}")
     print(f"this session is in that folder: {'yes' if in_main else 'no'}")
@@ -1285,6 +1304,10 @@ def cmd_main(args):
 
 
 def _person_post(body):
+    # Only the person's own session sends as "person": never a session that acts as an agent.
+    sess = session_for(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    if sess is not None and not is_person(sess):
+        die("this session is an agent; only the person's own session sends as the person")
     person = person_for(None)
     if person is None:
         die("the person's session is not set up on this machine (datastash watch --person --setup WORKBOOK_ID -)")
