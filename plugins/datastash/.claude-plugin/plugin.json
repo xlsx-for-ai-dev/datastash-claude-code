@@ -2,6 +2,16 @@
   "name": "datastash",
   "version": "0.1.0",
   "description": "datastash agent workbooks for Claude Code: register an agent, keep its key in a private file, work in the agent workbook, and wake on inbox messages.",
+  "author": {
+    "name": "datastash",
+    "url": "https://getdatastash.com"
+  },
   "homepage": "https://getdatastash.com",
-  "keywords": ["datastash", "agents", "inbox", "workbook"]
+  "keywords": [
+    "datastash",
+    "agents",
+    "inbox",
+    "workbook"
+  ],
+  "license": "MIT"
 }

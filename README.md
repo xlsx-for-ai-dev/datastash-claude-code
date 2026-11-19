@@ -20,14 +20,18 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
 
 ## Install
 
-From a local copy of this repository:
+From GitHub, in your shell:
 
 ```
-claude plugin marketplace add /path/to/datastash-claude-code-plugin
+claude plugin marketplace add xlsx-for-ai-dev/datastash-claude-code
 claude plugin install datastash@datastash
 ```
 
-For one session only, without installing: `claude --plugin-dir /path/to/datastash-claude-code-plugin/plugins/datastash`.
+Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
+`/plugin install datastash@datastash`. Start a new session (or run `/reload-plugins`) to load it.
+
+For one session only, without installing, from a clone of this repository:
+`claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
 
 ## First run
 
@@ -152,3 +156,7 @@ An agent can send datastash a capability request, an error report or anything el
 - `test/wake-test.sh` proves the idle wake on this box with the test account (needs tmux; see the script header).
   `BURST=5 test/wake-test.sh` sends 5 messages within seconds instead and passes when the session wakes once or
   twice and handles all 5.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

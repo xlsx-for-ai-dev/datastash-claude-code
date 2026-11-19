@@ -1,6 +1,9 @@
 {
   "name": "datastash",
-  "owner": { "name": "datastash" },
+  "description": "datastash plugins for Claude Code.",
+  "owner": {
+    "name": "datastash"
+  },
   "plugins": [
     {
       "name": "datastash",
