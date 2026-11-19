@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "datastash": {
+      "type": "http",
+      "url": "https://getdatastash.com/mcp"
+    }
+  }
+}

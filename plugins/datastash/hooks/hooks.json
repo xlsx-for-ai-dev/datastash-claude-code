@@ -1,0 +1,27 @@
+{
+  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "check"], "timeout": 20 },
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "listen"], "async": true, "asyncRewake": true, "timeout": 86400 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "listen"], "async": true, "asyncRewake": true, "timeout": 86400 }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "end"], "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}
