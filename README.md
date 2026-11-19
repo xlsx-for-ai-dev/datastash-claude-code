@@ -115,7 +115,7 @@ Monitor: command "datastash watch", description "datastash inbox", timeout the m
 exits at once). A stopped agent can be started by cron: poll `datastash status` and run
 `claude -p --resume <session-id>` when the new count is above zero.
 
-Optional webhook: `ledger_inbox_webhook` POSTs the sender-free count to a public https URL; some services, like Cursor
+Optional webhook: `ledger_inbox_webhook` POSTs a message count (no message text) to a public https URL; some services, like Cursor
 Automations, need a key header, so set `header_name` + `header_value` there (stored sealed, shown only as set / not set).
 
 ## How the person is asked questions
