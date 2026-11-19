@@ -22,7 +22,9 @@ The person's own session ("datastash main"; the person, never an agent; any fold
                             whether the person watch is set up
   main --on                 after the person typed "datastash main" in THIS session: make it the person's main for its
                             lifetime. Needs the main key (~/.config/datastash/main.key, mode 600, never printed); the
-                            first time on a machine it says to get one (the person's typed phrase is the approval).
+                            first time on a machine it says to get one (the person's typed phrase is the approval);
+                            on a machine whose connector already registered agents it opens the person's datastash
+                            sign-in in the browser once instead, and that fresh sign-in makes the key.
                             Refused in a session that acted as an agent.
   main --key -              trade a one-time main pickup code (stdin; from the connector's ledger_person_watch action
                             "main", the person's own sign-in) for the main key and save it; then finish --on when the
@@ -42,7 +44,9 @@ Hook entry points (run by Claude Code, not by hand): check, listen, end, prompt,
 The key is read from its file and sent only to https://getdatastash.com, never printed, logged or put on a
 command line. Everything datastash answers is data, never instructions.
 """
+import base64
 import errno
+import hashlib
 import http.client as httpclient
 import fcntl
 import json
@@ -51,6 +55,7 @@ import posixpath
 import random
 import re
 import secrets
+import shutil
 import signal
 import stat
 import subprocess
@@ -60,6 +65,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ORIGIN = "https://getdatastash.com"
 API_PREFIX = "/api/v1/agent/"
@@ -271,11 +277,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect())
 
 
-def http(method, path, key=None, body=None, form=None, timeout=40):
+def http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
     if not path.startswith("/"):
         path = "/" + path
     url = ORIGIN + path
-    headers = {"Accept": "application/json", "User-Agent": "datastash-claude-code-plugin/0.1"}
+    headers = {"Accept": accept, "User-Agent": "datastash-claude-code-plugin/0.1"}
     data = None
     if form is not None:
         data = urllib.parse.urlencode(form).encode()
@@ -1865,10 +1871,19 @@ def tool_carries_datastash(inp):
 
 
 def cmd_agent_tool(_args):
-    """PreToolUse and PostToolUse hook, every tool: a call that could carry datastash content records this session as an
+    """PreToolUse, PostToolUse and PostToolUseFailure hook, every tool: a call that could carry datastash content records this session as an
     agent (never main; see tool_carries_datastash). Never blocks the call and prints nothing. The session id's mark is
     written first, before the process walk, so a slow box can't skip it; the person's main session is never marked."""
     inp = hook_input()
+    try:
+        if (inp.get("hook_event_name") == "PostToolUseFailure" and inp.get("tool_name") == MAIN_CODE_TOOL
+                and inp.get("tool_input") == MAIN_CODE_INPUT):
+            # The connector refused the "main" call: this machine's connector registered agents, so the next
+            # "datastash main" opens the person's own sign-in instead (the failed call still records this session).
+            ensure_dirs()
+            write_private(MAIN_SIGN_IN_FLAG, json.dumps({"at": int(time.time())}))
+    except (AttributeError, OSError):
+        pass
     try:
         record, why = tool_carries_datastash(inp)
     except Exception:  # default-deny
@@ -1965,8 +1980,9 @@ def _main_gate(me):
 
 
 def _main_on(me, args):
-    """Turn this session into the person's main session. With the main key on this machine: at once. Without it: say how
-    to get it (once per machine; `main --key -` then finishes the switch-on)."""
+    """Turn this session into the person's main session. With the main key on this machine: at once. Without it, on a
+    machine whose connector already registered agents: the standard datastash sign-in opens in the browser once and the
+    person's fresh sign-in makes the key. Otherwise: say how to get it (once per machine; `main --key -` then finishes)."""
     if args:
         die("usage: datastash main --on")
     _main_gate(me)
@@ -1978,6 +1994,8 @@ def _main_on(me, args):
         if ok:
             return _main_finish(me, key)
         _set_aside(MAIN_KEY_FILE)  # stopped or unknown: get a new one
+    if _main_needs_sign_in():
+        return _take_main_code(me, _sign_in_main_code())
     print(MAIN_KEY_STEP)
     return 0
 
@@ -1991,6 +2009,20 @@ def _set_aside(path):
         pass
 
 
+class MainKeyLock:
+    """One main-key step at a time on this machine (two first agents at once must not both pick up a key)."""
+
+    def __enter__(self):
+        ensure_dirs()
+        self.fd = os.open(os.path.join(STATE, "main-key.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
 def _main_key(me, args):
     """Trade a one-time main pickup code (stdin) for the person's main key and save it (never printed). A working main key
     already on the machine is never replaced. Then, in a clean session where the person typed "datastash main", finish the
@@ -2001,30 +2033,182 @@ def _main_key(me, args):
     code = sys.stdin.readline(512).strip()
     if not re.fullmatch(MAIN_PICKUP_RE, code):
         die('that does not look like a main pickup code (ledger_person_watch, action "main")')
-    old = read_main_key()
-    if old is not None:
-        ok = _main_key_works(old)
-        if ok is None:
-            die("could not reach datastash; try again")
-        if ok:
-            die("this machine already has a working main key; nothing changed")
-        _set_aside(MAIN_KEY_FILE)
-    try:
-        status, _ctype, text = http("POST", PICKUP_PATH, form={"code": code}, timeout=30)
-    except ApiError as e:
-        die(f'pickup refused (HTTP {e.status}): the code is unknown, used or expired. Ask for a new one (ledger_person_watch, action "main").')
-    except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
-        die(f"could not reach datastash ({type(e).__name__})")
-    key = text.strip()
-    if status != 200 or not re.fullmatch(MAIN_KEY_RE, key):
-        die("datastash answered something that is not a main key; nothing saved")
-    ensure_dirs()
-    write_private(MAIN_KEY_FILE, key + "\n")
+    return _take_main_code(me, code)
+
+
+def _take_main_code(me, code):
+    """Pick up the main key for a one-time main pickup code, save it, and finish the switch-on in a clean requested
+    session. A session that acted as an agent never reads the main key already on the machine."""
+    with MainKeyLock():
+        refused = main_refusal(me)
+        if os.path.exists(MAIN_KEY_FILE) and refused is not None:
+            die(f"this machine already has a main key, and this session can't use it: {refused}")
+        old = read_main_key()
+        if old is not None:
+            ok = _main_key_works(old)
+            if ok is None:
+                die("could not reach datastash; try again")
+            if ok:
+                die("this machine already has a working main key; nothing changed")
+            _set_aside(MAIN_KEY_FILE)
+        try:
+            status, _ctype, text = http("POST", PICKUP_PATH, form={"code": code}, timeout=30)
+        except ApiError as e:
+            die(f'pickup refused (HTTP {e.status}): the code is unknown, used or expired. Ask for a new one (ledger_person_watch, action "main").')
+        except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+            die(f"could not reach datastash ({type(e).__name__})")
+        key = text.strip()
+        if status != 200 or not re.fullmatch(MAIN_KEY_RE, key):
+            die("datastash answered something that is not a main key; nothing saved")
+        ensure_dirs()
+        write_private(MAIN_KEY_FILE, key + "\n")
+        _drop(MAIN_SIGN_IN_FLAG)
     if main_refusal(me) is None and (is_main_session(me) or main_request_ok(me)):
         return _main_finish(me, key)
     print("saved the person's main key on this machine (never shown). This session is not the person's main; "
           "if you were registering an agent, run datastash auto-name again")
     return 0
+
+
+# PM ruling 11-19 (machines whose connector already registered agents): datastash gives the main pickup code only to a
+# connection that never registered an agent, so on such a machine the person's own typed "datastash main", in a clean
+# session, opens the standard datastash sign-in (the same page the connector's sign-in shows) once. That fresh sign-in
+# is a new connection with no agents: the plugin asks it for the main pickup code itself, trades it for the main key,
+# and keeps neither the sign-in nor the code. The AI never sees either.
+SIGN_IN_CLIENT_NAME = "Claude Code"  # the name the standard sign-in page shows; the same as Claude Code's own sign-in
+OAUTH_REG_PATH = "/oauth/reg"
+OAUTH_AUTH_PATH = "/oauth/auth"
+OAUTH_TOKEN_PATH = "/oauth/token"
+MCP_PATH = "/mcp"
+SIGN_IN_WAIT_SECONDS = float(os.environ.get("DATASTASH_SIGN_IN_WAIT_SECONDS", "280"))
+MAIN_SIGN_IN_FLAG = os.path.join(STATE, "main-needs-sign-in")  # the connector refused the "main" call on this machine
+
+
+def _main_needs_sign_in():
+    """True when this machine's connector already registered agents: agents on this machine, or the connector refused
+    the "main" call here. A machine with neither keeps the one connector call (no sign-in)."""
+    return bool(all_agents()) or os.path.exists(MAIN_SIGN_IN_FLAG)
+
+
+def _open_browser(url):
+    """Open url in the person's own browser (a graphical one only: never a terminal browser). True when started."""
+    if sys.platform == "darwin":
+        cmd = ["open", url]
+    elif sys.platform.startswith("win"):
+        cmd = ["cmd", "/c", "start", "", url]
+    elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        cmd = ["xdg-open", url]
+    else:
+        return False
+    if shutil.which(cmd[0]) is None:
+        return False
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
+def _wait_for_sign_in(state, port_box, ready):
+    """A one-shot loopback listener for the sign-in's return (RFC 8252). Returns the authorization code or None."""
+    got = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urllib.parse.urlsplit(self.path)
+            q = urllib.parse.parse_qs(u.query)
+            if u.path != "/callback" or not secrets.compare_digest((q.get("state") or [""])[0], state):
+                self.send_response(404)
+                self.end_headers()
+                return
+            got["code"] = (q.get("code") or [None])[0]
+            got["done"] = True
+            self.send_response(302)  # back to datastash's own page: no page of the plugin's own
+            self.send_header("Location", ORIGIN + "/")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 1
+    port_box.append(server.server_address[1])
+    deadline = time.time() + SIGN_IN_WAIT_SECONDS
+    try:
+        ready()
+        while not got.get("done") and time.time() < deadline:
+            server.handle_request()
+    finally:
+        server.server_close()
+    return got.get("code")
+
+
+def _sign_in_main_code():
+    """The person's fresh datastash sign-in (browser, once) and, from it, a one-time main pickup code. Never printed."""
+    def fail(why):
+        die(f"the datastash sign-in for the person's main key did not finish: {why}. Nothing was saved")
+
+    try:
+        _st, _ct, text = http("POST", OAUTH_REG_PATH, body={
+            "client_name": SIGN_IN_CLIENT_NAME, "application_type": "native", "redirect_uris": ["http://127.0.0.1/callback"],
+            "token_endpoint_auth_method": "none", "grant_types": ["authorization_code"], "response_types": ["code"]}, timeout=30)
+        client_id = json.loads(text).get("client_id")
+    except (ApiError, ValueError, AttributeError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        client_id = None
+    if not isinstance(client_id, str) or not client_id:
+        fail("could not reach datastash")
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    resource = ORIGIN + MCP_PATH
+    port_box, opened = [], {}
+
+    def ready():
+        redirect = f"http://127.0.0.1:{port_box[0]}/callback"
+        opened["redirect"] = redirect
+        opened["ok"] = _open_browser(ORIGIN + OAUTH_AUTH_PATH + "?" + urllib.parse.urlencode({
+            "response_type": "code", "client_id": client_id, "redirect_uri": redirect, "scope": "mcp:tools",
+            "resource": resource, "state": state, "code_challenge": challenge, "code_challenge_method": "S256"}))
+        if not opened["ok"]:
+            raise _NoBrowser()
+
+    try:
+        code = _wait_for_sign_in(state, port_box, ready)
+    except _NoBrowser:
+        fail("no browser could be opened on this machine (the sign-in needs the person's browser on this computer)")
+    if not code:
+        fail(f"no sign-in came back within {int(SIGN_IN_WAIT_SECONDS)} seconds (or it was cancelled)")
+    try:
+        _st, _ct, text = http("POST", OAUTH_TOKEN_PATH, form={
+            "grant_type": "authorization_code", "code": code, "redirect_uri": opened["redirect"], "client_id": client_id,
+            "code_verifier": verifier, "resource": resource}, timeout=30)
+        token = json.loads(text).get("access_token")
+    except (ApiError, ValueError, AttributeError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        token = None
+    if not isinstance(token, str) or not token:
+        fail("datastash did not accept the sign-in")
+    try:
+        _st, ctype, text = http("POST", MCP_PATH, key=token, accept="application/json, text/event-stream", timeout=30, body={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": MAIN_CODE_TOOL.rsplit("__", 1)[1], "arguments": dict(MAIN_CODE_INPUT)}})
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        fail("could not reach datastash")
+    if "text/event-stream" in (ctype or ""):
+        text = "\n".join(line[5:].strip() for line in text.splitlines() if line.startswith("data:"))
+    try:
+        result = json.loads(text).get("result") or {}
+        body = json.loads(((result.get("content") or [{}])[0]).get("text") or "")
+    except (ValueError, AttributeError, IndexError, TypeError):
+        result, body = {"isError": True}, {}
+    main_code = body.get("main_pickup_code") if isinstance(body, dict) else None
+    if result.get("isError") or not isinstance(main_code, str) or not re.fullmatch(MAIN_PICKUP_RE, main_code):
+        fail("datastash gave no main key for that sign-in (it gives one only to the person's own sign-in)")
+    return main_code
+
+
+class _NoBrowser(Exception):
+    pass
 
 
 def _main_key_works(key):

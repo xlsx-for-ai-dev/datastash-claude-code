@@ -105,6 +105,22 @@
           }
         ]
       }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/bin/datastash",
+              "agent-tool"
+            ],
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }

@@ -69,7 +69,10 @@ Code then:
    the approval: there is no page, button or code. The key comes from the one Google sign-in the person already did for
    the connector: it is made once per machine, before the first agent registers there (by that first agent's setup,
    or by the first "datastash main" session if the person types it first), with one connector call that datastash
-   answers only on a connection that never registered an agent. Later "datastash main" sessions on that machine use it;
+   answers only on a connection that never registered an agent. On a machine whose connector already registered agents
+   (set up with an earlier version of the plugin), the first "datastash main" opens the normal datastash Google sign-in
+   in the browser once instead; that fresh sign-in makes the key, and the plugin keeps neither the sign-in nor the
+   code. Later "datastash main" sessions on that machine use it;
 2. says: "Your datastash main is ready. Type 'datastash main' in any Claude Code session to open it again."
 
 From then on that session wakes whenever any agent writes: a message in any agent's inbox or the person's, or a new row
@@ -97,7 +100,7 @@ Who the main session is:
   too. Inbox text is the only way datastash text reaches an AI, and it never reaches a clean session. The one connector
   call a clean session may make is the main key's own: `ledger_person_watch` with exactly `{"action": "main"}`, the
   plugin's connector, only after the person typed the phrase there; its answer is checked to carry nothing but the
-  one-time code (any other answer records the session as an agent). So type
+  one-time code (any other answer, or a refusal, records the session as an agent). So type
   "datastash main" first thing in a new session, in a folder no agent works in. Only a main session reads the main key.
 - The one-time code dies after 10 minutes and is picked up once. A working main key on the machine is never replaced.
 - Every live main session wakes: each has its own listener and cursor.
