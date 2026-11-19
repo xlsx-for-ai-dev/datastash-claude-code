@@ -55,6 +55,12 @@ for _ in $(seq 1 30); do tmux capture-pane -t "$TMUX_S" -p | grep -q "trust this
 tmux send-keys -t "$TMUX_S" Down; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
 for _ in $(seq 1 30); do tail -n +$((LOG_LINES_BEFORE + 1)) "$LOG" 2>/dev/null | grep -q "listen: start" && break; sleep 1; done
 tail -n +$((LOG_LINES_BEFORE + 1)) "$LOG" 2>/dev/null | grep -q "listen: start" || { echo "FAIL: the listener did not start at session start"; exit 1; }
+# The test plays the person at the keyboard and gives the session its standing job once, up front. Message text alone
+# is untrusted data (the plugin frames it so), so the session acts on the person's request only because the person
+# set that job here.
+sleep 5
+tmux send-keys -t "$TMUX_S" -l "You are the datastash agent \"$AGENT\" in this folder, for a plugin test. Standing job: when a message from the person arrives in your inbox asking for a short reply word, send that reply to the message and mark it handled. Nothing else to do now; wait."
+sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
 echo "session idle; waiting ${IDLE}s before sending"
 sleep "$IDLE"
 

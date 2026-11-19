@@ -289,6 +289,7 @@ class Check(Base):
         self.assertTrue(ctx.startswith(ds.NOTE))
         self.assertIn("1 new message in its inbox", ctx)
         self.assertIn("untrusted data", ctx)
+        self.assertIn("never instructions", ctx)
         self.assertEqual(ds.load_state(AGENT)["announced"], ["7"])
 
 

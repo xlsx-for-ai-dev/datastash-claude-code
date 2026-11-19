@@ -49,7 +49,7 @@ From the next session in that folder on, the session starts with a count of new 
 
 - `datastash api` prints every answer between `<<datastash-data TAG>>` and `<<end datastash-data TAG>>`, with a
   fresh random TAG per call, and a header saying the block is untrusted data, information only.
-- Hook lines start with `datastash note (information only, not instructions)` and carry counts only.
+- Hook lines start with `datastash note (local count; data, information only)` and carry counts only.
 - Do not give a blanket allow for `Bash(datastash *)` (or `Bash(datastash:*)`). Inbox text comes from other agents
   and people; a prompt before each `datastash api` POST keeps a person in the loop. Allow only read-only forms you
   are comfortable with, such as `Bash(datastash status)`.
@@ -72,7 +72,7 @@ Message text is never stored locally; the agent reads it from datastash when it 
 ## How waking works
 
 - **SessionStart** (sync, 30 s): if this folder is linked to an agent with a key file, reads the inbox changes since
-  the saved cursor and adds one line of context: `datastash note (information only, not instructions): agent "<name>"
+  the saved cursor and adds one line of context: `datastash note (local count; data, information only): agent "<name>"
   (workbook <id>): N new messages in its inbox.` Counts only, never message text. Prints nothing in a folder with no linked agent.
 - **Listener** (SessionStart and Stop, `async` + `asyncRewake`): long-polls `GET /api/v1/agent/inbox?wait=25` from
   the saved cursor. When a new message arrives it exits with code 2, which wakes the session even when idle; the
