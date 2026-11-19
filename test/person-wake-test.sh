@@ -12,12 +12,12 @@
 # wake and the session answers the plugin's note (it was told to say PERSON-WOKE) within 120 s, and the note carried
 # no message text.
 # ANYWHERE=1 MAIN_KEY_FILE=<file> (owner 11-19: "datastash main" in any clean session): the folder is linked to nobody
-# (PM 11-19: only a session that never acted as an agent becomes main), nothing is linked as the person's. MAIN_KEY_FILE is a main key of the test account, approved once in the browser
+# (PM 11-19: only a session that never acted as an agent becomes main), nothing is linked as the person's. MAIN_KEY_FILE is a main key of the test account (from ledger_person_watch action "main")
 # (copied into the throwaway config folder, never printed). In the session the person types "datastash main" (the
 # prompt hook records it for that session), then "datastash main --on" runs inside that very session (Claude Code's "!"
 # shell). PASS needs the same wake as the person, and a second plain process using that session's id is not the person.
-# Without MAIN_KEY_FILE the ANYWHERE run says SKIP (a main key needs the person's browser approval).
-# The cleanup's "stop" stops the account's watch and main keys, so each ANYWHERE run needs a freshly approved main key.
+# Without MAIN_KEY_FILE the ANYWHERE run says SKIP.
+# The cleanup's "stop" stops the account's watch and main keys, so each ANYWHERE run needs a fresh main key.
 # Cleanup (pass or fail): ends the tmux session, stops the account's watch keys, deletes the workbook and the
 # throwaway config folder (moved to ~/trash). Never prints a key.
 set -uo pipefail
@@ -28,7 +28,7 @@ AGENT_KEY="${AGENT_KEY:-$HOME/.config/datastash/agent-cc-plugin-test.key}"
 IDLE="${IDLE:-60}"
 ANYWHERE="${ANYWHERE:-0}"
 MAIN_KEY_FILE="${MAIN_KEY_FILE:-}"
-if [[ "$ANYWHERE" == 1 && ! -r "$MAIN_KEY_FILE" ]]; then echo "SKIP: ANYWHERE needs MAIN_KEY_FILE (a browser-approved main key)"; exit 3; fi
+if [[ "$ANYWHERE" == 1 && ! -r "$MAIN_KEY_FILE" ]]; then echo "SKIP: ANYWHERE needs MAIN_KEY_FILE (a main key of the test account)"; exit 3; fi
 TMUX_S="dsperson-test-$$"
 call() { python3 "$HERE/mcp_call.py" "$PERSON_KEY" "$@"; }
 field() { python3 -I "$HERE/jfield.py" get "$1"; }
@@ -56,7 +56,7 @@ trap cleanup EXIT
 
 CODE="$(call ledger_person_watch "{\"workbook_id\":\"$WID\",\"action\":\"key\"}" | field answer.pickup_code)" || { echo "FAIL: no watch pickup code"; exit 1; }
 if [[ "$ANYWHERE" == 1 ]]; then
-  # A clean folder (no link); the person's main key is the browser-approved one (never printed).
+  # A clean folder (no link); the person's main key is copied in (never printed).
   ( umask 077; cp "$MAIN_KEY_FILE" "$DATASTASH_CONFIG_DIR/main.key" )
   # The throwaway workbook is the one this main watches (the account may hold others).
   ( umask 077; printf '{"workbook_id": "%s", "projects": []}\n' "$WID" > "$DATASTASH_CONFIG_DIR/person.json" )

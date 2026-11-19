@@ -22,9 +22,11 @@ The person's own session ("datastash main"; the person, never an agent; any fold
                             whether the person watch is set up
   main --on                 after the person typed "datastash main" in THIS session: make it the person's main for its
                             lifetime. Needs the main key (~/.config/datastash/main.key, mode 600, never printed); the
-                            first time on a machine it prints a link the person opens and approves in the browser,
-                            signed in with Google. Refused in a session that acted as an agent.
-  main --wait               wait for that approval, save the main key, and finish --on
+                            first time on a machine it says to get one (the person's typed phrase is the approval).
+                            Refused in a session that acted as an agent.
+  main --key -              trade a one-time main pickup code (stdin; from the connector's ledger_person_watch action
+                            "main", the person's own sign-in) for the main key and save it; then finish --on when the
+                            person typed "datastash main" in this clean session
   main --workbook ID        pick the agent workbook the main session watches (when there are several)
   list [--all]              the person's main view: open items, blocked on the person first (main key)
   read INBOX                read one inbox as the person ("person" or an agent's name; main key)
@@ -69,18 +71,18 @@ PERSON_INBOX_PATH = "/api/v1/person/inbox"
 # agent can have (an agent's slug is letters, digits and dashes only).
 PERSON_SLUG = "@person"
 PERSON_KEY_RE = r"ldgr_pw_[A-Za-z0-9_\-]+"
-# The person's main key (ldgr_pm_...): made only by the person approving "datastash main" in a browser signed in with
-# Google, once per machine; kept in main.key (mode 600, never printed). Person scope on the REST door's person routes.
+# The person's main key (ldgr_pm_...): made once per machine from the person's own Google sign-in of the datastash
+# connector (ledger_person_watch action "main", which datastash answers only on the person's own connection, never once it
+# has registered agents); kept in main.key (mode 600, never printed). Person scope on the REST door's person routes.
+# Owner ruling 11-19: the person typing "datastash main" is the approval; there is no approval page.
 MAIN_KEY_RE = r"ldgr_pm_[A-Za-z0-9_\-]+"
-MAIN_START_PATH = "/api/v1/main/start"
 PERSON_FILTER_PATH = "/api/v1/person/filter"
 PERSON_WORKBOOKS_PATH = "/api/v1/person/agent-workbooks"
 MAIN_PICKUP_RE = r"dsmk_[A-Za-z0-9_\-]{6,200}"
-# The show code: the approval page shows it and the plugin shows the same one, so the person never approves someone
-# else's request (a phished link). Not a secret.
-MAIN_SHOW_CODE_RE = r"[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}"
-MAIN_PENDING_SECONDS = 9 * 60  # the server's request dies 10 minutes after the start
-MAIN_WAIT_SECONDS = float(os.environ.get("DATASTASH_MAIN_WAIT_SECONDS", "600"))
+# The one connector call a clean session makes on its way to main (the plugin's own connector, exactly this input).
+MAIN_CODE_TOOL = "mcp__plugin_datastash_datastash__ledger_person_watch"
+MAIN_CODE_INPUT = {"action": "main"}
+MAIN_CODE_KEYS = {"main_pickup_code", "expires_at", "note"}
 WAIT_SECONDS = 25
 # The listener hook's own timeout is set in hooks.json; it stops itself a little before that, without waking anyone.
 LISTEN_MAX_SECONDS = int(os.environ.get("DATASTASH_LISTEN_MAX_SECONDS", str(86400 - 300)))
@@ -110,7 +112,7 @@ CONF = os.environ.get("DATASTASH_CONFIG_DIR") or os.path.join(HOME, ".config", "
 MAIN_DIR = os.environ.get("DATASTASH_MAIN_DIR") or os.path.join(HOME, "datastash main")
 MAIN_MARKER = ".datastash-main"  # marker file the main setup writes inside "datastash main" (a private token)
 MAIN_CONF = os.path.join(CONF, "main.json")  # private record of that folder and its token
-MAIN_KEY_FILE = os.path.join(CONF, "main.key")  # the person's main key (browser approval)
+MAIN_KEY_FILE = os.path.join(CONF, "main.key")  # the person's main key (from the person's own sign-in)
 STATE = os.path.join(CONF, "state")
 OFF = os.path.join(CONF, "off")
 
@@ -405,9 +407,11 @@ def _links_into_main(agents, root):
 # copied into another session's environment or another hook's input names nothing: the process does not match.
 # It is switched on in two steps, and only for a session that never acted as an agent:
 #   1. the person types the phrase: the UserPromptSubmit hook (`prompt`) records a request for this session;
-#   2. `main --on` trades a fresh watch pickup code, which datastash issues only to the person's own connection (the
-#      server's person-scope check: never an agent key, never a connection acting for or registering agents), and
-#      only then marks the session as main.
+#   2. `main --on` checks the person's main key (main.key) and only then marks the session as main. The first time on a
+#      machine there is none: the session makes one call to the plugin's connector (ledger_person_watch action "main",
+#      answered only on the person's own connection: never an agent key, never a connection acting for or registering
+#      agents), and `main --key -` trades the code for the key. The recorder lets exactly that call through in a clean
+#      session the person typed the phrase in, and checks its answer carries nothing else.
 # A session that holds an agent identity ($DATASTASH_AGENT) or used an agent key or set up an agent this session (api,
 # fetch, link), or whose parent Claude Code session did, is refused at both steps.
 
@@ -1685,13 +1689,22 @@ def auto_name(here, me, after=None):
     die("no free agent name for this folder")
 
 
+MAIN_KEY_FIRST = ('first: this machine\'s first agent gets the person\'s main key before registering (once per machine; it is '
+                  'saved, never shown, and never used by an agent): call the datastash connector\'s ledger_person_watch with '
+                  'exactly {"action": "main"}, pipe its main_pickup_code into: printf \'%s\\n\' \'<main_pickup_code>\' | '
+                  'datastash main --key -   then run datastash auto-name again. If the connector refuses that call, run '
+                  'datastash auto-name --no-main-key instead.')
+
+
 def cmd_auto_name(args):
     """Self-registration helper: which agent name this session registers (see auto_name). AI-facing lines."""
     after = None
+    no_main_key = "--no-main-key" in args
+    args = [a for a in args if a != "--no-main-key"]
     if args[:1] == ["--after"] and len(args) == 2:
         after = args[1].strip()[:44] or None
     elif args:
-        die("usage: datastash auto-name [--after NAME]")
+        die("usage: datastash auto-name [--after NAME] [--no-main-key]")
     here = os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     me = this_session()
     kind, name = auto_name(here, me, after)
@@ -1699,6 +1712,10 @@ def cmd_auto_name(args):
         mark_agent_use(me, "auto-name")  # self-registration has begun: this session is an agent, never main
     if kind == "main":
         print("main: this is the person's own session; it never registers an agent")
+    elif kind == "name" and not no_main_key and not all_agents() and read_main_key() is None:
+        # The machine's first agent: the person's main key comes first, from the connector while it is still only the
+        # person's sign-in (datastash gives it only to a connection that never registered an agent). Owner ruling 11-19.
+        print(MAIN_KEY_FIRST)
     elif kind == "linked":
         print(f'linked: "{disp(name)}" (this folder\'s agent: reuse it; no registration)')
     else:
@@ -1714,8 +1731,9 @@ def cmd_auto_name(args):
 # config, such as a claude.ai connector), it records the session as an agent.
 DATASTASH_HOST = "getdatastash.com"
 # The person's own switch-on steps, run in a clean session before it is main: only these exact one-command forms.
-MAIN_STEP_RE = re.compile(r"\s*(?:python3\s+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/datastash\"|['\"]?[^\s'\";&|`$()<>{}]*datastash['\"]?)\s+main"
-                          r"(?:\s+--on|\s+--wait|\s+--workbook\s+[0-9a-fA-F\-]{36})?\s*(?:2>&1)?\s*")
+_DS_CMD = r"(?:python3\s+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/datastash\"|['\"]?[^\s'\";&|`$()<>{}]*datastash['\"]?)"
+MAIN_STEP_RE = re.compile(r"\s*(?:printf\s+'%s\\n'\s+'dsmk_[A-Za-z0-9_\-]{6,200}'\s*\|\s*" + _DS_CMD + r"\s+main\s+--key\s+-"
+                          r"|" + _DS_CMD + r"\s+main(?:\s+--on|\s+--workbook\s+[0-9a-fA-F\-]{36})?)\s*(?:2>&1)?\s*")
 CLAUDE_USER_CONFIG = os.path.join(HOME, ".claude.json")  # Claude Code's user (and per-project) MCP servers
 FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Grep", "Glob")
 
@@ -1767,10 +1785,54 @@ def _touches_datastash_text(text):
     return "datastash" in t or "ldgr_" in t or os.path.realpath(CONF).lower() in t
 
 
+def _strings(v, out):
+    if isinstance(v, str):
+        out.append(v)
+    elif isinstance(v, dict):
+        for x in v.values():
+            _strings(x, out)
+    elif isinstance(v, list):
+        for x in v:
+            _strings(x, out)
+    return out
+
+
+def main_code_answer_ok(resp):
+    """True when a ledger_person_watch action "main" answer carries only its own fields: one JSON object with a main
+    pickup code, its expiry and a note, plus content-type labels; anything else (more text, other keys) is False."""
+    texts = [t for t in _strings(resp, []) if t != "text"]
+    if len(texts) != 1:
+        return False
+    try:
+        body = json.loads(texts[0])
+    except ValueError:
+        return False
+    return (isinstance(body, dict) and set(body) <= MAIN_CODE_KEYS and isinstance(body.get("main_pickup_code"), str)
+            and re.fullmatch(MAIN_PICKUP_RE, body["main_pickup_code"]) is not None
+            and all(isinstance(body.get(k, ""), str) for k in ("expires_at", "note")))
+
+
+def is_main_code_call(inp):
+    """True for the one connector call a clean session makes on its way to main: the plugin's own connector's
+    ledger_person_watch with exactly {"action": "main"}, in a session where the person typed "datastash main" and that
+    never acted as an agent; after the call (PostToolUse), only when its answer carries nothing but the code."""
+    if inp.get("tool_name") != MAIN_CODE_TOOL or inp.get("tool_input") != MAIN_CODE_INPUT:
+        return False
+    event = inp.get("hook_event_name")
+    if event not in ("PreToolUse", "PostToolUse"):
+        return False
+    me = this_session(inp)
+    if main_refusal(me) is not None or not main_request_ok(me):
+        return False
+    return event == "PreToolUse" or main_code_answer_ok(inp.get("tool_response"))
+
+
 def tool_carries_datastash(inp):
     """(record?, why) for one hook input. Default-deny: anything it can't read records."""
     if not isinstance(inp, dict):
         return True, "unreadable"
+    if is_main_code_call(inp):
+        return False, ""
     name, args = inp.get("tool_name"), inp.get("tool_input")
     if not isinstance(name, str) or not name:
         return True, "unreadable"
@@ -1858,10 +1920,10 @@ def cmd_main(args):
     the skill says what to tell the person). With --on WORKBOOK_ID [-|CODE]: trade a fresh watch pickup code from the
     person's own connection and turn THIS session into the person's main session."""
     me = this_session()
-    if args and args[0] in ("--on", "--wait", "--workbook"):
-        return {"--on": _main_on, "--wait": _main_wait, "--workbook": _main_workbook}[args[0]](me, args[1:])
+    if args and args[0] in ("--on", "--key", "--workbook"):
+        return {"--on": _main_on, "--key": _main_key, "--workbook": _main_workbook}[args[0]](me, args[1:])
     if args:
-        die("usage: datastash main  |  datastash main --on  |  datastash main --wait  |  datastash main --workbook ID")
+        die("usage: datastash main  |  datastash main --on  |  datastash main --key -  |  datastash main --workbook ID")
     here = os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     c = read_json(conf_path(PERSON_SLUG), None)
     set_up = bool(c and c.get("workbook_id")) and read_key(PERSON_SLUG) is not None
@@ -1869,7 +1931,7 @@ def cmd_main(args):
     why = None if on else main_refusal(me)
     print(f"this session is the person's datastash main: {'yes' if on else 'no'}")
     print(f"person watch set up on this machine: {'yes, agent workbook ' + disp(c['workbook_id']) if set_up else 'no'}")
-    print(f"main key on this machine (browser-approved): {'yes' if read_main_key() is not None else 'no'}")
+    print(f"main key on this machine: {'yes' if read_main_key() is not None else 'no'}")
     if not on:
         print(f"the person asked for main in this session: {'yes' if why is None and main_request_ok(me) else 'no'}")
         if why is not None:
@@ -1886,7 +1948,10 @@ def cmd_main(args):
     return 0
 
 
-MAIN_PENDING = os.path.join(STATE, "main-pickup.json")  # the open approval: link and pickup code (private)
+MAIN_KEY_STEP = ('no main key on this machine yet (made once per machine from the person\'s own sign-in; the person\'s typed '
+                 '"datastash main" is the approval, so there is no step for the person): call the datastash connector\'s '
+                 'ledger_person_watch with exactly {"action": "main"} and nothing else, then pipe its main_pickup_code, '
+                 "never shown, into: printf '%s\\n' '<main_pickup_code>' | datastash main --key -")
 
 
 def _main_gate(me):
@@ -1900,8 +1965,8 @@ def _main_gate(me):
 
 
 def _main_on(me, args):
-    """Turn this session into the person's main session. With the main key on this machine: at once. Without it: start a
-    browser approval (once per machine) and print its link for the person; then `main --wait`."""
+    """Turn this session into the person's main session. With the main key on this machine: at once. Without it: say how
+    to get it (once per machine; `main --key -` then finishes the switch-on)."""
     if args:
         die("usage: datastash main --on")
     _main_gate(me)
@@ -1912,39 +1977,9 @@ def _main_on(me, args):
             die("could not reach datastash; try again")
         if ok:
             return _main_finish(me, key)
-        _set_aside(MAIN_KEY_FILE)  # stopped or unknown: approve a new one
-    pend = _pending()
-    if pend is None:
-        try:
-            status, _ctype, text = http("POST", MAIN_START_PATH, timeout=30)
-            got = json.loads(text)
-        except (ApiError, ValueError) as e:
-            die(f"datastash refused the start ({getattr(e, 'status', 'bad answer')}); try again")
-        except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
-            die(f"could not reach datastash ({type(e).__name__})")
-        url, code, show = got.get("approve_url"), got.get("pickup_code"), got.get("show_code")
-        if not (isinstance(url, str) and url.startswith(ORIGIN + "/main/approve?") and isinstance(code, str)
-                and re.fullmatch(MAIN_PICKUP_RE, code) and isinstance(show, str) and re.fullmatch(MAIN_SHOW_CODE_RE, show)):
-            die("datastash answered something that is not an approval link; nothing saved")
-        ensure_dirs()
-        write_private(MAIN_PENDING, json.dumps({"approve_url": url, "code": code, "show": show, "at": int(time.time())}))
-        pend = {"approve_url": url, "code": code, "show": show}
-    print("approval needed (once on this machine): show the person this link to open in their browser, signed in with "
-          f"Google, and this code: {pend['approve_url']}  Code: {pend['show']}")
-    print("the approval page shows a code too; the person approves only if it is this same code")
-    print("then run: datastash main --wait")
+        _set_aside(MAIN_KEY_FILE)  # stopped or unknown: get a new one
+    print(MAIN_KEY_STEP)
     return 0
-
-
-def _pending():
-    """The open approval (link, pickup code and show code), or None (none, or near the end of its 10 minutes)."""
-    p = read_json(MAIN_PENDING, None)
-    if not p or not _num_ok(p.get("at")) or time.time() - p["at"] > MAIN_PENDING_SECONDS:
-        return None
-    if not (isinstance(p.get("code"), str) and re.fullmatch(MAIN_PICKUP_RE, p["code"]) and isinstance(p.get("approve_url"), str)
-            and isinstance(p.get("show"), str) and re.fullmatch(MAIN_SHOW_CODE_RE, p["show"])):
-        return None
-    return p
 
 
 def _set_aside(path):
@@ -1956,34 +1991,40 @@ def _set_aside(path):
         pass
 
 
-def _main_wait(me, args):
-    """Wait for the person's browser approval, then save the main key (never printed) and finish the switch-on."""
-    if args:
-        die("usage: datastash main --wait")
-    _main_gate(me)
-    pend = _pending()
-    if pend is None:
-        die("no approval is open; run datastash main --on")
-    deadline = time.time() + MAIN_WAIT_SECONDS
-    while True:
-        try:
-            status, _ctype, text = http("POST", PICKUP_PATH, form={"code": pend["code"]}, timeout=30)
-        except ApiError as e:
-            _set_aside(MAIN_PENDING)
-            die(f"the approval link expired or was used (HTTP {e.status}); run datastash main --on for a new one")
-        except (urllib.error.URLError, httpclient.HTTPException, OSError):
-            status, text = 0, ""
-        if status == 200:
-            key = text.strip()
-            if not re.fullmatch(MAIN_KEY_RE, key):
-                die("datastash answered something that is not a main key; nothing saved")
-            write_private(MAIN_KEY_FILE, key + "\n")
-            _set_aside(MAIN_PENDING)
-            return _main_finish(me, key)
-        if time.time() > deadline:
-            print(f"still waiting for the person's approval in the browser (Code: {pend['show']}); run datastash main --wait again")
-            return 0
-        time.sleep(3)
+def _main_key(me, args):
+    """Trade a one-time main pickup code (stdin) for the person's main key and save it (never printed). A working main key
+    already on the machine is never replaced. Then, in a clean session where the person typed "datastash main", finish the
+    switch-on; anywhere else the key is only saved (an agent session gets it once per machine, before the first agent
+    registers on the machine's connector, and never uses it)."""
+    if args not in (["-"], []):
+        die("usage: printf '%s\\n' '<main_pickup_code>' | datastash main --key -   (the code on stdin)")
+    code = sys.stdin.readline(512).strip()
+    if not re.fullmatch(MAIN_PICKUP_RE, code):
+        die('that does not look like a main pickup code (ledger_person_watch, action "main")')
+    old = read_main_key()
+    if old is not None:
+        ok = _main_key_works(old)
+        if ok is None:
+            die("could not reach datastash; try again")
+        if ok:
+            die("this machine already has a working main key; nothing changed")
+        _set_aside(MAIN_KEY_FILE)
+    try:
+        status, _ctype, text = http("POST", PICKUP_PATH, form={"code": code}, timeout=30)
+    except ApiError as e:
+        die(f'pickup refused (HTTP {e.status}): the code is unknown, used or expired. Ask for a new one (ledger_person_watch, action "main").')
+    except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+        die(f"could not reach datastash ({type(e).__name__})")
+    key = text.strip()
+    if status != 200 or not re.fullmatch(MAIN_KEY_RE, key):
+        die("datastash answered something that is not a main key; nothing saved")
+    ensure_dirs()
+    write_private(MAIN_KEY_FILE, key + "\n")
+    if main_refusal(me) is None and (is_main_session(me) or main_request_ok(me)):
+        return _main_finish(me, key)
+    print("saved the person's main key on this machine (never shown). This session is not the person's main; "
+          "if you were registering an agent, run datastash auto-name again")
+    return 0
 
 
 def _main_key_works(key):
@@ -1999,7 +2040,7 @@ def _main_key_works(key):
 
 def _main_finish(me, key):
     """Mark this session as the person's main and pick the agent workbook it watches."""
-    why = main_refusal(me)  # it may have acted as an agent while waiting for the approval
+    why = main_refusal(me)  # it may have acted as an agent since the person typed the phrase
     if why is not None:
         die(f"this session can't become the person's datastash main: {why}")
     try:
@@ -2055,7 +2096,7 @@ def _person_call(method, path, body=None, need_main=False, query=None):
         die('the person\'s datastash main is not set up on this machine (the person types "datastash main")')
     key = read_main_key() if need_main else read_key(PERSON_SLUG)
     if key is None:
-        die('no main key on this machine (the person types "datastash main" and approves it in the browser)')
+        die('no main key on this machine (the person types "datastash main")')
     if query is not None:
         path = path + "?" + urllib.parse.urlencode(dict(query, workbook_id=person["workbook_id"]))
     if body is not None:
@@ -2102,7 +2143,7 @@ def cmd_filter(args, hidden=True):
         die('only the person\'s datastash main session acts as the person (the person types "datastash main")')
     key = read_main_key()
     if key is None:
-        die('no main key on this machine (the person types "datastash main" and approves it in the browser)')
+        die('no main key on this machine (the person types "datastash main")')
     body["action"] = "filter" if hidden else "unfilter"
     try:
         status, _ctype, text = http("POST", PERSON_FILTER_PATH, key=key, body=body, timeout=60)

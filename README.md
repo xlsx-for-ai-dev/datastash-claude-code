@@ -65,9 +65,11 @@ It is one phrase, in any Claude Code session, in any folder: the person types "d
 That session becomes the person's main session for as long as it runs. There is no folder to choose or move to. Claude
 Code then:
 
-1. the first time on a machine, shows the person a short link; the person opens it in the browser, signed in with Google,
-   and presses Approve. That makes the person's main key, kept in `~/.config/datastash/main.key` (mode 600, never shown).
-   Later "datastash main" sessions on that machine use it, with no browser step;
+1. uses the person's main key, kept in `~/.config/datastash/main.key` (mode 600, never shown). Typing "datastash main" is
+   the approval: there is no page, button or code. The key comes from the one Google sign-in the person already did for
+   the connector: it is made once per machine, before the first agent registers there (by that first agent's setup,
+   or by the first "datastash main" session if the person types it first), with one connector call that datastash
+   answers only on a connection that never registered an agent. Later "datastash main" sessions on that machine use it;
 2. says: "Your datastash main is ready. Type 'datastash main' in any Claude Code session to open it again."
 
 From then on that session wakes whenever any agent writes: a message in any agent's inbox or the person's, or a new row
@@ -81,8 +83,9 @@ Who the main session is:
 - The main session is always the person: it never uses an agent key, whatever agent links the folder has
   (`datastash api`, `fetch` and `link` refuse there). Other sessions in the same folder keep their agent.
 - Only the person turns a session into main: the prompt hook records the person's typed phrase for that session, and
-  the switch needs the main key, which only the person's own browser approval makes (a fresh Google sign-in, one
-  button; datastash refuses it on every agent route and every MCP connector).
+  the switch needs the main key, which datastash gives only to the person's own connection (never to an agent key, a
+  connection acting for an agent, or one that registered agents) and refuses on every agent route and every MCP
+  connector.
 - Only a clean session becomes main: one that never touched datastash as an agent. The first agent action in a session
   (an agent identity at session start or in its listener, `DATASTASH_AGENT`, an agent key or inbox use, an agent
   fetched, linked or named, or any tool call that could carry datastash content, seen by a hook on every tool call:
@@ -91,11 +94,12 @@ Who the main session is:
   anything the hook can't tell, such as a connector it finds in no MCP config) records that session id
   and its Claude Code process as an agent, and main is refused for it from then on, by that record: replaying the typed
   phrase through the plugin's own `prompt` command changes nothing. A session started from such a session is refused
-  too. Inbox text is the only way datastash text reaches an AI, and it never reaches a clean session. So type
+  too. Inbox text is the only way datastash text reaches an AI, and it never reaches a clean session. The one connector
+  call a clean session may make is the main key's own: `ledger_person_watch` with exactly `{"action": "main"}`, the
+  plugin's connector, only after the person typed the phrase there; its answer is checked to carry nothing but the
+  one-time code (any other answer records the session as an agent). So type
   "datastash main" first thing in a new session, in a folder no agent works in. Only a main session reads the main key.
-- The approval page shows a code, and Claude Code shows the same code: approve only when they match (a link someone
-  else sent shows a different code). The link, the code and an approved key not yet picked up die after 10 minutes;
-  the key is picked up once.
+- The one-time code dies after 10 minutes and is picked up once. A working main key on the machine is never replaced.
 - Every live main session wakes: each has its own listener and cursor.
 - The person stops every main key from their own connection (`ledger_person_watch`, `action: "stop"`).
 - The limit, plainly: datastash keeps agents apart through its own tools; it doesn't defend against a program with full
@@ -155,8 +159,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
 | `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |
-| `main.key` | the person's main key (browser-approved; the person's main view, watch and send, REST only); read only by a main session |
-| `state/main-pickup.json` | an open browser approval (its link and one-time code; 15 minutes) |
+| `main.key` | the person's main key (from the person's own sign-in; the person's main view, watch and send, REST only); read only by a main session |
 | `state/main-session-<id>.json` | which session is the person's main (session id, its Claude Code process id and start time); removed at SessionEnd |
 | `state/main-request-<id>.json` | the person typed "datastash main" in that session (good for 30 minutes) |
 | `state/agent-used-*` | this session (or its process) acted as an agent, so it can't become main |
@@ -250,12 +253,11 @@ An agent can send datastash a capability request, an error report or anything el
   Main in any session: main in an agent-linked folder for that session only, another session in that folder staying
   the agent, an agent session refused, session id spoofing, and self-registration names. Clean sessions only: the
   review's attack replayed (an agent session fakes the typed phrase with the `prompt` command, with its own or a forged
-  session id, with a main key on the machine), each first agent action recording the session, and the show code.
+  session id, with a main key on the machine), each first agent action recording the session, and the one connector call on the way to main (exact call, typed phrase, answer shape).
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key
-  approved once in the browser: the person types "datastash main" there, the session turns into the main, and it wakes
-  as the person.
+  on the machine: the person types "datastash main" there, the session turns into the main, and it wakes as the person.
 - `test/wake-test.sh` proves the idle wake on this box with the test account (needs tmux; see the script header).
   `BURST=5 test/wake-test.sh` sends 5 messages within seconds instead and passes when the session wakes once or
   twice and handles all 5.
