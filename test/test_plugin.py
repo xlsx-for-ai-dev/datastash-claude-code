@@ -18,6 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.join(HERE, "..", "plugins", "datastash", "bin", "datastash")
 TMP = tempfile.mkdtemp(prefix="ds-test-")
 os.environ["DATASTASH_CONFIG_DIR"] = TMP
+MAIN = os.path.join(TMP, "home", "datastash main")
+os.environ["DATASTASH_MAIN_DIR"] = MAIN
 os.environ.pop("DATASTASH_AGENT", None)
 
 loader = importlib.machinery.SourceFileLoader("datastash_bin", BIN)
@@ -495,6 +497,58 @@ class PersonSession(Base):
         self.assertNotIn("ldgr_pw_", out.getvalue())
         self.assertEqual(calls[0][0][:2], ("POST", ds.PICKUP_PATH))
         self.assertEqual(oct(os.stat(ds.key_path(ds.PERSON_SLUG)).st_mode & 0o777), "0o600")
+        # The "datastash main" folder is made and linked, beside --project.
+        projects = ds.read_json(ds.conf_path(ds.PERSON_SLUG), {})["projects"]
+        self.assertIn(os.path.realpath(MAIN), projects)
+        self.assertIn(os.path.realpath(TMP), projects)
+        self.assertTrue(os.path.isdir(MAIN))
+
+    def test_main_makes_the_folder_and_says_what_is_set_up(self):
+        if os.path.isdir(MAIN):
+            os.rename(MAIN, MAIN + "-old-" + str(time.time()))
+        old_env = os.environ.get("CLAUDE_PROJECT_DIR")
+        try:
+            os.environ["CLAUDE_PROJECT_DIR"] = TMP
+            ds.read_key = lambda s: None
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ds.cmd_main([]), 0)
+            self.assertTrue(os.path.isdir(MAIN))
+            text = out.getvalue()
+            self.assertIn("folder: " + os.path.realpath(MAIN), text)
+            self.assertIn("person watch set up: no", text)
+            self.assertIn("this session is in that folder: no", text)
+            # Set up (key and workbook): the main folder is linked, and a session there is the person's.
+            ds.read_key = lambda s: "ldgr_pw_test" if s == ds.PERSON_SLUG else None
+            os.environ["CLAUDE_PROJECT_DIR"] = MAIN
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ds.cmd_main([]), 0)
+            text = out.getvalue()
+            self.assertIn("person watch set up: yes", text)
+            self.assertIn("this session is in that folder: yes", text)
+            self.assertNotIn("ldgr_pw_", text)
+            self.assertEqual(ds.session_for(MAIN)["slug"], ds.PERSON_SLUG)
+            # Run again: nothing changes, the folder is kept.
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(ds.cmd_main([]), 0)
+            self.assertEqual(ds.read_json(ds.conf_path(ds.PERSON_SLUG), {})["projects"].count(os.path.realpath(MAIN)), 1)
+            # A folder that belongs to an agent is named as the agent's, never the person's.
+            ds.agent_for = lambda p: dict(AGENT)
+            with redirect_stdout(io.StringIO()) as out:
+                ds.cmd_main([])
+            self.assertIn('linked to the agent "Tester"', out.getvalue())
+        finally:
+            if old_env is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = old_env
+
+    def test_skill_names_both_word_orders_of_both_phrases(self):
+        with open(os.path.join(HERE, "..", "plugins", "datastash", "skills", "datastash-agent", "SKILL.md")) as f:
+            text = f.read()
+        head = text.split("---")[1]
+        for phrase in ("datastash main", "main datastash", "sync datastash", "datastash sync"):
+            self.assertIn(f'"{phrase}"', head, phrase)
+            self.assertIn(f'"{phrase}"', text.split("## The person's phrases")[1], phrase)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ What it adds:
   agent-workbook work. Agents on one sign-in connection are labels, not walls; per-agent privacy holds only on
   agent keys.
 - **`datastash` command** (on the session's PATH): `fetch`, `link`, `status`, `api`, `off`, `watch`; for the person's own
-  session ("datastash main"): `watch --person`, `reply`, `send`.
+  session ("datastash main"): `main`, `watch --person`, `reply`, `send`.
 - **Hooks**: an inbox count at session start, and a background inbox listener that wakes the session when
   messages arrive.
 
@@ -56,15 +56,18 @@ From the next session in that folder on, the session starts with a count of new 
 agents shows up there, and the person answers any agent from it. datastash's part ends at the ping: the wake carries who
 and how many, never message text; the session reads the rest through the datastash connector with the person's own access.
 
-Set it up once, in the folder the person will use for it:
+Setting it up is one phrase. In any Claude Code session with this plugin, the person types "datastash main" (or
+"main datastash"). Claude Code then, with no folder chosen by the person:
 
-1. Start Claude Code in that folder with this plugin installed. Sign in to the datastash connector with the person's own
-   Google login. This session must never register an agent (a connection that registered agents is never the person).
-2. Ask the session: "set this up as datastash main for my agent workbook". It calls `ledger_person_watch` with
-   `action: "key"` and runs the fetch line it gets back itself, which trades the one-time code for the person's watch key
-   (saved to `~/.config/datastash/person.key`, mode 600, never printed) and links this folder.
-3. Start a new session in that folder. From then on it starts with a count of new items, and the listener wakes it when
-   any agent writes: a message in any agent's inbox or the person's, or a new row in the team tab.
+1. makes a folder named "datastash main" in the person's home folder, if it is missing;
+2. uses the person's own datastash sign-in, never an agent's (if agents registered on this machine's connector, it adds
+   a separate connector for that folder only, and the person signs in there with their own Google login);
+3. sets up the person watch (a one-time code traded for the person's watch key, kept in a private file, never shown);
+4. carries on as the main view in this session if it can, and tells the person, in plain words, to open Claude Code in
+   the "datastash main" folder from then on. Sessions there start with a count of new items and wake whenever any agent
+   writes: a message in any agent's inbox or the person's, or a new row in the team tab.
+
+The person never sees a command or code there: every line is plain words (who, kind, subject).
 
 What the person's AI does in this session:
 
@@ -76,15 +79,25 @@ What the person's AI does in this session:
   `datastash send AGENT -`, with the text on stdin.
 - Sets a filter only when the person asks ("filter Researcher", "filter tool activity"): `action: "filter"` with `agent`
   or `kind`. Filters are kept by datastash until the person removes them (`unfilter`); agents can't set or see them. They
-  hide items from the main view, the wake and the waiting count, never delete anything, and hidden asks and alerts are
-  still counted, so a filter never hides a blocker. Tool activity is filtered until the person unfilters it.
+  hide items from the person's own main view, wake and waiting count only (an agent's inbox and wake never change),
+  never delete anything, and hidden asks and alerts are still counted, so a filter never hides a blocker. @feedback
+  drafts waiting for the person's yes are always shown. Tool activity is filtered until the person unfilters it.
 
 Message kinds: agents send `kind` with each message: `ask` (stopped and waiting on the person), `alert`, `done`,
 `chatter` (the default) or `tool`.
 
+Typing "sync datastash" (or "datastash sync") is a different phrase: it turns on datastash sync for that chat.
+
 If hooks can't run, a Monitor does the same: `datastash watch --person` prints one line of counts per arrival.
 `datastash status` shows the person's session beside the agents. To stop the watch key everywhere: `ledger_person_watch`
 with `action: "stop"`.
+
+### Cursor
+
+There is no main session in Cursor. Cursor can still wake its cloud agents: point an agent's inbox webhook
+(`ledger_inbox_webhook`) at a Cursor Automation's webhook address, with the Automation's key as the webhook's key header
+(`header_name` and `header_value`). Each new message then starts the Automation, and the cloud agent reads its inbox
+through the datastash connector.
 
 ## Untrusted text and permissions
 

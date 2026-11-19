@@ -17,8 +17,11 @@ The person's own session ("datastash main"; the person, never an agent):
   watch --person --setup WORKBOOK_ID [-|CODE]
                             trade a one-time watch pickup code (from ledger_person_watch, action "key"; read from
                             stdin with "-") for the person's watch key, saved to ~/.config/datastash/person.key (mode
-                            600, never printed), and link this folder as the person's session for that agent workbook
+                            600, never printed), and link the "datastash main" folder (made if missing; --project DIR
+                            links DIR too) as the person's session for that agent workbook
   watch --person            print one line each time new items arrive across the agent workbook (for a Monitor loop)
+  main                      make the folder "datastash main" in the home folder if it is missing, link it as the
+                            person's session when the watch key is set up, and say what is set up
   reply MESSAGE_ID [-]      answer a message as the person; the text is read from stdin
   send AGENT [--subject S] [-]
                             send a message to an agent's inbox as the person; the text is read from stdin
@@ -80,6 +83,9 @@ LOG_MAX_BYTES = 256 * 1024
 
 HOME = os.path.expanduser("~")
 CONF = os.environ.get("DATASTASH_CONFIG_DIR") or os.path.join(HOME, ".config", "datastash")
+# The person's own session ("datastash main"): a folder named "datastash main" in the home folder, made by the plugin
+# itself, so the person never picks a folder.
+MAIN_DIR = os.environ.get("DATASTASH_MAIN_DIR") or os.path.join(HOME, "datastash main")
 STATE = os.path.join(CONF, "state")
 OFF = os.path.join(CONF, "off")
 
@@ -1234,8 +1240,11 @@ def person_setup(args):
     else:
         reset = False
     c["workbook_id"] = workbook
-    here = os.path.realpath(proj or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-    c["projects"] = [p for p in (c.get("projects") or []) if p != here] + [here]
+    # The person's session is the "datastash main" folder (made here if missing); --project links one more folder.
+    main_dir = make_main_dir()
+    linked = [main_dir] + ([os.path.realpath(proj)] if proj else [])
+    c["projects"] = [p for p in (c.get("projects") or []) if p not in linked] + linked
+    here = ", ".join(linked)
     write_private(conf_path(PERSON_SLUG), json.dumps(c, indent=2))
     if reset:
         p = person_for(None)
@@ -1243,6 +1252,35 @@ def person_setup(args):
             reset_cursor(p)
     print(f"saved the person's watch key to {key_path(PERSON_SLUG)} (mode 600; not printed) and linked {here} as the "
           f"person's session for agent workbook {workbook}. New Claude Code sessions in this folder wake when agents write.")
+    return 0
+
+
+def make_main_dir():
+    """The "datastash main" folder in the home folder, made if missing. Returns its real path."""
+    os.makedirs(MAIN_DIR, mode=0o700, exist_ok=True)
+    return os.path.realpath(MAIN_DIR)
+
+
+def cmd_main(args):
+    """The person typed "datastash main" (or "main datastash"): make the folder and say what is set up. AI-facing lines
+    (plain facts for the session's AI; the skill says what to tell the person)."""
+    if args:
+        die("usage: datastash main")
+    main_dir = make_main_dir()
+    here = os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    c = read_json(conf_path(PERSON_SLUG), None)
+    has_key = read_key(PERSON_SLUG) is not None
+    set_up = bool(c and c.get("workbook_id")) and has_key
+    if set_up and main_dir not in [os.path.realpath(p) for p in (c.get("projects") or [])]:
+        c["projects"] = list(c.get("projects") or []) + [main_dir]
+        write_private(conf_path(PERSON_SLUG), json.dumps(c, indent=2))
+    in_main = here == main_dir or here.startswith(main_dir.rstrip("/") + "/")
+    agent_here = agent_for(here)
+    print(f"folder: {main_dir}")
+    print(f"person watch set up: {'yes, agent workbook ' + disp(c['workbook_id']) if set_up else 'no'}")
+    print(f"this session is in that folder: {'yes' if in_main else 'no'}")
+    if agent_here is not None:
+        print(f'this folder is linked to the agent "{disp(agent_here["name"])}": this session is that agent, not the person')
     return 0
 
 
@@ -1301,7 +1339,7 @@ def main():
     args = sys.argv[2:]
     table = {"fetch": cmd_fetch, "link": cmd_link, "status": cmd_status, "api": cmd_api, "off": cmd_off,
              "watch": cmd_watch, "check": cmd_check, "listen": cmd_listen, "end": cmd_end, "reply": cmd_reply,
-             "send": cmd_send}
+             "send": cmd_send, "main": cmd_main}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # person-wake-test.sh: proves "datastash main": an IDLE interactive Claude Code session set up as the person's own session
-# (datastash watch --person --setup) wakes when an agent's message lands in the agent workbook. Live, on
+# (datastash watch --person --setup, which links the "datastash main" folder) wakes when an agent's message lands in the agent workbook. Live, on
 # getdatastash.com, test account only.
 #
 # Needs: tmux; claude; the test account's person key (PERSON_KEY, default ~/.config/x-hostproof/person.key, a key that
@@ -30,6 +30,8 @@ WB_NAME="cc-plugin-person-test $(date +%Y%m%d%H%M%S)"
 WID="$(call ledger_agent_workbook "{\"action\":\"create\",\"name\":\"$WB_NAME\"}" | field answer.workbook_id)" || { echo "FAIL: could not make the throwaway workbook"; exit 1; }
 PROJ="$(mktemp -d)"
 export DATASTASH_CONFIG_DIR="$(mktemp -d)"
+# The "datastash main" folder the plugin makes and links: a throwaway one here (never the real one in the home folder).
+export DATASTASH_MAIN_DIR="$PROJ"
 LOG="$DATASTASH_CONFIG_DIR/state/agent-@person.log"
 cleanup() {
   tmux kill-session -t "$TMUX_S" 2>/dev/null
@@ -40,10 +42,11 @@ cleanup() {
 trap cleanup EXIT
 
 CODE="$(call ledger_person_watch "{\"workbook_id\":\"$WID\",\"action\":\"key\"}" | field answer.pickup_code)" || { echo "FAIL: no watch pickup code"; exit 1; }
-printf '%s\n' "$CODE" | python3 "$PLUGIN/bin/datastash" watch --person --setup "$WID" - --project "$PROJ" >/dev/null || { echo "FAIL: setup"; exit 1; }
+printf '%s\n' "$CODE" | python3 "$PLUGIN/bin/datastash" watch --person --setup "$WID" - >/dev/null || { echo "FAIL: setup"; exit 1; }
+python3 "$PLUGIN/bin/datastash" main | grep -q "person watch set up: yes" || { echo "FAIL: datastash main does not see the setup"; exit 1; }
 CODE=""
 
-tmux new-session -d -s "$TMUX_S" -x 200 -y 50 -c "$PROJ" -e "DATASTASH_CONFIG_DIR=$DATASTASH_CONFIG_DIR" \
+tmux new-session -d -s "$TMUX_S" -x 200 -y 50 -c "$PROJ" -e "DATASTASH_CONFIG_DIR=$DATASTASH_CONFIG_DIR" -e "DATASTASH_MAIN_DIR=$DATASTASH_MAIN_DIR" \
   "claude --setting-sources project,local --plugin-dir '$PLUGIN'"
 for _ in $(seq 1 30); do tmux capture-pane -t "$TMUX_S" -p | grep -q "trust this folder" && break; sleep 1; done
 tmux send-keys -t "$TMUX_S" Down; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
