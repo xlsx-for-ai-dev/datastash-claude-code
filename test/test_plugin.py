@@ -80,11 +80,11 @@ class Base(unittest.TestCase):
         ds.ensure_dirs()
         for n in os.listdir(ds.STATE):
             os.replace(os.path.join(ds.STATE, n), os.path.join(TMP, "old-" + n + str(time.time())))
-        self.saved = {k: getattr(ds, k) for k in ("fetch_page", "read_key", "agent_for", "hook_input", "_session_pid",
+        self.saved = {k: getattr(ds, k) for k in ("fetch_page", "read_key", "resolve", "hook_input", "_session_pid",
                                                     "_sleep", "WAKE_GATHER_SECONDS", "WAKE_MIN_SECONDS", "random",
                                                     "announce_ids", "WAKE_IDLE_MAX_SECONDS")}
         ds.read_key = lambda s: "ldgr_ag_test"
-        ds.agent_for = lambda p: dict(AGENT)
+        ds.resolve = lambda p: (dict(AGENT), [])
         ds.hook_input = lambda: {"session_id": "s1"}
         ds._session_pid = lambda: os.getpid()
 
@@ -248,7 +248,7 @@ class CheckTimeout(Base):
             "spec = importlib.util.spec_from_loader('d', loader); d = importlib.util.module_from_spec(spec); loader.exec_module(d)\n"
             "d.CHECK_WAIT_SECONDS = 1.0\n"
             "d.read_key = lambda s: 'ldgr_ag_test'\n"
-            "d.agent_for = lambda p: {'name': 'Tester', 'slug': 'tester', 'workbook_id': 'wb1'}\n"
+            "d.resolve = lambda p: ({'name': 'Tester', 'slug': 'tester', 'workbook_id': 'wb1'}, [])\n"
             "d.hook_input = lambda: {}\n"
             "d.fetch_page = lambda *a, **k: time.sleep(60)\n"
             "sys.exit(d.cmd_check([]))\n"
@@ -408,7 +408,7 @@ class PersonSession(Base):
 
     def setUp(self):
         super().setUp()
-        ds.agent_for = lambda p: None
+        ds.resolve = self.saved["resolve"]
         ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps(PERSON))
         for k in ("http",):
             self.saved.setdefault(k, getattr(ds, k))
@@ -532,10 +532,16 @@ class PersonSession(Base):
                 self.assertEqual(ds.cmd_main([]), 0)
             self.assertEqual(ds.read_json(ds.conf_path(ds.PERSON_SLUG), {})["projects"].count(os.path.realpath(MAIN)), 1)
             # A folder that belongs to an agent is named as the agent's, never the person's.
-            ds.agent_for = lambda p: dict(AGENT)
-            with redirect_stdout(io.StringIO()) as out:
-                ds.cmd_main([])
-            self.assertIn('linked to the agent "Tester"', out.getvalue())
+            agent_dir = os.path.join(TMP, "agent-proj")
+            os.makedirs(agent_dir, exist_ok=True)
+            ds.write_private(ds.conf_path("tester"), json.dumps({"name": "Tester", "workbook_id": "wb1", "projects": [agent_dir]}))
+            try:
+                os.environ["CLAUDE_PROJECT_DIR"] = agent_dir
+                with redirect_stdout(io.StringIO()) as out:
+                    ds.cmd_main([])
+                self.assertIn('linked to the agent "Tester"', out.getvalue())
+            finally:
+                os.replace(ds.conf_path("tester"), os.path.join(TMP, "old-tester-" + str(time.time())))
         finally:
             if old_env is None:
                 os.environ.pop("CLAUDE_PROJECT_DIR", None)
@@ -543,7 +549,6 @@ class PersonSession(Base):
                 os.environ["CLAUDE_PROJECT_DIR"] = old_env
 
     def test_an_agent_linked_above_the_main_folder_never_takes_it_over(self):
-        ds.agent_for = self.saved["agent_for"]
         home = os.path.join(TMP, "home")
         os.makedirs(MAIN, exist_ok=True)
         ds.write_private(ds.conf_path("researcher"), json.dumps({"name": "Researcher", "workbook_id": "wb9", "projects": [home]}))
@@ -573,6 +578,236 @@ class PersonSession(Base):
         for phrase in ("datastash main", "main datastash", "sync datastash", "datastash sync"):
             self.assertIn(f'"{phrase}"', head, phrase)
             self.assertIn(f'"{phrase}"', text.split("## The person's phrases")[1], phrase)
+
+
+class MainFolderIdentity(Base):
+    """PM rule (review round 3): the "datastash main" folder, or anything inside it (real paths), is ALWAYS the person:
+    never an agent and never an agent key, whatever link files or $DATASTASH_AGENT say. Linking an agent there is
+    refused; stale links into it are ignored with a one-line note. One resolver answers every path."""
+
+    def setUp(self):
+        super().setUp()
+        ds.resolve = self.saved["resolve"]
+        self.keys_read = []
+        ds.read_key = lambda s: (self.keys_read.append(s) or ("ldgr_pw_test" if s == ds.PERSON_SLUG else "ldgr_ag_test"))
+        self.saved.setdefault("http", ds.http)
+        self.sent = []
+        ds.http = lambda method, path, key=None, body=None, form=None, timeout=40: (self.sent.append((method, path, key)) or (200, "application/json", "{}"))
+        self.home = os.path.join(TMP, "home")
+        os.makedirs(self.home, exist_ok=True)
+        if os.path.islink(MAIN):
+            os.replace(MAIN, os.path.join(TMP, "old-mainlink-" + str(time.time())))
+        self.main = ds.make_main_dir()
+        self.sub = os.path.join(self.main, "notes", "deep")
+        os.makedirs(self.sub, exist_ok=True)
+        self.elsewhere = tempfile.mkdtemp(prefix="agent-proj-", dir=TMP)
+        ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps(dict(PERSON, projects=[self.main])))
+        self.env = {k: os.environ.get(k) for k in ("CLAUDE_PROJECT_DIR", "DATASTASH_AGENT")}
+        self.confs = []
+
+    def tearDown(self):
+        for s in self.confs:
+            if os.path.exists(ds.conf_path(s)):
+                os.replace(ds.conf_path(s), os.path.join(TMP, f"old-{s}-{time.time()}"))
+        ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps(PERSON))
+        for k, v in self.env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def agent(self, s, name, projects):
+        self.confs.append(s)
+        ds.write_private(ds.conf_path(s), json.dumps({"name": name, "workbook_id": "wb-" + s, "projects": projects}))
+
+    def link(self, name, proj):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            try:
+                ds.cmd_link([name, "--workbook", "wb-x", "--project", proj])
+                return None
+            except SystemExit:
+                return err.getvalue()
+
+    def assert_person_everywhere(self, folders):
+        for f in folders:
+            sess, _ = ds.resolve(f)
+            self.assertEqual(sess["slug"], ds.PERSON_SLUG, f)
+            self.assertEqual(ds.session_for(f)["slug"], ds.PERSON_SLUG, f)
+            self.assertIsNone(ds.agent_for(f), f)
+            self.assertEqual(ds.person_for(f)["slug"], ds.PERSON_SLUG, f)
+
+    def api(self, folder):
+        os.environ["CLAUDE_PROJECT_DIR"] = folder
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            try:
+                return ds.cmd_api(["GET", "/api/v1/agent/inbox"]), err.getvalue()
+            except SystemExit as e:
+                return e.code, err.getvalue()
+
+    def test_marker_written_by_main_setup(self):
+        self.assertEqual(self.main, os.path.realpath(MAIN))
+        rec = ds.read_json(ds.MAIN_CONF, {})
+        self.assertEqual(rec["dir"], self.main)
+        self.assertEqual(ds._marker_token(self.main), rec["token"])
+        self.assertEqual(oct(os.stat(os.path.join(self.main, ds.MAIN_MARKER)).st_mode & 0o777), "0o600")
+        self.assertEqual(ds.make_main_dir(), self.main)  # again: same token, nothing changes
+        self.assertEqual(ds.read_json(ds.MAIN_CONF, {})["token"], rec["token"])
+
+    def test_agent_linked_to_main_itself(self):
+        self.agent("squatter", "Squatter", [self.main])
+        self.assert_person_everywhere([self.main, self.sub])
+        _, warn = ds.resolve(self.main)
+        self.assertEqual(len(warn), 1)
+        self.assertIn('"Squatter"', warn[0])
+        self.assertIn("ignored", warn[0])
+        self.assertIsNotNone(self.link("Squatter", self.main))
+        self.assertIsNotNone(self.link("Squatter", self.sub))
+
+    def test_agent_linked_via_a_symlink(self):
+        lnk = os.path.join(TMP, "main-link-" + str(time.time()))
+        os.symlink(self.main, lnk)
+        sublnk = os.path.join(self.elsewhere, "into-main")
+        os.symlink(self.sub, sublnk)
+        self.agent("sneaky", "Sneaky", [lnk, sublnk])
+        # Sessions through either link are the person (real path), and the folder itself is too.
+        self.assert_person_everywhere([lnk, sublnk, self.main, self.sub])
+        self.assertIn('"Sneaky"', ds.resolve(lnk)[1][0])
+        # Linking through a symlink is refused, compared by real paths.
+        self.assertIsNotNone(self.link("Sneaky", lnk))
+        self.assertIsNotNone(self.link("Sneaky", sublnk))
+        # A link named "datastash main" itself never makes another folder the person's.
+        os.replace(MAIN, os.path.join(TMP, "moved-main-" + str(time.time())))
+        try:
+            os.symlink(self.elsewhere, MAIN)
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ds.make_main_dir()
+        finally:
+            os.replace(MAIN, os.path.join(TMP, "old-mainlink-" + str(time.time())))
+
+    def test_stale_link_file(self):
+        # An agent once linked a folder that is now inside main (a folder moved, a link file left behind), plus a
+        # conflicting second link file for the main folder: both are ignored, with one line naming them.
+        stale = os.path.join(self.main, "old-project")
+        os.makedirs(stale, exist_ok=True)
+        self.agent("old-bot", "Old bot", [stale, "/nonexistent/gone"])
+        self.agent("other-bot", "Other bot", [self.main + "/"])
+        self.assert_person_everywhere([stale, self.main])
+        warn = ds.resolve(stale)[1]
+        self.assertEqual(len(warn), 1)
+        self.assertIn('"Old bot"', warn[0])
+        self.assertIn('"Other bot"', warn[0])
+        # The session-start note carries that line, then the person's counts; never an agent key.
+        ds.hook_input = lambda: {"cwd": stale}
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        ds.fetch_page = lambda *a, **k: ([], "c", False)
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ds.cmd_check([]), 0)
+        ctx = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(ctx.startswith(ds.LINK_NOTE))
+        self.assertIn(ds.NOTE, ctx)
+        self.assertIn("ignored agent links", ctx)
+        self.assertEqual(set(self.keys_read), {ds.PERSON_SLUG})
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_status([])
+        self.assertIn("ignored: inside", out.getvalue())
+
+    def test_parent_linked_agent(self):
+        self.agent("researcher", "Researcher", [self.home, "/"])
+        self.assert_person_everywhere([self.main, self.sub])
+        self.assertEqual(ds.resolve(self.main)[1], [])  # a parent link is not a link into main: no note
+        self.assertEqual(ds.session_for(self.home)["slug"], "researcher")
+        self.assertEqual(ds.agent_for(self.elsewhere)["slug"], "researcher")
+
+    def test_api_in_main_uses_no_agent_key(self):
+        self.agent("researcher", "Researcher", [self.home])
+        self.agent("squatter", "Squatter", [self.main])
+        for env_agent in (None, "Researcher", "Squatter"):
+            if env_agent:
+                os.environ["DATASTASH_AGENT"] = env_agent
+            else:
+                os.environ.pop("DATASTASH_AGENT", None)
+            for f in (self.main, self.sub):
+                rc, err = self.api(f)
+                self.assertNotEqual(rc, 0, (env_agent, f))
+                self.assertIn("datastash main", err)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.keys_read, [])
+        # $DATASTASH_AGENT never makes main an agent session either, and the AI is told it was ignored.
+        os.environ["DATASTASH_AGENT"] = "Researcher"
+        self.assert_person_everywhere([self.main])
+        self.assertTrue(any("DATASTASH_AGENT is ignored" in w for w in ds.resolve(self.main)[1]))
+        # The person's own send still works from main.
+        os.environ["CLAUDE_PROJECT_DIR"] = self.main
+        import sys as _s
+        _s.stdin = io.StringIO("go on")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ds.cmd_send(["Researcher", "-"]), 0)
+        self.assertEqual(self.sent[-1], ("POST", ds.PERSON_INBOX_PATH, "ldgr_pw_test"))
+
+    def test_agent_folders_still_work(self):
+        self.assertIsNone(self.link("Builder", self.elsewhere))
+        self.confs.append("builder")
+        self.assertEqual(ds.session_for(self.elsewhere)["slug"], "builder")
+        self.assertEqual(ds.agent_for(os.path.join(self.elsewhere))["slug"], "builder")
+        self.assertIsNone(ds.person_for(self.elsewhere))
+        self.assertEqual(ds.resolve(self.elsewhere)[1], [])
+        rc, _ = self.api(self.elsewhere)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.sent[-1], ("GET", "/api/v1/agent/inbox", "ldgr_ag_test"))
+        # An agent session never sends as the person.
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ds._person_post({"to": "x", "message": "y"})
+        # $DATASTASH_AGENT outside main still picks the agent.
+        self.agent("helper", "Helper", [])
+        os.environ["DATASTASH_AGENT"] = "Helper"
+        self.assertEqual(ds.agent_for(self.home)["slug"], "helper")
+        # A folder the person linked with --project, inside an agent's parent link: the closer link (the person's).
+        os.environ.pop("DATASTASH_AGENT")
+        extra = os.path.join(self.elsewhere, "person-extra")
+        os.makedirs(extra, exist_ok=True)
+        ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps(dict(PERSON, projects=[self.main, extra])))
+        self.assertEqual(ds.session_for(extra)["slug"], ds.PERSON_SLUG)
+        self.assertEqual(ds.session_for(self.elsewhere)["slug"], "builder")
+
+    def test_moved_main_folder_keeps_its_marker_and_a_copied_marker_counts_for_nothing(self):
+        moved = os.path.join(TMP, "renamed-main-" + str(time.time()))
+        rec = ds.read_json(ds.MAIN_CONF, {})
+        os.replace(self.main, moved)
+        try:
+            ds.write_private(ds.MAIN_CONF, json.dumps({"dir": "/nonexistent/old", "token": rec["token"]}))
+            self.agent("squatter", "Squatter", [moved])
+            self.assert_person_everywhere([moved, os.path.join(moved, "notes")])
+            # A marker with another token (copied into an agent's repo, say) makes nothing the person's.
+            ds.write_private(os.path.join(self.elsewhere, ds.MAIN_MARKER), "not-the-token-0123456789\n")
+            self.agent("builder", "Builder", [self.elsewhere])
+            self.assertEqual(ds.session_for(self.elsewhere)["slug"], "builder")
+        finally:
+            os.replace(moved, self.main)
+            ds.write_private(ds.MAIN_CONF, json.dumps(rec))
+
+    def test_one_resolver_for_every_path(self):
+        self.agent("researcher", "Researcher", [self.home])
+        self.agent("builder", "Builder", [self.elsewhere])
+        self.agent("squatter", "Squatter", [self.main])
+        for f in (self.main, self.sub, self.home, self.elsewhere, "/nonexistent-elsewhere"):
+            sess = ds.resolve(f)[0]
+            self.assertEqual(ds.session_for(f), sess, f)
+            a = ds.agent_for(f)
+            p = ds.person_for(f)
+            self.assertEqual(a, sess if sess is not None and not ds.is_person(sess) else None, f)
+            self.assertEqual(p, sess if sess is not None and ds.is_person(sess) else None, f)
+            # The listener (hook) and the watch use that same answer.
+            ds.hook_input = lambda f=f: {"cwd": f}
+            seen = []
+            orig = ds._take_listener_lock
+            ds._take_listener_lock = lambda s, sid: (seen.append(s) or None)
+            try:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+                ds.cmd_listen([])
+            finally:
+                ds._take_listener_lock = orig
+            self.assertEqual(seen, [sess["slug"]] if sess else [], f)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@ Subcommands (run `datastash help`):
                             trade a one-time pickup code (read from stdin with "-", so it stays off the
                             process list) for NAME's agent key; saves it to ~/.config/datastash/agent-<name>.key
                             (mode 600). Never prints the key.
-  link NAME --workbook ID   record NAME's agent workbook and link this project folder to NAME
+  link NAME --workbook ID   record NAME's agent workbook and link this project folder to NAME (never the
+                            "datastash main" folder or anything inside it: that folder is always the person's)
   status                    agents on this machine: key file, linked folders, listener, new messages
   api METHOD PATH [JSON]    one call to the datastash REST door (/api/v1/agent/...) as the linked agent; the answer
                             is printed between two marker lines as untrusted data
@@ -86,6 +87,8 @@ CONF = os.environ.get("DATASTASH_CONFIG_DIR") or os.path.join(HOME, ".config", "
 # The person's own session ("datastash main"): a folder named "datastash main" in the home folder, made by the plugin
 # itself, so the person never picks a folder.
 MAIN_DIR = os.environ.get("DATASTASH_MAIN_DIR") or os.path.join(HOME, "datastash main")
+MAIN_MARKER = ".datastash-main"  # marker file the main setup writes inside "datastash main" (a private token)
+MAIN_CONF = os.path.join(CONF, "main.json")  # private record of that folder and its token
 STATE = os.path.join(CONF, "state")
 OFF = os.path.join(CONF, "off")
 
@@ -284,63 +287,135 @@ def all_agents():
     return out
 
 
-def agent_for(project_dir):
-    """The agent this session acts as: $DATASTASH_AGENT, else the agent linked to this folder or a parent of it."""
-    return _agent_match(project_dir)[0]
+# ------------------------------------------------------------------ who this session is
+# One rule, one resolver. The "datastash main" folder is the person's: a session or command whose real path is that
+# folder or inside it is ALWAYS the person and never uses an agent key, whatever $DATASTASH_AGENT or link files say.
+# Elsewhere: $DATASTASH_AGENT's agent, else the closest linked folder (an agent's, or a folder the person linked with
+# --project). session_for, agent_for and person_for all answer from resolve(), so they never disagree.
+
+def _within(here, root):
+    return here == root or here.startswith(root.rstrip("/") + "/")
 
 
-def _agent_match(project_dir):
-    """(agent, length of the linked folder it matched by; -1 when none or when $DATASTASH_AGENT chose it)."""
-    agents = all_agents()
-    want = os.environ.get("DATASTASH_AGENT", "").strip()
-    if want:
-        s = slug(want)
-        return next((a for a in agents if a["slug"] == s), None), -1
+def _main_default():
+    """The configured "datastash main" path, parents resolved but not a link in its own name (a link named "datastash
+    main" never makes the folder it points at the person's)."""
+    return os.path.join(os.path.realpath(os.path.dirname(MAIN_DIR.rstrip("/")) or "/"), os.path.basename(MAIN_DIR.rstrip("/")))
+
+
+def _marker_token(d):
+    """The token in d's marker file, or None (read without following a link, private regular file of this user only)."""
+    try:
+        fd = os.open(os.path.join(d, MAIN_MARKER), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        if not stat_ok(os.fstat(fd)):
+            return None
+        return os.read(fd, 256).decode("ascii", "replace").strip() or None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def main_root(project_dir):
+    """The real path of the "datastash main" folder that project_dir (real path) is or is inside, else None. That folder
+    is the configured one, the one recorded when it was made, or any folder holding the marker file whose token
+    matches the private record (so a moved or renamed main folder is still the person's, and a copied marker is not)."""
     if not project_dir:
-        return None, -1
+        return None
     here = os.path.realpath(project_dir)
-    best, best_len = None, -1
-    for a in agents:
-        for p in a.get("projects") or []:
-            rp = os.path.realpath(p)
-            if (here == rp or here.startswith(rp.rstrip("/") + "/")) and len(rp) > best_len:
-                best, best_len = a, len(rp)
-    return best, best_len
+    rec = read_json(MAIN_CONF, {})
+    roots = [_main_default()]
+    if isinstance(rec.get("dir"), str) and rec["dir"].startswith("/"):
+        roots.append(os.path.realpath(rec["dir"]))
+    for r in roots:
+        if _within(here, r):
+            return r
+    tok = rec.get("token")
+    if isinstance(tok, str) and tok:
+        d = here
+        while True:
+            t = _marker_token(d)
+            if t is not None and secrets.compare_digest(t, tok):
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    return None
 
 
-def _person_match_len(c, project_dir):
-    here = os.path.realpath(project_dir)
-    best = -1
-    for p in c.get("projects") or []:
-        rp = os.path.realpath(p)
-        if (here == rp or here.startswith(rp.rstrip("/") + "/")) and len(rp) > best:
-            best = len(rp)
-    return best
-
-
-def person_for(project_dir):
-    """The person's own session config when this folder (or a parent) is linked as the person's session, else None."""
+def _person_conf():
+    """The person's own session config when the watch is set up on this machine, else None."""
     c = read_json(conf_path(PERSON_SLUG), None)
     if not c or not c.get("workbook_id"):
         return None
     c["slug"] = PERSON_SLUG
     c["name"] = "datastash main"
-    if project_dir is None:
-        return c
-    return c if _person_match_len(c, project_dir) >= 0 else None
+    return c
+
+
+def _links_into_main(agents, root):
+    """Names of agents with a link file entry whose real path is root or inside it (ignored)."""
+    return sorted({a["name"] for a in agents for p in (a.get("projects") or [])
+                   if isinstance(p, str) and _within(os.path.realpath(p), root)})
+
+
+def resolve(project_dir):
+    """(session, warnings): the ONE answer to who a session or command in project_dir is. session is the person's
+    config, an agent's config, or None. warnings are one-line notes for the session's AI (ignored links)."""
+    agents = all_agents()
+    person = _person_conf()
+    root = main_root(project_dir)
+    if root is not None:
+        warn = []
+        names = _links_into_main(agents, root)
+        if names:
+            warn.append(f'{LINK_NOTE}: ignored agent link{"s" if len(names) > 1 else ""} into the "datastash main" folder '
+                        f'({", ".join(chr(34) + disp(n) + chr(34) for n in names)}): that folder is always the person\'s, never an agent.')
+        if os.environ.get("DATASTASH_AGENT", "").strip():
+            warn.append(f'{LINK_NOTE}: DATASTASH_AGENT is ignored in the "datastash main" folder: it is always the person\'s.')
+        return person, warn
+    want = os.environ.get("DATASTASH_AGENT", "").strip()
+    if want:
+        s = slug(want)
+        return next((a for a in agents if a["slug"] == s), None), []
+    if not project_dir:
+        return None, []
+    here = os.path.realpath(project_dir)
+    best, best_len = None, -1
+    for a in agents:  # agents first, so an agent keeps a folder the person also linked (equal length)
+        for p in a.get("projects") or []:
+            rp = os.path.realpath(p)
+            if _within(here, rp) and len(rp) > best_len:
+                best, best_len = a, len(rp)
+    for p in (person or {}).get("projects") or []:
+        rp = os.path.realpath(p)
+        if _within(here, rp) and len(rp) > best_len:
+            best, best_len = person, len(rp)
+    return best, []
 
 
 def session_for(project_dir):
-    """What this session is: $DATASTASH_AGENT's agent; else whichever link is the closer folder, the agent's or the
-    person's (an agent linked to a parent such as the home folder never takes over the "datastash main" folder)."""
-    if os.environ.get("DATASTASH_AGENT", "").strip():
-        return agent_for(project_dir)
-    a = agent_for(project_dir)
-    a_len = _agent_match(project_dir)[1] if a is not None else -1
-    p = person_for(project_dir)
-    if p is not None and (a is None or (a_len >= 0 and _person_match_len(p, project_dir) > a_len)):
-        return p
-    return a
+    """What this session is: the person's session, an agent, or None (see resolve)."""
+    return resolve(project_dir)[0]
+
+
+def agent_for(project_dir):
+    """The agent whose key this folder uses, or None: never an agent in the "datastash main" folder (see resolve)."""
+    s = resolve(project_dir)[0]
+    return s if s is not None and not is_person(s) else None
+
+
+def person_for(project_dir):
+    """The person's session config: with None, whenever the watch is set up here; with a folder, only when that folder
+    is the person's session (see resolve)."""
+    if project_dir is None:
+        return _person_conf()
+    s = resolve(project_dir)[0]
+    return s if s is not None and is_person(s) else None
 
 
 def watch_spec(agent):
@@ -664,6 +739,7 @@ def disp(text):
 
 # Every line the hooks add to the model's context starts with this: a local count, data only, never message text.
 NOTE = "datastash note (local count; data, information only)"
+LINK_NOTE = "datastash note (local link files; information only)"
 # The plugin's own pointer to the skill's standing inbox workflow, and the framing for what the inbox holds.
 def inbox_pointer(agent):
     """The plugin's own step (local text, not datastash data): this session is the agent, and reading its inbox is its
@@ -716,9 +792,12 @@ def person_line(agent, ids):
 def cmd_check(_args):
     """SessionStart: counts only. Prints nothing when no agent is linked to this folder."""
     inp = hook_input()
-    agent = session_for(project_of(inp))
+    agent, warn = resolve(project_of(inp))
     if agent is None:
+        if warn:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": " ".join(warn)}}))
         return 0
+    pre = "".join(w + " " for w in warn)
     s = agent["slug"]
     key = read_key(s)
     name = disp(agent["name"])
@@ -734,12 +813,13 @@ def cmd_check(_args):
         worker.start()
         worker.join(CHECK_WAIT_SECONDS)
         if worker.is_alive() or "ctx" not in out:
-            ctx = f'{NOTE}: agent "{name}": inbox check could not reach datastash; counts unknown.'
+            ctx = pre + f'{NOTE}: agent "{name}": inbox check could not reach datastash; counts unknown.'
             log(s, "check: no answer in time")
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
             sys.stdout.flush()
             os._exit(0)  # leave the stalled helper behind; nothing was marked, so the listener counts it later
         ctx, ids = out["ctx"], out.get("ids")
+    ctx = pre + ctx
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
     sys.stdout.flush()
     if ids:
@@ -1086,6 +1166,9 @@ def cmd_link(args):
         c["agent_id"] = opts["--agent-id"]
     c.pop("watch_tab", None)
     proj = os.path.realpath(opts.get("--project") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    if main_root(proj) is not None:
+        die(f'{proj} is the person\'s "datastash main" folder or inside it; an agent is never linked there. '
+            "Link the agent from its own project folder.")
     projects = [p for p in (c.get("projects") or []) if p != proj] + [proj]
     c["projects"] = projects
     write_private(conf_path(s), json.dumps(c, indent=2))
@@ -1112,7 +1195,9 @@ def cmd_status(_args):
         st = load_state(a)
         info = read_json(lock_path(s), {})
         running = isinstance(info.get("pid"), int) and _alive(info["pid"]) and _is_listener(info["pid"])
-        print(f'"{a["name"]}": workbook {a["workbook_id"]}; {keyinfo}; folders: {", ".join(a.get("projects") or []) or "none"}; '
+        folders = [f + (" (ignored: inside \"datastash main\", always the person's)" if not is_person(a) and main_root(f) else "")
+                   for f in (a.get("projects") or [])]
+        print(f'"{a["name"]}": workbook {a["workbook_id"]}; {keyinfo}; folders: {", ".join(folders) or "none"}; '
               f'listener: {"running (pid " + str(info["pid"]) + ")" if running else "not running (it starts at session start and after each turn)"}; '
               f'new: {len(st["new"])}{"; KEY REFUSED" if st.get("key_refused") else ""}'
               )
@@ -1134,7 +1219,11 @@ def cmd_api(args):
             body = json.loads(raw)
         except ValueError:
             die("JSON_BODY is not valid JSON")
-    agent = agent_for(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    here = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    if main_root(here) is not None:
+        die('this is the person\'s "datastash main" folder: it never acts as an agent and never uses an agent key '
+            "(the person uses the datastash connector here)")
+    agent = agent_for(here)
     if agent is None:
         die("no agent is linked to this folder (datastash link NAME --workbook ID, or set DATASTASH_AGENT)")
     key = read_key(agent["slug"])
@@ -1216,10 +1305,9 @@ def cmd_watch(args):
         if person is None:
             die("the person's session is not set up on this machine (datastash watch --person --setup WORKBOOK_ID -)")
         return cmd_listen([], printer=out, forced=person)
-    rc = cmd_listen([], printer=out)
-    if rc == 0 and agent_for(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()) is None:
+    if session_for(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()) is None:
         die("no agent is linked to this folder")
-    return rc
+    return cmd_listen([], printer=out)
 
 
 def person_setup(args):
@@ -1271,12 +1359,29 @@ def person_setup(args):
 
 
 def make_main_dir():
-    """The "datastash main" folder in the home folder, made if missing. Returns its real path."""
+    """The "datastash main" folder in the home folder, made if missing, and marked as the person's: a private marker
+    file inside it holds a token that matches the private record in the config folder. Returns its real path."""
+    if os.path.islink(MAIN_DIR.rstrip("/")):
+        die(f'"{MAIN_DIR}" is a link; the "datastash main" folder must be a real folder (move the link aside)')
     try:
         os.makedirs(MAIN_DIR, mode=0o700, exist_ok=True)
     except OSError:
         die(f'could not make the folder "{MAIN_DIR}" (a file of that name may be in the way)')
-    return os.path.realpath(MAIN_DIR)
+    if not os.path.isdir(MAIN_DIR) or os.path.islink(MAIN_DIR.rstrip("/")):
+        die(f'"{MAIN_DIR}" is not a folder')
+    main_dir = os.path.realpath(MAIN_DIR)
+    ensure_dirs()
+    rec = read_json(MAIN_CONF, {})
+    tok = rec.get("token") if isinstance(rec.get("token"), str) and re.fullmatch(r"[A-Za-z0-9_\-]{20,100}", rec.get("token") or "") else None
+    tok = tok or secrets.token_urlsafe(24)
+    try:
+        if _marker_token(main_dir) != tok:
+            write_private(os.path.join(main_dir, MAIN_MARKER), tok + "\n")
+    except OSError:
+        die(f'could not mark the folder "{main_dir}" as the person\'s (marker file {MAIN_MARKER})')
+    if rec.get("dir") != main_dir or rec.get("token") != tok:
+        write_private(MAIN_CONF, json.dumps({"dir": main_dir, "token": tok}, indent=2))
+    return main_dir
 
 
 def cmd_main(args):
@@ -1292,14 +1397,16 @@ def cmd_main(args):
     if set_up and main_dir not in [os.path.realpath(p) for p in (c.get("projects") or [])]:
         c["projects"] = list(c.get("projects") or []) + [main_dir]
         write_private(conf_path(PERSON_SLUG), json.dumps(c, indent=2))
-    in_main = here == main_dir or here.startswith(main_dir.rstrip("/") + "/")
-    sess = session_for(here)
+    in_main = main_root(here) is not None
+    sess, warn = resolve(here)
     agent_here = sess if sess is not None and not is_person(sess) else None
     print(f"folder: {main_dir}")
     print(f"person watch set up: {'yes, agent workbook ' + disp(c['workbook_id']) if set_up else 'no'}")
     print(f"this session is in that folder: {'yes' if in_main else 'no'}")
     if agent_here is not None:
         print(f'this folder is linked to the agent "{disp(agent_here["name"])}": this session is that agent, not the person')
+    for w in warn:
+        print(w)
     return 0
 
 

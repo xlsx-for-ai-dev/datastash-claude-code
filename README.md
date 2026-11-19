@@ -69,6 +69,12 @@ Setting it up is one phrase. In any Claude Code session with this plugin, the pe
 
 The person never sees a command or code there: every line is plain words (who, kind, subject).
 
+The "datastash main" folder is always the person's. The setup marks it (a private marker file inside it that matches a
+private record in `~/.config/datastash`), and any session or command whose real path (symlinks resolved) is that folder
+or inside it is the person: it never acts as an agent and never uses an agent key, whatever link files or
+`DATASTASH_AGENT` say. `datastash link` refuses that folder and anything inside it; an older agent link into it is
+ignored, with a one-line note to the session's AI.
+
 What the person's AI does in this session:
 
 - Shows the person plain words only: one line per item (who, kind, subject), in the order datastash gives (asks first,
