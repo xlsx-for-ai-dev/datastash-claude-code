@@ -20,11 +20,15 @@ Subcommands (run `datastash help`):
 The person's own session ("datastash main"; the person, never an agent; any folder, one session at a time):
   main                      say whether this session is the person's main, whether the person asked for it here, and
                             whether the person watch is set up
-  main --on WORKBOOK_ID [-|CODE]
-                            after the person typed "datastash main" in THIS session: trade a fresh one-time watch
-                            pickup code (from ledger_person_watch, action "key", on the person's own connection; read
-                            from stdin with "-") for the person's watch key (mode 600, never printed) and make this
-                            session the person's main for its lifetime. Refused in a session that acted as an agent.
+  main --on                 after the person typed "datastash main" in THIS session: make it the person's main for its
+                            lifetime. Needs the main key (~/.config/datastash/main.key, mode 600, never printed); the
+                            first time on a machine it prints a link the person opens and approves in the browser,
+                            signed in with Google. Refused in a session that acted as an agent.
+  main --wait               wait for that approval, save the main key, and finish --on
+  main --workbook ID        pick the agent workbook the main session watches (when there are several)
+  list [--all]              the person's main view: open items, blocked on the person first (main key)
+  read INBOX                read one inbox as the person ("person" or an agent's name; main key)
+  filter AGENT | --kind K   the person's filters (unfilter undoes one; main key)
   watch --person --setup WORKBOOK_ID [-|CODE] [--project DIR]
                             (earlier design, still works) the same trade without making a session main; links DIR
   watch --person            print one line each time new items arrive across the agent workbook (for a Monitor loop)
@@ -65,6 +69,14 @@ PERSON_INBOX_PATH = "/api/v1/person/inbox"
 # agent can have (an agent's slug is letters, digits and dashes only).
 PERSON_SLUG = "@person"
 PERSON_KEY_RE = r"ldgr_pw_[A-Za-z0-9_\-]+"
+# The person's main key (ldgr_pm_...): made only by the person approving "datastash main" in a browser signed in with
+# Google, once per machine; kept in main.key (mode 600, never printed). Person scope on the REST door's person routes.
+MAIN_KEY_RE = r"ldgr_pm_[A-Za-z0-9_\-]+"
+MAIN_START_PATH = "/api/v1/main/start"
+PERSON_FILTER_PATH = "/api/v1/person/filter"
+PERSON_WORKBOOKS_PATH = "/api/v1/person/agent-workbooks"
+MAIN_PICKUP_RE = r"dsmk_[A-Za-z0-9_\-]{6,200}"
+MAIN_WAIT_SECONDS = float(os.environ.get("DATASTASH_MAIN_WAIT_SECONDS", "600"))
 WAIT_SECONDS = 25
 # The listener hook's own timeout is set in hooks.json; it stops itself a little before that, without waking anyone.
 LISTEN_MAX_SECONDS = int(os.environ.get("DATASTASH_LISTEN_MAX_SECONDS", str(86400 - 300)))
@@ -94,6 +106,7 @@ CONF = os.environ.get("DATASTASH_CONFIG_DIR") or os.path.join(HOME, ".config", "
 MAIN_DIR = os.environ.get("DATASTASH_MAIN_DIR") or os.path.join(HOME, "datastash main")
 MAIN_MARKER = ".datastash-main"  # marker file the main setup writes inside "datastash main" (a private token)
 MAIN_CONF = os.path.join(CONF, "main.json")  # private record of that folder and its token
+MAIN_KEY_FILE = os.path.join(CONF, "main.key")  # the person's main key (browser approval)
 STATE = os.path.join(CONF, "state")
 OFF = os.path.join(CONF, "off")
 
@@ -123,20 +136,26 @@ def slug(name):
     return s[:64]
 
 
+def person_slug(s):
+    """The person's slugs: "@person" and "@person-<session id>" (one per main session: its own listener, lock and cursor,
+    so every live main session wakes). No agent slug starts with "@"."""
+    return isinstance(s, str) and (s == PERSON_SLUG or s.startswith(PERSON_SLUG + "-"))
+
+
 def key_path(s):
-    if s == PERSON_SLUG:
+    if person_slug(s):
         return os.path.join(CONF, "person.key")
     return os.path.join(CONF, f"agent-{s}.key")
 
 
 def conf_path(s):
-    if s == PERSON_SLUG:
+    if person_slug(s):
         return os.path.join(CONF, "person.json")
     return os.path.join(CONF, f"agent-{s}.json")
 
 
 def is_person(agent):
-    return agent.get("slug") == PERSON_SLUG
+    return person_slug(agent.get("slug"))
 
 
 def state_path(s):
@@ -180,8 +199,17 @@ def read_json(path, default):
 
 
 def read_key(s):
-    """The agent key, or None. Refuses a key file anyone else can read."""
-    p = key_path(s)
+    """The agent key, or None. Refuses a key file anyone else can read. For the person: the main key, else the watch key."""
+    if person_slug(s):
+        return _read_key_file(MAIN_KEY_FILE, MAIN_KEY_RE, s) or _read_key_file(key_path(s), PERSON_KEY_RE, s)
+    return _read_key_file(key_path(s), r"ldgr_ag_[A-Za-z0-9_\-]+", s)
+
+
+def read_main_key():
+    return _read_key_file(MAIN_KEY_FILE, MAIN_KEY_RE, PERSON_SLUG)
+
+
+def _read_key_file(p, pattern, s):
     try:
         fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
@@ -199,9 +227,7 @@ def read_key(s):
     finally:
         if fd is not None:
             os.close(fd)
-    if s == PERSON_SLUG:
-        return k if re.fullmatch(PERSON_KEY_RE, k) else None
-    return k if re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", k) else None
+    return k if re.fullmatch(pattern, k) else None
 
 
 def stat_ok(st):
@@ -515,6 +541,13 @@ def resolve(project_dir, me=None):
     """(session, warnings): the ONE answer to who a session or command in project_dir is. session is the person's
     config, an agent's config, or None. warnings are one-line notes for the session's AI (ignored links).
     The person's main session (me, see is_main_session) comes first: it is always the person, in any folder."""
+    sess, warn = _resolve(project_dir, me)
+    if sess is not None and is_person(sess) and me is not None and me.get("sid"):
+        sess = dict(sess, slug=f"{PERSON_SLUG}-{me['sid']}")  # this session's own listener and cursor
+    return sess, warn
+
+
+def _resolve(project_dir, me):
     agents = all_agents()
     person = _person_conf()
     if is_main_session(me):
@@ -1242,6 +1275,7 @@ def cmd_end(_args):
     agent = session_for(project_of(inp), me=me)
     if is_main_session(me):
         _drop(_main_path(me["sid"]))  # main lasts for the session's lifetime only
+        _drop(state_path(f"{PERSON_SLUG}-{me['sid']}"))
     if me["sid"]:
         _drop(_request_path(me["sid"]))
     if agent is None:
@@ -1285,6 +1319,18 @@ def _acts_as_agent(me, here):
     if sess is not None:
         return not is_person(sess)  # a folder the person linked (the earlier "datastash main" folder) stays the person's
     return bool(me and (os.environ.get("DATASTASH_AGENT", "").strip() or any(os.path.exists(p) for p in _used_paths(me))))
+
+
+def _person_allowed(me, here):
+    """May this command act as the person (main key, watch key)? Only the person's main session, a folder the person
+    linked (the earlier "datastash main" folder), or a terminal outside Claude Code; never a session that acts as an
+    agent, and never an ordinary session that did not become main."""
+    if is_main_session(me):
+        return True
+    if _acts_as_agent(me, here):
+        return False
+    sess = session_for(here, me=me)
+    return (sess is not None and is_person(sess)) or (me is not None and me["proc"] is None)
 
 
 def _no_agent_in_main(me, what):
@@ -1496,8 +1542,8 @@ def cmd_watch(args):
             return person_setup(rest[1:])
         if rest:
             die("usage: datastash watch --person  |  datastash watch --person --setup WORKBOOK_ID [-|CODE] [--project DIR]")
-        if _acts_as_agent(this_session(), os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()):
-            die("this session is an agent; only the person's own session watches as the person")
+        if not _person_allowed(this_session(), os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()):
+            die('only the person\'s datastash main session watches as the person (the person types "datastash main")')
         person = person_for(None)
         if person is None:
             die('the person\'s watch is not set up on this machine (the person types "datastash main")')
@@ -1679,10 +1725,10 @@ def cmd_main(args):
     the skill says what to tell the person). With --on WORKBOOK_ID [-|CODE]: trade a fresh watch pickup code from the
     person's own connection and turn THIS session into the person's main session."""
     me = this_session()
-    if args and args[0] == "--on":
-        return _main_on(me, args[1:])
+    if args and args[0] in ("--on", "--wait", "--workbook"):
+        return {"--on": _main_on, "--wait": _main_wait, "--workbook": _main_workbook}[args[0]](me, args[1:])
     if args:
-        die("usage: datastash main  |  datastash main --on WORKBOOK_ID -")
+        die("usage: datastash main  |  datastash main --on  |  datastash main --wait  |  datastash main --workbook ID")
     here = os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     c = read_json(conf_path(PERSON_SLUG), None)
     set_up = bool(c and c.get("workbook_id")) and read_key(PERSON_SLUG) is not None
@@ -1690,6 +1736,7 @@ def cmd_main(args):
     why = None if on else main_refusal(me)
     print(f"this session is the person's datastash main: {'yes' if on else 'no'}")
     print(f"person watch set up on this machine: {'yes, agent workbook ' + disp(c['workbook_id']) if set_up else 'no'}")
+    print(f"main key on this machine (browser-approved): {'yes' if read_main_key() is not None else 'no'}")
     if not on:
         print(f"the person asked for main in this session: {'yes' if why is None and main_request_ok(me) else 'no'}")
         if why is not None:
@@ -1706,46 +1753,225 @@ def cmd_main(args):
     return 0
 
 
-def _main_on(me, args):
-    """Turn this session into the person's main session: only when the person typed the phrase in this very session
-    (prompt hook), the session never acted as an agent, and datastash accepts a fresh watch pickup code (issued only to
-    the person's own connection)."""
-    if len(args) not in (1, 2):
-        die("usage: datastash main --on WORKBOOK_ID [-|PICKUP_CODE]")
+MAIN_PENDING = os.path.join(STATE, "main-pickup.json")  # the open approval: link and pickup code (private)
+
+
+def _main_gate(me):
+    """Main mode is switched on only for the person's own typed phrase in this very session, never in an agent session."""
     why = main_refusal(me)
     if why is not None:
         die(f"this session can't become the person's datastash main: {why}")
     if not is_main_session(me) and not main_request_ok(me):
         die('the person has not typed "datastash main" in this session (or it was over 30 minutes ago); only the '
             "person's own typed phrase starts it")
-    _trade_watch_code(args)
+
+
+def _main_on(me, args):
+    """Turn this session into the person's main session. With the main key on this machine: at once. Without it: start a
+    browser approval (once per machine) and print its link for the person; then `main --wait`."""
+    if args:
+        die("usage: datastash main --on")
+    _main_gate(me)
+    key = read_main_key()
+    if key is not None:
+        ok = _main_key_works(key)
+        if ok is None:
+            die("could not reach datastash; try again")
+        if ok:
+            return _main_finish(me, key)
+        _set_aside(MAIN_KEY_FILE)  # stopped or unknown: approve a new one
+    pend = _pending()
+    if pend is None:
+        try:
+            status, _ctype, text = http("POST", MAIN_START_PATH, timeout=30)
+            got = json.loads(text)
+        except (ApiError, ValueError) as e:
+            die(f"datastash refused the start ({getattr(e, 'status', 'bad answer')}); try again")
+        except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+            die(f"could not reach datastash ({type(e).__name__})")
+        url, code = got.get("approve_url"), got.get("pickup_code")
+        if not (isinstance(url, str) and url.startswith(ORIGIN + "/main/approve?") and isinstance(code, str)
+                and re.fullmatch(MAIN_PICKUP_RE, code)):
+            die("datastash answered something that is not an approval link; nothing saved")
+        ensure_dirs()
+        write_private(MAIN_PENDING, json.dumps({"approve_url": url, "code": code, "at": int(time.time())}))
+        pend = {"approve_url": url, "code": code}
+    print("approval needed (once on this machine): show the person this link to open in their browser, signed in with "
+          f"Google: {pend['approve_url']}")
+    print("then run: datastash main --wait")
+    return 0
+
+
+def _pending():
+    """The open approval (link and code), or None (none, or older than its 15 minutes)."""
+    p = read_json(MAIN_PENDING, None)
+    if not p or not _num_ok(p.get("at")) or time.time() - p["at"] > 14 * 60:
+        return None
+    if not (isinstance(p.get("code"), str) and re.fullmatch(MAIN_PICKUP_RE, p["code"]) and isinstance(p.get("approve_url"), str)):
+        return None
+    return p
+
+
+def _set_aside(path):
+    """Move a file to the off folder (never deleted)."""
+    try:
+        os.makedirs(OFF, mode=0o700, exist_ok=True)
+        os.replace(path, os.path.join(OFF, f"{os.path.basename(path)}.{time.strftime('%Y%m%d-%H%M%S')}"))
+    except OSError:
+        pass
+
+
+def _main_wait(me, args):
+    """Wait for the person's browser approval, then save the main key (never printed) and finish the switch-on."""
+    if args:
+        die("usage: datastash main --wait")
+    _main_gate(me)
+    pend = _pending()
+    if pend is None:
+        die("no approval is open; run datastash main --on")
+    deadline = time.time() + MAIN_WAIT_SECONDS
+    while True:
+        try:
+            status, _ctype, text = http("POST", PICKUP_PATH, form={"code": pend["code"]}, timeout=30)
+        except ApiError as e:
+            _set_aside(MAIN_PENDING)
+            die(f"the approval link expired or was used (HTTP {e.status}); run datastash main --on for a new one")
+        except (urllib.error.URLError, httpclient.HTTPException, OSError):
+            status, text = 0, ""
+        if status == 200:
+            key = text.strip()
+            if not re.fullmatch(MAIN_KEY_RE, key):
+                die("datastash answered something that is not a main key; nothing saved")
+            write_private(MAIN_KEY_FILE, key + "\n")
+            _set_aside(MAIN_PENDING)
+            return _main_finish(me, key)
+        if time.time() > deadline:
+            print("still waiting for the person's approval in the browser; run datastash main --wait again")
+            return 0
+        time.sleep(3)
+
+
+def _main_key_works(key):
+    """True when datastash takes the main key, False when it refuses it, None when it can't be reached."""
+    try:
+        http("GET", PERSON_WORKBOOKS_PATH, key=key, timeout=30)
+        return True
+    except ApiError as e:
+        return False if e.status in (401, 403) else None
+    except (urllib.error.URLError, httpclient.HTTPException, OSError):
+        return None
+
+
+def _main_finish(me, key):
+    """Mark this session as the person's main and pick the agent workbook it watches."""
+    try:
+        _status, _ctype, text = http("GET", PERSON_WORKBOOKS_PATH, key=key, timeout=30)
+        books = json.loads(text).get("agent_workbooks")
+    except (ApiError, ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        books = None
+    books = [b for b in (books or []) if isinstance(b, dict) and isinstance(b.get("workbook_id"), str)]
+    c = read_json(conf_path(PERSON_SLUG), {})
+    ids = [b["workbook_id"] for b in books]
+    if c.get("workbook_id") not in ids and len(ids) == 1:
+        c["workbook_id"] = ids[0]
+        c.setdefault("projects", [])
+        ensure_dirs()
+        write_private(conf_path(PERSON_SLUG), json.dumps(c, indent=2))
     ensure_dirs()
     write_private(_main_path(me["sid"]), json.dumps({"sid": me["sid"], "pid": me["proc"][0], "start": me["proc"][1],
                                                      "since": int(time.time())}))
     _drop(_request_path(me["sid"]))
     print("this session is now the person's datastash main (for its lifetime; agent links for this folder are ignored "
           "here, and other sessions keep theirs). The listener starts when this reply ends.")
+    if not ids:
+        print("no agent workbook in this account yet: nothing to watch until one is made")
+    elif c.get("workbook_id") not in ids:
+        print("several agent workbooks; ask the person which one, then run datastash main --workbook ID: "
+              + "; ".join(f'{disp(b.get("name", ""))} ({disp(b["workbook_id"])})' for b in books))
     print(f"confirmation for the person: {MAIN_READY}")
     return 0
 
 
-def _person_post(body):
-    # Only the person's own session sends as "person": never a session that acts as an agent.
-    if _acts_as_agent(this_session(), os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()):
-        die("this session is an agent; only the person's own session sends as the person")
+def _main_workbook(me, args):
+    """Pick the agent workbook the person's main watches (main session only)."""
+    if len(args) != 1 or not re.fullmatch(r"[0-9a-fA-F\-]{36}", args[0]):
+        die("usage: datastash main --workbook WORKBOOK_ID")
+    if not is_main_session(me):
+        die("only the person's main session picks its workbook")
+    c = read_json(conf_path(PERSON_SLUG), {})
+    c["workbook_id"] = args[0]
+    c.setdefault("projects", [])
+    write_private(conf_path(PERSON_SLUG), json.dumps(c, indent=2))
+    print(f"the person's main watches agent workbook {args[0]}")
+    return 0
+
+
+def _person_call(method, path, body=None, need_main=False, query=None):
+    """One call as the person, from the person's own session only: never from a session that acts as an agent (its folder
+    or DATASTASH_AGENT names an agent, or it used an agent key), whatever key files are on the machine. need_main: the
+    main key only (list, read, filter). The answer is printed framed as untrusted data."""
+    if not _person_allowed(this_session(), os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()):
+        die('only the person\'s datastash main session acts as the person (the person types "datastash main")')
     person = person_for(None)
-    if person is None:
-        die("the person's session is not set up on this machine (datastash watch --person --setup WORKBOOK_ID -)")
-    key = read_key(PERSON_SLUG)
+    if person is None and path != PERSON_WORKBOOKS_PATH:
+        die('the person\'s datastash main is not set up on this machine (the person types "datastash main")')
+    key = read_main_key() if need_main else read_key(PERSON_SLUG)
     if key is None:
-        die(f"no usable watch key ({key_path(PERSON_SLUG)}); ask for a new one (ledger_person_watch, action \"key\")")
-    body = dict(body, workbook_id=person["workbook_id"])
+        die('no main key on this machine (the person types "datastash main" and approves it in the browser)')
+    if query is not None:
+        path = path + "?" + urllib.parse.urlencode(dict(query, workbook_id=person["workbook_id"]))
+    if body is not None:
+        body = dict(body, workbook_id=person["workbook_id"]) if person is not None else body
     try:
-        status, _ctype, text = http("POST", PERSON_INBOX_PATH, key=key, body=body, timeout=60)
-        print(framed("POST", PERSON_INBOX_PATH, status, text))
+        status, _ctype, text = http(method, path, key=key, body=body, timeout=60)
+        print(framed(method, path, status, text))
         return 0
     except ApiError as e:
-        print(framed("POST", PERSON_INBOX_PATH, e.status, json.dumps({"http_status": e.status, **e.body})))
+        print(framed(method, path, e.status, json.dumps({"http_status": e.status, **e.body})))
+        return 1
+    except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+        die(f"could not reach datastash ({type(e).__name__})")
+
+
+def _person_post(body):
+    return _person_call("POST", PERSON_INBOX_PATH, body=body)
+
+
+def cmd_list(args):
+    """The person's main view: every open item, blocked-on-the-person first, one plain line each (main key)."""
+    q = {"action": "list"}
+    if args[:1] == ["--all"]:
+        q["all"] = "true"
+    return _person_call("GET", PERSON_WATCH_PATH, need_main=True, query=q)
+
+
+def cmd_read(args):
+    """Read one inbox as the person (main key): "person" or an agent's name."""
+    if len(args) != 1 or not args[0].strip():
+        die("usage: datastash read INBOX   (\"person\" or an agent's name)")
+    return _person_call("GET", PERSON_INBOX_PATH, need_main=True, query={"inbox": args[0].strip()})
+
+
+def cmd_filter(args, hidden=True):
+    """The person's filters (main key): datastash filter AGENT | datastash filter --kind KIND (unfilter undoes it)."""
+    if len(args) == 2 and args[0] == "--kind":
+        body = {"kind": args[1]}
+    elif len(args) == 1 and args[0].strip():
+        body = {"agent": args[0].strip()}
+    else:
+        die(f"usage: datastash {'filter' if hidden else 'unfilter'} AGENT  |  --kind KIND")
+    if not _person_allowed(this_session(), os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()):
+        die('only the person\'s datastash main session acts as the person (the person types "datastash main")')
+    key = read_main_key()
+    if key is None:
+        die('no main key on this machine (the person types "datastash main" and approves it in the browser)')
+    body["action"] = "filter" if hidden else "unfilter"
+    try:
+        status, _ctype, text = http("POST", PERSON_FILTER_PATH, key=key, body=body, timeout=60)
+        print(framed("POST", PERSON_FILTER_PATH, status, text))
+        return 0
+    except ApiError as e:
+        print(framed("POST", PERSON_FILTER_PATH, e.status, json.dumps({"http_status": e.status, **e.body})))
         return 1
     except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
         die(f"could not reach datastash ({type(e).__name__})")
@@ -1787,7 +2013,8 @@ def main():
     args = sys.argv[2:]
     table = {"fetch": cmd_fetch, "link": cmd_link, "status": cmd_status, "api": cmd_api, "off": cmd_off,
              "watch": cmd_watch, "check": cmd_check, "listen": cmd_listen, "end": cmd_end, "reply": cmd_reply,
-             "send": cmd_send, "main": cmd_main, "prompt": cmd_prompt, "auto-name": cmd_auto_name}
+             "send": cmd_send, "main": cmd_main, "prompt": cmd_prompt, "auto-name": cmd_auto_name, "list": cmd_list,
+             "read": cmd_read, "filter": cmd_filter, "unfilter": lambda a: cmd_filter(a, hidden=False)}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

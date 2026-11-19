@@ -468,6 +468,9 @@ class PersonSession(Base):
         self.assertEqual(ds.due_ids(p, ids, time.time()), (ids, None))
 
     def test_reply_and_send_post_as_the_person(self):
+        old_env = os.environ.get("CLAUDE_PROJECT_DIR")
+        os.environ["CLAUDE_PROJECT_DIR"] = TMP  # a folder the person linked: the person's own session
+        self.addCleanup(lambda: os.environ.__setitem__("CLAUDE_PROJECT_DIR", old_env) if old_env is not None else os.environ.pop("CLAUDE_PROJECT_DIR", None))
         sent = []
         ds.read_key = lambda s: "ldgr_pw_test" if s == ds.PERSON_SLUG else None
         ds.http = lambda method, path, key=None, body=None, form=None, timeout=40: (sent.append((method, path, key, body)) or (200, "application/json", '{"from":"person"}'))
@@ -799,23 +802,37 @@ WID = "11111111-2222-3333-4444-555555555555"
 class MainBase(Base):
     """Owner ruling 11-19: "datastash main" works in ANY Claude Code session, any folder. Main is per session (session
     id, bound to the session's own Claude Code process); it is switched on only after the person typed the phrase in
-    that session (prompt hook) and datastash accepted a fresh watch pickup code (issued to the person's own connection
-    only); a session that holds an agent identity or used an agent key is refused."""
+    that session (prompt hook), with the person's main key, which only the person's browser approval makes (once per
+    machine); a session that holds an agent identity or used an agent key is refused."""
 
     def setUp(self):
         super().setUp()
         ds.resolve = self.saved["resolve"]
         self.saved.setdefault("http", ds.http)
         self.keys_read = []
-        ds.read_key = lambda s: (self.keys_read.append(s) or ("ldgr_pw_test" if s == ds.PERSON_SLUG else "ldgr_ag_test"))
+        ds.read_key = lambda s: (self.keys_read.append(s) or ("ldgr_pw_test" if ds.person_slug(s) else "ldgr_ag_test"))
         self.sent = []
+        self.approved = True
+        for f in (ds.MAIN_KEY_FILE, ds.MAIN_PENDING):
+            if os.path.exists(f):
+                os.replace(f, os.path.join(TMP, f"old-{os.path.basename(f)}-{time.time()}"))
 
         def fake_http(method, path, key=None, body=None, form=None, timeout=40):
             self.sent.append((method, path, key))
+            if path == ds.MAIN_START_PATH:
+                return 200, "application/json", json.dumps({"approve_url": ds.ORIGIN + "/main/approve?r=tok", "pickup_code": "dsmk_code123456"})
             if path == ds.PICKUP_PATH:
-                return 200, "text/plain", "ldgr_pw_" + "k" * 43 + "\n"
+                if not self.approved:
+                    return 202, "application/json", '{"status":"pending"}'
+                return 200, "text/plain", "ldgr_pm_" + "k" * 43 + "\n"
+            if path == ds.PERSON_WORKBOOKS_PATH:
+                if not (key or "").startswith("ldgr_pm_"):
+                    raise ds.ApiError(401, {})
+                return 200, "application/json", json.dumps({"agent_workbooks": [{"workbook_id": WID, "name": "Agents"}]})
             return 200, "application/json", "{}"
         ds.http = fake_http
+        self.saved.setdefault("MAIN_WAIT_SECONDS", ds.MAIN_WAIT_SECONDS)
+        ds.MAIN_WAIT_SECONDS = 0.0
         self.folder = tempfile.mkdtemp(prefix="agent-linked-", dir=TMP)
         ds.write_private(ds.conf_path("builder"), json.dumps({"name": "Builder", "workbook_id": "wb-b", "projects": [self.folder]}))
         ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps({"workbook_id": WID, "projects": []}))
@@ -851,15 +868,21 @@ class MainBase(Base):
         v = out.getvalue()
         return json.loads(v)["hookSpecificOutput"]["additionalContext"] if v.strip() else None
 
-    def on(self):
-        import sys as _s
-        _s.stdin = io.StringIO("dspw_watchcode123\n")
+    def main_cmd(self, *args):
         with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
             try:
-                rc = ds.cmd_main(["--on", WID, "-"])
+                rc = ds.cmd_main(list(args))
             except SystemExit as e:
                 rc = e.code
         return rc, out.getvalue(), err.getvalue()
+
+    def on(self):
+        """The skill's steps: --on (the first time on a machine it prints the approval link), then --wait."""
+        rc, out, err = self.main_cmd("--on")
+        if rc == 0 and "approval needed" in out:
+            rc2, out2, err2 = self.main_cmd("--wait")
+            return rc2, out + out2, err + err2
+        return rc, out, err
 
     def api(self):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
@@ -887,9 +910,9 @@ class MainAnySession(MainBase):
         self.assertEqual(ds.MAIN_READY, "Your datastash main is ready. Type 'datastash main' in any Claude Code session to open it again.")
         self.assertNotIn("ldgr_pw_", out)
         self.assertTrue(ds.is_main_session(a))
-        self.assertEqual(ds.session_for(self.folder, me=a)["slug"], ds.PERSON_SLUG)
+        self.assertEqual(ds.session_for(self.folder, me=a)["slug"], ds.PERSON_SLUG + "-sess-A")
         self.assertIsNone(ds.agent_for(self.folder, me=a))
-        self.assertEqual(ds.person_for(self.folder, me=a)["slug"], ds.PERSON_SLUG)
+        self.assertTrue(ds.is_person(ds.person_for(self.folder, me=a)))
         # Never an agent key in the main session, whatever the folder's link says.
         self.keys_read.clear()
         rc, err = self.api()
@@ -914,7 +937,7 @@ class MainAnySession(MainBase):
             ds.cmd_listen([])
         finally:
             ds._take_listener_lock = orig
-        self.assertEqual(seen, [ds.PERSON_SLUG])
+        self.assertEqual(seen, [ds.PERSON_SLUG + "-sess-A"])
         with redirect_stdout(io.StringIO()) as o:
             ds.cmd_main([])
         self.assertIn("this session is the person's datastash main: yes", o.getvalue())
@@ -953,7 +976,8 @@ class MainAnySession(MainBase):
         self.assertNotEqual(rc, 0)
         self.assertIn("acted as an agent", err)
         self.assertFalse(ds.is_main_session(self.be("sess-C", (3003, "tC"))))
-        self.assertNotIn(ds.PICKUP_PATH, [p for _, p, _ in self.sent])  # refused before any code is traded
+        self.assertNotIn(ds.PICKUP_PATH, [p for _, p, _ in self.sent])  # refused before any network call
+        self.assertNotIn(ds.MAIN_START_PATH, [p for _, p, _ in self.sent])
         # 2. It holds an agent identity ($DATASTASH_AGENT).
         self.be("sess-D", (4004, "tD"))
         os.environ["DATASTASH_AGENT"] = "Builder"
@@ -1030,6 +1054,86 @@ class MainAnySession(MainBase):
         self.make_main()
         ds.fetch_page = lambda *a, **k: (_ for _ in ()).throw(AssertionError("polled as the agent"))
         self.assertEqual(ds._listen_loop(agent, "builder", "sess-A", None, me=a), 0)
+
+    def test_main_key_comes_only_from_browser_approval_once_per_machine(self):
+        self.be("sess-A", (1001, "tA"))
+        self.prompt("sess-A")
+        self.approved = False
+        rc, out, _ = self.main_cmd("--on")
+        self.assertEqual(rc, 0)
+        self.assertIn("approval needed (once on this machine)", out)
+        self.assertIn(ds.ORIGIN + "/main/approve?r=tok", out)
+        self.assertNotIn("dsmk_", out)  # the pickup code stays in a private file
+        self.assertEqual(oct(os.stat(ds.MAIN_PENDING).st_mode & 0o777), "0o600")
+        rc, out, _ = self.main_cmd("--wait")  # not approved yet
+        self.assertIn("still waiting", out)
+        self.assertFalse(os.path.exists(ds.MAIN_KEY_FILE))
+        self.assertFalse(ds.is_main_session(self.be("sess-A", (1001, "tA"))))
+        self.approved = True
+        rc, out, err = self.main_cmd("--wait")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("ldgr_pm_", out)
+        self.assertIn("confirmation for the person: " + ds.MAIN_READY, out)
+        self.assertEqual(oct(os.stat(ds.MAIN_KEY_FILE).st_mode & 0o777), "0o600")
+        self.assertTrue(ds.is_main_session(self.be("sess-A", (1001, "tA"))))
+        self.assertEqual(ds.read_json(ds.conf_path(ds.PERSON_SLUG), {})["workbook_id"], WID)
+        # Another session later: the key is reused, no browser step.
+        self.sent.clear()
+        self.be("sess-C", (3303, "tC2"))
+        self.prompt("sess-C")
+        rc, out, err = self.main_cmd("--on")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("approval needed", out)
+        self.assertNotIn(ds.MAIN_START_PATH, [p for _, p, _ in self.sent])
+        self.assertTrue(ds.is_main_session(self.be("sess-C", (3303, "tC2"))))
+
+    def test_the_main_key_is_never_used_by_an_agent_session_or_an_ordinary_one(self):
+        self.make_main()
+        calls = (lambda: ds.cmd_list([]), lambda: ds.cmd_read(["person"]), lambda: ds.cmd_filter(["Builder"]),
+                 lambda: ds._person_post({"to": "Builder", "message": "x"}), lambda: ds.cmd_watch(["--person"]))
+        # An agent session in the same folder, and an ordinary session elsewhere that never became main.
+        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        for sid, proc, folder in (("sess-B", (2002, "tB"), self.folder), ("sess-P", (2102, "tP"), plain)):
+            self.be(sid, proc)
+            os.environ["CLAUDE_PROJECT_DIR"] = folder
+            self.sent.clear()
+            for call in calls:
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                    call()
+                self.assertIn("datastash main", err.getvalue())
+            self.assertEqual(self.sent, [])
+        # The main session itself uses it.
+        self.be("sess-A", (1001, "tA"))
+        os.environ["CLAUDE_PROJECT_DIR"] = self.folder
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ds.cmd_list([]), 0)
+        self.assertEqual(self.sent[-1][1].split("?")[0], ds.PERSON_WATCH_PATH)
+        self.assertTrue(self.sent[-1][2].startswith("ldgr_pm_"))
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ds.cmd_read(["Builder"]), 0)
+        self.assertIn("inbox=Builder", self.sent[-1][1])
+
+    def test_every_live_main_session_gets_its_own_listener(self):
+        self.make_main("sess-A", (1001, "tA"))
+        self.make_main("sess-C", (3303, "tC2"))
+        a = ds.session_for(self.folder, me=self.be("sess-A", (1001, "tA")))
+        c = ds.session_for(self.folder, me=self.be("sess-C", (3303, "tC2")))
+        self.assertNotEqual(a["slug"], c["slug"])
+        fa = ds._take_listener_lock(a["slug"], "sess-A")
+        fc = ds._take_listener_lock(c["slug"], "sess-C")
+        try:
+            self.assertIsNotNone(fa)
+            self.assertIsNotNone(fc)  # both hold a listener: both wake
+        finally:
+            for fd in (fa, fc):
+                if fd is not None:
+                    os.close(fd)
+        self.assertNotEqual(ds.state_path(a["slug"]), ds.state_path(c["slug"]))
+        self.assertEqual(ds.key_path(a["slug"]), ds.key_path(ds.PERSON_SLUG))
+
+    def test_no_person_connector_in_the_plugin(self):
+        with open(os.path.join(HERE, "..", "plugins", "datastash", ".mcp.json")) as f:
+            self.assertEqual(list(json.load(f)["mcpServers"]), ["datastash"])
 
     def test_the_owner_approved_lines_and_no_folder_steps(self):
         with open(os.path.join(HERE, "..", "plugins", "datastash", "skills", "datastash-agent", "SKILL.md")) as f:
