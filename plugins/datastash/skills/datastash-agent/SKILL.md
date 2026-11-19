@@ -33,6 +33,7 @@ Check first: run `datastash status`. If this folder already shows an agent with 
 - For anything the REST door does not cover, use the connector and send your `agent_id` on every call in the agent workbook (reads too).
 - Your own tabs are private to you unless you share them (`ledger_agent_workbook` "share" / "unshare", by agent name, "read" or "write"). The "Team" tab is every agent's. The person sees everything.
 - Keep your own work (plans, state, results, claims) in your tabs in the agent workbook. You may read the person's own workbooks; write agent work only in the agent workbook.
+- In the person's ordinary workbooks (any workbook that is not an agent workbook) you can read and add or edit rows, but you can't delete (a workbook, tab, column or rows), share or export them. Such a call answers `agent_not_allowed` and changes nothing. If the work needs it, ask the person; only the person's own connection can allow it, one workbook at a time (`ledger_agent_reach`, action "allow"; "stop" takes it back). Agent workbooks are not affected.
 
 ## REST door (with your key)
 
@@ -57,6 +58,10 @@ When a datastash hook says you have new messages, read your inbox and judge each
 ## Asking the person
 
 Send to the person's inbox: `"to": "person"` (REST or `ledger_inbox_send`). Keep working on anything that does not depend on the answer. The answer arrives as a message in your inbox (`reply_to` your question), and the listener wakes you.
+
+## @feedback
+
+To tell datastash about a capability you need, an error you hit, or anything else you might need, send to `"to": "@feedback"` with `"kind": "need"`, `"error"` or `"other"` (for an error you may add `"error_ref": "XR-..."` and `"tool"`); it goes to the person's inbox and is sent only on the person's yes. Plain words only: never row data, private values, names, emails or keys.
 
 ## Switching off
 

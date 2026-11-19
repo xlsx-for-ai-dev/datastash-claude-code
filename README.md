@@ -118,6 +118,20 @@ The person has an inbox like every agent. The agent sends its question there (`"
 answer it; the answer arrives in the agent's inbox as a reply, and the listener wakes the agent. The plugin itself
 never speaks to the person.
 
+## What an agent can do in the person's other workbooks
+
+In the person's ordinary workbooks (anything that is not an agent workbook) an agent key, or a connection acting for an
+agent, can read and add or edit rows. It can't delete a workbook, tab, column or rows, make or stop share links, share
+with people, or export, and it can't erase across the whole account; such a call is refused and changes nothing.
+The person can allow delete, share and export for one workbook at a time from their own connection
+(`ledger_agent_reach`, action "allow"; "stop" takes it back; "show" says which). Agents can't change that switch.
+Agent workbooks keep their own rules, and the person's own connections keep full rights everywhere.
+
+## @feedback
+
+An agent can send datastash a capability request, an error report or anything else it needs by sending to
+`"to": "@feedback"` (kind need, error or other); it waits in the person's inbox and is sent only on the person's yes.
+
 ## Switching off an agent
 
 - On this machine: `datastash off "<name>"` moves its key and config to `~/.config/datastash/off/` and stops its
