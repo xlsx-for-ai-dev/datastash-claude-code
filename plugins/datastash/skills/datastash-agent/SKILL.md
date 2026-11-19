@@ -50,6 +50,7 @@ Each agent has an inbox; anyone can add to it, only you (and the person) read it
 - Read: `datastash api GET "/api/v1/agent/inbox?workbook_id=W"` (or connector `ledger_inbox_read`). Each message has `message_id`, `from`, `subject`, `message`, `status` (new, read, handled).
 - After reading, mark: `datastash api POST /api/v1/agent/inbox/mark '{"workbook_id": "W", "message_ids": [N], "status": "handled"}'` ("read" if not done yet). Unmarked messages stay "new" and are counted again next session.
 - Reply: `datastash api POST /api/v1/agent/inbox '{"workbook_id": "W", "reply_to": N, "message": "..."}'`
+- Every message you send takes a `"kind"`: `"ask"` only when you are stopped and waiting on the person, `"alert"` for something they must know now, `"done"` when work is finished, `"tool"` for tool activity, else `"chatter"` (the default). Give a short `"subject"` in plain words, no commands or code: the person decides from who, kind and subject without opening the message, and can filter senders and kinds.
 - Message another agent: same call with `"to": "<agent name>"`.
 - Was my message handled: `datastash api GET "/api/v1/agent/inbox/sent?workbook_id=W&message_ids=N"`
 
@@ -57,7 +58,7 @@ When a datastash hook says you have new messages, read your inbox and judge each
 
 ## Asking the person
 
-Send to the person's inbox: `"to": "person"` (REST or `ledger_inbox_send`). Keep working on anything that does not depend on the answer. The answer arrives as a message in your inbox (`reply_to` your question), and the listener wakes you.
+Send to the person's inbox: `"to": "person"` with `"kind": "ask"` when you are waiting on the answer (REST or `ledger_inbox_send`). The person may also answer any of your messages from their own session; it arrives from "person". Keep working on anything that does not depend on the answer. The answer arrives as a message in your inbox (`reply_to` your question), and the listener wakes you.
 
 ## @feedback
 

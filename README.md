@@ -12,7 +12,8 @@ What it adds:
 - **Hand-off rule**: once an agent has its own agent key, it uses that key, not the shared connector, for its
   agent-workbook work. Agents on one sign-in connection are labels, not walls; per-agent privacy holds only on
   agent keys.
-- **`datastash` command** (on the session's PATH): `fetch`, `link`, `status`, `api`, `off`, `watch`.
+- **`datastash` command** (on the session's PATH): `fetch`, `link`, `status`, `api`, `off`, `watch`; for the person's own
+  session ("datastash main"): `watch --person`, `reply`, `send`.
 - **Hooks**: an inbox count at session start, and a background inbox listener that wakes the session when
   messages arrive.
 
@@ -49,6 +50,42 @@ Researcher"). The skill makes it:
 
 From the next session in that folder on, the session starts with a count of new messages and the listener runs.
 
+## datastash main: the person's own session
+
+"datastash main" is the person's own Claude Code session (terminal or VS Code), not an agent. Activity from all their
+agents shows up there, and the person answers any agent from it. datastash's part ends at the ping: the wake carries who
+and how many, never message text; the session reads the rest through the datastash connector with the person's own access.
+
+Set it up once, in the folder the person will use for it:
+
+1. Start Claude Code in that folder with this plugin installed. Sign in to the datastash connector with the person's own
+   Google login. This session must never register an agent (a connection that registered agents is never the person).
+2. Ask the session: "set this up as datastash main for my agent workbook". It calls `ledger_person_watch` with
+   `action: "key"` and runs the fetch line it gets back itself, which trades the one-time code for the person's watch key
+   (saved to `~/.config/datastash/person.key`, mode 600, never printed) and links this folder.
+3. Start a new session in that folder. From then on it starts with a count of new items, and the listener wakes it when
+   any agent writes: a message in any agent's inbox or the person's, or a new row in the team tab.
+
+What the person's AI does in this session:
+
+- Shows the person plain words only: one line per item (who, kind, subject), in the order datastash gives (asks first,
+  then @feedback drafts waiting for a yes, then alerts, then the rest). Never commands, code or code blocks.
+- Lists open items with the connector's main view (`ledger_person_watch`, `action: "list"`), reads a message on demand
+  (`ledger_inbox_read`), and answers with `ledger_inbox_send` (`reply_to`, or `to` an agent name); the agent receives it
+  from "person" and wakes like on any message. From a terminal the same is `datastash reply MESSAGE_ID -` or
+  `datastash send AGENT -`, with the text on stdin.
+- Sets a filter only when the person asks ("filter Researcher", "filter tool activity"): `action: "filter"` with `agent`
+  or `kind`. Filters are kept by datastash until the person removes them (`unfilter`); agents can't set or see them. They
+  hide items from the main view, the wake and the waiting count, never delete anything, and hidden asks and alerts are
+  still counted, so a filter never hides a blocker. Tool activity is filtered until the person unfilters it.
+
+Message kinds: agents send `kind` with each message: `ask` (stopped and waiting on the person), `alert`, `done`,
+`chatter` (the default) or `tool`.
+
+If hooks can't run, a Monitor does the same: `datastash watch --person` prints one line of counts per arrival.
+`datastash status` shows the person's session beside the agents. To stop the watch key everywhere: `ledger_person_watch`
+with `action: "stop"`.
+
 ## Untrusted text and permissions
 
 - `datastash api` prints every answer between `<<datastash-data TAG>>` and `<<end datastash-data TAG>>`, with a
@@ -69,6 +106,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-<name>.json` | the inbox cursor, the ids of messages still "new", and the last wake time (no message text) |
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
+| `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |
 | `off/` | key and config files of agents switched off on this machine |
 
 Message text is never stored locally; the agent reads it from datastash when it needs it.
@@ -153,6 +191,8 @@ An agent can send datastash a capability request, an error report or anything el
   checks, state shape, name collisions, listener match, backoff (410, 5xx, network, fast empty polls, the cursor race
   in the session-start count), the session-start check's short wait on a stalled network, and wake pacing, including
   a simulated burst of 5 messages and a hostile sender whose wakes bring nothing handled.
+- `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
+  throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
 - `test/wake-test.sh` proves the idle wake on this box with the test account (needs tmux; see the script header).
   `BURST=5 test/wake-test.sh` sends 5 messages within seconds instead and passes when the session wakes once or
   twice and handles all 5.

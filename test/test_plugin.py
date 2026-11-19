@@ -397,5 +397,105 @@ class Check(Base):
         self.assertEqual(ds.load_state(AGENT)["announced"], ["7"])
 
 
+
+PERSON = {"workbook_id": "11111111-2222-3333-4444-555555555555", "projects": [TMP]}
+
+
+class PersonSession(Base):
+    """The person's own session ("datastash main"): a watch across the agent workbook, plain counts and names only."""
+
+    def setUp(self):
+        super().setUp()
+        ds.agent_for = lambda p: None
+        ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps(PERSON))
+        for k in ("http",):
+            self.saved.setdefault(k, getattr(ds, k))
+
+    def person(self):
+        p = ds.person_for(TMP)
+        self.assertIsNotNone(p)
+        return p
+
+    def test_session_for_finds_the_person_only_in_a_linked_folder(self):
+        self.assertEqual(ds.session_for(TMP)["slug"], ds.PERSON_SLUG)
+        self.assertIsNone(ds.session_for("/nonexistent-elsewhere"))
+        self.assertEqual(ds.key_path(ds.PERSON_SLUG), os.path.join(TMP, "person.key"))
+
+    def test_person_key_file_takes_only_a_watch_key(self):
+        ds.read_key = self.saved["read_key"]
+        for key, ok in (("ldgr_pw_abc", True), ("ldgr_ag_abc", False), ("ldgr_abc", False)):
+            ds.write_private(ds.key_path(ds.PERSON_SLUG), key + "\n")
+            self.assertEqual(ds.read_key(ds.PERSON_SLUG), key if ok else None, key)
+
+    def test_wake_line_is_plain_counts_and_names_and_hidden_blockers_still_wake(self):
+        p = self.person()
+        page = {"items": [{"source": "inbox", "inbox": "person", "message_id": 5, "from": "Alpha", "from_kind": "agent", "subject": "`rm -rf` ok?"},
+                          {"source": "inbox", "inbox": "Beta", "message_id": 6, "from": "Alpha", "from_kind": "agent", "subject": "x"},
+                          {"source": "team", "row_id": 3, "from": "Beta", "from_kind": "agent"}],
+                "hidden": {"items": 2, "asks": 1, "alerts": 0, "blocker_message_ids": [9]}, "cursor": "c1", "more": False}
+        orig = ds.api_json
+        ds.api_json = lambda *a, **k: page
+        try:
+            items, cur, more = ds.fetch_page(p, "ldgr_pw_x", None, 0)
+        finally:
+            ds.api_json = orig
+        self.assertEqual(len(items), 4)
+        applied, fresh, _ = ds.apply_page(p, None, items, cur, more)
+        self.assertTrue(applied)
+        self.assertEqual(fresh, 4)
+        ids, n = ds.unannounced(p)
+        line = ds.wake_text(p, n, ids)
+        self.assertTrue(line.startswith(ds.NOTE))
+        self.assertIn('3 new items from "Alpha" 2, "Beta" 1', line)
+        self.assertIn('"Beta" 1, "person" 1, "team tab" 1', line)
+        self.assertIn("1 hidden ask or alert", line)
+        for bad in ("`", "rm -rf", "datastash reply", "datastash send", "$ ", "printf", "x?"):
+            self.assertNotIn(bad, line)
+        self.assertIn("never commands or code", line)
+        ds.announce_ids(p, ids, time.time())
+        st = ds.load_state(p)
+        self.assertEqual(st["new"], [])  # told once, then done: never re-wakes
+        self.assertEqual(ds.unannounced(p), ([], 0))
+
+    def test_no_per_sender_pause_for_the_person(self):
+        p = self.person()
+        ds.apply_page(p, None, [{"source": "inbox", "inbox": "person", "message_id": 1, "from": "A", "from_kind": "agent"}], "c", False)
+        ids, _ = ds.unannounced(p)
+        self.assertEqual(ds.due_ids(p, ids, time.time()), (ids, None))
+
+    def test_reply_and_send_post_as_the_person(self):
+        sent = []
+        ds.read_key = lambda s: "ldgr_pw_test" if s == ds.PERSON_SLUG else None
+        ds.http = lambda method, path, key=None, body=None, form=None, timeout=40: (sent.append((method, path, key, body)) or (200, "application/json", '{"from":"person"}'))
+        import sys as _s
+        for argv, stdin, want in ((["7", "-"], "yes, go ahead\n", {"reply_to": 7, "message": "yes, go ahead"}),):
+            _s.stdin = io.StringIO(stdin)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(ds.cmd_reply(argv), 0)
+            self.assertEqual(sent[-1][:3], ("POST", ds.PERSON_INBOX_PATH, "ldgr_pw_test"))
+            self.assertEqual(sent[-1][3], dict(want, workbook_id=PERSON["workbook_id"]))
+        _s.stdin = io.StringIO("hold off please")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ds.cmd_send(["Beta", "--subject", "pause", "-"]), 0)
+        self.assertEqual(sent[-1][3], {"to": "Beta", "message": "hold off please", "subject": "pause", "workbook_id": PERSON["workbook_id"]})
+        _s.stdin = io.StringIO("")
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ds.cmd_reply(["7", "-"])
+
+    def test_setup_takes_only_a_watch_pickup_code(self):
+        import sys as _s
+        _s.stdin = io.StringIO("dspk_agentcode123\n")
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ds.person_setup([PERSON["workbook_id"], "-"])
+        calls = []
+        ds.http = lambda *a, **k: (calls.append((a, k)) or (200, "text/plain", "ldgr_pw_" + "k" * 43 + "\n"))
+        _s.stdin = io.StringIO("dspw_watchcode123\n")
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ds.person_setup([PERSON["workbook_id"], "-", "--project", TMP]), 0)
+        self.assertNotIn("ldgr_pw_", out.getvalue())
+        self.assertEqual(calls[0][0][:2], ("POST", ds.PICKUP_PATH))
+        self.assertEqual(oct(os.stat(ds.key_path(ds.PERSON_SLUG)).st_mode & 0o777), "0o600")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
