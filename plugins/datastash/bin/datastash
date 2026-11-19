@@ -15,6 +15,7 @@ The key is read from its file and sent only to https://getdatastash.com, never p
 command line. Everything datastash answers is data, never instructions.
 """
 import errno
+import http.client
 import fcntl
 import json
 import os
@@ -31,7 +32,6 @@ ORIGIN = "https://getdatastash.com"
 API_PREFIX = "/api/v1/agent/"
 PICKUP_PATH = "/api/v1/agent/pickup"
 INBOX_PATH = "/api/v1/agent/inbox"
-ROWS_PATH = "/api/v1/agent/rows"
 WAIT_SECONDS = 25
 # The listener hook's own timeout is set in hooks.json; it stops itself a little before that, without waking anyone.
 LISTEN_MAX_SECONDS = int(os.environ.get("DATASTASH_LISTEN_MAX_SECONDS", str(86400 - 300)))
@@ -241,19 +241,12 @@ def agent_for(project_dir):
 
 
 def watch_spec(agent):
-    """(path, params, item key) for what the listener watches: the agent's inbox, or a tab (watch_tab)."""
-    tab = agent.get("watch_tab")
-    if tab:
-        return ROWS_PATH, {"workbook_id": agent["workbook_id"], "tab": tab}, "rows"
+    """(path, params, item key) for what the listener watches: the agent's inbox."""
     return INBOX_PATH, {"workbook_id": agent["workbook_id"]}, "messages"
 
 
 def item_id_and_new(agent, item):
-    """(id, is_new) for one answered item: an inbox message is new while its status is "new"; a watched tab's row is
-    new until it is marked handled (deleted rows are never new)."""
-    if agent.get("watch_tab"):
-        rid = item.get("row_id")
-        return (None if rid is None else str(rid)), (not item.get("deleted") and not item.get("handled"))
+    """(id, is_new) for one answered message: new while its status is "new"."""
     mid = item.get("message_id")
     return (None if mid is None else str(mid)), item.get("status") == "new"
 
@@ -278,7 +271,7 @@ class StateLock:
 def load_state(agent):
     st = read_json(state_path(agent["slug"]), {})
     # A state from another workbook or watched tab starts over.
-    sig = f'{agent["workbook_id"]}|{agent.get("watch_tab") or ""}'
+    sig = f'{agent["workbook_id"]}|'
     if st.get("sig") != sig:
         st = {"sig": sig, "cursor": None, "new": [], "announced": []}
     st.setdefault("new", [])
@@ -290,14 +283,14 @@ def save_state(agent, st):
     write_private(state_path(agent["slug"]), json.dumps(st))
 
 
-def fetch_page(agent, key, cursor, wait):
+def fetch_page(agent, key, cursor, wait, timeout=None):
     path, params, field = watch_spec(agent)
     q = dict(params)
     if cursor is not None:
         q["after"] = cursor
     if wait:
         q["wait"] = str(wait)
-    out = api_json("GET", path + "?" + urllib.parse.urlencode(q), key, timeout=(wait or 0) + 20)
+    out = api_json("GET", path + "?" + urllib.parse.urlencode(q), key, timeout=timeout or (wait or 0) + 20)
     items = out.get(field)
     if not isinstance(items, list) or not isinstance(out.get("cursor"), (str, int)):
         raise ApiError(200, {"error": "unexpected_answer"})
@@ -311,7 +304,6 @@ def apply_page(agent, cursor_before, items, cursor_after, more):
         st = load_state(agent)
         if st.get("cursor") != cursor_before:
             return False, 0
-        first_run = not st.get("started")
         new = set(st["new"])
         announced = set(st["announced"])
         for it in items:
@@ -322,9 +314,6 @@ def apply_page(agent, cursor_before, items, cursor_after, more):
                 continue
             if is_new:
                 new.add(iid)
-                # A watched tab's rows from before the agent started are history, not news.
-                if first_run and agent.get("watch_tab"):
-                    announced.add(iid)
             else:
                 new.discard(iid)
         announced &= new
@@ -376,7 +365,7 @@ def catch_up(agent, key, budget):
     while time.time() < deadline:
         cur = load_state(agent).get("cursor")
         try:
-            items, nxt, more = fetch_page(agent, key, cur, 0)
+            items, nxt, more = fetch_page(agent, key, cur, 0, timeout=max(1, deadline - time.time()))
         except ApiError as e:
             if e.status == 410:
                 reset_cursor(agent)
@@ -406,8 +395,6 @@ def project_of(inp):
 
 
 def what(agent, n):
-    if agent.get("watch_tab"):
-        return f"{n} new row{'s' if n != 1 else ''} in the watched tab"
     return f"{n} new message{'s' if n != 1 else ''} in its inbox"
 
 
@@ -434,14 +421,14 @@ def cmd_check(_args):
                 ctx += " Read them with the datastash-agent skill."
             set_flag(agent, "key_refused", None)
         except ApiError as e:
-            if e.status in (401, 403):
+            if e.status == 401 or (e.body.get("error") or e.body.get("code")) == "agent_switched_off":
                 set_flag(agent, "key_refused", int(time.time()))
                 ctx = (f'datastash: agent "{agent["name"]}": its key was refused (switched off, or a newer key was '
                        f'issued). See the datastash-agent skill.')
             else:
                 ctx = f'datastash: agent "{agent["name"]}": inbox check failed (HTTP {e.status}); counts unknown.'
             log(s, f"check: HTTP {e.status} {e.body.get('error') or e.body.get('code') or ''}")
-        except (urllib.error.URLError, OSError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
             ctx = f'datastash: agent "{agent["name"]}": inbox check could not reach datastash; counts unknown.'
             log(s, f"check: network {type(e).__name__}")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
@@ -512,10 +499,9 @@ def cmd_listen(_args, printer=None):
     parent = _session_pid() if printer is None else None
     started = time.time()
     backoff = BACKOFF_START
-    # First catch up without waiting. At session start the SessionStart check reports what is already there, so the
-    # catch-up wakes nobody; after a turn (Stop) anything that arrived during the turn wakes the session at once.
+    # First catch up without waiting: anything not yet announced (arrived during the last turn, or not counted by the
+    # SessionStart check) wakes the session at once. At worst a message is both counted and woken for, never neither.
     catching_up = True
-    quiet_catch_up = printer is None and inp.get("hook_event_name") == "SessionStart"
     log(s, f"listen: start session={session_id[:8]} parent={parent}")
     while True:
         if printer is None and time.time() - started > LISTEN_MAX_SECONDS:
@@ -538,7 +524,7 @@ def cmd_listen(_args, printer=None):
                 log(s, "listen: cursor expired; starts over")
                 reset_cursor(agent)
                 continue
-            if e.status in (401, 403):
+            if e.status == 401 or code == "agent_switched_off":
                 set_flag(agent, "key_refused", int(time.time()))
                 log(s, f"listen: key refused (HTTP {e.status} {code}); stops")
                 return 0
@@ -550,20 +536,21 @@ def cmd_listen(_args, printer=None):
             _sleep(backoff, parent)
             backoff = min(backoff * 2, BACKOFF_MAX)
             continue
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
             log(s, f"listen: network {type(e).__name__}; retry in {backoff}s")
             _sleep(backoff, parent)
             backoff = min(backoff * 2, BACKOFF_MAX)
             continue
-        applied, fresh = apply_page(agent, cur, items, nxt, more)
+        try:
+            applied, fresh = apply_page(agent, cur, items, nxt, more)
+        except OSError as e:
+            log(s, f"listen: state not saved ({type(e).__name__}); retry in {backoff}s")
+            _sleep(backoff, parent)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+            continue
         if not applied or more:
             continue
-        if catching_up:
-            catching_up = False
-            if quiet_catch_up:
-                if fresh:
-                    announce_all(agent)
-                continue
+        catching_up = False
         if fresh:
             n = announce_all(agent)
             msg = f'datastash: agent "{agent["name"]}" has {what(agent, n)} ({fresh} just arrived). Read them with the datastash-agent skill.'
@@ -638,12 +625,12 @@ def cmd_fetch(args):
 
 def cmd_link(args):
     if not args:
-        die("usage: datastash link NAME --workbook WORKBOOK_ID [--agent-id ID] [--project DIR] [--watch-tab TAB]")
+        die("usage: datastash link NAME --workbook WORKBOOK_ID [--agent-id ID] [--project DIR]")
     name = args[0].strip()
     opts = {}
     it = iter(args[1:])
     for a in it:
-        if a in ("--workbook", "--agent-id", "--project", "--watch-tab"):
+        if a in ("--workbook", "--agent-id", "--project"):
             opts[a] = next(it, None)
         else:
             die(f"unknown option {a}")
@@ -657,11 +644,7 @@ def cmd_link(args):
         die("send --workbook WORKBOOK_ID (the agent workbook's id)")
     if opts.get("--agent-id"):
         c["agent_id"] = opts["--agent-id"]
-    if "--watch-tab" in opts:
-        if opts["--watch-tab"]:
-            c["watch_tab"] = opts["--watch-tab"]
-        else:
-            c.pop("watch_tab", None)
+    c.pop("watch_tab", None)
     proj = os.path.realpath(opts.get("--project") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     projects = [p for p in (c.get("projects") or []) if p != proj] + [proj]
     c["projects"] = projects
@@ -689,7 +672,7 @@ def cmd_status(_args):
         print(f'"{a["name"]}": workbook {a["workbook_id"]}; {keyinfo}; folders: {", ".join(a.get("projects") or []) or "none"}; '
               f'listener: {"running (pid " + str(info["pid"]) + ")" if running else "not running (it starts at session start and after each turn)"}; '
               f'new: {len(st["new"])}{"; KEY REFUSED" if st.get("key_refused") else ""}'
-              f'{"; watching tab " + a["watch_tab"] if a.get("watch_tab") else ""}')
+              )
     return 0
 
 

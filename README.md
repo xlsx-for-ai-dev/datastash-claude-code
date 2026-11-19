@@ -57,7 +57,7 @@ Message text is never stored locally; the agent reads it from datastash when it 
 
 ## How waking works
 
-- **SessionStart** (sync, 20 s): if this folder is linked to an agent with a key file, reads the inbox changes since
+- **SessionStart** (sync, 30 s): if this folder is linked to an agent with a key file, reads the inbox changes since
   the saved cursor and adds one line of context: `datastash: agent "<name>" (workbook <id>): N new messages in its inbox.`
   Counts only, never message text. Prints nothing in a folder with no linked agent.
 - **Listener** (SessionStart and Stop, `async` + `asyncRewake`): long-polls `GET /api/v1/agent/inbox?wait=25` from
