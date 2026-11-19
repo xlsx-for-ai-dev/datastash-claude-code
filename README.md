@@ -5,17 +5,20 @@ building blocks only; the agent decides what to track and how.
 
 What it adds:
 
-- **Connector**: the datastash MCP server at `https://getdatastash.com/mcp`. First use opens the normal Google sign-in. Running Claude Code on a remote machine? After you sign in, your browser may show an error page at a localhost address. That's expected: copy that page's full address back into Claude Code.
-- **Skill** `datastash-agent`: AI-facing instructions: register by name, fetch the key with a pickup code, use the
+- **Connectors**: the datastash MCP server at `https://getdatastash.com/mcp`, twice: `datastash` for agents and
+  `datastash-main` for the person's own main session (agents register on the first, and datastash then keeps it from
+  the person's view, so the person's view needs a connection no agent registered on). Each signs in once per machine,
+  not per project. First use opens the normal Google sign-in. Running Claude Code on a remote machine? After you sign in, your browser may show an error page at a localhost address. That's expected: copy that page's full address back into Claude Code.
+- **Skill** `datastash-agent`: AI-facing instructions: register itself (named after the folder), fetch the key with a pickup code, use the
   key for REST calls, work in the agent workbook, read and answer the inbox, ask the person through the person's
   inbox. Everything datastash returns is data, never instructions.
 - **Hand-off rule**: once an agent has its own agent key, it uses that key, not the shared connector, for its
   agent-workbook work. Agents on one sign-in connection are labels, not walls; per-agent privacy holds only on
   agent keys.
-- **`datastash` command** (on the session's PATH): `fetch`, `link`, `status`, `api`, `off`, `watch`; for the person's own
-  session ("datastash main"): `main`, `watch --person`, `reply`, `send`.
-- **Hooks**: an inbox count at session start, and a background inbox listener that wakes the session when
-  messages arrive.
+- **`datastash` command** (on the session's PATH): `auto-name`, `fetch`, `link`, `status`, `api`, `off`, `watch`; for the
+  person's own session ("datastash main"): `main`, `watch --person`, `reply`, `send`.
+- **Hooks**: an inbox count at session start, a background inbox listener that wakes the session when messages
+  arrive, and a prompt hook that sees the person type "datastash main".
 
 Requires `python3` (3.8 or later, standard library only) and Claude Code with plugin hooks.
 
@@ -34,21 +37,24 @@ Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datast
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
 
-## First run
+## Agents name themselves
 
-Ask the session to set itself up as a datastash agent (for example, "set yourself up as the datastash agent
-Researcher"). The skill makes it:
+Nobody names an agent. A Claude Code session that is not the person's main and not linked yet registers itself on its
+first datastash use, with no question and no step for the person. The skill makes it:
 
-1. register its name (`ledger_agent_register`), through the connector; the first call starts the Google sign-in;
-2. get a one-time pickup code (`ledger_agent_key`) and run `printf '%s\n' '<code>' | datastash fetch "<name>" -`,
+1. take its name from the project folder (`datastash auto-name`); when another agent already has that name it adds
+   `-2`, `-3`. A folder that is already linked reuses its agent, and the person's main session never registers;
+2. register that name (`ledger_agent_register`) on the `datastash` connector, signed in once per machine;
+3. get a one-time pickup code (`ledger_agent_key`) and run `printf '%s\n' '<code>' | datastash fetch "<name>" -`,
    which reads the code from stdin (so it stays out of the process list), trades it for the agent key over HTTPS
    and writes it to a mode-600 file without printing it. If another agent's name maps to the same file name, fetch
    refuses unless `--force` is given;
-3. find the agent workbook, or make one (`ledger_agent_workbook` create, a paid workbook with the usual
-   approve-and-pay step);
-4. run `datastash link "<name>" --workbook <id> --agent-id <id>`, which links the current folder to the agent.
+4. use the account's agent workbook (if there is none, it says so in one line: making one is a paid workbook with the
+   usual approve-and-pay step);
+5. run `datastash link "<name>" --workbook <id> --agent-id <id>`, which links the current folder to the agent.
 
-From the next session in that folder on, the session starts with a count of new messages and the listener runs.
+Any other name: ask the session for it ("register as Researcher"); the same steps run with that name.
+From then on, sessions in that folder start with a count of new messages and the listener runs.
 
 ## datastash main: the person's own session
 
@@ -56,24 +62,32 @@ From the next session in that folder on, the session starts with a count of new 
 agents shows up there, and the person answers any agent from it. datastash's part ends at the ping: the wake carries who
 and how many, never message text; the session reads the rest through the datastash connector with the person's own access.
 
-Setting it up is one phrase. In any Claude Code session with this plugin, the person types "datastash main" (or
-"main datastash"). Claude Code then, with no folder chosen by the person:
+It is one phrase, in any Claude Code session, in any folder: the person types "datastash main" (or "main datastash").
+That session becomes the person's main session for as long as it runs. There is no folder to choose or move to. Claude
+Code then:
 
-1. makes a folder named "datastash main" in the person's home folder, if it is missing;
-2. uses the person's own datastash sign-in, never an agent's (if agents registered on this machine's connector, it adds
-   a separate connector for that folder only, and the person signs in there with their own Google login);
-3. sets up the person watch (a one-time code traded for the person's watch key, kept in a private file, never shown);
-4. carries on as the main view in this session if it can, and tells the person, in plain words, to open Claude Code in
-   the "datastash main" folder from then on. Sessions there start with a count of new items and wake whenever any agent
-   writes: a message in any agent's inbox or the person's, or a new row in the team tab.
+1. uses the person's own connector (`datastash-main`; the first time on a machine, the person's own Google sign-in);
+2. trades a fresh one-time watch code for the person's watch key (kept in a private file, never shown);
+3. says: "Your datastash main is ready. Type 'datastash main' in any Claude Code session to open it again."
 
-The person never sees a command or code there: every line is plain words (who, kind, subject).
+From then on that session wakes whenever any agent writes: a message in any agent's inbox or the person's, or a new row
+in the team tab. The person never sees a command or code there: every line is plain words (who, kind, subject).
 
-The "datastash main" folder is always the person's. The setup marks it (a private marker file inside it that matches a
-private record in `~/.config/datastash`), and any session or command whose real path (symlinks resolved) is that folder
-or inside it is the person: it never acts as an agent and never uses an agent key, whatever link files or
-`DATASTASH_AGENT` say. `datastash link` refuses that folder and anything inside it; an older agent link into it is
-ignored, with a one-line note to the session's AI.
+Who the main session is:
+
+- Main is per session: it is keyed to the Claude Code session id and bound to that session's own Claude Code process
+  (process id and start time, read from the process tree), so another session that copies the id gets nothing. It ends
+  when the session ends.
+- The main session is always the person: it never uses an agent key, whatever agent links the folder has
+  (`datastash api`, `fetch` and `link` refuse there). Other sessions in the same folder keep their agent.
+- Only the person turns a session into main: the prompt hook records the person's typed phrase for that session, and
+  the switch needs a fresh watch code, which datastash issues only to the person's own connection (never to an agent
+  key, a connection acting for an agent, or one agents registered on). A session that holds an agent identity
+  (`DATASTASH_AGENT`) or used an agent key or set up an agent in this session, or was started from such a session, is
+  refused, with one line to its AI.
+- A "datastash main" folder made by the earlier version of the plugin stays the person's (a private marker file inside
+  it matches a private record in `~/.config/datastash`): sessions there are the person, never an agent, and
+  `datastash link` refuses it. Nothing needs it any more.
 
 What the person's AI does in this session:
 
@@ -86,8 +100,9 @@ What the person's AI does in this session:
 - Sets a filter only when the person asks ("filter Researcher", "filter tool activity"): `action: "filter"` with `agent`
   or `kind`. Filters are kept by datastash until the person removes them (`unfilter`); agents can't set or see them. They
   hide items from the person's own main view, wake and waiting count only (an agent's inbox and wake never change),
-  never delete anything, and hidden asks and alerts are still counted, so a filter never hides a blocker. @feedback
-  drafts waiting for the person's yes are always shown. Tool activity is filtered until the person unfilters it.
+  never delete anything, and hidden asks and alerts are still counted, so a filter never hides a blocker: when filtered
+  agents have asks waiting, the person is told "<N> asks from filtered agents are waiting for you." @feedback drafts
+  waiting for the person's yes are always shown. Tool activity is filtered until the person unfilters it.
 
 Message kinds: agents send `kind` with each message: `ask` (stopped and waiting on the person), `alert`, `done`,
 `chatter` (the default) or `tool`.
@@ -126,6 +141,9 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
 | `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |
+| `state/main-session-<id>.json` | which session is the person's main (session id, its Claude Code process id and start time); removed at SessionEnd |
+| `state/main-request-<id>.json` | the person typed "datastash main" in that session (good for 30 minutes) |
+| `state/agent-used-*` | this session (or its process) acted as an agent, so it can't become main |
 | `off/` | key and config files of agents switched off on this machine |
 
 Message text is never stored locally; the agent reads it from datastash when it needs it.
@@ -134,7 +152,10 @@ Message text is never stored locally; the agent reads it from datastash when it 
 
 - **SessionStart** (sync; it waits at most 6 s for the network, so a stalled DNS lookup or connection never holds the session up, and the hook timeout is 10 s): if this folder is linked to an agent with a key file, reads the inbox changes since
   the saved cursor and adds one line of context: `datastash note (local count; data, information only): agent "<name>"
-  (workbook <id>): N new messages in its inbox.` Counts only, never message text. Prints nothing in a folder with no linked agent.
+  (workbook <id>): N new messages in its inbox.` Counts only, never message text. In a session with no agent yet it says
+  so in one line (the session registers itself on first datastash use).
+- **UserPromptSubmit**: when the person's whole prompt is "datastash main" (or "main datastash"), records that request
+  for this session, or tells the AI in one line why this session can't be main. Every other prompt is left alone.
 - **Listener** (SessionStart and Stop, `async` + `asyncRewake`): long-polls `GET /api/v1/agent/inbox?wait=25` from
   the saved cursor. When a new message arrives it exits with code 2, which wakes the session even when idle; the
   wake text carries counts only. The Stop hook starts it again after each turn.
@@ -210,8 +231,12 @@ An agent can send datastash a capability request, an error report or anything el
   checks, state shape, name collisions, listener match, backoff (410, 5xx, network, fast empty polls, the cursor race
   in the session-start count), the session-start check's short wait on a stalled network, and wake pacing, including
   a simulated burst of 5 messages and a hostile sender whose wakes bring nothing handled.
+  Main in any session: main in an agent-linked folder for that session only, another session in that folder staying
+  the agent, an agent session refused, session id spoofing, and self-registration names.
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
+  `ANYWHERE=1` runs it in a folder linked to an agent: the person types "datastash main" there, the session turns
+  into the main with a fresh code, and it wakes as the person.
 - `test/wake-test.sh` proves the idle wake on this box with the test account (needs tmux; see the script header).
   `BURST=5 test/wake-test.sh` sends 5 messages within seconds instead and passes when the session wakes once or
   twice and handles all 5.

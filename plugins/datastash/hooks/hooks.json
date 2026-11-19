@@ -1,11 +1,18 @@
 {
-  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive.",
+  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive; the person's typed \"datastash main\" makes that session the person's main session.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "check"], "timeout": 10 },
           { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "listen"], "async": true, "asyncRewake": true, "timeout": 86400 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/bin/datastash", "prompt"], "timeout": 10 }
         ]
       }
     ],

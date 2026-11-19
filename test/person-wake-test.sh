@@ -11,6 +11,11 @@
 # IDLE seconds (default 60); the agent sends the person an ask over the REST door. PASS when the person listener logs a
 # wake and the session answers the plugin's note (it was told to say PERSON-WOKE) within 120 s, and the note carried
 # no message text.
+# ANYWHERE=1 (owner 11-19: "datastash main" in any session): the folder is linked to an agent instead, nothing is linked
+# as the person's; in the session the person types "datastash main" (the prompt hook records it for that session), then
+# a fresh watch pickup code is traded with "datastash main --on" run inside that very session (Claude Code's "!" shell,
+# reading the code from a private file, so it is never on screen). PASS needs the same wake as the person, and a
+# second plain process using that session's id is not the person.
 # Cleanup (pass or fail): ends the tmux session, stops the account's watch keys, deletes the workbook and the
 # throwaway config folder (moved to ~/trash). Never prints a key.
 set -uo pipefail
@@ -19,6 +24,7 @@ PLUGIN="$HERE/../plugins/datastash"
 PERSON_KEY="${PERSON_KEY:-$HOME/.config/x-hostproof/person.key}"
 AGENT_KEY="${AGENT_KEY:-$HOME/.config/datastash/agent-cc-plugin-test.key}"
 IDLE="${IDLE:-60}"
+ANYWHERE="${ANYWHERE:-0}"
 TMUX_S="dsperson-test-$$"
 call() { python3 "$HERE/mcp_call.py" "$PERSON_KEY" "$@"; }
 field() { python3 -I "$HERE/jfield.py" get "$1"; }
@@ -42,16 +48,39 @@ cleanup() {
 trap cleanup EXIT
 
 CODE="$(call ledger_person_watch "{\"workbook_id\":\"$WID\",\"action\":\"key\"}" | field answer.pickup_code)" || { echo "FAIL: no watch pickup code"; exit 1; }
-printf '%s\n' "$CODE" | python3 "$PLUGIN/bin/datastash" watch --person --setup "$WID" - >/dev/null || { echo "FAIL: setup"; exit 1; }
-python3 "$PLUGIN/bin/datastash" main | grep -q "person watch set up: yes" || { echo "FAIL: datastash main does not see the setup"; exit 1; }
+if [[ "$ANYWHERE" == 1 ]]; then
+  # The folder belongs to an agent; the person's watch key comes from the session itself (main --on), below.
+  ( cd "$PROJ" && python3 "$PLUGIN/bin/datastash" link "CC plugin anywhere" --workbook "$WID" --project "$PROJ" >/dev/null ) || { echo "FAIL: link"; exit 1; }
+  CODEFILE="$DATASTASH_CONFIG_DIR/code"; ( umask 077; printf '%s\n' "$CODE" > "$CODEFILE" )
+else
+  printf '%s\n' "$CODE" | python3 "$PLUGIN/bin/datastash" watch --person --setup "$WID" - --project "$PROJ" >/dev/null || { echo "FAIL: setup"; exit 1; }
+  python3 "$PLUGIN/bin/datastash" main | grep -q "person watch set up on this machine: yes" || { echo "FAIL: datastash main does not see the setup"; exit 1; }
+fi
 CODE=""
 
 tmux new-session -d -s "$TMUX_S" -x 200 -y 50 -c "$PROJ" -e "DATASTASH_CONFIG_DIR=$DATASTASH_CONFIG_DIR" -e "DATASTASH_MAIN_DIR=$DATASTASH_MAIN_DIR" \
   "claude --setting-sources project,local --plugin-dir '$PLUGIN'"
 for _ in $(seq 1 30); do tmux capture-pane -t "$TMUX_S" -p | grep -q "trust this folder" && break; sleep 1; done
 tmux send-keys -t "$TMUX_S" Down; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
-for _ in $(seq 1 30); do grep -q "listen: start" "$LOG" 2>/dev/null && break; sleep 1; done
-grep -q "listen: start" "$LOG" 2>/dev/null || { echo "FAIL: the person listener did not start at session start"; exit 1; }
+if [[ "$ANYWHERE" == 1 ]]; then
+  sleep 8
+  tmux send-keys -t "$TMUX_S" -l "datastash main"; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
+  for _ in $(seq 1 20); do ls "$DATASTASH_CONFIG_DIR"/state/main-request-* >/dev/null 2>&1 && break; sleep 1; done
+  ls "$DATASTASH_CONFIG_DIR"/state/main-request-* >/dev/null 2>&1 || { echo "FAIL: the prompt hook did not record the person's request"; exit 1; }
+  # Let the session's AI finish its reply to the phrase (it can't reach a connector here), then interrupt anything left.
+  sleep 40; tmux send-keys -t "$TMUX_S" Escape; sleep 2
+  tmux send-keys -t "$TMUX_S" -l "!python3 '$PLUGIN/bin/datastash' main --on $WID - < '$CODEFILE'"; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
+  for _ in $(seq 1 30); do ls "$DATASTASH_CONFIG_DIR"/state/main-session-* >/dev/null 2>&1 && break; sleep 1; done
+  mkdir -p "$HOME/trash"; mv "$CODEFILE" "$HOME/trash/code-$$" 2>/dev/null
+  ls "$DATASTASH_CONFIG_DIR"/state/main-session-* >/dev/null 2>&1 || { echo "FAIL: the session did not become the person's main"; tmux capture-pane -t "$TMUX_S" -p | grep -v '^$' | tail -8; exit 1; }
+  SID="$(basename "$(ls "$DATASTASH_CONFIG_DIR"/state/main-session-* | head -1)" .json)"; SID="${SID#main-session-}"
+  # The same session id from a plain process (not that session's Claude Code) is not the person.
+  ( cd "$PROJ" && CLAUDE_CODE_SESSION_ID="$SID" python3 "$PLUGIN/bin/datastash" main | grep -q "person's datastash main: no" ) || { echo "FAIL: a copied session id was taken as main"; exit 1; }
+  # The person listener starts when that turn ends (Stop hook).
+  tmux send-keys -t "$TMUX_S" -l "Say OK."; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
+fi
+for _ in $(seq 1 60); do grep -q "listen: start" "$LOG" 2>/dev/null && break; sleep 1; done
+grep -q "listen: start" "$LOG" 2>/dev/null || { echo "FAIL: the person listener did not start"; exit 1; }
 sleep 5
 tmux send-keys -t "$TMUX_S" -l "This is the person's datastash main session, for a plugin test. When a datastash note about new items arrives, answer in this chat with the word PERSON-WOKE and the number of new items, nothing else. Wait until then."
 sleep 0.5; tmux send-keys -t "$TMUX_S" Enter

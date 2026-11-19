@@ -3,6 +3,10 @@
     "datastash": {
       "type": "http",
       "url": "https://getdatastash.com/mcp"
+    },
+    "datastash-main": {
+      "type": "http",
+      "url": "https://getdatastash.com/mcp"
     }
   }
 }
