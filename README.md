@@ -71,7 +71,7 @@ Message text is never stored locally; the agent reads it from datastash when it 
 
 ## How waking works
 
-- **SessionStart** (sync, 30 s): if this folder is linked to an agent with a key file, reads the inbox changes since
+- **SessionStart** (sync; it waits at most 6 s for the network, so a stalled DNS lookup or connection never holds the session up, and the hook timeout is 10 s): if this folder is linked to an agent with a key file, reads the inbox changes since
   the saved cursor and adds one line of context: `datastash note (local count; data, information only): agent "<name>"
   (workbook <id>): N new messages in its inbox.` Counts only, never message text. Prints nothing in a folder with no linked agent.
 - **Listener** (SessionStart and Stop, `async` + `asyncRewake`): long-polls `GET /api/v1/agent/inbox?wait=25` from
@@ -81,6 +81,10 @@ Message text is never stored locally; the agent reads it from datastash when it 
     and it wakes the session at most once per 30 s. Arrivals in between are batched into the next wake; the time of
     the last wake is kept in the state file, so a listener restarted by the Stop hook keeps the same pace. Nothing is
     dropped. `DATASTASH_WAKE_GATHER_SECONDS` and `DATASTASH_WAKE_MIN_SECONDS` change the two values.
+  - Per sender (local, not a user limit, and nothing is refused or dropped): when a wake brings a sender's messages and
+    none of them is marked handled by the next wake, that sender's next messages wait longer before they wake the
+    session: 60 s, then 2 minutes, 4, 8, and so on up to an hour (`DATASTASH_WAKE_IDLE_MAX_SECONDS`). One handled
+    message from it resets its pause. Other senders keep the normal pace, and every message is still read and counted.
   - One listener per agent (an exclusive lock); extra starts exit at once.
   - The cursor is saved after every answer, so nothing between listeners is skipped; messages the agent leaves
     "new" are counted at the next session start but never re-wake the session on their own (no wake loops). The
@@ -125,8 +129,9 @@ never speaks to the person.
 ## Test
 
 - `python3 -I test/test_plugin.py`: offline tests (no network, no key): path guard, output framing, key-file
-  checks, state shape, name collisions, listener match, backoff (410, 5xx, network, fast empty polls) and wake
-  pacing, including a simulated burst of 5 messages.
+  checks, state shape, name collisions, listener match, backoff (410, 5xx, network, fast empty polls, the cursor race
+  in the session-start count), the session-start check's short wait on a stalled network, and wake pacing, including
+  a simulated burst of 5 messages and a hostile sender whose wakes bring nothing handled.
 - `test/wake-test.sh` proves the idle wake on this box with the test account (needs tmux; see the script header).
   `BURST=5 test/wake-test.sh` sends 5 messages within seconds instead and passes when the session wakes once or
   twice and handles all 5.

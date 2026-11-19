@@ -30,6 +30,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -42,7 +43,7 @@ INBOX_PATH = "/api/v1/agent/inbox"
 WAIT_SECONDS = 25
 # The listener hook's own timeout is set in hooks.json; it stops itself a little before that, without waking anyone.
 LISTEN_MAX_SECONDS = int(os.environ.get("DATASTASH_LISTEN_MAX_SECONDS", str(86400 - 300)))
-CHECK_BUDGET_SECONDS = 8
+CHECK_BUDGET_SECONDS = 4
 BACKOFF_START, BACKOFF_MAX = 5, 300
 NOT_FOUND_BACKOFF = 600
 # A cursor the server keeps calling expired (410) after this many straight tries is treated as an error (backoff).
@@ -54,6 +55,11 @@ FAST_POLL_SECONDS = 1.0
 # into the next wake. Nothing is dropped: the cursor and the "new" ids are saved before every wake.
 WAKE_GATHER_SECONDS = float(os.environ.get("DATASTASH_WAKE_GATHER_SECONDS", "3"))
 WAKE_MIN_SECONDS = float(os.environ.get("DATASTASH_WAKE_MIN_SECONDS", "30"))
+# A sender whose wakes bring nothing handled waits longer before its items wake the session again (local pause only;
+# nothing is refused or dropped, and other senders are not slowed): WAKE_MIN_SECONDS doubled per idle wake, up to this.
+WAKE_IDLE_MAX_SECONDS = float(os.environ.get("DATASTASH_WAKE_IDLE_MAX_SECONDS", "3600"))
+# The SessionStart check never holds the session up longer than this, even if DNS or the network stalls.
+CHECK_WAIT_SECONDS = float(os.environ.get("DATASTASH_CHECK_WAIT_SECONDS", "6"))
 LOG_MAX_BYTES = 256 * 1024
 
 HOME = os.path.expanduser("~")
@@ -303,6 +309,10 @@ def load_state(agent):
         st = {"sig": sig, "cursor": None, "new": [], "announced": []}
     st.setdefault("new", [])
     st.setdefault("announced", [])
+    st.setdefault("from", {})
+    st.setdefault("woke", {})
+    st.setdefault("woke_handled", [])
+    st.setdefault("quiet", {})
     return st
 
 
@@ -321,7 +331,24 @@ def _state_shape_ok(st):
             return False
     if "started" in st and not isinstance(st["started"], bool):
         return False
+    if "woke_handled" in st and not _str_list(st["woke_handled"]):
+        return False
+    for k in ("from", "woke"):
+        if k in st and not (isinstance(st[k], dict) and _str_list(list(st[k].keys())) and _str_list(list(st[k].values()))):
+            return False
+    if "quiet" in st:
+        q = st["quiet"]
+        if not isinstance(q, dict) or not _str_list(list(q.keys())):
+            return False
+        for v in q.values():
+            if not (isinstance(v, dict) and set(v) == {"idle", "last"} and _num_ok(v["idle"]) and _num_ok(v["last"])
+                    and isinstance(v["idle"], int)):
+                return False
     return True
+
+
+def _num_ok(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0
 
 
 def save_state(agent, st):
@@ -344,13 +371,18 @@ def fetch_page(agent, key, cursor, wait, timeout=None):
 
 def apply_page(agent, cursor_before, items, cursor_after, more):
     """Fold one answered page into the state, if no other process moved the cursor meanwhile.
-    Returns (applied, number of new items not yet announced)."""
+    Returns (applied, number of new items not yet announced, number of items that turned new in this page).
+    It also keeps who sent each new item, and which items of the last wake came back handled (wake pacing per sender)."""
     with StateLock(agent["slug"]):
         st = load_state(agent)
         if st.get("cursor") != cursor_before:
-            return False, 0
+            return False, 0, 0
         new = set(st["new"])
+        before = set(new)
         announced = set(st["announced"])
+        senders = dict(st["from"])
+        woke = st["woke"]
+        handled = set(st["woke_handled"])
         for it in items:
             if not isinstance(it, dict):
                 continue
@@ -359,14 +391,19 @@ def apply_page(agent, cursor_before, items, cursor_after, more):
                 continue
             if is_new:
                 new.add(iid)
+                senders[iid] = sender_of(it)
             else:
                 new.discard(iid)
+                if iid in woke and it.get("status") == "handled":
+                    handled.add(iid)
         announced &= new
         st["new"], st["announced"], st["cursor"] = sorted(new, key=_num), sorted(announced, key=_num), cursor_after
+        st["from"] = {k: v for k, v in senders.items() if k in new}
+        st["woke_handled"] = sorted(handled, key=_num)
         if not more:
             st["started"] = True
         save_state(agent, st)
-        return True, len(new - announced)
+        return True, len(new - announced), len(new - before)
 
 
 def _num(v):
@@ -384,14 +421,67 @@ def unannounced(agent):
 
 
 def announce_ids(agent, ids, wake_time=None):
-    """Mark these items as announced, after the session was told about them. A wake also records its time (pacing)."""
+    """Mark these items as announced, after the session was told about them. A wake also records its time (pacing),
+    first judges the last wake (a sender none of whose items in it came back handled gets a longer pause before its
+    items wake the session again; one handled item resets it), and records who sent the items of this wake."""
     with StateLock(agent["slug"]):
         st = load_state(agent)
         new = set(st["new"])
         st["announced"] = sorted((set(st["announced"]) | set(ids)) & new, key=_num)
         if wake_time is not None:
             st["last_wake"] = wake_time
+            _judge_last_wake(st)
+            quiet = st["quiet"]
+            woke = {}
+            for i in ids:
+                who = st["from"].get(i, "")
+                woke[i] = who
+                q = quiet.setdefault(who, {"idle": 0, "last": 0})
+                q["last"] = wake_time
+            st["woke"], st["woke_handled"] = woke, []
+            st["quiet"] = {k: v for k, v in quiet.items() if v["idle"] > 0 or k in woke.values()}
         save_state(agent, st)
+
+
+def _judge_last_wake(st):
+    """Per sender of the last wake: none of its items handled since -> one more idle wake; any handled -> back to 0."""
+    handled = set(st["woke_handled"])
+    by = {}
+    for i, who in st["woke"].items():
+        by.setdefault(who, False)
+        if i in handled:
+            by[who] = True
+    for who, any_handled in by.items():
+        q = st["quiet"].setdefault(who, {"idle": 0, "last": 0})
+        q["idle"] = 0 if any_handled else q["idle"] + 1
+
+
+def sender_pause(idle):
+    """How long a sender's items wait after its last wake before they may wake the session again: none while its wakes
+    get handled; then WAKE_MIN_SECONDS doubled for each wake in a row that brought nothing handled, up to
+    WAKE_IDLE_MAX_SECONDS. A pause only: every item is still read, counted and kept; nothing is refused or dropped."""
+    if idle <= 0:
+        return 0.0
+    return min(WAKE_MIN_SECONDS * (2 ** min(idle, 20)), WAKE_IDLE_MAX_SECONDS)
+
+
+def due_ids(agent, ids, now):
+    """Split unannounced ids into (those that may wake the session now, the time the next paused one may)."""
+    st = load_state(agent)
+    wake, next_at = [], None
+    for i in ids:
+        q = st["quiet"].get(st["from"].get(i, ""))
+        at = 0 if q is None else q["last"] + sender_pause(q["idle"])
+        if at <= now:
+            wake.append(i)
+        elif next_at is None or at < next_at:
+            next_at = at
+    return wake, next_at
+
+
+def sender_of(item):
+    """Who sent an inbox message, as the server names it (never the claimed label): kind and name."""
+    return f'{item.get("from_kind") or ""}:{str(item.get("from") or "").strip().lower()}'[:64]
 
 
 def reset_cursor(agent):
@@ -428,9 +518,13 @@ def catch_up(agent, key, budget):
                 continue
             raise
         gone = 0
-        applied, _ = apply_page(agent, cur, items, nxt, more)
+        applied, _, _ = apply_page(agent, cur, items, nxt, more)
         if applied and not more:
             return True
+        if not applied or not items:
+            # Another process moved the cursor (or "more" came with an empty page): pause before reading again, as the
+            # listener does, so a race never spins.
+            time.sleep(max(0.0, min(random.uniform(0.2, 1.0), deadline - time.time())))
     return False
 
 
@@ -493,25 +587,19 @@ def cmd_check(_args):
         ctx = (f'{NOTE}: agent "{name}" is linked to this folder but its key file is missing or unusable '
                f'({key_path(s)}). The datastash-agent skill covers getting a new pickup code.')
     else:
-        try:
-            done = catch_up(agent, key, CHECK_BUDGET_SECONDS)
-            ids, n = unannounced(agent)
-            more = "" if done else " (still counting; there may be more)"
-            ctx = f'{NOTE}: agent "{name}" (workbook {disp(agent["workbook_id"])}): {what(agent, n)}{more}.'
-            if n:
-                ctx += " " + inbox_pointer(agent)
-            set_flag(agent, "key_refused", None)
-        except ApiError as e:
-            if e.status == 401 or (e.body.get("error") or e.body.get("code")) == "agent_switched_off":
-                set_flag(agent, "key_refused", int(time.time()))
-                ctx = (f'{NOTE}: agent "{name}": its key was refused (switched off, or a newer key was issued). '
-                       "The datastash-agent skill covers this.")
-            else:
-                ctx = f'{NOTE}: agent "{name}": inbox check failed (HTTP {e.status}); counts unknown.'
-            log(s, f"check: HTTP {e.status} {_code(e)}")
-        except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+        # The network part runs in a helper thread and the hook waits at most CHECK_WAIT_SECONDS for it, so a stalled
+        # DNS lookup or connection can never hold the session start up (the answer is then "counts unknown").
+        out = {}
+        worker = threading.Thread(target=_check_counts, args=(agent, key, name, out), daemon=True)
+        worker.start()
+        worker.join(CHECK_WAIT_SECONDS)
+        if worker.is_alive() or "ctx" not in out:
             ctx = f'{NOTE}: agent "{name}": inbox check could not reach datastash; counts unknown.'
-            log(s, f"check: network {type(e).__name__}")
+            log(s, "check: no answer in time")
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
+            sys.stdout.flush()
+            os._exit(0)  # leave the stalled helper behind; nothing was marked, so the listener counts it later
+        ctx, ids = out["ctx"], out.get("ids")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}))
     sys.stdout.flush()
     if ids:
@@ -520,6 +608,33 @@ def cmd_check(_args):
         except OSError as e:
             log(s, f"check: state not saved ({type(e).__name__})")
     return 0
+
+
+def _check_counts(agent, key, name, out):
+    """The SessionStart check's network part (in a helper thread): sets out["ctx"] and, when there are new items,
+    out["ids"] (the ids to mark announced after the line is printed)."""
+    s = agent["slug"]
+    try:
+        done = catch_up(agent, key, CHECK_BUDGET_SECONDS)
+        ids, n = unannounced(agent)
+        more = "" if done else " (still counting; there may be more)"
+        ctx = f'{NOTE}: agent "{name}" (workbook {disp(agent["workbook_id"])}): {what(agent, n)}{more}.'
+        if n:
+            ctx += " " + inbox_pointer(agent)
+        set_flag(agent, "key_refused", None)
+        out["ids"] = ids
+    except ApiError as e:
+        if e.status == 401 or (e.body.get("error") or e.body.get("code")) == "agent_switched_off":
+            set_flag(agent, "key_refused", int(time.time()))
+            ctx = (f'{NOTE}: agent "{name}": its key was refused (switched off, or a newer key was issued). '
+                   "The datastash-agent skill covers this.")
+        else:
+            ctx = f'{NOTE}: agent "{name}": inbox check failed (HTTP {e.status}); counts unknown.'
+        log(s, f"check: HTTP {e.status} {_code(e)}")
+    except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
+        ctx = f'{NOTE}: agent "{name}": inbox check could not reach datastash; counts unknown.'
+        log(s, f"check: network {type(e).__name__}")
+    out["ctx"] = ctx
 
 
 def _code(e):
@@ -636,11 +751,17 @@ def _listen_loop(agent, s, session_id, printer):
             if left <= 0:
                 try:
                     ids, n = unannounced(agent)
+                    ids, paused_until = due_ids(agent, ids, time.time())
                 except OSError as e:
                     fail(f"state not read ({type(e).__name__})")
                     continue
                 pending_since = None
                 if not ids:
+                    if paused_until is not None:
+                        # Only items of senders whose wakes brought nothing handled: they wake the session after their
+                        # pause, with whatever else has come by then. Nothing is dropped.
+                        pending_since = paused_until - WAKE_GATHER_SECONDS
+                        log(s, f"listen: paused sender(s); next wake check in {int(paused_until - time.time())}s")
                     continue  # read or handled meanwhile: nothing to wake for
                 msg = wake_text(agent, n, len(ids))
                 log(s, f"listen: wake, {len(ids)} arrived, {n} new")
@@ -690,7 +811,7 @@ def _listen_loop(agent, s, session_id, printer):
             continue
         gone = 0
         try:
-            applied, fresh = apply_page(agent, cur, items, nxt, more)
+            applied, fresh, arrived = apply_page(agent, cur, items, nxt, more)
         except OSError as e:
             fail(f"state not saved ({type(e).__name__})")
             continue
@@ -704,6 +825,8 @@ def _listen_loop(agent, s, session_id, printer):
         catching_up = False
         if fresh and pending_since is None:
             pending_since = time.time() - (WAKE_GATHER_SECONDS if wait == 0 else 0)
+        elif arrived and pending_since is not None and pending_since > time.time():
+            pending_since = time.time()  # a new arrival while only paused senders wait: judge it now (it may be due)
         elif not items and wait > 0 and time.time() - t0 < FAST_POLL_SECONDS:
             pause(random.uniform(1.0, 2.0))  # an empty long poll came back at once: keep a floor between polls
 
