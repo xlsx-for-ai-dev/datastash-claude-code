@@ -1203,11 +1203,12 @@ class DoNScope(Base):
         self.assertEqual(self.answers(), [])
 
     def test_details_view_after_the_list_ends_it(self):
-        self.prompt("status of all my agents")
-        self.prompt("full context of 2")
-        self.calls.clear()
-        self.assertIsNone(self.prompt("do 2"))
-        self.assertEqual(self.answers(), [])
+        for n in ("2", "4"):  # 4: the list's last ask, so the details line alone looks like a whole list
+            self.prompt("status of all my agents")
+            self.prompt("full context of " + n)
+            self.calls.clear()
+            self.assertIsNone(self.prompt("do " + n))
+            self.assertEqual(self.answers(), [])
 
     def test_a_reformatted_list_missing_its_last_item_does_not_answer(self):
         ctx = self.prompt("status of all my agents", say=False)
@@ -1324,6 +1325,29 @@ class Relayed(Base):
             self.prompt(typed)
             self.assertEqual(self.answers()[-1][3]["answer"], want)
             ds.save_status_cache(WB, [ds.norm_status_row(r) for r in self.server_rows], time.time(), merge=False)
+
+    def test_every_option_is_kept_and_only_the_screen_is_bounded(self):
+        """No new size cap: 14 options and a long one go up and stay whole; one screen shows 10, every one can be picked."""
+        opts = [f"choice {i}" for i in range(13)] + ["a very long option " + "w" * 150]
+        row = ds.build_status({"doing": "Waiting.", "asks": [{"text": "Which one?", "options": opts}]}, self.folder,
+                              "web-app", "web-app")
+        self.assertEqual(ds.status_body(row, WB)["asks"][0]["options"], opts)
+        self.with_asks("api", [{"id": "q1", "version": 3, "text": "Which one?", "options": opts}])
+        ctx = self.prompt("status of all my agents")
+        self.assertIn("j) choice 9. (4 more options; type the one you want in its own words.)", ctx)
+        self.assertNotIn("choice 10", ctx)
+        self.prompt("4: choice 12")
+        self.assertEqual(self.answers()[-1][3]["answer"], "choice 12")
+
+    def test_a_sent_line_with_numbered_items_is_not_skipped(self):
+        for between in (True, False):  # its own turn after the list, or in the list's turn
+            self.prompt("status of all my agents")
+            if between:
+                self.prompt("tell the reviewer", say=False)
+            self.says("sess1", "Sent to the reviewer: 1) fix a 2) fix b")
+            self.calls.clear()
+            self.assertIsNone(self.prompt("do 2"), between)
+        self.assertEqual(self.answers(), [])
 
     def test_free_text_goes_as_framed_bounded_data(self):
         self.prompt("status of all my agents")

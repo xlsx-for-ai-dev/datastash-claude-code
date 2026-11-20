@@ -3372,8 +3372,8 @@ def _norm_ask(a):
     # Addendum 5 c, d: the choices the ask offers (an answer can only pick one), and "needs the person" (stricter only:
     # set by the asking agent or the server; nothing here ever clears it)
     opts = []
-    for o in (a.get("options") if isinstance(a.get("options"), list) else [])[:ASK_OPTIONS_MAX]:
-        o = _clean(o, 80) if isinstance(o, str) else ""
+    for o in (a.get("options") if isinstance(a.get("options"), list) else []):  # all of them: no cap on what is stored
+        o = _clean(o, 300) if isinstance(o, str) else ""
         if o and _phrase(o) and _phrase(o) not in {_phrase(x) for x in opts}:
             opts.append(o)
     if len(opts) >= 2:
@@ -3383,7 +3383,7 @@ def _norm_ask(a):
     return out
 
 
-ASK_OPTIONS_MAX = 10  # a display bound for one ask's choices (layout, not a limit on what is stored)
+ASK_OPTIONS_SHOWN = 10  # how many of one ask's choices one screen shows (layout only; every option stays and can be picked)
 
 
 CARD_STEPS = ("built", "review", "merged", "epm_pass", "live", "live_check")
@@ -3961,7 +3961,10 @@ def ask_line(a):
         if v:
             out += f" {word}: {v}" + ("" if v[-1] in ".!?" else ".")
     if a.get("options"):
-        out += " Options: " + "; ".join(f"{chr(97 + i)}) {o}" for i, o in enumerate(a["options"])) + "."
+        shown = a["options"][:ASK_OPTIONS_SHOWN]
+        out += " Options: " + "; ".join(f"{_opt_label(i)}) {_clean(o, 80)}" for i, o in enumerate(shown)) + "."
+        if len(a["options"]) > len(shown):
+            out += f" ({len(a['options']) - len(shown)} more options; type the one you want in its own words.)"
     if a.get("needs_person"):
         out += " (needs your OK on the datastash site)"
     return out
@@ -4787,7 +4790,7 @@ def _said_turns(entries, end, most=4):
 
 ANSWER_ONLY_RE = re.compile(r"(sending your answer to|sent to|answered|not sent|saved your answer|taking back|undone|"
                             r"not undone|too late to undo)\b")
-NUMBERED_RE = re.compile(r"(#?\d{1,3}[.):]|\(\d{1,3}\))\s")  # a numbered item ("2. ...", "2) ...", "(2) ...", "2: ...")
+NUMBERED_IN_RE = re.compile(r"(^|\s)(#?\d{1,3}[.):]|\(\d{1,3}\))\s")
 
 
 def _ask_key(text):
@@ -4804,12 +4807,12 @@ def _list_last(lines, data):
     if not key or not isinstance(n, int) or not isinstance(last, int) or last < n:
         return False
     i_ask = next((i for i, x in enumerate(lines) if re.match(rf"#?{n}[.)]\s", x) and key in x), None)
-    if i_ask is None:
-        return False
+    if i_ask is None or not any(re.match(r"#?\d{1,3}[.)]\s", x) for x in lines[:i_ask]):
+        return False  # an ask always follows its agent's numbered line: one quoted item (a details view) is not the list
     i_end = i_ask if last == n else next((i for i in range(i_ask + 1, len(lines)) if re.match(rf"#?{last}[.)]\s", lines[i])), None)
     if i_end is None:
         return False
-    return not any(NUMBERED_RE.match(x) or any(k in x for k in keys) for x in lines[i_end + 1:])
+    return not any(NUMBERED_IN_RE.search(x) or any(k in x for k in keys) for x in lines[i_end + 1:])
 
 
 def shown_ok(kind, data, turns):
@@ -4819,7 +4822,7 @@ def shown_ok(kind, data, turns):
         lines = [x for x in (_norm_seen(l) for l in t.splitlines()) if x]
         if not lines:
             continue
-        if kind == "answer" and all(ANSWER_ONLY_RE.match(x) for x in lines):
+        if kind == "answer" and all(ANSWER_ONLY_RE.match(x) and not NUMBERED_IN_RE.search(x) for x in lines):
             continue
         seen = " ".join(lines)
         if kind == "fill":
@@ -5108,9 +5111,13 @@ def pick_option(answer, options):
     """Addendum 5 c: the one option an answer picks (its letter "b", "option b", or its own words), else None."""
     t = re.sub(r"^option\s+", "", _phrase(answer))
     for i, o in enumerate(options):
-        if t == chr(97 + i) or t == _phrase(o):
+        if (i < ASK_OPTIONS_SHOWN and t == _opt_label(i)) or t == _phrase(o):
             return o
     return None
+
+
+def _opt_label(i):
+    return chr(97 + i)
 
 
 def _answers_sent_path():
