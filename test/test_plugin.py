@@ -79,6 +79,10 @@ class FakeInbox:
         return items, str(cur), False
 
 
+def _offline_http(*a, **k):
+    raise ds.urllib.error.URLError("offline test")
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         ds.ensure_dirs()
@@ -87,7 +91,12 @@ class Base(unittest.TestCase):
         self.saved = {k: getattr(ds, k) for k in ("fetch_page", "read_key", "resolve", "hook_input", "_session_pid",
                                                     "_sleep", "WAKE_GATHER_SECONDS", "WAKE_MIN_SECONDS", "random",
                                                     "announce_ids", "WAKE_IDLE_MAX_SECONDS", "_claude_chain",
-                                                    "signed_in", "imported_connector_hint")}
+                                                    "signed_in", "imported_connector_hint", "http", "_spawn_poller",
+                                                    "_open_browser")}
+        # Offline: no test ever reaches datastash, starts a background poll or opens a browser unless it fakes them.
+        ds.http = _offline_http
+        ds._spawn_poller = lambda: True
+        ds._open_browser = lambda url: False
         ds.signed_in = lambda: True  # XLI-278: this computer's datastash login (SignInHint and Login test the real one)
         ds.imported_connector_hint = lambda: None
         ds.read_key = lambda s: "ldgr_ag_test"
@@ -2032,6 +2041,20 @@ class SignInHint(Base):
         ds.hook_heartbeat("check", {"session_id": "s1"})
         self.proj = os.path.join(root, "proj")
         os.makedirs(self.proj)
+        self.starts = []
+        self.start_answer = None  # None: a good answer; else an exception to raise
+        self.spawned = []
+        ds._spawn_poller = lambda: self.spawned.append(1) or True
+
+        def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
+            if path != ds.DEVICE_START_PATH:
+                raise ds.urllib.error.URLError("offline test")
+            self.starts.append(timeout)
+            if self.start_answer is not None:
+                raise self.start_answer
+            return 200, "application/json", json.dumps({"device_code": "dsdc_" + "d" * 43, "user_code": "BCDF-GHJK",
+                                                        "verification_uri": ds.ORIGIN + "/device", "expires_in": 600, "interval": 5})
+        ds.http = fake_http
 
     def tearDown(self):
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
@@ -2041,28 +2064,132 @@ class SignInHint(Base):
         ds.write_private(ds.LOGIN_REFRESH_FILE, "dsrt_" + "r" * 43 + "\n")
         ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": 1}))
 
-    def check_ctx(self, sid="s1"):
+    def check_out(self, sid="s1"):
         ds.hook_input = lambda: {"session_id": sid}
         ds.resolve = lambda p, me=None: (None, [])
         out = io.StringIO()
         with redirect_stdout(out):
             ds.cmd_check([])
-        return json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+        return json.loads(out.getvalue())
 
-    def test_session_start_says_login_once_per_session(self):
-        ctx = self.check_ctx("sess-A")
-        self.assertTrue(ctx.startswith(ds.SIGN_IN_NOTE), ctx)
-        self.assertIn("run datastash login", ctx)
-        self.assertIn(ds.LOGIN_HINT, ctx)
-        self.assertNotIn("dsrt_", ctx)
-        self.assertNotIn("run datastash login", self.check_ctx("sess-A"))  # a second start in that session: not again
-        self.assertIn("run datastash login", self.check_ctx("sess-B"))  # a new session: once more
+    def check_ctx(self, sid="s1"):
+        return self.check_out(sid)["hookSpecificOutput"]["additionalContext"]
+
+    def test_session_start_shows_the_person_the_link_itself_once_per_session(self):
+        got = self.check_out("sess-A")
+        msg, ctx = got.get("systemMessage", ""), got["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("open https://getdatastash.com/device (on any device), enter code BCDF-GHJK and press Approve.", msg)
+        self.assertIn("The code works for 10 more minutes.", msg)
+        self.assertTrue(ctx.startswith(ds.AI_SHOWN_NOTE), ctx)  # the AI is told there is nothing to start
+        for text in (msg, ctx):
+            self.assertNotIn("dsdc_", text)
+            self.assertNotIn("dsrt_", text)
+        self.assertNotIn("BCDF-GHJK", ctx)  # the code goes to the person only
+        self.assertEqual(self.starts, [ds.HOOK_START_SECONDS])
+        self.assertEqual(len(self.spawned), 1)  # a detached poll finishes it
+        self.assertEqual(os.stat(ds.LOGIN_PENDING_FILE).st_mode & 0o777, 0o600)
+        again = self.check_out("sess-A")  # a second start in that session (compact, resume): quiet
+        self.assertNotIn("systemMessage", again)
+        self.assertNotIn(ds.SIGN_IN_NOTE, again["hookSpecificOutput"]["additionalContext"])
+        nxt = self.check_out("sess-B")  # the next session: the same code again, no new one
+        self.assertIn("enter code BCDF-GHJK", nxt["systemMessage"])
+        self.assertEqual(len(self.starts), 1)
+
+    def test_a_new_code_only_after_the_old_one_ends(self):
+        self.check_out("sess-A")
+        p = json.load(open(ds.LOGIN_PENDING_FILE))
+        ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps(dict(p, until=time.time() - 1)))
+        self.assertIn("enter code BCDF-GHJK", self.check_out("sess-B")["systemMessage"])
+        self.assertEqual(len(self.starts), 2)
+        # An older (0.1.0) pending file with no code to show: a fresh code, so the person always gets one.
+        ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps({"device_code": "dsdc_x", "until": time.time() + 300}))
+        self.assertIn("systemMessage", self.check_out("sess-C"))
+        self.assertEqual(len(self.starts), 3)
+
+    def test_unreachable_falls_back_to_the_ai_note_and_pauses(self):
+        self.start_answer = ds.urllib.error.URLError("down")
+        got = self.check_out("sess-A")
+        self.assertNotIn("systemMessage", got)
+        self.assertTrue(got["hookSpecificOutput"]["additionalContext"].startswith(ds.AI_FALLBACK_NOTE))
+        self.check_out("sess-B")  # within a minute: no second try from a hook
+        self.assertEqual(len(self.starts), 1)
+        e = ds.ApiError(429, {"error": "slow_down", "message": "Too many"})
+        e.retry_after = 400
+        self.start_answer = e
+        st = json.load(open(ds._start_state_file()))
+        ds.write_private(ds._start_state_file(), json.dumps(dict(st, failed_at=time.time() - 61)))
+        self.check_out("sess-C")
+        self.assertEqual(len(self.starts), 2)
+        with redirect_stderr(io.StringIO()):  # datastash's Retry-After holds even a typed datastash login
+            with self.assertRaises(SystemExit):
+                ds.cmd_login([])
+        self.assertEqual(len(self.starts), 2)
+
+    def test_a_slow_datastash_never_holds_the_session_start(self):
+        self.saved.setdefault("HOOK_START_SECONDS", ds.HOOK_START_SECONDS)
+        ds.HOOK_START_SECONDS = 0.2
+        slow = threading.Event()
+
+        def stalled(*a, **k):
+            slow.wait(3)
+            raise ds.urllib.error.URLError("late")
+        ds.http = stalled
+        t = time.time()
+        got = self.check_out("sess-S")
+        self.assertLess(time.time() - t, 2)
+        slow.set()
+        self.assertTrue(got["hookSpecificOutput"]["additionalContext"].startswith(ds.AI_FALLBACK_NOTE))
+
+    def run_hook(self, fn, inp):
+        ds.hook_input = lambda: inp
+        out = io.StringIO()
+        with redirect_stdout(out):
+            fn([])
+        return json.loads(out.getvalue()) if out.getvalue().strip() else None
+
+    def test_after_approval_the_person_gets_one_line_to_connect_now(self):
+        self.check_out("sess-R")
+        prompt = {"session_id": "sess-R", "hook_event_name": "UserPromptSubmit", "prompt": "hello"}
+        self.assertIsNone(self.run_hook(ds.cmd_prompt, prompt))  # still waiting, no datastash use: quiet
+        self.login_on_file()  # the background poll saved the login
+        got = self.run_hook(ds.cmd_prompt, prompt)
+        self.assertEqual(got["systemMessage"], ds.CONNECT_LINE)
+        self.assertIn("/mcp reconnect all", ds.CONNECT_LINE)
+        self.assertEqual(got["hookSpecificOutput"]["additionalContext"], ds.AI_CONNECT_NOTE)
+        self.assertIsNone(self.run_hook(ds.cmd_prompt, prompt))  # once
+        tool = {"session_id": "sess-R", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "datastash status"}}
+        self.saved.setdefault("_agent_tool", ds._agent_tool)
+        ds._agent_tool = lambda inp: 0
+        self.assertIsNone(self.run_hook(ds.cmd_agent_tool, tool))
+        # A session that started signed in never gets it.
+        self.assertNotIn("systemMessage", self.check_out("sess-T"))
+        self.assertIsNone(self.run_hook(ds.cmd_prompt, dict(prompt, session_id="sess-T")))
+
+    def test_first_datastash_use_shows_the_link_again_once(self):
+        self.check_out("sess-U")
+        self.saved.setdefault("_agent_tool", ds._agent_tool)
+        ds._agent_tool = lambda inp: 0
+        other = {"session_id": "sess-U", "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}}
+        self.assertIsNone(self.run_hook(ds.cmd_agent_tool, other))
+        use = dict(other, tool_input={"command": "datastash status"})
+        got = self.run_hook(ds.cmd_agent_tool, use)
+        self.assertIn("enter code BCDF-GHJK", got["systemMessage"])
+        self.assertEqual(got["hookSpecificOutput"]["additionalContext"], ds.AI_SHOWN_NOTE)
+        self.assertIsNone(self.run_hook(ds.cmd_agent_tool, use))  # once per session
+        self.assertIsNone(self.run_hook(ds.cmd_prompt, {"session_id": "sess-U", "prompt": "use datastash"}))
+        self.assertEqual(len(self.starts), 1)  # the same code throughout
+        # A prompt naming datastash counts as first use too (another session).
+        self.check_out("sess-V")
+        got = self.run_hook(ds.cmd_prompt, {"session_id": "sess-V", "prompt": "save this in datastash"})
+        self.assertIn("enter code BCDF-GHJK", got["systemMessage"])
 
     def test_session_start_silent_when_signed_in(self):
         self.login_on_file()
         ctx = self.check_ctx("sess-C")
-        self.assertNotIn("run datastash login", ctx)
+        self.assertNotIn(ds.SIGN_IN_NOTE + ":", ctx)
         self.assertNotIn("dsrt_", ctx)
+        self.assertEqual(self.starts, [])
 
     def test_imported_connector_line_is_said_once_per_computer(self):
         self.login_on_file()
@@ -2078,9 +2205,10 @@ class SignInHint(Base):
         out = io.StringIO()
         with redirect_stdout(out):
             ds.cmd_check([])
-        ctx = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
-        self.assertTrue(ctx.startswith(ds.SIGN_IN_NOTE))
-        self.assertIn("run datastash login", ctx)
+        got = json.loads(out.getvalue())
+        ctx = got["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(ctx.startswith(ds.AI_SHOWN_NOTE))
+        self.assertIn("enter code BCDF-GHJK", got["systemMessage"])
         self.assertIn("1 new message in its inbox", ctx)
 
     def test_doctor_and_first_use_check(self):
@@ -2121,7 +2249,8 @@ class Login(Base):
         super().setUp()
         ds.signed_in = self.saved["signed_in"]
         for k in ("CONF", "STATE", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE", "http",
-                  "_keychain_set", "_keychain_get", "_keychain_del", "_open_browser"):
+                  "_keychain_set", "_keychain_get", "_keychain_del", "_open_browser", "LOGIN_LOCK_FILE", "fcntl",
+                  "login_token"):
             self.saved.setdefault(k, getattr(ds, k))
         root = tempfile.mkdtemp(dir=TMP)
         ds.CONF = os.path.join(root, "conf")
@@ -2169,6 +2298,7 @@ class Login(Base):
             ds.time.sleep = self.saved.pop("time_sleep")
 
     def test_login_prints_the_code_opens_the_page_and_never_a_token(self):
+        ds._spawn_poller = self.saved["_spawn_poller"]
         self.saved.setdefault("Popen", ds.subprocess.Popen)
         started = []
         ds.subprocess.Popen = lambda *a, **k: started.append(a[0])
@@ -2187,6 +2317,52 @@ class Login(Base):
         with redirect_stdout(io.StringIO()) as out:
             ds.cmd_login(["--check"])
         self.assertIn("signed in: waiting", out.getvalue())
+
+    def test_login_again_shows_the_waiting_code_never_a_second_sign_in(self):
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_login([])
+        with redirect_stdout(io.StringIO()) as out2:
+            ds.cmd_login([])
+        self.assertEqual(sum(1 for c in self.calls if c[1] == ds.DEVICE_START_PATH), 1)
+        self.assertIn("code: BCDF-GHJK (the code already shown to the person; no new sign-in started)", out2.getvalue())
+        self.assertNotIn("dsdc_", out.getvalue() + out2.getvalue())
+
+    def test_the_device_name_can_be_set_for_a_proof_run(self):
+        os.environ["DATASTASH_DEVICE_NAME"] = "datastash-selftest-ab12<script>"
+        try:
+            self.assertEqual(ds._device_name(), "datastash-selftest-ab12script")
+        finally:
+            os.environ.pop("DATASTASH_DEVICE_NAME")
+        self.assertTrue(ds._device_name())
+
+    def test_one_background_poll_per_computer(self):
+        spawned = []
+        ds._spawn_poller = lambda: spawned.append(1) or True
+        held = ds._try_lock(ds._poll_lock_file())
+        try:
+            self.assertTrue(ds._ensure_poller())
+            self.assertEqual(spawned, [])  # one runs already
+        finally:
+            ds._unlock(held)
+        self.assertTrue(ds._ensure_poller())
+        self.assertEqual(spawned, [1])
+
+    def test_a_poll_never_drops_a_newer_code(self):
+        ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps({"device_code": "dsdc_old", "interval": 5, "until": time.time() + 30}))
+        p = json.load(open(ds.LOGIN_PENDING_FILE))
+        newer = {"device_code": "dsdc_new", "interval": 5, "until": time.time() + 300}
+
+        def deny_and_replace(*a, **k):
+            ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps(newer))
+            raise ds.ApiError(400, {"error": "access_denied"})
+        ds.http = deny_and_replace
+        self.saved.setdefault("time_sleep", ds.time.sleep)
+        ds.time.sleep = lambda s: None
+        try:
+            ds._login_poll_loop(p, 5, time.time() + 30)
+        finally:
+            ds.time.sleep = self.saved.pop("time_sleep")
+        self.assertEqual(json.load(open(ds.LOGIN_PENDING_FILE))["device_code"], "dsdc_new")
 
     def test_the_background_poll_saves_the_refresh_token_in_the_keychain(self):
         self.finish_login()
@@ -2225,30 +2401,95 @@ class Login(Base):
             ds.cmd_token(["--header"])
         self.assertEqual(json.loads(buf.getvalue()), {"Authorization": "Bearer dsat_" + "1" * 43})
 
-    def test_token_header_refuses_a_terminal_and_is_empty_when_signed_out(self):
+    def token_out(self, stream=None):
+        buf = stream or io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.cmd_token(["--header"]), 0)
+        return buf.getvalue()
+
+    def test_token_header_never_gives_a_terminal_a_token(self):
         class Tty(io.StringIO):
             def isatty(self):
                 return True
-        with redirect_stdout(Tty()), redirect_stderr(io.StringIO()) as err:
-            with self.assertRaises(SystemExit):
-                ds.cmd_token(["--header"])
-        self.assertIn("never to a terminal", err.getvalue())
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            ds.cmd_token(["--header"])
-        self.assertEqual(json.loads(buf.getvalue()), {})
+        self.finish_login()
+        out = self.token_out(Tty())
+        self.assertEqual(json.loads(out), {"Authorization": "Bearer signed-out"})
+        self.assertNotIn("dsat_", out)
+
+    def test_token_header_always_a_header_never_empty_never_a_failure(self):
+        """EPM ruling 11-20: the helper ALWAYS supplies Authorization (Claude Code then never offers OAuth): the token,
+        or the fixed placeholder in every other state. Never {} and never a non-zero exit."""
+        placeholder = {"Authorization": "Bearer signed-out"}
+        states = []
+        states.append(("signed out", lambda: None))
+        states.append(("waiting for approval", lambda: ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps(
+            {"device_code": "dsdc_" + "d" * 43, "user_code": "BCDF-GHJK", "verification_uri": ds.ORIGIN + "/device",
+             "interval": 5, "until": time.time() + 300}))))
+
+        def refresh_refused():
+            self.finish_login()
+            self.expire_access()
+            self.refresh_status = 401
+
+        def refresh_unreachable():
+            self.finish_login()
+            self.expire_access()
+            ds.http = lambda *a, **k: (_ for _ in ()).throw(ds.urllib.error.URLError("down"))
+
+        def keychain_missing():
+            self.finish_login()
+            self.expire_access()
+            self.keychain.clear()  # the login says "keychain" but the item is gone or the tool can't run
+
+        def no_file_locks():
+            self.finish_login()
+            self.expire_access()
+            self.saved.setdefault("fcntl", ds.fcntl)
+            ds.fcntl = None
+
+        def crash():
+            self.saved.setdefault("login_token", ds.login_token)
+            ds.login_token = lambda force=False: (_ for _ in ()).throw(RuntimeError("anything"))
+
+        def nonsense_token():
+            self.saved.setdefault("login_token", ds.login_token)
+            ds.login_token = lambda force=False: "not a token\n{}"
+        states += [("refresh refused", refresh_refused), ("refresh unreachable", refresh_unreachable),
+                   ("keychain missing", keychain_missing), ("no file locks", no_file_locks), ("crash", crash),
+                   ("nonsense token", nonsense_token)]
+        fake_http = ds.http
+        for name, setup in states:
+            with self.subTest(name):
+                root = tempfile.mkdtemp(dir=TMP)  # a fresh computer for each state
+                ds.CONF = os.path.join(root, "conf")
+                ds.STATE = os.path.join(ds.CONF, "state")
+                for k, n in (("LOGIN_FILE", "login.json"), ("LOGIN_REFRESH_FILE", "login.refresh"),
+                             ("LOGIN_ACCESS_FILE", "login.access.json"), ("LOGIN_PENDING_FILE", "login.pending.json"),
+                             ("LOGIN_LOCK_FILE", "login.lock")):
+                    self.saved.setdefault(k, getattr(ds, k))
+                    setattr(ds, k, os.path.join(ds.CONF, n))
+                ds.ensure_dirs()
+                self.keychain.clear()
+                self.refresh_status = 200
+                ds.http = fake_http
+                for k in ("login_token", "fcntl"):
+                    if k in self.saved:
+                        setattr(ds, k, self.saved[k])
+                setup()
+                out = self.token_out()
+                self.assertEqual(json.loads(out), placeholder, name)
+                self.assertNotIn("{}", out)
+
+    def test_token_header_as_a_real_process_in_a_signed_out_home(self):
+        """The helper as Claude Code runs it (a pipe, a fresh config folder): exit 0 and the placeholder header."""
+        home = tempfile.mkdtemp(dir=TMP)
+        env = dict(os.environ, DATASTASH_CONFIG_DIR=os.path.join(home, "conf"), HOME=home)
+        r = subprocess.run([sys.executable, "-I", BIN, "token", "--header"], capture_output=True, text=True, env=env, timeout=20)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(json.loads(r.stdout), {"Authorization": "Bearer signed-out"})
+        self.assertEqual(r.stderr, "")
 
     def test_token_header_never_fails_the_connector(self):
-        """No keychain, no file locks, or anything unexpected: {} (the connector's usual sign-in), never a crash."""
-        def boom(force=False):
-            raise RuntimeError("no keychain here")
-        self.saved.setdefault("login_token", ds.login_token)
-        ds.login_token = boom
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            self.assertEqual(ds.cmd_token(["--header"]), 0)
-        self.assertEqual(json.loads(buf.getvalue()), {})
-        ds.login_token = self.saved["login_token"]
         self.finish_login()
         self.expire_access()
         self.saved.setdefault("fcntl", ds.fcntl)

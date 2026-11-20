@@ -7,7 +7,8 @@ What it adds:
 
 - **Connector**: the datastash MCP server at `https://getdatastash.com/mcp`. In Claude Code it connects already signed
   in: its `headersHelper` runs `datastash token --header`, which hands it a 15-minute token from this computer's
-  `datastash login`. There is no `/mcp` step. In Claude chat and Cowork (where plugins have no commands) the same
+  `datastash login`. There is no `/mcp` sign-in: while the computer is signed out the helper sends a fixed placeholder
+  header, so Claude Code never offers its OAuth (localhost) sign-in for it. In Claude chat and Cowork (where plugins have no commands) the same
   connector is connected the usual way, with **Connect** on the plugin's Connectors tab.
 - **Skill** `datastash-agent`: AI-facing instructions: register itself (named after the folder), fetch the key with a pickup code, use the
   key for REST calls, work in the agent workbook, read and answer the inbox, ask the person through the person's
@@ -36,17 +37,28 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
    (Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
    `/plugin install datastash@datastash`.)
 2. **Restart Claude Code.**
-3. **First use opens a browser sign-in.** The first time you use datastash, a datastash page opens in your browser and
-   Claude tells you a code. Type it on the page (signed in with Google) and press **Approve**. Restart Claude Code once
-   more so the connector picks up the sign-in; from then on every session connects to datastash already signed in.
-   There is no `/mcp` step.
+3. **Sign in once, from the link the plugin shows.** At the start of the first session, the plugin itself (no AI step)
+   starts the sign-in and shows you two lines:
+
+   ```
+   datastash isn't signed in on this computer. To sign in, open https://getdatastash.com/device (on any device), enter code BCDF-GHJK and press Approve.
+   The code works for 10 more minutes.
+   ```
+
+   Open the page on any device (it works on a remote computer too: no localhost redirect), sign in with Google, type the
+   code and press **Approve**. A background helper finishes the login. If this computer has a desktop browser, the page
+   also opens there (at most once a day). Not approved yet? The next session start, and your first datastash use in a
+   session, show the same link and code again while it is good; a new code is made only after the old one ends.
+4. **Connect in the session you're in.** After you approve, that session shows "datastash is signed in. Type /mcp
+   reconnect all to connect it in this session; new sessions connect by themselves." (Claude Code connects a connector
+   only when a session starts or on `/mcp reconnect`.) From then on every session connects to datastash already signed in.
 
 In Claude chat on claude.ai, the desktop app and Cowork, nothing changes: the datastash connector signs in with its
 usual **Connect** button. The plugin needs no shell or keychain there.
 
 About `datastash login`:
 
-- The approval page shows the computer's name, its system and the network it came from, and says "Only approve a code
+- The approval page shows the computer's name (its host name, or `DATASTASH_DEVICE_NAME` when set), its system and the network it came from, and says "Only approve a code
   you started yourself in the last few minutes." The code is typed, never filled in from a link. It works for 10
   minutes, once.
 - The login's refresh token is kept in the system keychain (macOS Keychain; libsecret's `secret-tool` on Linux), or in
@@ -214,6 +226,11 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `login.refresh` | the login's refresh token, only when no system keychain works (otherwise it is in the keychain, service `datastash`) |
 | `login.access.json` | the current 15-minute access token (so each helper call doesn't refresh); read only by the `datastash` command |
 | `login.lock` | held while one `datastash` process refreshes the login, so two never send the same refresh token; empty |
+| `login.pending.json` | while a sign-in waits for the person: the device code, the short code and page shown to the person, and when it ends (mode 600); removed when it ends |
+| `login.start.lock` / `login.poll.lock` | one sign-in start at a time; one background poll per computer; empty |
+| `state/login-start.json` | when a sign-in start last failed and datastash's Retry-After (no codes) |
+| `state/login-browser.json` | when a hook last opened the browser for the sign-in (at most once a day) |
+| `state/signed-out-start-sid-*`, `state/sign-in-*-sid-*` | this session started signed out / was shown the sign-in (for the one "signed in now" line and the once-per-session re-show) |
 | `main.key` | an earlier main key (made before datastash login); still used until it is stopped, read only by a main session |
 | `state/main-session-<id>.json` | which session is the person's main (session id, its Claude Code process id and start time); removed at SessionEnd |
 | `state/main-request-<id>.json` | the person typed "datastash main" in that session (good for 30 minutes) |
@@ -228,12 +245,20 @@ Message text is never stored locally; the agent reads it from datastash when it 
 - **SessionStart** (sync; it waits at most 6 s for the network, so a stalled DNS lookup or connection never holds the session up, and the hook timeout is 10 s): if this folder is linked to an agent with a key file, reads the inbox changes since
   the saved cursor and adds one line of context: `datastash note (local count; data, information only): agent "<name>"
   (workbook <id>): N new messages in its inbox.` Counts only, never message text. In a session with no agent yet it says
-  so in one line (the session registers itself on first datastash use). When this computer is not signed in
-  (`datastash login`), it adds one line, once per session, asking the AI to run `datastash login` and tell the person to
-  type the code on the page that opens. It reads only whether a login is recorded, never a token. Once per computer it
+  so in one line (the session registers itself on first datastash use). When this computer is not signed in, the hook
+  itself starts the device sign-in (or reuses the code still waiting) and shows the person the link and code through
+  Claude Code's `systemMessage` (shown as "SessionStart:startup says: ..."), once per session; a detached background
+  helper polls until the person approves. The AI gets one line saying the person has the link and there is nothing to
+  start (if datastash can't be reached within 4 s, the AI line instead says to run `datastash login`). Hooks start at most
+  one code per 10 minutes per computer, pause a minute after a failed start, and honour datastash's Retry-After. It
+  never reads or prints a token. Once per computer it
   also says: if `/mcp` shows a "claude.ai datastash" connector needing authentication, tell the person "/mcp, pick
   datastash, choose Authenticate". It also puts the plugin's `scripts/` folder on the session's PATH (through
   `CLAUDE_ENV_FILE`).
+- **UserPromptSubmit and PreToolUse** (sign-in only, in a session that started signed out): once the login is
+  recorded, one line to the person: "datastash is signed in. Type /mcp reconnect all to connect it in this session; new
+  sessions connect by themselves." While still signed out, the session's first datastash use (a prompt naming datastash,
+  or a tool call that touches datastash) shows the link and code again, once.
 - **UserPromptSubmit**: when the person's whole prompt is "datastash main" (or "main datastash"), records that request
   for this session, or tells the AI in one line why this session can't be main. Every other prompt is left alone.
 - **Listener** (SessionStart and Stop, `async` + `asyncRewake`): long-polls `GET /api/v1/agent/inbox?wait=25` from
@@ -281,10 +306,11 @@ Common causes:
 - **The plugin was installed or turned on after the session started**: restart Claude Code or type `/reload-plugins`.
 - **A locked-down machine** where the install fails: the install needs to write `~/.claude/` and to reach github.com.
   If it can't, run from a copy with `claude --plugin-dir <copy>/plugins/datastash`.
-- **A remote machine**: after the Google sign-in, the browser may show an error page at a localhost address. That's
-  expected, not a failure: copy that page's full address back into Claude Code.
-- **The connector isn't signed in**: this computer has no datastash login yet (or it was signed out). Ask Claude to run
-  `datastash login`, then type the code on the page that opens.
+- **The connector isn't signed in**: this computer has no datastash login yet (or it was signed out). The next session
+  start shows the sign-in link and code; or ask Claude to run `datastash login`, which shows the same code. Open
+  `https://getdatastash.com/device` on any device, type the code, press **Approve**, then type `/mcp reconnect all`.
+  `/mcp` shows the plugin's datastash connector as failed (HTTP 401) while signed out, with no Authenticate option;
+  that is expected.
 - **New datastash tools not showing**: current versions of datastash tell Claude Code when its tools change; on an older
   session, reconnect the datastash connector (`/mcp`).
 
@@ -346,9 +372,15 @@ An agent can send datastash a capability request, an error report or anything el
   re-checked), and nothing on a healthy machine or a read-only sandbox mount.
   datastash login: the code printed and the page opened (no code in its address, the device code never on a command
   line), the background poll saving the refresh token in the keychain or a mode-600 file, `token --header` printing
-  only the header (never to a terminal, `{}` when signed out, the 15-minute token reused and refreshed near its end),
-  a login revoked at datastash forgotten locally, logout, the session-start line said once per session and never with a
-  token, the imported-connector line said once per computer, and doctor's line.
+  only the header (always a header and exit 0: the placeholder when signed out, waiting, refresh refused or unreachable,
+  keychain missing, no file locks, or a crash; never a token to a terminal; the 15-minute token reused and refreshed
+  near its end), a login revoked at datastash forgotten locally, logout, the session-start sign-in (the person's link and
+  code once per session, the same code reused across sessions, a new one only after it ends, the AI fallback and pause
+  when datastash can't be reached, Retry-After, a stalled network never holding the session start), the "signed in now"
+  line, the first-use re-show, one background poll per computer, a poll never dropping a newer code, the
+  imported-connector line said once per computer, and doctor's line.
+- `python3 -I test/test_release.py`: fails when the plugin's files change and `plugin.json`'s version does not (Claude
+  Code pins a plugin to its set version); `test/plugin-release.json` records each version's fingerprint.
   Main in any session: main in an agent-linked folder for that session only, another session in that folder staying
   the agent, an agent session refused, session id spoofing, and self-registration names. Clean sessions only: the
   review's attack replayed (an agent session fakes the typed phrase with the `prompt` command, with its own or a forged
