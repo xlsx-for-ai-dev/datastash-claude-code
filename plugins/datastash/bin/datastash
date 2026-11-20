@@ -16,6 +16,9 @@ Subcommands (run `datastash help`):
                             is printed between two marker lines as untrusted data
   off NAME                  stop using NAME on this machine (key file moved to ~/.config/datastash/off/)
   watch                     print one line each time new messages arrive (for a Monitor loop)
+  doctor                    check this machine's setup (hooks firing, Claude Code settings files, plugin enabled, key
+                            files, reaching getdatastash.com, the listener) and print each problem with its exact fix;
+                            the cheap checks also run at an agent's first datastash use and in status
 
 The person's own session ("datastash main"; the person, never an agent; any folder, one session at a time):
   main                      say whether this session is the person's main, whether the person asked for it here, and
@@ -55,6 +58,7 @@ import posixpath
 import random
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -993,6 +997,7 @@ def person_line(agent, ids):
 def cmd_check(_args):
     """SessionStart: counts only. Prints nothing when no agent is linked to this folder."""
     inp = hook_input()
+    hook_heartbeat("check", inp)
     agent, warn = resolve(project_of(inp), me=this_session(inp))
     if agent is None:
         if main_root(project_of(inp)) is None:
@@ -1128,6 +1133,8 @@ def cmd_listen(_args, printer=None, forced=None):
     Pacing: a burst of arrivals is gathered into one wake, and wakes are at least WAKE_MIN_SECONDS apart (the time of
     the last wake is kept in the state, so a listener restarted by the Stop hook keeps the same pace)."""
     inp = hook_input() if printer is None else {}
+    if printer is None:
+        hook_heartbeat("listen", inp)
     me = this_session(inp) if printer is None else this_session()
     agent = forced if forced is not None else session_for(project_of(inp), me=me)
     if agent is None:
@@ -1298,6 +1305,8 @@ def cmd_end(_args):
         _drop(state_path(f"{PERSON_SLUG}-{me['sid']}"))
     if me["sid"]:
         _drop(_request_path(me["sid"]))
+        _drop(_seen_path(me["sid"]))
+        _drop(os.path.join(STATE, f"setup-checked-sid-{me['sid']}"))
     if agent is None:
         return 0
     info = read_json(lock_path(agent["slug"]), {})
@@ -1435,6 +1444,7 @@ def cmd_link(args):
 
 
 def cmd_status(_args):
+    auto_setup_check(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), me=this_session())
     agents = all_agents()
     person = person_for(None)
     if person is not None:
@@ -1459,6 +1469,330 @@ def cmd_status(_args):
               f'listener: {"running (pid " + str(info["pid"]) + ")" if running else "not running (it starts at session start and after each turn)"}; '
               f'new: {len(st["new"])}{"; KEY REFUSED" if st.get("key_refused") else ""}'
               )
+    return 0
+
+
+# ------------------------------------------------------------------ setup checks (doctor)
+# Owner request 11-20: a session whose hooks never load (for example a Claude Code settings file owned by another user)
+# never wakes, and nothing said why. The hooks write a heartbeat; `datastash doctor` and the automatic check at an
+# agent's first datastash use (auto-name, status, the session's first api call) name each problem and its exact fix.
+HEARTBEAT = os.path.join(STATE, "hooks-heartbeat.json")  # the last hook run on this machine (event and time only)
+HEARTBEAT_FRESH_SECONDS = 60  # any hook this recent counts as this session's (the PreToolUse hook runs just before us)
+TOOL_HEARTBEAT_EVERY = 30  # the tool hooks refresh the heartbeat at most this often
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+FIX_ASK = ("Datastash can fix this for you or give you instructions to fix it yourself. "
+           "Would you like us to fix this?")
+WATCH_FALLBACK = "Until then, `datastash watch` under a Monitor still delivers messages."
+SETUP_NOTE = "datastash setup check (local; information only)"
+
+
+def _seen_path(sid):
+    return os.path.join(STATE, f"hooks-seen-sid-{sid}")
+
+
+def hook_heartbeat(event, inp, throttle=0):
+    """A hook ran: record the event and time (machine-wide) and that this session's hooks fire. Never raises."""
+    try:
+        sid = inp.get("session_id") if isinstance(inp, dict) else None
+        sid = sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None
+        seen = sid is not None and os.path.exists(_seen_path(sid))
+        if throttle and (seen or sid is None):
+            try:
+                if time.time() - os.stat(HEARTBEAT).st_mtime < throttle:
+                    return
+            except OSError:
+                pass
+        ensure_dirs()
+        rec = json.dumps({"event": event, "at": int(time.time())})
+        write_private(HEARTBEAT, rec)
+        if sid is not None and not seen:
+            write_private(_seen_path(sid), rec)
+    except Exception:
+        pass
+
+
+def _tilde(p):
+    return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + os.sep) else p
+
+
+def _q(p):
+    return shlex.quote(p)
+
+
+def _user():
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError):
+        return str(os.getuid())
+
+
+def _owner(uid):
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError):
+        return f"user {uid}"
+
+
+def _finding(fid, problem, steps, cmd=None, sudo=False, wake=False, after=""):
+    return {"id": fid, "problem": problem, "steps": steps, "cmd": cmd, "sudo": sudo, "wake": wake, "after": after}
+
+
+def finding_line(f):
+    """The one AI-facing line for a finding: the problem, the owner's question, the exact fix and the instructions."""
+    s = f"{SETUP_NOTE}: {f['problem']}"
+    if f["cmd"]:
+        s += (f' Tell the person this in plain words, then ask exactly: "{FIX_ASK}" On yes: show the person this command, '
+              f"then run it: {f['cmd']}")
+        if f["sudo"]:
+            s += (" (it needs admin rights: run it with sudo -n first; if sudo asks for a password, ask the person to run "
+                  "the shown command in their own terminal and type their own password there; never ask for the "
+                  "password in chat and never store it; if this user can't use sudo, give the instructions below for "
+                  "the machine's admin instead)")
+        s += "." + (f" {f['after']}" if f["after"] else "") + f' On "instructions": {f["steps"]}'
+    else:
+        s += f" Fix: {f['steps']}"
+    if f["wake"]:
+        s += " " + WATCH_FALLBACK
+    return s
+
+
+def _hooks_fired():
+    """(ever, this_session, last record): has any plugin hook run on this machine, and in this session."""
+    rec = read_json(HEARTBEAT, None)
+    try:
+        age = time.time() - os.stat(HEARTBEAT).st_mtime
+    except OSError:
+        return False, False, None
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    sid = sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None
+    if sid is None:
+        return True, None, rec  # outside a session: only the machine-wide answer
+    return True, age < HEARTBEAT_FRESH_SECONDS or os.path.exists(_seen_path(sid)), rec
+
+
+def _settings_files(project):
+    out = [os.path.join(CLAUDE_DIR, "settings.json")]
+    if project:
+        for n in ("settings.json", "settings.local.json"):
+            p = os.path.join(os.path.realpath(project), ".claude", n)
+            if os.path.realpath(p) not in [os.path.realpath(x) for x in out]:
+                out.append(p)
+    return out
+
+
+def _lstat(path):
+    return os.lstat(path)
+
+
+def _file_findings(path, label, wake_broken, kind="file", mode=None):
+    """Ownership and access findings for one path (a settings file, a folder or a key file)."""
+    try:
+        st = _lstat(path)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return [_finding("unreadable", f"{label} ({_tilde(path)}) can't be checked by this user.",
+                         f"have the machine's admin give this user access to {_tilde(path)}, then restart Claude Code.")]
+    me, user, qp = os.getuid(), _user(), _q(path)
+    is_dir = stat.S_ISDIR(st.st_mode)
+    want = mode or ("u+rwx" if is_dir else "u+rw")
+    rec = " -R" if is_dir else ""
+    restart = "Then the person restarts Claude Code." if kind != "key" else ""
+    if st.st_uid != me:
+        effect = ("so the plugin's automatic parts are off" if wake_broken else
+                  "so Claude Code can't save settings there and the plugin's automatic parts can stop working")
+        if kind == "key":
+            effect = "so datastash won't use it"
+        elif kind == "dir":
+            effect = "so datastash can't save its keys and wake state" if "datastash" in label else effect
+        lead = "datastash can't wake this session: " if wake_broken and kind != "key" else ""
+        return [_finding("other_owner", f"{lead}{label} ({_tilde(path)}) belongs to another user ({_owner(st.st_uid)}), {effect}.",
+                         f"have the machine's admin give this user ({user}) ownership of {_tilde(path)}"
+                         f"{' and everything in it' if is_dir else ''}, then restart Claude Code.",
+                         cmd=f"sudo chown{rec} {_q(user)} {qp} && chmod {want} {qp}", sudo=True,
+                         wake=wake_broken and kind != "key", after=restart)]
+    if kind == "key":
+        out = []
+        if not stat.S_ISREG(st.st_mode):
+            out.append(_finding("key_not_file", f"{label} ({_tilde(path)}) is not a plain file, so datastash won't use it.",
+                                "move it out of the way and get a new key as the datastash-agent skill says."))
+        elif st.st_mode & 0o077:
+            out.append(_finding("key_mode", f"{label} ({_tilde(path)}) can be read by other users (mode "
+                                f"{oct(st.st_mode & 0o777)[2:]}), so datastash won't use it.",
+                                f"make it private to this user: chmod 600 {qp}.", cmd=f"chmod 600 {qp}"))
+        return out
+    # The owner's mode bits, not os.access: Claude Code's sandbox mounts its own settings read-only for commands, which
+    # must not read as a problem (the file is this user's and Claude Code itself can write it).
+    need = 0o700 if is_dir else 0o600
+    if st.st_mode & need != need:
+        lead = "datastash can't wake this session: " if wake_broken else ""
+        return [_finding("no_access", f"{lead}{label} ({_tilde(path)}) isn't readable and writable by this user, so "
+                         "Claude Code can't use it fully and the plugin's automatic parts can be off.",
+                         f"give this user read and write access: chmod {want} {qp}, then restart Claude Code.",
+                         cmd=f"chmod {want} {qp}", wake=wake_broken, after=restart)]
+    if kind == "settings":
+        try:
+            with open(path) as fh:
+                json.load(fh)
+        except ValueError as e:
+            where = f" (line {e.lineno})" if hasattr(e, "lineno") else ""
+            return [_finding("bad_json", f"{label} ({_tilde(path)}) is not valid JSON{where}, so Claude Code can ignore "
+                             "it and the plugin's automatic parts can be off.",
+                             f"fix the JSON syntax error{where} in {_tilde(path)}, keeping every setting, then restart "
+                             "Claude Code.", wake=wake_broken)]
+        except OSError:
+            pass
+    return []
+
+
+def _plugin_enabled(project):
+    """(value, path): the effective enabledPlugins entry for datastash (local over project over user), or (None, None)."""
+    val, where = None, None
+    for p in _settings_files(project):
+        plugs = read_json(p, {}).get("enabledPlugins")
+        if isinstance(plugs, dict):
+            for k, v in plugs.items():
+                if isinstance(k, str) and k.split("@", 1)[0] == "datastash":
+                    val, where = v, p
+    return val, where
+
+
+def setup_findings(project, me=None, deep=False):
+    """The problems found, as findings. Cheap checks only unless deep (network reach)."""
+    out = []
+    ever, here, _rec = _hooks_fired()
+    hooks_ok = here if here is not None else ever
+    wake_broken = not hooks_ok
+    # Causes first: a more specific cause replaces the generic "hooks never ran" finding.
+    out += _file_findings(CLAUDE_DIR, "Claude Code's settings folder", wake_broken, kind="dir")
+    for i, p in enumerate(_settings_files(project)):
+        label = "Claude Code's settings file" if i == 0 else "this project's Claude Code settings file"
+        out += _file_findings(p, label, wake_broken, kind="settings")
+    out += _file_findings(CONF, "datastash's own folder", wake_broken, kind="dir", mode="u+rwx")
+    if not hooks_ok:
+        val, where = _plugin_enabled(project)
+        if val is False:
+            out.append(_finding("plugin_disabled", f"datastash can't wake this session: the datastash plugin is turned off "
+                                f"in Claude Code ({_tilde(where)} has it disabled), so its automatic parts don't run.",
+                                "turn it on with /plugin (Installed, datastash, Enable), then restart Claude Code.",
+                                cmd="claude plugin enable datastash@datastash", wake=True,
+                                after="Then the person restarts Claude Code."))
+        causes = bool(out)
+        if not causes and not ever:
+            out.append(_finding("hooks_never", "datastash can't wake this session: none of the plugin's automatic parts "
+                                "(hooks) has ever run on this machine, so new messages won't wake it.",
+                                "the person restarts Claude Code (or types /reload-plugins) and checks that datastash is "
+                                "enabled under /plugin; if this line comes back, run datastash doctor.", wake=True))
+        elif not causes:
+            out.append(_finding("hooks_not_here", "datastash can't wake this session yet: the plugin's automatic parts "
+                                "(hooks) have not run in this session (the plugin was likely installed, enabled or "
+                                "updated after the session started).",
+                                "the person restarts Claude Code or types /reload-plugins.", wake=True))
+    # Key files: every key here must be a private file of this user; the folder's agent needs one.
+    try:
+        names = sorted(n for n in os.listdir(CONF) if n.endswith(".key"))
+    except OSError:
+        names = []
+    for n in names:
+        out += _file_findings(os.path.join(CONF, n), f"the datastash key file {n}", False, kind="key")
+    try:
+        agent = agent_for(project, me=me) if project else None
+    except SystemExit:
+        agent = None
+    if agent is not None and not os.path.lexists(key_path(agent["slug"])):
+        out.append(_finding("key_missing", f'this folder\'s agent "{disp(agent["name"])}" has no key file '
+                            f"({_tilde(key_path(agent['slug']))}), so it can't read its inbox.",
+                            "you fix this yourself, with no step for the person: get a new pickup code "
+                            "(ledger_agent_key) and run datastash fetch as the datastash-agent skill says."))
+    if deep:
+        why = _reach()
+        if why:
+            out.append(_finding("no_reach", f"this machine can't reach https://getdatastash.com ({why}), so nothing "
+                                "datastash does can work from here.",
+                                "allow HTTPS to getdatastash.com through the firewall or proxy (set HTTPS_PROXY if the "
+                                "network needs one), then run datastash doctor again.", wake=True))
+    return out
+
+
+def _reach():
+    """None when https://getdatastash.com answers (any HTTP answer), else a short reason."""
+    try:
+        http("GET", "/", timeout=8, accept="text/html")
+        return None
+    except ApiError:
+        return None
+    except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
+        r = getattr(e, "reason", None)
+        return re.sub(r"[^A-Za-z0-9 _.:\-]", "", str(r if r is not None else type(e).__name__))[:80] or "no answer"
+
+
+def auto_setup_check(project, me=None, stream=None, once=False):
+    """The automatic check: one AI-facing line per problem found, nothing on a healthy machine. With once, at most once
+    per session (needs a session id)."""
+    try:
+        if once:
+            sid = (me or {}).get("sid")
+            if not sid:
+                return
+            mark = os.path.join(STATE, f"setup-checked-sid-{sid}")
+            if os.path.exists(mark):
+                return
+            ensure_dirs()
+            write_private(mark, json.dumps({"at": int(time.time())}))
+        for f in setup_findings(project, me=me):
+            print(finding_line(f), file=stream or sys.stdout)
+    except Exception:
+        pass
+
+
+def _listener_line(project, me):
+    agent = session_for(project, me=me) if project else None
+    if agent is None:
+        return "note: listener: this folder has no agent yet, so there is no listener (it starts once the session registers)."
+    s = agent["slug"]
+    info = read_json(lock_path(s), {})
+    running = isinstance(info.get("pid"), int) and _alive(info["pid"]) and _is_listener(info["pid"])
+    if not running:
+        return ("note: listener: not running right now. That is normal during a turn a wake started (it starts again when "
+                "the turn ends) and in claude -p; if it stays off between turns, use datastash watch under a Monitor.")
+    sid = (me or {}).get("sid")
+    if sid and info.get("session_id") and info.get("session_id") != sid:
+        return ("note: listener: running, but for another Claude Code session on this agent, so new messages wake that "
+                "session, not this one. Use datastash watch under a Monitor here, or work in that session.")
+    return f"ok: listener: running for this session (pid {info['pid']})."
+
+
+def cmd_doctor(_args):
+    """Every setup check, each with ok/problem/note, and each problem's exact fix."""
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    me = this_session()
+    found = setup_findings(project, me=me, deep=True)
+    ids = {f["id"] for f in found}
+    ever, here, rec = _hooks_fired()
+    print("datastash doctor (local setup checks; information only)")
+    if ever:
+        age = int(time.time() - (rec or {}).get("at", time.time()))
+        print(f"ok: hooks: the plugin's hooks last ran {age} s ago on this machine"
+              + ("" if here is None else ("; in this session: yes" if here else "; in this session: no")) + ".")
+    if not ids & {"other_owner", "no_access", "bad_json", "unreadable"}:
+        print("ok: settings: Claude Code's settings files are this user's, readable and writable.")
+    if "plugin_disabled" not in ids:
+        val, where = _plugin_enabled(project)
+        print("ok: plugin: enabled in " + _tilde(where) + "." if val is True else
+              "ok: plugin: no setting turns it off.")
+    if not ids & {"key_mode", "key_missing", "key_not_file"}:
+        print("ok: keys: every datastash key file here is private to this user (mode 600).")
+    if "no_reach" not in ids:
+        print("ok: network: https://getdatastash.com answers.")
+    print(_listener_line(project, me))
+    for f in found:
+        print("problem: " + finding_line(f))
+        if f["cmd"]:
+            print("fix: " + f["cmd"] + (" (admin rights)" if f["sudo"] else ""))
+    print(f"summary: {len(found)} problem{'s' if len(found) != 1 else ''}."
+          + (" Tell the person each one in plain words." if found else ""))
     return 0
 
 
@@ -1487,6 +1821,7 @@ def cmd_api(args):
     if agent is None:
         die("no agent is linked to this folder (datastash link NAME --workbook ID, or set DATASTASH_AGENT)")
     mark_agent_use(me, "api")
+    auto_setup_check(here, me=me, stream=sys.stderr, once=True)  # once per session, outside the data frame
     key = read_key(agent["slug"])
     if key is None:
         die(f"no usable key file for \"{agent['name']}\" ({key_path(agent['slug'])})")
@@ -1726,6 +2061,8 @@ def cmd_auto_name(args):
         print(f'linked: "{disp(name)}" (this folder\'s agent: reuse it; no registration)')
     else:
         print(f"name: {name}")
+    if kind != "main":
+        auto_setup_check(here, me=me)  # the agent's first datastash use: name any setup problem and its fix
     return 0
 
 
@@ -1875,6 +2212,7 @@ def cmd_agent_tool(_args):
     agent (never main; see tool_carries_datastash). Never blocks the call and prints nothing. The session id's mark is
     written first, before the process walk, so a slow box can't skip it; the person's main session is never marked."""
     inp = hook_input()
+    hook_heartbeat("tool", inp, throttle=TOOL_HEARTBEAT_EVERY)
     try:
         if (inp.get("hook_event_name") == "PostToolUseFailure" and inp.get("tool_name") == MAIN_CODE_TOOL
                 and inp.get("tool_input") == MAIN_CODE_INPUT):
@@ -1906,6 +2244,7 @@ def cmd_prompt(_args):
     """UserPromptSubmit hook: the person typed "datastash main" (or "main datastash") in this session. Records the
     request for this session (bound to its process), or tells the AI in one line why this session can't be main."""
     inp = hook_input()
+    hook_heartbeat("prompt", inp, throttle=TOOL_HEARTBEAT_EVERY)
     if not is_main_phrase(inp.get("prompt")):
         return 0
     me = this_session(inp)
@@ -2377,7 +2716,7 @@ def main():
     table = {"fetch": cmd_fetch, "link": cmd_link, "status": cmd_status, "api": cmd_api, "off": cmd_off,
              "watch": cmd_watch, "check": cmd_check, "listen": cmd_listen, "end": cmd_end, "reply": cmd_reply,
              "send": cmd_send, "main": cmd_main, "prompt": cmd_prompt, "auto-name": cmd_auto_name, "list": cmd_list,
-             "read": cmd_read, "filter": cmd_filter, "agent-tool": cmd_agent_tool, "unfilter": lambda a: cmd_filter(a, hidden=False)}
+             "read": cmd_read, "filter": cmd_filter, "agent-tool": cmd_agent_tool, "doctor": cmd_doctor, "unfilter": lambda a: cmd_filter(a, hidden=False)}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

@@ -91,6 +91,7 @@ class Base(unittest.TestCase):
         ds._claude_chain = lambda: [[4242, "start-A"]]  # this test's "Claude Code process"
         ds.hook_input = lambda: {"session_id": "s1"}
         ds._session_pid = lambda: os.getpid()
+        ds.hook_heartbeat("check", {})  # the plugin's hooks run on this test machine (see SetupDoctor for when not)
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -1576,7 +1577,7 @@ class SelfRegistration(MainBase):
         os.environ["CLAUDE_PROJECT_DIR"] = folder
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ds.cmd_auto_name(["--after", after] if after else []), 0)
-        return out.getvalue().strip()
+        return out.getvalue().strip().splitlines()[0]  # the answer; setup-check lines follow it (SetupDoctor)
 
     def test_first_use_is_named_from_the_folder(self):
         self.be("sess-R", (1201, "tR"))
@@ -1920,6 +1921,255 @@ class SignInOnce(MainBase):
         groups = hooks["hooks"]["PostToolUseFailure"]
         self.assertEqual([h["args"][-1] for g in groups for h in g["hooks"]], ["agent-tool"])
         self.assertEqual([g["matcher"] for g in groups], ["*"])
+
+
+class SetupDoctor(Base):
+    """Owner request 11-20: name each setup problem (hooks not firing, a Claude Code settings file owned by another user,
+    the plugin turned off, a missing or open key file, no reach) with its exact fix; nothing on a healthy machine."""
+
+    def setUp(self):
+        super().setUp()
+        for k in ("CONF", "STATE", "HEARTBEAT", "CLAUDE_DIR", "_lstat", "http"):
+            self.saved.setdefault(k, getattr(ds, k))
+        root = tempfile.mkdtemp(dir=TMP)
+        ds.CONF = os.path.join(root, "conf")
+        ds.STATE = os.path.join(ds.CONF, "state")
+        ds.HEARTBEAT = os.path.join(ds.STATE, "hooks-heartbeat.json")
+        ds.CLAUDE_DIR = os.path.join(root, "home", ".claude")
+        os.makedirs(ds.CLAUDE_DIR, mode=0o700)
+        self.proj = os.path.join(root, "proj")
+        os.makedirs(self.proj)
+        ds.ensure_dirs()
+        self.settings = os.path.join(ds.CLAUDE_DIR, "settings.json")
+        self.write(self.settings, {"enabledPlugins": {"datastash@datastash": True}})
+        ds.resolve = lambda p, me=None: (None, [])
+        self.others = set()  # paths that look owned by another user
+        real = self.saved["_lstat"]
+
+        def fake_lstat(path):
+            st = real(path)
+            if path in self.others:
+                v = list(st)
+                v[4] = os.getuid() + 1
+                return os.stat_result(v)
+            return st
+        ds._lstat = fake_lstat
+        ds.http = lambda *a, **k: (200, "text/html", "")
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "sess-doc"
+        os.environ["CLAUDE_PROJECT_DIR"] = self.proj
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        super().tearDown()
+
+    def write(self, path, obj, mode=0o600):
+        with open(path, "w") as f:
+            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+        os.chmod(path, mode)
+
+    def beat(self, sid="sess-doc"):
+        ds.hook_heartbeat("check", {"session_id": sid})
+
+    def found(self, deep=False):
+        return {f["id"]: f for f in ds.setup_findings(self.proj, deep=deep)}
+
+    def auto(self):
+        out = io.StringIO()
+        ds.auto_setup_check(self.proj, stream=out)
+        return out.getvalue()
+
+    def run_fix(self, cmd):
+        r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_healthy_machine_says_nothing(self):
+        self.beat()
+        os.makedirs(os.path.join(self.proj, ".claude"))
+        self.write(os.path.join(self.proj, ".claude", "settings.local.json"), {"permissions": {}})
+        self.write(os.path.join(ds.CONF, "agent-tester.key"), "ldgr_ag_x")
+        ds.resolve = lambda p, me=None: (dict(AGENT), [])
+        self.assertEqual(self.found(deep=True), {})
+        self.assertEqual(self.auto(), "")
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_doctor([])
+        text = out.getvalue()
+        self.assertIn("summary: 0 problems.", text)
+        self.assertNotIn("problem:", text)
+        self.assertIn("in this session: yes", text)
+
+    def test_read_only_mount_is_not_a_problem(self):
+        # Claude Code's sandbox mounts its settings read-only for commands: own file, mode 600, is healthy.
+        self.beat()
+        orig = os.access
+        os.access = lambda *a, **k: False
+        try:
+            self.assertEqual(self.found(), {})
+        finally:
+            os.access = orig
+
+    def test_settings_owned_by_another_user_the_real_case(self):
+        self.others.add(self.settings)
+        f = self.found()
+        self.assertEqual(list(f), ["other_owner"])  # the specific cause, not the generic "hooks never ran"
+        f = f["other_owner"]
+        user = ds._user()
+        self.assertEqual(f["cmd"], f"sudo chown {user} {self.settings} && chmod u+rw {self.settings}")
+        self.assertTrue(f["sudo"])
+        line = ds.finding_line(f)
+        self.assertIn("datastash can't wake this session: Claude Code's settings file", line)
+        self.assertIn("belongs to another user", line)
+        self.assertIn("the plugin's automatic parts are off", line)
+        self.assertIn('"Datastash can fix this for you or give you instructions to fix it yourself. Would you like us to '
+                      'fix this?"', line)
+        self.assertIn("sudo -n first", line)
+        self.assertIn("own terminal and type their own password there", line)
+        self.assertIn("never ask for the password in chat", line)
+        self.assertIn("instructions below for the machine's admin", line)
+        self.assertIn("have the machine's admin give this user", line)
+        self.assertIn("restart Claude Code", line)
+        self.assertIn("`datastash watch` under a Monitor still delivers messages", line)
+        self.assertEqual(self.auto().strip(), line)
+
+    def test_sudo_fix_quotes_odd_paths(self):
+        ds.CLAUDE_DIR = os.path.join(tempfile.mkdtemp(dir=TMP), "my home", ".claude")
+        os.makedirs(ds.CLAUDE_DIR)
+        os.chmod(ds.CLAUDE_DIR, 0o700)
+        path = os.path.join(ds.CLAUDE_DIR, "settings.json")
+        self.write(path, {})
+        self.others.add(path)
+        self.beat()
+        cmd = self.found()["other_owner"]["cmd"]
+        import shlex
+        self.assertEqual(shlex.split(cmd), ["sudo", "chown", ds._user(), path, "&&", "chmod", "u+rw", path])
+        self.assertNotIn("can't wake", self.found()["other_owner"]["problem"])  # hooks fire: no wake claim
+
+    def test_settings_folder_owned_by_another_user(self):
+        self.others.add(ds.CLAUDE_DIR)
+        f = self.found()["other_owner"]
+        self.assertEqual(f["cmd"], f"sudo chown -R {ds._user()} {ds.CLAUDE_DIR} && chmod u+rwx {ds.CLAUDE_DIR}")
+
+    def test_unwritable_settings_fix_command_works(self):
+        os.chmod(self.settings, 0o400)
+        f = self.found()["no_access"]
+        self.assertEqual(f["cmd"], f"chmod u+rw {self.settings}")
+        self.assertFalse(f["sudo"])
+        self.run_fix(f["cmd"])
+        self.beat()
+        self.assertEqual(self.found(), {})
+
+    def test_project_settings_bad_json(self):
+        self.beat()
+        os.makedirs(os.path.join(self.proj, ".claude"))
+        p = os.path.join(self.proj, ".claude", "settings.json")
+        self.write(p, '{"hooks": ,}')
+        f = self.found()["bad_json"]
+        self.assertIn("this project's Claude Code settings file", f["problem"])
+        self.assertIn("line 1", f["problem"])
+        self.assertIsNone(f["cmd"])
+
+    def test_no_hook_ever_ran(self):
+        f = self.found()
+        self.assertEqual(list(f), ["hooks_never"])
+        line = ds.finding_line(f["hooks_never"])
+        self.assertIn("has ever run on this machine", line)
+        self.assertIn("/reload-plugins", line)
+        self.assertIn("datastash watch", line)
+
+    def test_hooks_not_in_this_session_then_fresh(self):
+        self.beat(sid="sess-other")
+        old = time.time() - 600
+        os.utime(ds.HEARTBEAT, (old, old))
+        self.assertEqual(list(self.found()), ["hooks_not_here"])
+        self.beat()  # this session's own hook ran
+        self.assertEqual(self.found(), {})
+        # Outside a session (a plain shell) only the machine-wide answer counts.
+        os.environ.pop("CLAUDE_CODE_SESSION_ID")
+        os.utime(ds.HEARTBEAT, (old, old))
+        self.assertEqual(self.found(), {})
+
+    def test_hooks_write_the_heartbeat(self):
+        ds.hook_input = lambda: {"session_id": "sess-doc", "tool_name": "Read", "tool_input": {"file_path": "/x"},
+                                 "hook_event_name": "PreToolUse", "cwd": self.proj}
+        ds.cmd_agent_tool([])
+        self.assertTrue(os.path.exists(ds.HEARTBEAT))
+        self.assertTrue(os.path.exists(ds._seen_path("sess-doc")))
+        self.assertEqual(self.found(), {})
+
+    def test_plugin_disabled(self):
+        self.write(self.settings, {"enabledPlugins": {"datastash@datastash": False}})
+        f = self.found()
+        self.assertEqual(list(f), ["plugin_disabled"])
+        self.assertEqual(f["plugin_disabled"]["cmd"], "claude plugin enable datastash@datastash")
+        line = ds.finding_line(f["plugin_disabled"])
+        self.assertIn("turned off", line)
+        self.assertIn(ds.FIX_ASK, line)
+        # A project-local setting that turns it on wins over the user setting.
+        os.makedirs(os.path.join(self.proj, ".claude"))
+        self.write(os.path.join(self.proj, ".claude", "settings.local.json"),
+                   {"enabledPlugins": {"datastash@datastash": True}})
+        self.assertEqual(list(self.found()), ["hooks_never"])
+
+    def test_missing_key(self):
+        self.beat()
+        ds.resolve = lambda p, me=None: (dict(AGENT), [])
+        f = self.found()["key_missing"]
+        self.assertIn('"Tester" has no key file', f["problem"])
+        self.assertIn("ledger_agent_key", f["steps"])
+        self.assertNotIn(ds.FIX_ASK, ds.finding_line(f))  # the agent fixes its own key; no person step
+
+    def test_open_key_file_fix_command_works(self):
+        self.beat()
+        p = os.path.join(ds.CONF, "agent-tester.key")
+        self.write(p, "ldgr_ag_x", mode=0o644)
+        f = self.found()["key_mode"]
+        self.assertEqual(f["cmd"], f"chmod 600 {p}")
+        self.assertIn("mode 644", f["problem"])
+        self.run_fix(f["cmd"])
+        self.assertEqual(self.found(), {})
+
+    def test_key_owned_by_another_user(self):
+        self.beat()
+        p = os.path.join(ds.CONF, "main.key")
+        self.write(p, "ldgr_pm_x")
+        self.others.add(p)
+        f = self.found()["other_owner"]
+        self.assertEqual(f["cmd"], f"sudo chown {ds._user()} {p} && chmod u+rw {p}")
+        self.assertNotIn("can't wake", f["problem"])
+
+    def test_config_folder_owned_by_another_user(self):
+        self.others.add(ds.CONF)
+        f = self.found()["other_owner"]
+        self.assertIn("datastash's own folder", f["problem"])
+        self.assertEqual(f["cmd"], f"sudo chown -R {ds._user()} {ds.CONF} && chmod u+rwx {ds.CONF}")
+
+    def test_no_reach(self):
+        self.beat()
+
+        def down(*a, **k):
+            raise ds.urllib.error.URLError("Name or service not known")
+        ds.http = down
+        self.assertEqual(self.found(), {})  # the cheap checks never go to the network
+        f = self.found(deep=True)["no_reach"]
+        self.assertIn("Name or service not known", f["problem"])
+        ds.http = lambda *a, **k: (_ for _ in ()).throw(ds.ApiError(404, {}))
+        self.assertEqual(self.found(deep=True), {})  # any HTTP answer is reach
+
+    def test_auto_name_and_api_say_it(self):
+        ds._claude_chain = lambda: [[4242, "start-A"]]
+        self.others.add(self.settings)
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_auto_name([])
+        self.assertIn("belongs to another user", out.getvalue())
+        self.assertIn(ds.FIX_ASK, out.getvalue())
+        me = ds.this_session()
+        err = io.StringIO()
+        ds.auto_setup_check(self.proj, me=me, stream=err, once=True)
+        ds.auto_setup_check(self.proj, me=me, stream=err, once=True)
+        self.assertEqual(err.getvalue().count("belongs to another user"), 1)  # once per session
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_status([])
+        self.assertIn("belongs to another user", out.getvalue())
 
 
 if __name__ == "__main__":

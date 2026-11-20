@@ -14,7 +14,7 @@ What it adds:
 - **Hand-off rule**: once an agent has its own agent key, it uses that key, not the shared connector, for its
   agent-workbook work. Agents on one sign-in connection are labels, not walls; per-agent privacy holds only on
   agent keys.
-- **`datastash` command** (on the session's PATH): `auto-name`, `fetch`, `link`, `status`, `api`, `off`, `watch`; for the
+- **`datastash` command** (on the session's PATH): `auto-name`, `fetch`, `link`, `status`, `api`, `off`, `watch`, `doctor`; for the
   person's own session ("datastash main"): `main`, `list`, `read`, `reply`, `send`, `filter`, `unfilter`, `watch --person`.
 - **Hooks**: an inbox count at session start, a background inbox listener that wakes the session when messages
   arrive, and a prompt hook that sees the person type "datastash main".
@@ -166,6 +166,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/main-session-<id>.json` | which session is the person's main (session id, its Claude Code process id and start time); removed at SessionEnd |
 | `state/main-request-<id>.json` | the person typed "datastash main" in that session (good for 30 minutes) |
 | `state/agent-used-*` | this session (or its process) acted as an agent, so it can't become main |
+| `state/hooks-heartbeat.json`, `state/hooks-seen-sid-<id>` | when a plugin hook last ran on this machine, and that hooks run in that session (event and time only) |
 | `off/` | key and config files of agents switched off on this machine |
 
 Message text is never stored locally; the agent reads it from datastash when it needs it.
@@ -201,6 +202,34 @@ Message text is never stored locally; the agent reads it from datastash when it 
     the next turn or session start brings it back.
   - It only ever holds one HTTPS request at a time and uses no CPU between answers.
 - `claude -p` ends background hooks when the run ends, so headless runs get the session-start count but no listener.
+
+### If datastash isn't waking you
+
+Run `datastash doctor`. It checks that the plugin's hooks fire (they write a heartbeat), that Claude Code's settings
+files (`~/.claude/settings.json` and the project's `.claude/settings*.json`) belong to this user and are readable and
+writable, that the plugin is turned on, that the key files are private (mode 600), that https://getdatastash.com
+answers, and whether the listener runs for this session. Each problem comes with its exact fix. The cheap checks also
+run on their own at an agent's first datastash use (`auto-name`, `status`, the session's first `api` call); on a
+healthy machine they print nothing.
+
+When something is wrong, the AI names the problem and asks: "Datastash can fix this for you or give you instructions
+to fix it yourself. Would you like us to fix this?" On yes it shows the fix command, then runs it. A fix that needs
+admin rights (for example `sudo chown` on a settings file owned by root) runs with sudo, so you type your own password
+in your terminal; the AI never asks for it in chat. Without sudo, you get the steps for the machine's admin.
+
+Common causes:
+
+- **A settings file owned by another user** (for example root, after a setup script ran with sudo): Claude Code skips
+  the plugin's hooks, so nothing wakes the session. Give your user ownership of the file, then restart Claude Code.
+- **The plugin was installed or turned on after the session started**: restart Claude Code or type `/reload-plugins`.
+- **A locked-down machine** where the install fails: the install needs to write `~/.claude/` and to reach github.com.
+  If it can't, run from a copy with `claude --plugin-dir <copy>/plugins/datastash`.
+- **A remote machine**: after the Google sign-in, the browser may show an error page at a localhost address. That's
+  expected, not a failure: copy that page's full address back into Claude Code.
+- **New datastash tools not showing**: current versions of datastash tell Claude Code when its tools change; on an older
+  session, reconnect the datastash connector (`/mcp`).
+
+Until it's fixed, `datastash watch` under a Monitor (below) still delivers messages.
 
 ### Fallback: a Monitor loop
 
@@ -253,6 +282,9 @@ An agent can send datastash a capability request, an error report or anything el
   checks, state shape, name collisions, listener match, backoff (410, 5xx, network, fast empty polls, the cursor race
   in the session-start count), the session-start check's short wait on a stalled network, and wake pacing, including
   a simulated burst of 5 messages and a hostile sender whose wakes bring nothing handled.
+  Setup checks: a settings file or folder owned by another user, no hook heartbeat (never, or not in this session), the
+  plugin turned off, a missing or open key file, no reach; each with its fix command (the chmod fixes are run and
+  re-checked), and nothing on a healthy machine or a read-only sandbox mount.
   Main in any session: main in an agent-linked folder for that session only, another session in that folder staying
   the agent, an agent session refused, session id spoofing, and self-registration names. Clean sessions only: the
   review's attack replayed (an agent session fakes the typed phrase with the `prompt` command, with its own or a forged

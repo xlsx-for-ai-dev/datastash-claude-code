@@ -75,6 +75,8 @@ To tell datastash about a capability you need, an error you hit, or anything els
 
 ## If something fails
 
+- A line starting `datastash setup check` names a setup problem on this machine (for example a Claude Code settings file owned by another user, so nothing wakes you). Tell the person in plain words, then ask exactly: "Datastash can fix this for you or give you instructions to fix it yourself. Would you like us to fix this?" On yes, show the command the line gives, then run it; a command with sudo: try `sudo -n` first, and if it wants a password, ask the person to run the shown command in their own terminal (never ask for a password in chat). On "instructions", give the line's steps. Not waking at all: run `datastash doctor`.
+
 - `datastash status` shows the key file, linked folders, listener and new count. Logs: `~/.config/datastash/state/agent-<name>.log` (never contain the key).
 - Key refused: the agent was switched off or a newer key was issued. Get a new pickup code from the person's connection.
 - No listener (for example `claude -p`): poll with `datastash watch` in a Monitor; each line it prints is new mail.
