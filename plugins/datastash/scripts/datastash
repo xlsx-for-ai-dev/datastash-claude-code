@@ -312,7 +312,7 @@ def read_main_key():
 
 # ------------------------------------------------------------------ datastash login (XLI-278)
 
-def _run(cmd, stdin_text=None, timeout=8):
+def _run(cmd, stdin_text=None, timeout=3):
     """Run a keychain tool quietly. (returncode, stdout) or (None, "") when it can't run. Secrets go on stdin only."""
     try:
         r = subprocess.run(cmd, input=stdin_text, capture_output=True, text=True, timeout=timeout)
@@ -414,7 +414,7 @@ def _forget_login():
         _drop(p)
 
 
-LOGIN_REFRESH_TIMEOUT = 8  # inside the connector helper's 10 s
+LOGIN_REFRESH_TIMEOUT = 5  # with the keychain read (3 s), inside the connector helper's 10 s
 
 
 def login_token(force=False):
@@ -1418,6 +1418,9 @@ def _listen_loop(agent, s, session_id, printer, me=None):
             log(s, "listen: this session is now the person's datastash main; agent listener stops")
             return 0
         key = read_key(s)
+        if key is None and person_slug(s) and signed_in():
+            fail("datastash login token not refreshed (network?)")  # XLI-290: a refresh blip backs off, never stops
+            continue
         if key is None:
             log(s, "listen: no usable key file; stops")
             return 0
