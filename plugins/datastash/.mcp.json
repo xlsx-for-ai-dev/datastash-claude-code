@@ -2,7 +2,8 @@
   "mcpServers": {
     "datastash": {
       "type": "http",
-      "url": "https://getdatastash.com/mcp"
+      "url": "https://getdatastash.com/mcp",
+      "headersHelper": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/datastash\" token --header"
     }
   }
 }

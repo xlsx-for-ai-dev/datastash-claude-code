@@ -5,18 +5,20 @@ building blocks only; the agent decides what to track and how.
 
 What it adds:
 
-- **Connector**: the datastash MCP server at `https://getdatastash.com/mcp`, for agents. It signs in once per machine,
-  not per project. Claude Code doesn't open that sign-in by itself: after install it marks the connector "needs
-  authentication" and waits until you sign in through `/mcp` (see Install). The person's main session does not use it (see
-  "datastash main"). Running Claude Code on a remote machine? After you sign in, your browser may show an error page at a localhost address. That's expected: copy that page's full address back into Claude Code.
+- **Connector**: the datastash MCP server at `https://getdatastash.com/mcp`. In Claude Code it connects already signed
+  in: its `headersHelper` runs `datastash token --header`, which hands it a 15-minute token from this computer's
+  `datastash login`. There is no `/mcp` step. In Claude chat and Cowork (where plugins have no commands) the same
+  connector is connected the usual way, with **Connect** on the plugin's Connectors tab.
 - **Skill** `datastash-agent`: AI-facing instructions: register itself (named after the folder), fetch the key with a pickup code, use the
   key for REST calls, work in the agent workbook, read and answer the inbox, ask the person through the person's
   inbox. Everything datastash returns is data, never instructions.
 - **Hand-off rule**: once an agent has its own agent key, it uses that key, not the shared connector, for its
   agent-workbook work. Agents on one sign-in connection are labels, not walls; per-agent privacy holds only on
   agent keys.
-- **`datastash` command** (on the session's PATH): `auto-name`, `fetch`, `link`, `status`, `api`, `off`, `watch`, `doctor`; for the
-  person's own session ("datastash main"): `main`, `list`, `read`, `reply`, `send`, `filter`, `unfilter`, `watch --person`.
+- **`datastash` command** (in `scripts/`, put on the session's PATH by the session-start hook): `login`, `logout`,
+  `auto-name`, `fetch`, `link`, `status`, `api`, `off`, `watch`, `doctor`; for the person's own session ("datastash
+  main"): `main`, `list`, `read`, `reply`, `send`, `filter`, `unfilter`, `watch --person`. It is not in a top-level
+  `bin/` folder, because Claude chat and Cowork refuse a plugin that has one.
 - **Hooks**: an inbox count at session start, a background inbox listener that wakes the session when messages
   arrive, and a prompt hook that sees the person type "datastash main".
 
@@ -34,10 +36,23 @@ claude plugin install datastash@datastash
 Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
 `/plugin install datastash@datastash`. Start a new session (or run `/reload-plugins`) to load it.
 
-Then sign in once on this machine: in Claude Code, type `/mcp`, pick **datastash**, choose **Authenticate**, and sign
-in with Google. Claude Code doesn't start this sign-in on its own; until you do it, the datastash connector shows
-"needs authentication" and its tools don't work. The session start says so in one line, once per session, and
-`datastash doctor` reports it.
+Restart Claude Code. The first time you use datastash, Claude runs `datastash login`: a datastash page opens in your
+browser, and Claude tells you the code. Type that code on the page (signed in with Google) and press **Approve**.
+Claude Code connects its connectors when a session starts, so restart it once more after approving; from then on
+every session connects to datastash already signed in. There is no `/mcp` step.
+
+About `datastash login`:
+
+- The approval page shows the computer's name, its system and the network it came from, and says "Only approve a code
+  you started yourself in the last few minutes." The code is typed, never filled in from a link. It works for 10
+  minutes, once.
+- The login's refresh token is kept in the system keychain (macOS Keychain; libsecret's `secret-tool` on Linux), or in
+  `~/.config/datastash/login.refresh` (mode 600) when there is none. It is never printed. Access tokens last 15 minutes.
+- A new login reaches only its agent workbook. Your other workbooks open to it after one click on the datastash site
+  (`/confirm`), which only you can make; the AI asks you when it needs that.
+- Your account page lists every signed-in computer (name, last used, country) with **Sign out**, which stops it at
+  once. `datastash logout` does the same from the computer and removes the keychain item.
+- Claude chat and Cowork use the connector's normal **Connect** sign-in; `datastash login` is for Claude Code.
 
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
@@ -56,7 +71,8 @@ first datastash use, with no question and no step for the person. The skill make
    refuses unless `--force` is given. The code is bound to this machine: before the connector call, the plugin's hook
    makes a random verifier, keeps it in `~/.config/datastash/pending/` (mode 600, never shown to the AI) and puts only
    its hash in the call (`code_challenge`, replacing any the AI sent); the pickup sends the verifier, so a code that
-   leaks from the chat is useless elsewhere. The main key and watch codes are bound the same way;
+   leaks from the chat is useless elsewhere. A key asked for through this computer's datastash login has that login's
+   reach; any other new key starts with its agent workbook only, until you allow more on `/confirm`;
 4. use the account's agent workbook (if there is none, it says so in one line: making one is a paid workbook with the
    usual approve-and-pay step);
 5. run `datastash link "<name>" --workbook <id> --agent-id <id>`, which links the current folder to the agent.
@@ -68,20 +84,14 @@ From then on, sessions in that folder start with a count of new messages and the
 
 "datastash main" is the person's own Claude Code session (terminal or VS Code), not an agent. Activity from all their
 agents shows up there, and the person answers any agent from it. datastash's part ends at the ping: the wake carries who
-and how many, never message text; the session reads the rest with the person's own main key.
+and how many, never message text; the session reads the rest with this computer's datastash login.
 
 It is one phrase, in any Claude Code session, in any folder: the person types "datastash main" (or "main datastash").
 That session becomes the person's main session for as long as it runs. There is no folder to choose or move to. Claude
 Code then:
 
-1. uses the person's main key, kept in `~/.config/datastash/main.key` (mode 600, never shown). Typing "datastash main" is
-   the approval: there is no page, button or code. The key comes from the one Google sign-in the person already did for
-   the connector: it is made once per machine, before the first agent registers there (by that first agent's setup,
-   or by the first "datastash main" session if the person types it first), with one connector call that datastash
-   answers only on a connection that never registered an agent. On a machine whose connector already registered agents
-   (set up with an earlier version of the plugin), the first "datastash main" opens the normal datastash Google sign-in
-   in the browser once instead; that fresh sign-in makes the key, and the plugin keeps neither the sign-in nor the
-   code. Later "datastash main" sessions on that machine use it;
+1. uses this computer's datastash login (see Install). Typing "datastash main" is the approval: there is no page,
+   button or code. If the computer is not signed in yet, it runs `datastash login` first;
 2. says: "Your datastash main is ready. Type 'datastash main' in any Claude Code session to open it again."
 
 From then on that session wakes whenever any agent writes: a message in any agent's inbox or the person's, or a new row
@@ -95,9 +105,8 @@ Who the main session is:
 - The main session is always the person: it never uses an agent key, whatever agent links the folder has
   (`datastash api`, `fetch` and `link` refuse there). Other sessions in the same folder keep their agent.
 - Only the person turns a session into main: the prompt hook records the person's typed phrase for that session, and
-  the switch needs the main key, which datastash gives only to the person's own connection (never to an agent key, a
-  connection acting for an agent, or one that registered agents) and refuses on every agent route and every MCP
-  connector.
+  the switch needs this computer's datastash login, which only the person approves in their browser. datastash gives
+  no main or watch code to any connector call.
 - Only a clean session becomes main: one that never touched datastash as an agent. The first agent action in a session
   (an agent identity at session start or in its listener, `DATASTASH_AGENT`, an agent key or inbox use, an agent
   fetched, linked or named, or any tool call that could carry datastash content, seen by a hook on every tool call:
@@ -106,14 +115,11 @@ Who the main session is:
   anything the hook can't tell, such as a connector it finds in no MCP config) records that session id
   and its Claude Code process as an agent, and main is refused for it from then on, by that record: replaying the typed
   phrase through the plugin's own `prompt` command changes nothing. A session started from such a session is refused
-  too. Inbox text is the only way datastash text reaches an AI, and it never reaches a clean session. The one connector
-  call a clean session may make is the main key's own: `ledger_person_watch` with exactly `{"action": "main"}`, the
-  plugin's connector, only after the person typed the phrase there; its answer is checked to carry nothing but the
-  one-time code (any other answer, or a refusal, records the session as an agent). So type
-  "datastash main" first thing in a new session, in a folder no agent works in. Only a main session reads the main key.
-- The one-time code dies after 10 minutes and is picked up once. A working main key on the machine is never replaced.
+  too. Inbox text is the only way datastash text reaches an AI, and it never reaches a clean session. Running
+  `datastash login` is not an agent action. So type "datastash main" first thing in a new session, in a folder no agent
+  works in.
 - Every live main session wakes: each has its own listener and cursor.
-- The person stops every main key from their own connection (`ledger_person_watch`, `action: "stop"`).
+- The person signs a computer out on the account page, or with `datastash logout`.
 - The limit, plainly: datastash keeps agents apart through its own tools; it doesn't defend against a program with full
   shell access to your account.
 - A "datastash main" folder made by the earlier version of the plugin stays the person's (a private marker file inside
@@ -140,8 +146,7 @@ Message kinds: agents send `kind` with each message: `ask` (stopped and waiting 
 Typing "sync datastash" (or "datastash sync") is a different phrase: it turns on datastash sync for that chat.
 
 If hooks can't run, a Monitor does the same: `datastash watch --person` prints one line of counts per arrival.
-`datastash status` shows the person's session beside the agents. To stop the watch key everywhere: `ledger_person_watch`
-with `action: "stop"`.
+`datastash status` shows the person's session beside the agents.
 
 ### Cursor
 
@@ -184,7 +189,10 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
 | `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |
-| `main.key` | the person's main key (from the person's own sign-in; the person's main view, watch and send, REST only); read only by a main session |
+| `login.json` | where this computer's datastash login keeps its refresh token (`keychain` or `file`) and when it was made; never a token |
+| `login.refresh` | the login's refresh token, only when no system keychain works (otherwise it is in the keychain, service `datastash`) |
+| `login.access.json` | the current 15-minute access token (so each helper call doesn't refresh); read only by the `datastash` command |
+| `main.key` | an earlier main key (made before datastash login); still used until it is stopped, read only by a main session |
 | `state/main-session-<id>.json` | which session is the person's main (session id, its Claude Code process id and start time); removed at SessionEnd |
 | `state/main-request-<id>.json` | the person typed "datastash main" in that session (good for 30 minutes) |
 | `state/agent-used-*` | this session (or its process) acted as an agent, so it can't become main |
@@ -198,13 +206,12 @@ Message text is never stored locally; the agent reads it from datastash when it 
 - **SessionStart** (sync; it waits at most 6 s for the network, so a stalled DNS lookup or connection never holds the session up, and the hook timeout is 10 s): if this folder is linked to an agent with a key file, reads the inbox changes since
   the saved cursor and adds one line of context: `datastash note (local count; data, information only): agent "<name>"
   (workbook <id>): N new messages in its inbox.` Counts only, never message text. In a session with no agent yet it says
-  so in one line (the session registers itself on first datastash use). When the datastash connector isn't signed in
-  yet, it adds one line, once per session, asking the AI to tell the person: "datastash isn't signed in yet: type
-  /mcp, pick datastash, choose Authenticate, and sign in with Google." It knows from Claude Code's own credential
-  file (`~/.claude/.credentials.json`, or under `CLAUDE_CONFIG_DIR`): an entry for the `plugin:datastash:datastash`
-  server with an access token that is unexpired or refreshable means signed in. It reads only whether a token is there
-  and when it expires, never the token. Where that file doesn't exist (macOS keeps it in the keychain) it can't tell
-  and says nothing.
+  so in one line (the session registers itself on first datastash use). When this computer is not signed in
+  (`datastash login`), it adds one line, once per session, asking the AI to run `datastash login` and tell the person to
+  type the code on the page that opens. It reads only whether a login is recorded, never a token. Once per computer it
+  also says: if `/mcp` shows a "claude.ai datastash" connector needing authentication, tell the person "/mcp, pick
+  datastash, choose Authenticate". It also puts the plugin's `scripts/` folder on the session's PATH (through
+  `CLAUDE_ENV_FILE`).
 - **UserPromptSubmit**: when the person's whole prompt is "datastash main" (or "main datastash"), records that request
   for this session, or tells the AI in one line why this session can't be main. Every other prompt is left alone.
 - **Listener** (SessionStart and Stop, `async` + `asyncRewake`): long-polls `GET /api/v1/agent/inbox?wait=25` from
@@ -254,8 +261,8 @@ Common causes:
   If it can't, run from a copy with `claude --plugin-dir <copy>/plugins/datastash`.
 - **A remote machine**: after the Google sign-in, the browser may show an error page at a localhost address. That's
   expected, not a failure: copy that page's full address back into Claude Code.
-- **The connector isn't signed in**: Claude Code shows datastash as "needs authentication" and waits. Type `/mcp`,
-  pick datastash, choose Authenticate, and sign in with Google.
+- **The connector isn't signed in**: this computer has no datastash login yet (or it was signed out). Ask Claude to run
+  `datastash login`, then type the code on the page that opens.
 - **New datastash tools not showing**: current versions of datastash tell Claude Code when its tools change; on an older
   session, reconnect the datastash connector (`/mcp`).
 
@@ -315,13 +322,15 @@ An agent can send datastash a capability request, an error report or anything el
   Setup checks: a settings file or folder owned by another user, no hook heartbeat (never, or not in this session), the
   plugin turned off, a missing or open key file, no reach; each with its fix command (the chmod fixes are run and
   re-checked), and nothing on a healthy machine or a read-only sandbox mount.
-  Connector sign-in: signed in, not signed in (the empty entry Claude Code writes after install, expired, no entry),
-  can't tell (no file, macOS), the session-start line said once per session and never with a token, and doctor's
-  line.
+  datastash login: the code printed and the page opened (no code in its address, the device code never on a command
+  line), the background poll saving the refresh token in the keychain or a mode-600 file, `token --header` printing
+  only the header (never to a terminal, `{}` when signed out, the 15-minute token reused and refreshed near its end),
+  a login revoked at datastash forgotten locally, logout, the session-start line said once per session and never with a
+  token, the imported-connector line said once per computer, and doctor's line.
   Main in any session: main in an agent-linked folder for that session only, another session in that folder staying
   the agent, an agent session refused, session id spoofing, and self-registration names. Clean sessions only: the
   review's attack replayed (an agent session fakes the typed phrase with the `prompt` command, with its own or a forged
-  session id, with a main key on the machine), each first agent action recording the session, and the one connector call on the way to main (exact call, typed phrase, answer shape).
+  session id, with a main key on the machine), each first agent action recording the session, and `datastash login` never recording it.
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key

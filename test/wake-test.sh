@@ -43,7 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-( cd "$PROJ" && python3 "$PLUGIN/bin/datastash" link "$AGENT" --workbook "$WID" >/dev/null ) || { echo "FAIL: link"; exit 1; }
+( cd "$PROJ" && python3 "$PLUGIN/scripts/datastash" link "$AGENT" --workbook "$WID" >/dev/null ) || { echo "FAIL: link"; exit 1; }
 # The listener's first catch-up in a fresh workbook state must not count old mail: start clean.
 STATE="$HOME/.config/datastash/state/agent-$SLUG.json"
 LOG_LINES_BEFORE=$(wc -l < "$LOG" 2>/dev/null || echo 0)

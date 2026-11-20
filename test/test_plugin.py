@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for plugins/datastash/bin/datastash: no network, no key, a throwaway config folder.
+"""Offline tests for plugins/datastash/scripts/datastash: no network, no key, a throwaway config folder.
 Run: python3 -I test/test_plugin.py   (from the repository root, or by path from anywhere)."""
 import importlib.machinery
 import importlib.util
@@ -17,7 +17,7 @@ import urllib.parse
 from contextlib import redirect_stdout, redirect_stderr
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.join(HERE, "..", "plugins", "datastash", "bin", "datastash")
+BIN = os.path.join(HERE, "..", "plugins", "datastash", "scripts", "datastash")
 TMP = tempfile.mkdtemp(prefix="ds-test-")
 os.environ["DATASTASH_CONFIG_DIR"] = TMP
 MAIN = os.path.join(TMP, "home", "datastash main")
@@ -86,7 +86,10 @@ class Base(unittest.TestCase):
             os.replace(os.path.join(ds.STATE, n), os.path.join(TMP, "old-" + n + str(time.time())))
         self.saved = {k: getattr(ds, k) for k in ("fetch_page", "read_key", "resolve", "hook_input", "_session_pid",
                                                     "_sleep", "WAKE_GATHER_SECONDS", "WAKE_MIN_SECONDS", "random",
-                                                    "announce_ids", "WAKE_IDLE_MAX_SECONDS", "_claude_chain")}
+                                                    "announce_ids", "WAKE_IDLE_MAX_SECONDS", "_claude_chain",
+                                                    "signed_in", "imported_connector_hint")}
+        ds.signed_in = lambda: True  # XLI-278: this computer's datastash login (SignInHint and Login test the real one)
+        ds.imported_connector_hint = lambda: None
         ds.read_key = lambda s: "ldgr_ag_test"
         ds.resolve = lambda p, me=None: (dict(AGENT), [])
         ds._claude_chain = lambda: [[4242, "start-A"]]  # this test's "Claude Code process"
@@ -254,6 +257,8 @@ class CheckTimeout(Base):
             "spec = importlib.util.spec_from_loader('d', loader); d = importlib.util.module_from_spec(spec); loader.exec_module(d)\n"
             "d.CHECK_WAIT_SECONDS = 1.0\n"
             "d.read_key = lambda s: 'ldgr_ag_test'\n"
+            "d.signed_in = lambda: True\n"
+            "d.imported_connector_hint = lambda: None\n"
             "d.resolve = lambda p, me=None: ({'name': 'Tester', 'slug': 'tester', 'workbook_id': 'wb1'}, [])\n"
             "d.hook_input = lambda: {}\n"
             "d.fetch_page = lambda *a, **k: time.sleep(60)\n"
@@ -493,25 +498,16 @@ class PersonSession(Base):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             ds.cmd_reply(["7", "-"])
 
-    def test_setup_takes_only_a_watch_pickup_code(self):
+    def test_the_earlier_watch_setup_is_refused(self):
         import sys as _s
-        _s.stdin = io.StringIO("dspk_agentcode123\n")
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            ds.person_setup([PERSON["workbook_id"], "-"])
         calls = []
         ds.http = lambda *a, **k: (calls.append((a, k)) or (200, "text/plain", "ldgr_pw_" + "k" * 43 + "\n"))
-        _s.stdin = io.StringIO("dspw_watchcode123\n")
-        with redirect_stdout(io.StringIO()) as out:
-            self.assertEqual(ds.person_setup([PERSON["workbook_id"], "-", "--project", TMP]), 0)
-        self.assertNotIn("ldgr_pw_", out.getvalue())
-        self.assertEqual(calls[0][0][:2], ("POST", ds.PICKUP_PATH))
-        self.assertEqual(oct(os.stat(ds.key_path(ds.PERSON_SLUG)).st_mode & 0o777), "0o600")
-        # --project is linked; no folder is made (a "datastash main" folder from the earlier design stays linked).
-        projects = ds.read_json(ds.conf_path(ds.PERSON_SLUG), {})["projects"]
-        self.assertIn(os.path.realpath(TMP), projects)
-        old_main = ds.read_json(ds.MAIN_CONF, {}).get("dir")
-        if old_main and os.path.isdir(old_main):
-            self.assertIn(old_main, projects)
+        for code in ("dspk_agentcode123", "dspw_watchcode123"):
+            _s.stdin = io.StringIO(code + "\n")
+            with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                ds.person_setup([PERSON["workbook_id"], "-", "--project", TMP])
+            self.assertIn("datastash login", err.getvalue())
+        self.assertEqual(calls, [])
 
     def test_main_status_makes_no_folder_and_says_what_is_set_up(self):
         if os.path.isdir(MAIN):
@@ -815,11 +811,7 @@ class MainBase(Base):
         super().setUp()
         ds.resolve = self.saved["resolve"]
         self.saved.setdefault("http", ds.http)
-        # These tests model a machine whose connector registered no agent (the one connector call); SignInOnce below
-        # uses the real check.
-        self.saved.setdefault("_main_needs_sign_in", ds._main_needs_sign_in)
         self.saved.setdefault("_open_browser", ds._open_browser)
-        ds._main_needs_sign_in = lambda: False
         ds._open_browser = lambda url: self.fail("no browser outside the sign-in tests")
         self.keys_read = []
         ds.read_key = lambda s: (self.keys_read.append(s) or ("ldgr_pw_test" if ds.person_slug(s) else "ldgr_ag_test"))
@@ -835,11 +827,15 @@ class MainBase(Base):
                     raise ds.ApiError(400, {})
                 return 200, "text/plain", "ldgr_pm_" + "k" * 43 + "\n"
             if path == ds.PERSON_WORKBOOKS_PATH:
-                if not (key or "").startswith("ldgr_pm_"):
+                if not (key or "").startswith(("ldgr_pm_", "dsat_")):
                     raise ds.ApiError(401, {})
                 return 200, "application/json", json.dumps({"agent_workbooks": [{"workbook_id": WID, "name": "Agents"}]})
             return 200, "application/json", "{}"
         ds.http = fake_http
+        # XLI-278: this computer is signed in with datastash login; its 15-minute token is the person's credential.
+        self.saved.setdefault("login_token", ds.login_token)
+        self.login = "dsat_" + "t" * 43
+        ds.login_token = lambda force=False: self.login
         self.folder = tempfile.mkdtemp(prefix="agent-linked-", dir=TMP)
         ds.write_private(ds.conf_path("builder"), json.dumps({"name": "Builder", "workbook_id": "wb-b", "projects": [self.folder]}))
         ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps({"workbook_id": WID, "projects": []}))
@@ -895,13 +891,8 @@ class MainBase(Base):
             sys.stdin = orig
 
     def on(self):
-        """The skill's steps: --on (the first time on a machine it says to get the key with the one connector call),
-        then --key with that call's code."""
-        rc, out, err = self.main_cmd("--on")
-        if rc == 0 and "no main key on this machine yet" in out:
-            rc2, out2, err2 = self.key_cmd()
-            return rc2, out + out2, err + err2
-        return rc, out, err
+        """The skill's step: --on (XLI-278: signed in by this computer's datastash login)."""
+        return self.main_cmd("--on")
 
     def api(self):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
@@ -1073,59 +1064,35 @@ class MainAnySession(MainBase):
         ds.fetch_page = lambda *a, **k: (_ for _ in ()).throw(AssertionError("polled as the agent"))
         self.assertEqual(ds._listen_loop(agent, "builder", "sess-A", None, me=a), 0)
 
-    def test_typing_is_the_approval_the_key_is_made_once_per_machine_with_no_page(self):
+    def test_typing_is_the_approval_signed_in_by_datastash_login(self):
+        """XLI-278: the person's typed phrase plus this computer's datastash login: main at once, no code, no page."""
         self.be("sess-A", (1001, "tA"))
         self.prompt("sess-A")
+        self.login = None  # not signed in yet
         rc, out, _ = self.main_cmd("--on")
         self.assertEqual(rc, 0)
-        self.assertIn("no main key on this machine yet", out)
-        self.assertIn('ledger_person_watch with exactly {"action": "main"}', out)
-        for word in ("approv" + "e in", "browser", "link", "Code:"):
-            self.assertNotIn(word, out)
-        self.assertEqual(self.sent, [])  # nothing started on the server, no page
+        self.assertEqual(out.strip(), ds.LOGIN_STEP)
+        self.assertNotIn("ledger_person_watch", out)
+        self.assertEqual(self.sent, [])
         self.assertFalse(ds.is_main_session(self.be("sess-A", (1001, "tA"))))
-        rc, out, err = self.key_cmd()
-        self.assertEqual(rc, 0, err)
-        self.assertNotIn("ldgr_pm_", out + err)
-        self.assertNotIn(MAIN_CODE, out + err)
-        self.assertIn("confirmation for the person: " + ds.MAIN_READY, out)
-        self.assertEqual(oct(os.stat(ds.MAIN_KEY_FILE).st_mode & 0o777), "0o600")
-        self.assertTrue(ds.is_main_session(self.be("sess-A", (1001, "tA"))))
-        self.assertEqual(ds.read_json(ds.conf_path(ds.PERSON_SLUG), {})["workbook_id"], WID)
-        # Another session later: the key is reused, no connector call, no pickup.
-        self.sent.clear()
-        self.be("sess-C", (3303, "tC2"))
-        self.prompt("sess-C")
+        self.login = "dsat_" + "t" * 43  # the person approved the login
         rc, out, err = self.main_cmd("--on")
         self.assertEqual(rc, 0, err)
-        self.assertNotIn("no main key", out)
+        self.assertNotIn("dsat_", out + err)
+        self.assertIn("confirmation for the person: " + ds.MAIN_READY, out)
+        self.assertTrue(ds.is_main_session(self.be("sess-A", (1001, "tA"))))
+        self.assertEqual(ds.read_json(ds.conf_path(ds.PERSON_SLUG), {})["workbook_id"], WID)
         self.assertNotIn(ds.PICKUP_PATH, [p for _, p, _ in self.sent])
-        self.assertTrue(ds.is_main_session(self.be("sess-C", (3303, "tC2"))))
-        # A working key is never replaced.
-        rc, _, err = self.key_cmd()
-        self.assertNotEqual(rc, 0)
-        self.assertIn("already has a working main key", err)
 
-    def test_the_key_step_takes_only_a_main_pickup_code_and_saves_nothing_else(self):
+    def test_the_earlier_key_step_is_refused_and_saves_nothing(self):
         self.be("sess-K", (1101, "tK"))
         self.prompt("sess-K")
-        for bad in ("", "dspw_" + "c" * 32, "ldgr_pm_" + "k" * 43, "dsmk_x y"):
-            rc, _, err = self.key_cmd(bad)
-            self.assertNotEqual(rc, 0, bad)
+        for code in (MAIN_CODE, "", "dspw_" + "c" * 32):
+            rc, _, err = self.key_cmd(code)
+            self.assertNotEqual(rc, 0)
+            self.assertIn("datastash login", err)
             self.assertFalse(os.path.exists(ds.MAIN_KEY_FILE))
         self.assertEqual(self.sent, [])
-        self.code_ok = False  # unknown, used or expired
-        rc, _, err = self.key_cmd()
-        self.assertNotEqual(rc, 0)
-        self.assertIn('action "main"', err)
-        self.assertFalse(os.path.exists(ds.MAIN_KEY_FILE))
-        # Something that is not a main key is never saved.
-        self.code_ok = True
-        real = ds.http
-        ds.http = lambda method, path, **k: (200, "text/plain", "ldgr_ag_" + "k" * 43) if path == ds.PICKUP_PATH else real(method, path, **k)
-        rc, _, err = self.key_cmd()
-        self.assertNotEqual(rc, 0)
-        self.assertFalse(os.path.exists(ds.MAIN_KEY_FILE))
         self.assertFalse(ds.is_main_session(self.be("sess-K", (1101, "tK"))))
 
     def test_the_main_key_is_never_used_by_an_agent_session_or_an_ordinary_one(self):
@@ -1149,7 +1116,7 @@ class MainAnySession(MainBase):
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ds.cmd_list([]), 0)
         self.assertEqual(self.sent[-1][1].split("?")[0], ds.PERSON_WATCH_PATH)
-        self.assertTrue(self.sent[-1][2].startswith("ldgr_pm_"))
+        self.assertTrue(self.sent[-1][2].startswith("dsat_"))  # XLI-278: the datastash login's token
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ds.cmd_read(["Builder"]), 0)
         self.assertIn("inbox=Builder", self.sent[-1][1])
@@ -1419,19 +1386,17 @@ class CleanSessionOnly(MainBase):
         finally:
             ds.tool_carries_datastash = orig
 
-    def test_an_agent_action_before_the_key_step_refuses_main_but_keeps_the_key(self):
+    def test_running_datastash_login_never_records_the_session_as_an_agent(self):
         plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = plain
-        self.be("sess-W", (8401, "tW"))
-        self.prompt("sess-W")
-        self.assertEqual(self.main_cmd("--on")[0], 0)
-        self.tool_hook("sess-W", "mcp__claude_ai_Datastash__ledger_inbox_read")  # before the key step
-        rc, out, err = self.key_cmd()
-        self.assertEqual(rc, 0, err)
-        self.assertIn("This session is not the person's main", out)
-        self.assertNotIn(ds.MAIN_READY, out)
-        self.assertFalse(ds.is_main_session(self.be("sess-W", (8401, "tW"))))
-        self.assertTrue(os.path.exists(ds.MAIN_KEY_FILE))
+        sid, proc = "sess-W", (8401, "tW")
+        self.be(sid, proc)
+        self.prompt(sid)
+        for cmd in ("datastash login", "datastash login --check", 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/datastash" login'):
+            self.tool_hook(sid, "Bash", {"command": cmd})
+        self.assertFalse(self.recorded(sid, proc))
+        self.tool_hook(sid, "Bash", {"command": "datastash logout"})
+        self.assertTrue(self.recorded(sid, proc))
 
     def test_the_main_session_is_never_recorded(self):
         self.put_main_key()
@@ -1516,51 +1481,41 @@ class CleanSessionOnly(MainBase):
         self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "main"}, event="Other", response=self.main_answer())
         self.assertTrue(self.recorded(sid, proc))
 
-    def test_the_first_agent_on_a_machine_gets_the_main_key_before_it_registers(self):
-        for s in ("builder",):
-            os.replace(ds.conf_path(s), os.path.join(TMP, f"old-{s}-{time.time()}"))
+    def test_the_first_agent_on_a_machine_signs_the_computer_in_first(self):
+        """XLI-278: not signed in: the first agent's auto-name says to run datastash login first; signed in: the name."""
+        for s_ in ("builder",):
+            os.replace(ds.conf_path(s_), os.path.join(TMP, f"old-{s_}-{time.time()}"))
         proj = os.path.join(tempfile.mkdtemp(dir=TMP), "reports")
         os.makedirs(proj)
         os.environ["CLAUDE_PROJECT_DIR"] = proj
         self.be("sess-F1", (7801, "tF1"))
+        ds.signed_in = lambda: False
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ds.cmd_auto_name([]), 0)
-        self.assertEqual(out.getvalue().strip(), ds.MAIN_KEY_FIRST)
+        self.assertEqual(out.getvalue().splitlines()[0], ds.LOGIN_FIRST)  # the setup check may name it again below
         self.assertTrue(self.recorded("sess-F1", (7801, "tF1")))  # an agent session from its first step
-        # Its connector call is recorded (it is an agent), and the key step only saves the key.
-        self.tool_hook("sess-F1", ds.MAIN_CODE_TOOL, {"action": "main"}, response=self.main_answer())
-        rc, out, err = self.key_cmd()
-        self.assertEqual(rc, 0, err)
-        self.assertIn("run datastash auto-name again", out)
-        self.assertNotIn("ldgr_pm_", out + err)
-        self.assertFalse(ds.is_main_session(self.be("sess-F1", (7801, "tF1"))))
-        self.assertEqual(oct(os.stat(ds.MAIN_KEY_FILE).st_mode & 0o777), "0o600")
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_auto_name(["--no-login"])
+        self.assertEqual(out.getvalue().splitlines()[0], "name: reports")
+        ds.signed_in = lambda: True
         with redirect_stdout(io.StringIO()) as out:
             ds.cmd_auto_name([])
         self.assertEqual(out.getvalue().strip(), "name: reports")
-        # The agent session never uses the main key.
+        # The agent session never acts as the person, signed in or not.
         for call in (lambda: ds.cmd_list([]), lambda: ds.cmd_read(["person"])):
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 call()
-        # Without a key, --no-main-key skips the step (the connector refused it); a machine with agents never asks.
-        os.replace(ds.MAIN_KEY_FILE, os.path.join(TMP, f"old-main.key-{time.time()}"))
-        with redirect_stdout(io.StringIO()) as out:
-            ds.cmd_auto_name(["--no-main-key"])
-        self.assertEqual(out.getvalue().strip(), "name: reports")
-        ds.write_private(ds.conf_path("builder"), json.dumps({"name": "Builder", "workbook_id": "wb-b", "projects": [self.folder]}))
-        with redirect_stdout(io.StringIO()) as out:
-            ds.cmd_auto_name([])
-        self.assertEqual(out.getvalue().strip(), "name: reports")
 
-    def test_the_skill_and_readme_have_no_approval_page(self):
+    def test_the_skill_and_readme_have_no_main_page_or_main_code(self):
         with open(os.path.join(HERE, "..", "plugins", "datastash", "skills", "datastash-agent", "SKILL.md")) as f:
             skill = f.read()
         with open(os.path.join(HERE, "..", "README.md")) as f:
             readme = f.read()
         for text in (skill, readme):
-            for gone in ("main --wait", "approval needed", "show code", "Approve", "/main/approve"):
+            for gone in ("main --wait", "show code", "/main/approve", "main --key", "main_pickup_code"):
                 self.assertNotIn(gone, text)
-        self.assertIn('{"action": "main"}', skill)
+        self.assertNotIn('{"action": "main"}', skill)  # XLI-278: no main code from a connector call
+        self.assertIn("datastash login", skill)
         self.assertIn("`first:`", skill)
         self.assertNotIn("MAIN_START_PATH", dir(ds))
         self.assertNotIn("_main_wait", dir(ds))
@@ -1695,10 +1650,8 @@ class PickupBinding(MainBase):
         # Any connector's name for the tool (a claude.ai connector too), and main and watch codes.
         other = self.tool_hook(sid, "mcp__claude_ai_Datastash__ledger_agent_key", {"name": "Res One"}, event="PreToolUse")
         self.assertEqual(other["code_challenge"], ds.challenge_of(ds.read_verifier("agent-res-one")))
-        main = self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "main"}, event="PreToolUse")
-        self.assertEqual(main["code_challenge"], ds.challenge_of(ds.read_verifier("main")))
-        watch = self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "key", "workbook_id": "w"}, event="PreToolUse")
-        self.assertEqual(watch["code_challenge"], ds.challenge_of(ds.read_verifier("watch")))
+        # XLI-278: main and watch calls get no challenge (datastash gives no such code to any tool).
+        self.assertIsNone(self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "main"}, event="PreToolUse"))
         # No binding (and no output) for anything else: other actions, other tools, after the call, a name with no letter.
         self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "list"}, event="PreToolUse")
         self.tool_hook(sid, "mcp__plugin_datastash_datastash__ledger_inbox_read", {"name": "x"}, event="PreToolUse")
@@ -1732,306 +1685,14 @@ class PickupBinding(MainBase):
         self.assertIn("another machine", err.getvalue())
         self.assertTrue(os.path.exists(ds.verifier_path("agent-res-two")))
 
-    def test_main_and_watch_pickups_send_their_verifiers(self):
+    def test_main_and_watch_calls_never_carry_a_challenge(self):
+        """XLI-278: datastash gives main and watch codes to no tool; the hook only removes a challenge the AI planted."""
         self.be("sess-W7", (8803, "tW7"))
-        self.tool_hook("sess-W7", ds.MAIN_CODE_TOOL, {"action": "key", "workbook_id": PERSON["workbook_id"]}, event="PreToolUse")
-        v = ds.read_verifier("watch")
-        forms = []
-        ds.http = lambda method, path, key=None, body=None, form=None, timeout=40: (forms.append(form) or (200, "text/plain", "ldgr_pw_" + "k" * 43 + "\n"))
-        import sys as _s
-        _s.stdin = io.StringIO("dspw_watchcode123\n")
-        with redirect_stdout(io.StringIO()):
-            self.assertEqual(ds.person_setup([PERSON["workbook_id"], "-"]), 0)
-        self.assertEqual(forms, [{"code": "dspw_watchcode123", "verifier": v}])
-        self.assertFalse(os.path.exists(ds.verifier_path("watch")))
+        self.assertIsNone(self.tool_hook("sess-W7", ds.MAIN_CODE_TOOL, {"action": "key", "workbook_id": PERSON["workbook_id"]}, event="PreToolUse"))
+        self.assertEqual(self.tool_hook("sess-W7", ds.MAIN_CODE_TOOL, {"action": "main", "code_challenge": "C" * 43}, event="PreToolUse"), {"action": "main"})
+        self.assertIsNone(ds.read_verifier("main"))
+        self.assertIsNone(ds.read_verifier("watch"))
 
-    def test_the_rewritten_main_call_still_counts_as_the_one_clean_call_but_a_foreign_challenge_does_not(self):
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
-        os.environ["CLAUDE_PROJECT_DIR"] = plain
-        sid, proc = "sess-R7", (8804, "tR7")
-        self.be(sid, proc)
-        self.prompt(sid)
-        bound = self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "main"}, event="PreToolUse")
-        self.tool_hook(sid, ds.MAIN_CODE_TOOL, bound, response=self.main_answer())  # PostToolUse may show the rewritten input
-        self.assertFalse(self.recorded(sid, proc))
-        sid2, proc2 = "sess-R8", (8805, "tR8")
-        self.be(sid2, proc2)
-        self.prompt(sid2)
-        self.tool_hook(sid2, ds.MAIN_CODE_TOOL, {"action": "main", "code_challenge": "B" * 43}, response=self.main_answer())
-        self.assertTrue(self.recorded(sid2, proc2))
-
-
-class SignInOnce(MainBase):
-    """PM ruling 11-19: on a machine whose connector already registered agents, the person's first "datastash main" in a
-    clean session opens the standard datastash sign-in once; that fresh sign-in (a new connection with no agents) makes
-    the main key. An agent session still can't; a fresh machine is unchanged (no sign-in)."""
-
-    put_main_key = CleanSessionOnly.put_main_key
-    recorded = CleanSessionOnly.recorded
-    tool_hook = CleanSessionOnly.tool_hook
-
-    def setUp(self):
-        super().setUp()
-        self.saved.setdefault("CLAUDE_USER_CONFIG", ds.CLAUDE_USER_CONFIG)
-        ds.CLAUDE_USER_CONFIG = os.path.join(tempfile.mkdtemp(dir=TMP), ".claude.json")  # never the real one
-        ds._main_needs_sign_in = self.saved["_main_needs_sign_in"]
-        self.opened = []
-        self.mcp_refuses = False
-        self.saved.setdefault("SIGN_IN_WAIT_SECONDS", ds.SIGN_IN_WAIT_SECONDS)
-        base = ds.http
-
-        def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
-            if path == ds.OAUTH_REG_PATH:
-                self.sent.append((method, path, key))
-                self.reg = body
-                return 201, "application/json", json.dumps({"client_id": "fresh-client", "client_name": body["client_name"]})
-            if path == ds.OAUTH_TOKEN_PATH:
-                self.sent.append((method, path, key))
-                self.token_form = form
-                if form.get("code") != "authcode-1":
-                    raise ds.ApiError(400, {"error": "invalid_grant"})
-                return 200, "application/json", json.dumps({"access_token": TOKEN, "token_type": "Bearer", "expires_in": 3600})
-            if path == ds.MCP_PATH:
-                self.sent.append((method, path, key))
-                self.mcp_body, self.mcp_accept = body, accept
-                if self.mcp_refuses:
-                    res = {"isError": True, "content": [{"type": "text", "text": json.dumps({"code": "agent_id_needed"})}]}
-                else:
-                    res = {"content": [{"type": "text", "text": json.dumps({"main_pickup_code": MAIN_CODE, "expires_at": "x", "note": "n"})}]}
-                return 200, "text/event-stream", "event: message\ndata: " + json.dumps({"jsonrpc": "2.0", "id": 1, "result": res}) + "\n\n"
-            if path == ds.PICKUP_PATH:
-                self.pickup_form = form
-            return base(method, path, key=key, body=body, form=form, timeout=timeout)
-        ds.http = fake_http
-
-    def browser(self, signs_in=True, wrong_state_first=False):
-        """The person's browser: the standard sign-in page, then the return to this machine's loopback listener."""
-        def open_(url):
-            self.opened.append(url)
-            q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
-            if not signs_in:
-                return True
-
-            def go():
-                import http.client
-                port = urllib.parse.urlsplit(q["redirect_uri"]).port
-                if wrong_state_first:
-                    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                    c.request("GET", "/callback?" + urllib.parse.urlencode({"code": "authcode-evil", "state": "nope"}))
-                    self.wrong_status = c.getresponse().status
-                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-                c.request("GET", "/callback?" + urllib.parse.urlencode({"code": "authcode-1", "state": q["state"]}))
-                r = c.getresponse()
-                self.back = (r.status, r.getheader("Location"))
-            threading.Thread(target=go, daemon=True).start()
-            return True
-        ds._open_browser = open_
-
-    def registered_machine(self):
-        """A machine set up by the earlier plugin: agents here (Builder), no main key."""
-        self.assertTrue(ds.all_agents())
-        self.assertFalse(os.path.exists(ds.MAIN_KEY_FILE))
-
-    def leaked(self, text):
-        return any(x in text for x in (TOKEN, MAIN_CODE, "ldgr_pm_", "authcode-1"))
-
-    def test_an_already_registered_machine_gets_main_after_one_sign_in(self):
-        self.registered_machine()
-        self.browser(wrong_state_first=True)
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
-        os.environ["CLAUDE_PROJECT_DIR"] = plain
-        sid, proc = "sess-R", (9101, "tR")
-        self.be(sid, proc)
-        self.assertIn("the person typed", self.prompt(sid))
-        self.tool_hook(sid, "Bash", {"command": "datastash main --on"}, event="PreToolUse")  # the person's own step
-        rc, out, err = self.main_cmd("--on")
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(len(self.opened), 1)  # the sign-in opened once
-        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.opened[0]).query))
-        self.assertTrue(self.opened[0].startswith(ds.ORIGIN + ds.OAUTH_AUTH_PATH + "?"))
-        self.assertEqual((q["client_id"], q["response_type"], q["code_challenge_method"], q["resource"], q["scope"]),
-                         ("fresh-client", "code", "S256", ds.ORIGIN + ds.MCP_PATH, "mcp:tools"))
-        self.assertTrue(q["redirect_uri"].startswith("http://127.0.0.1:"))
-        # The standard page shows the same name as Claude Code's own sign-in: no new words.
-        self.assertEqual(self.reg["client_name"], "Claude Code")
-        self.assertEqual(self.reg["redirect_uris"], ["http://127.0.0.1/callback"])
-        self.assertEqual(self.wrong_status, 404)  # a return with another state is ignored
-        self.assertEqual(self.back, (302, ds.ORIGIN + "/"))  # back to datastash's own page
-        self.assertEqual(self.token_form["code_verifier"] and len(self.token_form["code_verifier"]) >= 43, True)
-        self.assertEqual(self.token_form["redirect_uri"], q["redirect_uri"])
-        # The fresh sign-in asks for the code itself (exactly {"action": "main"}), then the pickup makes the key.
-        args = self.mcp_body["params"]["arguments"]
-        self.assertEqual((self.mcp_body["params"]["name"], set(args), args["action"]), ("ledger_person_watch", {"action", "code_challenge"}, "main"))
-        # Security review H7: the code is bound to a verifier held in memory only, and the pickup sends it.
-        self.assertEqual(ds.challenge_of(self.pickup_form["verifier"]), args["code_challenge"])
-        self.assertNotEqual(ds.read_verifier("main"), self.pickup_form["verifier"])  # never written to a file
-        self.assertIn("text/event-stream", self.mcp_accept)
-        paths = [p for _, p, _ in self.sent]
-        self.assertEqual(paths[:4], [ds.OAUTH_REG_PATH, ds.OAUTH_TOKEN_PATH, ds.MCP_PATH, ds.PICKUP_PATH])
-        self.assertEqual([k for _, p, k in self.sent if p == ds.MCP_PATH], [TOKEN])
-        self.assertIn("confirmation for the person: " + ds.MAIN_READY, out)
-        self.assertFalse(self.leaked(out + err))
-        self.assertTrue(ds.is_main_session(self.be(sid, proc)))
-        self.assertFalse(self.recorded(sid, proc))
-        self.assertEqual(oct(os.stat(ds.MAIN_KEY_FILE).st_mode & 0o777), "0o600")
-        # Neither the sign-in nor the code is kept anywhere.
-        for root, _dirs, files in os.walk(TMP):
-            for f in files:
-                try:
-                    with open(os.path.join(root, f), errors="replace") as fh:
-                        text = fh.read()
-                except OSError:
-                    continue
-                self.assertNotIn(TOKEN, text, f)
-                self.assertNotIn(MAIN_CODE, text, f)
-        # Once: the next "datastash main" on this machine uses the key, with no sign-in.
-        self.opened.clear()
-        self.be("sess-R2", (9102, "tR2"))
-        self.prompt("sess-R2")
-        rc, out, err = self.main_cmd("--on")
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(self.opened, [])
-        self.assertTrue(ds.is_main_session(self.be("sess-R2", (9102, "tR2"))))
-
-    def test_a_refused_connector_call_records_the_session_and_the_next_one_signs_in(self):
-        # No agents on this machine, but the connector refuses "main" (its sign-in registered agents elsewhere).
-        os.replace(ds.conf_path("builder"), os.path.join(TMP, f"old-builder-{time.time()}"))
-        self.assertFalse(ds.all_agents())
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
-        os.environ["CLAUDE_PROJECT_DIR"] = plain
-        self.be("sess-F", (9201, "tF"))
-        self.prompt("sess-F")
-        rc, out, _ = self.main_cmd("--on")
-        self.assertIn("no main key on this machine yet", out)
-        self.tool_hook("sess-F", ds.MAIN_CODE_TOOL, {"action": "main"}, event="PreToolUse")
-        self.assertFalse(self.recorded("sess-F", (9201, "tF")))
-        inp = {"session_id": "sess-F", "tool_name": ds.MAIN_CODE_TOOL, "tool_input": {"action": "main"},
-               "hook_event_name": "PostToolUseFailure", "error": "refused", "cwd": plain}
-        self.tool_hook("sess-F", None, raw=inp)
-        self.assertTrue(self.recorded("sess-F", (9201, "tF")))  # a refusal records the session (default-deny)
-        self.assertTrue(os.path.exists(ds.MAIN_SIGN_IN_FLAG))
-        # The next clean session signs in once, and the flag goes.
-        self.browser()
-        self.be("sess-F2", (9202, "tF2"))
-        self.prompt("sess-F2")
-        rc, out, err = self.main_cmd("--on")
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(len(self.opened), 1)
-        self.assertTrue(ds.is_main_session(self.be("sess-F2", (9202, "tF2"))))
-        self.assertFalse(os.path.exists(ds.MAIN_SIGN_IN_FLAG))
-
-    def test_an_agent_session_still_cannot(self):
-        self.registered_machine()
-        self.browser()
-        # The agent's own folder session, and a session that used the connector, both type (or fake) the phrase.
-        for sid, proc, folder, step in (("sess-AG", (9301, "tAG"), self.folder, "check"),
-                                        ("sess-AC", (9302, "tAC"), tempfile.mkdtemp(dir=TMP), "connector")):
-            os.environ["CLAUDE_PROJECT_DIR"] = folder
-            self.be(sid, proc)
-            if step == "check":
-                ds.fetch_page = lambda *a, **k: ([], "c", False)
-                ds.hook_input = lambda: {"session_id": sid, "cwd": folder}
-                with redirect_stdout(io.StringIO()):
-                    ds.cmd_check([])
-            else:
-                self.tool_hook(sid, "mcp__plugin_datastash_datastash__ledger_inbox_read")
-            self.sent.clear()
-            self.assertIn("can't become", self.prompt(sid))
-            rc, out, err = self.main_cmd("--on")
-            self.assertNotEqual(rc, 0)
-            self.assertEqual(self.opened, [])  # no sign-in ever opens for an agent session
-            self.assertEqual(self.sent, [])
-            self.assertFalse(ds.is_main_session(self.be(sid, proc)))
-        # An agent session with a main key on the machine never reads it (review LOW): the key step stops first.
-        self.put_main_key()
-        reads = []
-        real = ds.read_main_key
-        ds.read_main_key = lambda: reads.append(1) or real()
-        try:
-            rc, _, err = self.key_cmd()
-        finally:
-            ds.read_main_key = real
-        self.assertNotEqual(rc, 0)
-        self.assertIn("can't use it", err)
-        self.assertEqual(reads, [])
-        self.assertEqual(self.sent, [])
-
-    def test_a_fresh_machine_is_unchanged(self):
-        os.replace(ds.conf_path("builder"), os.path.join(TMP, f"old-builder-{time.time()}"))
-        self.assertFalse(ds.all_agents())
-        self.assertFalse(os.path.exists(ds.MAIN_SIGN_IN_FLAG))
-        ds._open_browser = lambda url: self.fail("a fresh machine never opens a sign-in")
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
-        os.environ["CLAUDE_PROJECT_DIR"] = plain
-        self.be("sess-N", (9401, "tN"))
-        self.prompt("sess-N")
-        rc, out, _ = self.main_cmd("--on")
-        self.assertEqual(rc, 0)
-        self.assertEqual(out.strip(), ds.MAIN_KEY_STEP)
-        self.assertEqual(self.sent, [])
-        rc, out, err = self.key_cmd()  # the one connector call's code
-        self.assertEqual(rc, 0, err)
-        self.assertTrue(ds.is_main_session(self.be("sess-N", (9401, "tN"))))
-        self.assertNotIn(ds.OAUTH_REG_PATH, [p for _, p, _ in self.sent])
-
-    def test_a_sign_in_that_does_not_finish_saves_nothing(self):
-        self.registered_machine()
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
-        os.environ["CLAUDE_PROJECT_DIR"] = plain
-        cases = [("no browser", lambda: setattr(ds, "_open_browser", lambda url: False), "no browser"),
-                 ("never comes back", lambda: (self.browser(signs_in=False), setattr(ds, "SIGN_IN_WAIT_SECONDS", 1.5)), "no sign-in came back"),
-                 ("datastash refuses", lambda: (self.browser(), setattr(self, "mcp_refuses", True)), "gave no main key")]
-        for i, (label, arrange, words) in enumerate(cases):
-            with self.subTest(label):
-                arrange()
-                sid, proc = f"sess-X{i}", (9500 + i, f"tX{i}")
-                self.be(sid, proc)
-                self.prompt(sid)
-                rc, out, err = self.main_cmd("--on")
-                self.assertNotEqual(rc, 0)
-                self.assertIn(words, err)
-                self.assertIn("Nothing was saved", err)
-                self.assertFalse(self.leaked(out + err))
-                self.assertFalse(os.path.exists(ds.MAIN_KEY_FILE))
-                self.assertFalse(ds.is_main_session(self.be(sid, proc)))
-                self.assertNotIn(ds.PICKUP_PATH, [p for _, p, _ in self.sent])
-
-    def test_two_key_steps_at_once_pick_up_one_key(self):
-        """Review LOW: two first agents at once both saw no key and the second overwrote the first."""
-        os.replace(ds.conf_path("builder"), os.path.join(TMP, f"old-builder-{time.time()}"))
-        base = ds.http
-        pickups = []
-
-        def slow(method, path, **k):
-            if path == ds.PICKUP_PATH:
-                pickups.append(1)
-                time.sleep(0.4)
-            return base(method, path, **k)
-        ds.http = slow
-        results = []
-
-        def run(sid, pid):
-            me = self.be(sid, (pid, f"t{pid}"))
-            ds.mark_agent_use(me, "auto-name")  # a first agent
-            try:
-                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    results.append(ds._take_main_code(me, MAIN_CODE))
-            except SystemExit as e:
-                results.append(e.code)
-        ts = [threading.Thread(target=run, args=(f"sess-T{i}", 9600 + i)) for i in range(2)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join(10)
-        self.assertEqual(len(pickups), 1)
-        self.assertEqual(sorted(r == 0 for r in results), [False, True])
-
-    def test_the_failure_hook_is_wired(self):
-        with open(os.path.join(HERE, "..", "plugins", "datastash", "hooks", "hooks.json")) as f:
-            hooks = json.load(f)
-        groups = hooks["hooks"]["PostToolUseFailure"]
-        self.assertEqual([h["args"][-1] for g in groups for h in g["hooks"]], ["agent-tool"])
-        self.assertEqual([g["matcher"] for g in groups], ["*"])
 
 
 class SetupDoctor(Base):
@@ -2312,40 +1973,34 @@ class SetupDoctor(Base):
 
 
 class SignInHint(Base):
-    """The connector sign-in check (finding 11-20): after install Claude Code marks the datastash connector "needs
-    authentication" and waits; the session start, doctor and the first-use check tell the person to /mcp."""
+    """XLI-278: this computer's datastash login. Not signed in: the session start (once per session), doctor and the
+    first-use check tell the AI to run datastash login; never a token in any line. The imported claude.ai connector line
+    is said once per computer, ever."""
 
     def setUp(self):
         super().setUp()
-        for k in ("CLAUDE_DIR", "STATE", "HEARTBEAT", "CONF"):
+        ds.signed_in = self.saved["signed_in"]
+        ds.imported_connector_hint = self.saved["imported_connector_hint"]
+        for k in ("STATE", "HEARTBEAT", "CONF", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE"):
             self.saved.setdefault(k, getattr(ds, k))
         root = tempfile.mkdtemp(dir=TMP)
         ds.CONF = os.path.join(root, "conf")
         ds.STATE = os.path.join(ds.CONF, "state")
         ds.HEARTBEAT = os.path.join(ds.STATE, "hooks-heartbeat.json")
-        ds.CLAUDE_DIR = os.path.join(root, ".claude")
-        os.makedirs(ds.CLAUDE_DIR, mode=0o700)
+        for k, n in (("LOGIN_FILE", "login.json"), ("LOGIN_REFRESH_FILE", "login.refresh"), ("LOGIN_ACCESS_FILE", "login.access.json"), ("LOGIN_PENDING_FILE", "login.pending.json")):
+            setattr(ds, k, os.path.join(ds.CONF, n))
         ds.ensure_dirs()
         ds.hook_heartbeat("check", {"session_id": "s1"})
         self.proj = os.path.join(root, "proj")
         os.makedirs(self.proj)
-        self.saved.setdefault("platform", ds.sys.platform)
 
     def tearDown(self):
-        ds.sys.platform = self.saved.pop("platform")
         os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
         super().tearDown()
 
-    def creds(self, entry=None, raw=None, name="plugin:datastash:datastash"):
-        data = {"claudeAiOauth": {"accessToken": "SECRET-CLAUDE"}, "mcpOAuth": {}}
-        if entry is not None:
-            e = {"serverName": name, "serverUrl": "https://getdatastash.com/mcp"}
-            e.update(entry)
-            data["mcpOAuth"][name + "|2607c1f407630c0e"] = e
-        p = os.path.join(ds.CLAUDE_DIR, ".credentials.json")
-        with open(p, "w") as f:
-            f.write(raw if raw is not None else json.dumps(data))
-        os.chmod(p, 0o600)
+    def login_on_file(self):
+        ds.write_private(ds.LOGIN_REFRESH_FILE, "dsrt_" + "r" * 43 + "\n")
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": 1}))
 
     def check_ctx(self, sid="s1"):
         ds.hook_input = lambda: {"session_id": sid}
@@ -2355,56 +2010,30 @@ class SignInHint(Base):
             ds.cmd_check([])
         return json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
 
-    def test_detection(self):
-        day = (time.time() + 86400) * 1000
-        past = (time.time() - 60) * 1000
-        ds.sys.platform = "linux"
-        self.assertIsNone(ds.connector_signed_in())  # no file: can't tell
-        self.creds(raw="{not json")
-        self.assertIsNone(ds.connector_signed_in())
-        self.creds(raw="[]")
-        self.assertIsNone(ds.connector_signed_in())
-        self.creds()
-        self.assertFalse(ds.connector_signed_in())  # no entry for the connector yet
-        self.creds({"accessToken": "", "discoveryState": {}})  # what Claude Code writes after install (11-20)
-        self.assertFalse(ds.connector_signed_in())
-        self.creds({"accessToken": "tok", "expiresAt": past})
-        self.assertFalse(ds.connector_signed_in())  # expired, nothing to refresh with
-        self.creds({"accessToken": "tok", "expiresAt": past, "refreshToken": "r"})
-        self.assertTrue(ds.connector_signed_in())  # Claude Code refreshes it
-        self.creds({"accessToken": "tok", "expiresAt": day})
-        self.assertTrue(ds.connector_signed_in())
-        self.creds({"accessToken": "tok"})
-        self.assertTrue(ds.connector_signed_in())
-        self.creds({"accessToken": "tok", "expiresAt": day}, name="some-other-server")
-        self.assertFalse(ds.connector_signed_in())  # another server's sign-in doesn't count
-        ds.sys.platform = "darwin"
-        self.creds({"accessToken": ""})
-        self.assertIsNone(ds.connector_signed_in())  # the keychain may hold it
-        self.creds({"accessToken": "tok"})
-        self.assertTrue(ds.connector_signed_in())
-
-    def test_session_start_says_it_once_per_session(self):
-        ds.sys.platform = "linux"
-        self.creds({"accessToken": ""})
+    def test_session_start_says_login_once_per_session(self):
         ctx = self.check_ctx("sess-A")
         self.assertTrue(ctx.startswith(ds.SIGN_IN_NOTE), ctx)
-        self.assertIn(ds.SIGN_IN_HINT, ctx)
-        self.assertIn("type /mcp, pick datastash, choose Authenticate, and sign in with Google", ctx)
-        self.assertEqual(ctx.count("/mcp"), 1)
-        self.assertNotIn("SECRET", ctx)
-        self.assertNotIn(ds.SIGN_IN_HINT, self.check_ctx("sess-A"))  # a second start in that session: not again
-        self.assertIn(ds.SIGN_IN_HINT, self.check_ctx("sess-B"))  # a new session: once more
+        self.assertIn("run datastash login", ctx)
+        self.assertIn(ds.LOGIN_HINT, ctx)
+        self.assertNotIn("dsrt_", ctx)
+        self.assertNotIn("run datastash login", self.check_ctx("sess-A"))  # a second start in that session: not again
+        self.assertIn("run datastash login", self.check_ctx("sess-B"))  # a new session: once more
 
-    def test_session_start_silent_when_signed_in_or_unknown(self):
-        ds.sys.platform = "linux"
-        self.assertNotIn("/mcp", self.check_ctx("sess-C"))  # no credential file: can't tell, say nothing
-        self.creds({"accessToken": "tok"})
-        self.assertNotIn("/mcp", self.check_ctx("sess-D"))
+    def test_session_start_silent_when_signed_in(self):
+        self.login_on_file()
+        ctx = self.check_ctx("sess-C")
+        self.assertNotIn("run datastash login", ctx)
+        self.assertNotIn("dsrt_", ctx)
+
+    def test_imported_connector_line_is_said_once_per_computer(self):
+        self.login_on_file()
+        first = self.check_ctx("sess-D")
+        self.assertIn('"/mcp, pick datastash, choose Authenticate"', first)
+        self.assertIn("claude.ai datastash", first)
+        for sid in ("sess-D", "sess-E", "sess-F"):
+            self.assertNotIn("choose Authenticate", self.check_ctx(sid))
 
     def test_agent_session_start_keeps_its_count(self):
-        ds.sys.platform = "linux"
-        self.creds({"accessToken": ""})
         ds.hook_input = lambda: {"session_id": "sess-E"}
         ds.fetch_page = lambda *a, **k: ([{"message_id": 7, "status": "new"}], "1", False)
         out = io.StringIO()
@@ -2412,38 +2041,192 @@ class SignInHint(Base):
             ds.cmd_check([])
         ctx = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
         self.assertTrue(ctx.startswith(ds.SIGN_IN_NOTE))
-        self.assertIn(ds.SIGN_IN_HINT, ctx)
+        self.assertIn("run datastash login", ctx)
         self.assertIn("1 new message in its inbox", ctx)
 
     def test_doctor_and_first_use_check(self):
-        ds.sys.platform = "linux"
         ds.http = lambda *a, **k: (200, "text/html", "")
         self.saved.setdefault("http", ds.http)
         os.environ["CLAUDE_CODE_SESSION_ID"] = "s1"
         ds.resolve = lambda p, me=None: (None, [])
-        self.creds({"accessToken": ""})
         found = {f["id"]: f for f in ds.setup_findings(self.proj)}
         self.assertIn("not_signed_in", found)
-        self.assertIsNone(found["not_signed_in"]["cmd"])  # nothing to run: the person signs in through /mcp
+        self.assertIsNone(found["not_signed_in"]["cmd"])
         err = io.StringIO()
         ds.auto_setup_check(self.proj, stream=err)
-        self.assertIn(ds.SIGN_IN_HINT, err.getvalue())
-        with redirect_stdout(io.StringIO()) as out:
-            ds.cmd_doctor([])
-        self.assertIn("problem: " + ds.SETUP_NOTE + ": the datastash connector is not signed in", out.getvalue())
-        self.assertIn(ds.SIGN_IN_HINT, out.getvalue())
-        self.creds({"accessToken": "tok"})
+        self.assertIn("run datastash login", err.getvalue())
+        self.login_on_file()
         self.assertNotIn("not_signed_in", {f["id"] for f in ds.setup_findings(self.proj)})
         with redirect_stdout(io.StringIO()) as out:
             ds.cmd_doctor([])
-        self.assertIn("ok: sign-in: the datastash connector is signed in.", out.getvalue())
-        self.assertNotIn("tok", out.getvalue().replace("token", ""))
-        ds.sys.platform = "darwin"
-        self.creds({"accessToken": ""})
+        self.assertIn("ok: sign-in: this computer is signed in to datastash", out.getvalue())
+        self.assertNotIn("dsrt_", out.getvalue())
+
+    def test_put_on_path_writes_the_scripts_folder_once(self):
+        env = os.path.join(TMP, f"env-{time.time()}")
+        os.environ["CLAUDE_ENV_FILE"] = env
+        try:
+            ds.put_on_path()
+            with open(env) as f:
+                line = f.read()
+            self.assertIn(os.path.dirname(os.path.realpath(BIN)), line)
+            self.assertTrue(line.startswith("export PATH="))
+        finally:
+            os.environ.pop("CLAUDE_ENV_FILE", None)
+
+
+class Login(Base):
+    """XLI-278: datastash login (device flow), the keychain or a mode-600 file, datastash token --header, logout."""
+
+    def setUp(self):
+        super().setUp()
+        ds.signed_in = self.saved["signed_in"]
+        for k in ("CONF", "STATE", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE", "http",
+                  "_keychain_set", "_keychain_get", "_keychain_del", "_open_browser"):
+            self.saved.setdefault(k, getattr(ds, k))
+        root = tempfile.mkdtemp(dir=TMP)
+        ds.CONF = os.path.join(root, "conf")
+        ds.STATE = os.path.join(ds.CONF, "state")
+        for k, n in (("LOGIN_FILE", "login.json"), ("LOGIN_REFRESH_FILE", "login.refresh"), ("LOGIN_ACCESS_FILE", "login.access.json"), ("LOGIN_PENDING_FILE", "login.pending.json")):
+            setattr(ds, k, os.path.join(ds.CONF, n))
+        ds.ensure_dirs()
+        self.keychain = {}
+        self.calls = []
+        ds._keychain_set = lambda t: (self.keychain.__setitem__("rt", t) or True) if self.keychain_works else False
+        ds._keychain_get = lambda: self.keychain.get("rt")
+        ds._keychain_del = lambda: self.keychain.pop("rt", None)
+        ds._open_browser = lambda url: self.calls.append(("browser", url)) or True
+        self.keychain_works = True
+        self.refresh_status = 200
+        self.n = 0
+
+        def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
+            self.calls.append((method, path, json.dumps(body)))
+            if path == ds.DEVICE_START_PATH:
+                return 200, "application/json", json.dumps({"device_code": "dsdc_" + "d" * 43, "user_code": "BCDF-GHJK",
+                                                            "verification_uri": ds.ORIGIN + "/device", "expires_in": 600, "interval": 5})
+            if path == ds.DEVICE_TOKEN_PATH:
+                return 200, "application/json", json.dumps({"access_token": "dsat_" + "a" * 43, "refresh_token": "dsrt_" + "r" * 43, "expires_in": 900})
+            if path == ds.DEVICE_REFRESH_PATH:
+                if self.refresh_status != 200:
+                    raise ds.ApiError(self.refresh_status, {"error": "invalid_grant"})
+                self.n += 1
+                return 200, "application/json", json.dumps({"access_token": "dsat_" + str(self.n) * 43, "expires_in": 900})
+            if path == ds.DEVICE_LOGOUT_PATH:
+                return 200, "application/json", json.dumps({"revoked": True})
+            raise AssertionError(path)
+        ds.http = fake_http
+
+    def finish_login(self):
+        ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps({"device_code": "dsdc_" + "d" * 43, "interval": 5, "until": time.time() + 30}))
+        self.saved.setdefault("time_sleep", ds.time.sleep)
+        ds.time.sleep = lambda s: None
+        try:
+            ds._login_poll()
+        finally:
+            ds.time.sleep = self.saved.pop("time_sleep")
+
+    def test_login_prints_the_code_opens_the_page_and_never_a_token(self):
+        self.saved.setdefault("Popen", ds.subprocess.Popen)
+        started = []
+        ds.subprocess.Popen = lambda *a, **k: started.append(a[0])
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ds.cmd_login([]), 0)
+        finally:
+            ds.subprocess.Popen = self.saved.pop("Popen")
+        text = out.getvalue()
+        self.assertIn("code: BCDF-GHJK", text)
+        self.assertIn("Type the code BCDF-GHJK there and press Approve", text)
+        self.assertNotIn("dsdc_", text)
+        self.assertEqual(self.calls[1], ("browser", ds.ORIGIN + "/device"))  # no code in the address
+        self.assertEqual(started[0][-2:], ["login", "--poll"])  # the device code is never on a command line
+        self.assertEqual(os.stat(ds.LOGIN_PENDING_FILE).st_mode & 0o777, 0o600)
         with redirect_stdout(io.StringIO()) as out:
-            ds.cmd_doctor([])
-        self.assertIn("note: sign-in: can't tell", out.getvalue())
-        self.assertNotIn("not_signed_in", {f["id"] for f in ds.setup_findings(self.proj)})
+            ds.cmd_login(["--check"])
+        self.assertIn("signed in: waiting", out.getvalue())
+
+    def test_the_background_poll_saves_the_refresh_token_in_the_keychain(self):
+        self.finish_login()
+        self.assertEqual(self.keychain["rt"], "dsrt_" + "r" * 43)
+        self.assertFalse(os.path.exists(ds.LOGIN_REFRESH_FILE))
+        self.assertFalse(os.path.exists(ds.LOGIN_PENDING_FILE))
+        self.assertEqual(json.load(open(ds.LOGIN_FILE))["store"], "keychain")
+        self.assertTrue(ds.signed_in())
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_login(["--check"])
+        self.assertIn("signed in: yes", out.getvalue())
+
+    def test_no_keychain_falls_back_to_a_private_file(self):
+        self.keychain_works = False
+        self.finish_login()
+        self.assertEqual(json.load(open(ds.LOGIN_FILE))["store"], "file")
+        self.assertEqual(os.stat(ds.LOGIN_REFRESH_FILE).st_mode & 0o777, 0o600)
+        self.assertEqual(ds.refresh_token(), "dsrt_" + "r" * 43)
+        os.chmod(ds.LOGIN_REFRESH_FILE, 0o644)
+        self.assertIsNone(ds.refresh_token())  # a file others can read is never used
+
+    def test_token_header_prints_only_the_header_and_reuses_the_15_minute_token(self):
+        self.finish_login()
+        self.saved.setdefault("stdout_isatty", None)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(ds.cmd_token(["--header"]), 0)
+        self.assertEqual(json.loads(buf.getvalue()), {"Authorization": "Bearer dsat_" + "a" * 43})
+        self.assertNotIn("dsrt_", buf.getvalue())
+        self.assertFalse(any(c[1] == ds.DEVICE_REFRESH_PATH for c in self.calls))  # the cached token still had time
+        # Near its end it refreshes.
+        a = json.load(open(ds.LOGIN_ACCESS_FILE))
+        ds.write_private(ds.LOGIN_ACCESS_FILE, json.dumps(dict(a, exp=int(time.time()) + 30)))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ds.cmd_token(["--header"])
+        self.assertEqual(json.loads(buf.getvalue()), {"Authorization": "Bearer dsat_" + "1" * 43})
+
+    def test_token_header_refuses_a_terminal_and_is_empty_when_signed_out(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        with redirect_stdout(Tty()), redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                ds.cmd_token(["--header"])
+        self.assertIn("never to a terminal", err.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ds.cmd_token(["--header"])
+        self.assertEqual(json.loads(buf.getvalue()), {})
+
+    def test_revoked_at_datastash_forgets_the_local_login(self):
+        self.finish_login()
+        os.replace(ds.LOGIN_ACCESS_FILE, os.path.join(TMP, f"old-access-{time.time()}"))
+        self.refresh_status = 401
+        self.assertIsNone(ds.login_token())
+        self.assertFalse(ds.signed_in())
+        self.assertNotIn("rt", self.keychain)
+
+    def test_logout_revokes_and_removes_the_keychain_item(self):
+        self.finish_login()
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_logout([])
+        self.assertIn("signed out: this computer's datastash login is stopped", out.getvalue())
+        self.assertIn(("POST", ds.DEVICE_LOGOUT_PATH, json.dumps({"refresh_token": "dsrt_" + "r" * 43})), self.calls)
+        self.assertNotIn("rt", self.keychain)
+        self.assertFalse(os.path.exists(ds.LOGIN_ACCESS_FILE))
+        self.assertFalse(ds.signed_in())
+
+    def test_the_person_credential_is_the_login_token(self):
+        self.finish_login()
+        ds.read_key = self.saved["read_key"]
+        self.assertEqual(ds.read_key(ds.PERSON_SLUG), "dsat_" + "a" * 43)
+        self.assertEqual(ds.read_main_key(), "dsat_" + "a" * 43)
+
+    def test_mcp_json_uses_the_header_helper(self):
+        with open(os.path.join(HERE, "..", "plugins", "datastash", ".mcp.json")) as f:
+            cfg = json.load(f)["mcpServers"]["datastash"]
+        self.assertEqual(cfg["url"], "https://getdatastash.com/mcp")
+        self.assertIn("scripts/datastash", cfg["headersHelper"])
+        self.assertTrue(cfg["headersHelper"].endswith("token --header"))
+        self.assertFalse(os.path.exists(os.path.join(HERE, "..", "plugins", "datastash", "bin")))  # chat and Cowork refuse a top-level bin/
 
 
 if __name__ == "__main__":

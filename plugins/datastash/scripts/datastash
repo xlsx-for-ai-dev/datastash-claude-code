@@ -24,24 +24,24 @@ The person's own session ("datastash main"; the person, never an agent; any fold
   main                      say whether this session is the person's main, whether the person asked for it here, and
                             whether the person watch is set up
   main --on                 after the person typed "datastash main" in THIS session: make it the person's main for its
-                            lifetime. Needs the main key (~/.config/datastash/main.key, mode 600, never printed); the
-                            first time on a machine it says to get one (the person's typed phrase is the approval);
-                            on a machine whose connector already registered agents it opens the person's datastash
-                            sign-in in the browser once instead, and that fresh sign-in makes the key.
-                            Refused in a session that acted as an agent.
-  main --key -              trade a one-time main pickup code (stdin; from the connector's ledger_person_watch action
-                            "main", the person's own sign-in) for the main key and save it; then finish --on when the
-                            person typed "datastash main" in this clean session
+                            lifetime, signed in by this computer's datastash login. Refused in a session that acted
+                            as an agent.
   main --workbook ID        pick the agent workbook the main session watches (when there are several)
   list [--all]              the person's main view: open items, blocked on the person first (main key)
   read INBOX                read one inbox as the person ("person" or an agent's name; main key)
   filter AGENT | --kind K   the person's filters (unfilter undoes one; main key)
-  watch --person --setup WORKBOOK_ID [-|CODE] [--project DIR]
-                            (earlier design, still works) the same trade without making a session main; links DIR
   watch --person            print one line each time new items arrive across the agent workbook (for a Monitor loop)
   reply MESSAGE_ID [-]      answer a message as the person; the text is read from stdin
   send AGENT [--subject S] [-]
                             send a message to an agent's inbox as the person; the text is read from stdin
+This computer's datastash login (XLI-278; the person approves it once in their browser):
+  login                     start the login: prints a code and opens https://getdatastash.com/device, where the person
+                            types the code and approves; a background helper finishes it. The refresh token goes in the
+                            OS keychain (macOS Keychain, libsecret), or a mode-600 file when there is none. Never printed.
+  login --check             signed in: yes, waiting or no
+  logout                    sign this computer out at datastash and remove the keychain item
+  token --header            for the datastash connector's headersHelper only: prints {"Authorization": "Bearer ..."} (a
+                            15-minute token) when stdout is not a terminal, {} when not signed in. Never logs.
 Hook entry points (run by Claude Code, not by hand): check, listen, end, prompt, agent-tool.
 
 The key is read from its file and sent only to https://getdatastash.com, never printed, logged or put on a
@@ -54,6 +54,7 @@ import http.client as httpclient
 import fcntl
 import json
 import os
+import platform
 import posixpath
 import random
 import re
@@ -61,6 +62,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -69,7 +71,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ORIGIN = "https://getdatastash.com"
 API_PREFIX = "/api/v1/agent/"
@@ -122,7 +123,22 @@ CONF = os.environ.get("DATASTASH_CONFIG_DIR") or os.path.join(HOME, ".config", "
 MAIN_DIR = os.environ.get("DATASTASH_MAIN_DIR") or os.path.join(HOME, "datastash main")
 MAIN_MARKER = ".datastash-main"  # marker file the main setup writes inside "datastash main" (a private token)
 MAIN_CONF = os.path.join(CONF, "main.json")  # private record of that folder and its token
-MAIN_KEY_FILE = os.path.join(CONF, "main.key")  # the person's main key (from the person's own sign-in)
+MAIN_KEY_FILE = os.path.join(CONF, "main.key")  # an earlier main key (XLI-240); XLI-278 uses the datastash login instead
+# XLI-278: this computer's datastash login (OAuth device flow). The refresh token lives in the OS keychain (service
+# "datastash"), or in LOGIN_REFRESH_FILE (mode 600) when no keychain works; LOGIN_FILE records which (never a token).
+# LOGIN_ACCESS_FILE caches the current 15-minute access token (mode 600) so every hook and helper call doesn't refresh.
+LOGIN_FILE = os.path.join(CONF, "login.json")
+LOGIN_REFRESH_FILE = os.path.join(CONF, "login.refresh")
+LOGIN_ACCESS_FILE = os.path.join(CONF, "login.access.json")
+LOGIN_PENDING_FILE = os.path.join(CONF, "login.pending.json")  # the device code while the person approves (mode 600)
+KEYCHAIN_SERVICE = "datastash"
+KEYCHAIN_ACCOUNT = "refresh-token"
+DEVICE_START_PATH = "/api/v1/device/start"
+DEVICE_TOKEN_PATH = "/api/v1/device/token"
+DEVICE_REFRESH_PATH = "/api/v1/device/refresh"
+DEVICE_LOGOUT_PATH = "/api/v1/device/logout"
+REFRESH_RE = r"dsrt_[A-Za-z0-9_\-]{20,100}"
+ACCESS_RE = r"dsat_[A-Za-z0-9_\-]{20,100}"
 STATE = os.path.join(CONF, "state")
 OFF = os.path.join(CONF, "off")
 # Security review H7: pickup codes bound to this machine (PKCE-style). Before a connector call that asks for a pickup code
@@ -232,18 +248,12 @@ def pickup_binding(inp):
     name, args = inp.get("tool_name"), inp.get("tool_input")
     if not isinstance(name, str) or not isinstance(args, dict) or not PICKUP_TOOL_RE.fullmatch(name):
         return None
-    if name.endswith("__ledger_agent_key"):
-        agent = args.get("name")
-        if not isinstance(agent, str) or not re.sub(r"[^a-z0-9]+", "", agent.lower()):
-            return strip_challenge(inp)  # no file name to keep a verifier under: never pass the AI's own challenge
-        kind = f"agent-{slug(agent)}"
-    elif args.get("action") == "main":
-        kind = "main"
-    elif args.get("action") == "key":
-        kind = "watch"
-    else:
-        return None
-    return dict(args, code_challenge=new_challenge(kind))
+    if not name.endswith("__ledger_agent_key"):
+        return strip_challenge(inp)  # XLI-278: datastash gives no main or watch code to any tool; never pass the AI's
+    agent = args.get("name")
+    if not isinstance(agent, str) or not re.sub(r"[^a-z0-9]+", "", agent.lower()):
+        return strip_challenge(inp)  # no file name to keep a verifier under: never pass the AI's own challenge
+    return dict(args, code_challenge=new_challenge(f"agent-{slug(agent)}"))
 
 
 def strip_challenge(inp):
@@ -288,14 +298,153 @@ def read_json(path, default):
 
 
 def read_key(s):
-    """The agent key, or None. Refuses a key file anyone else can read. For the person: the main key, else the watch key."""
+    """The agent key, or None. Refuses a key file anyone else can read. For the person: this computer's datastash login
+    (a 15-minute token), else an earlier main or watch key."""
     if person_slug(s):
-        return _read_key_file(MAIN_KEY_FILE, MAIN_KEY_RE, s) or _read_key_file(key_path(s), PERSON_KEY_RE, s)
+        return login_token() or _read_key_file(MAIN_KEY_FILE, MAIN_KEY_RE, s) or _read_key_file(key_path(s), PERSON_KEY_RE, s)
     return _read_key_file(key_path(s), r"ldgr_ag_[A-Za-z0-9_\-]+", s)
 
 
 def read_main_key():
-    return _read_key_file(MAIN_KEY_FILE, MAIN_KEY_RE, PERSON_SLUG)
+    """The person's main-session credential: the datastash login's token, else an earlier main key."""
+    return login_token() or _read_key_file(MAIN_KEY_FILE, MAIN_KEY_RE, PERSON_SLUG)
+
+
+# ------------------------------------------------------------------ datastash login (XLI-278)
+
+def _run(cmd, stdin_text=None, timeout=8):
+    """Run a keychain tool quietly. (returncode, stdout) or (None, "") when it can't run. Secrets go on stdin only."""
+    try:
+        r = subprocess.run(cmd, input=stdin_text, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+
+
+def _keychain_set(token):
+    """True when the OS keychain now holds the refresh token. The token never goes on a command line."""
+    if not re.fullmatch(REFRESH_RE, token):
+        return False
+    if sys.platform == "darwin" and shutil.which("security"):
+        # security -i reads its commands from stdin, so the token stays off the process list.
+        rc, _ = _run(["security", "-i"], f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w "{token}"\n')
+        return rc == 0 and _keychain_get() == token
+    if shutil.which("secret-tool"):
+        rc, _ = _run(["secret-tool", "store", "--label=datastash login", "service", KEYCHAIN_SERVICE, "account", KEYCHAIN_ACCOUNT], token)
+        return rc == 0 and _keychain_get() == token
+    return False
+
+
+def _keychain_get():
+    if sys.platform == "darwin" and shutil.which("security"):
+        rc, out = _run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"])
+    elif shutil.which("secret-tool"):
+        rc, out = _run(["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "account", KEYCHAIN_ACCOUNT])
+    else:
+        return None
+    out = (out or "").strip()
+    return out if rc == 0 and re.fullmatch(REFRESH_RE, out) else None
+
+
+def _keychain_del():
+    if sys.platform == "darwin" and shutil.which("security"):
+        _run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
+    elif shutil.which("secret-tool"):
+        _run(["secret-tool", "clear", "service", KEYCHAIN_SERVICE, "account", KEYCHAIN_ACCOUNT])
+
+
+def _read_private_json(path):
+    """A JSON object from a private file of this user (mode 600), or None."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        if not stat_ok(os.fstat(fd)):
+            return None
+        with os.fdopen(fd, "r") as f:
+            fd = None
+            v = json.loads(f.read(65536))
+        return v if isinstance(v, dict) else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def refresh_token():
+    """This computer's datastash login refresh token, or None (not signed in). Never printed."""
+    where = read_json(LOGIN_FILE, {}).get("store")
+    if where == "keychain":
+        return _keychain_get()
+    if where == "file":
+        return _read_key_file(LOGIN_REFRESH_FILE, REFRESH_RE, PERSON_SLUG)
+    return None
+
+
+def signed_in():
+    return refresh_token() is not None
+
+
+def _save_login(refresh, access, expires_in):
+    ensure_dirs()
+    if _keychain_set(refresh):
+        _drop(LOGIN_REFRESH_FILE)
+        store = "keychain"
+    else:
+        write_private(LOGIN_REFRESH_FILE, refresh + "\n")
+        store = "file"
+    write_private(LOGIN_FILE, json.dumps({"store": store, "at": int(time.time())}))
+    _save_access(access, expires_in)
+    return store
+
+
+def _save_access(access, expires_in):
+    try:
+        ttl = int(expires_in)
+    except (TypeError, ValueError):
+        ttl = 900
+    write_private(LOGIN_ACCESS_FILE, json.dumps({"token": access, "exp": int(time.time()) + max(60, min(ttl, 3600))}))
+
+
+def _forget_login():
+    _keychain_del()
+    for p in (LOGIN_REFRESH_FILE, LOGIN_ACCESS_FILE, LOGIN_FILE, LOGIN_PENDING_FILE):
+        _drop(p)
+
+
+LOGIN_REFRESH_TIMEOUT = 8  # inside the connector helper's 10 s
+
+
+def login_token(force=False):
+    """A live access token of this computer's datastash login (refreshed within a minute of its end), or None: not
+    signed in, signed out at datastash (then the local login is removed), or datastash can't be reached. Never printed
+    or logged by this function."""
+    if not force:
+        a = _read_private_json(LOGIN_ACCESS_FILE)
+        if a and isinstance(a.get("token"), str) and re.fullmatch(ACCESS_RE, a["token"]) and _num_ok(a.get("exp")) and a["exp"] - 60 > time.time():
+            return a["token"]
+    rt = refresh_token()
+    if rt is None:
+        return None
+    try:
+        _st, _ct, text = http("POST", DEVICE_REFRESH_PATH, body={"refresh_token": rt}, timeout=LOGIN_REFRESH_TIMEOUT)
+        got = json.loads(text)
+    except ApiError as e:
+        if e.status in (400, 401):
+            _forget_login()  # signed out at datastash (account page or logout elsewhere)
+        return None
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return None
+    tok = got.get("access_token") if isinstance(got, dict) else None
+    if not isinstance(tok, str) or not re.fullmatch(ACCESS_RE, tok):
+        return None
+    try:
+        _save_access(tok, got.get("expires_in"))
+    except OSError:
+        pass
+    return tok
 
 
 def _read_key_file(p, pattern, s):
@@ -1072,9 +1221,13 @@ def cmd_check(_args):
     inp = hook_input()
     hook_heartbeat("check", inp)
     agent, warn = resolve(project_of(inp), me=this_session(inp))
+    put_on_path()
     hint = sign_in_hint(inp)
     if hint:
         warn = [hint] + list(warn)
+    once = imported_connector_hint()
+    if once:
+        warn = list(warn) + [once]
     if agent is None:
         if main_root(project_of(inp)) is None:
             warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. On its first datastash use it registers '
@@ -1565,57 +1718,19 @@ WATCH_FALLBACK = "Until then, `datastash watch` under a Monitor still delivers m
 SETUP_NOTE = "datastash setup check (local; information only)"
 
 
-CONNECTOR_SERVER = "plugin:datastash:datastash"  # the name Claude Code gives this plugin's datastash connector
-SIGN_IN_HINT = ("datastash isn't signed in yet: type /mcp, pick datastash, choose Authenticate, and sign in with "
-                "Google.")
+SIGN_IN_HINT = 'this computer is not signed in to datastash yet: run datastash login (the person approves it in the browser once).'
 SIGN_IN_NOTE = "datastash note (local sign-in check; information only)"
 
 
-def connector_signed_in():
-    """Is this plugin's datastash connector signed in? True, False, or None (can't tell).
-
-    The signal is Claude Code's own credential file, <Claude config folder>/.credentials.json, where Claude Code keeps
-    each MCP server's sign-in under "mcpOAuth" (key "<server name>|<hash>", with serverName, serverUrl, accessToken,
-    refreshToken, expiresAt in ms). After install Claude Code adds an entry for "plugin:datastash:datastash" with an
-    empty accessToken and shows the server as "needs authentication"; it does not open the sign-in by itself.
-    Signed in = a matching entry with an access token that is not expired, or that has a refresh token.
-    Only presence and expiry are read; no token is kept, compared, logged or printed.
-    Not used: `claude mcp list` (it connects to every server, takes seconds, and does not list plugin servers outside
-    a plugin session) and a 401 from https://getdatastash.com/mcp (the plugin never holds Claude Code's token, so every
-    call it could make is a 401). No file (macOS keeps it in the system keychain, which can't be read without a
-    prompt), an unreadable file or an unknown shape is None: say nothing rather than guess. On macOS a file without a
-    usable entry is None too (the keychain may hold the sign-in)."""
-    try:
-        with open(os.path.join(CLAUDE_DIR, ".credentials.json")) as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    entries = data.get("mcpOAuth", {})
-    if not isinstance(entries, dict):
-        return None
-    now_ms = time.time() * 1000
-    for k, v in entries.items():
-        if not isinstance(v, dict):
-            continue
-        if v.get("serverName") != CONNECTOR_SERVER and not (isinstance(k, str) and k.split("|", 1)[0] == CONNECTOR_SERVER):
-            continue
-        access, refresh, exp = v.get("accessToken"), v.get("refreshToken"), v.get("expiresAt")
-        if not (isinstance(access, str) and access):
-            continue
-        if isinstance(refresh, str) and refresh:
-            return True
-        if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= 0 or exp > now_ms:
-            return True
-    return None if sys.platform == "darwin" else False
+LOGIN_HINT = ("A datastash page opened in your browser. Type the code shown there and press Approve.")
+RESTART_LINE = "You're signed in. Restart Claude Code once so datastash connects; it stays signed in after that."
 
 
 def sign_in_hint(inp):
-    """The SessionStart line telling the AI to walk the person through the connector sign-in, or None. Once per
-    session (a marker per session id); without a session id it is said (SessionStart itself runs once)."""
+    """XLI-278: the SessionStart line telling the AI to run datastash login when this computer is not signed in, or None.
+    Once per session (a marker per session id). Never reads or prints a token: it checks only that a login is recorded."""
     try:
-        if connector_signed_in() is not False:
+        if signed_in():
             return None
         sid = inp.get("session_id") if isinstance(inp, dict) else None
         sid = sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None
@@ -1625,10 +1740,45 @@ def sign_in_hint(inp):
                 return None
             ensure_dirs()
             write_private(mark, json.dumps({"at": int(time.time())}))
-        return (f'{SIGN_IN_NOTE}: the datastash connector is not signed in, so its tools can\'t be used, and Claude Code '
-                f'waits for the person instead of opening the sign-in. Tell the person once, in plain words: "{SIGN_IN_HINT}"')
+        return (f'{SIGN_IN_NOTE}: this computer is not signed in to datastash, so the datastash connector can\'t connect '
+                'yet. Before the first datastash use, run datastash login and tell the person, in plain words: '
+                f'"{LOGIN_HINT}" (the command\'s answer has the code). When the person says it is done, run datastash '
+                'login --check. Never ask the person for the code or any token.')
     except Exception:
         return None
+
+
+IMPORTED_HINT_MARK = "imported-connector-hint"
+IMPORTED_HINT = "/mcp, pick datastash, choose Authenticate"
+
+
+def imported_connector_hint():
+    """Owner add-on (11-20): once per computer, ever: if Claude Code shows the datastash connector imported from claude.ai
+    as needing authentication, the AI tells the person how to sign it in. Never again after the first session."""
+    try:
+        mark = os.path.join(STATE, IMPORTED_HINT_MARK)
+        if os.path.exists(mark):
+            return None
+        ensure_dirs()
+        write_private(mark, json.dumps({"at": int(time.time())}))
+        return (f'{SIGN_IN_NOTE} (said once): if /mcp shows a "claude.ai datastash" connector as needing authentication, '
+                f'tell the person once, in plain words: "{IMPORTED_HINT}". Otherwise say nothing about it.')
+    except Exception:
+        return None
+
+
+def put_on_path():
+    """The plugin's command lives in scripts/ (a top-level bin/ makes Claude chat and Cowork refuse the whole plugin), so
+    the SessionStart hook puts that folder on this session's PATH through CLAUDE_ENV_FILE. Never raises."""
+    try:
+        env_file = os.environ.get("CLAUDE_ENV_FILE")
+        here = os.path.dirname(os.path.realpath(__file__))
+        if not env_file or here in os.environ.get("PATH", "").split(os.pathsep):
+            return
+        with open(env_file, "a") as f:
+            f.write(f"export PATH={shlex.quote(here)}:\"$PATH\"\n")
+    except Exception:
+        pass
 
 
 def _seen_path(sid):
@@ -1856,10 +2006,9 @@ def setup_findings(project, me=None, deep=False):
                                 "(hooks) have not run in this session (the plugin was likely installed, enabled or "
                                 "updated after the session started).",
                                 "the person restarts Claude Code or types /reload-plugins.", wake=True))
-    if connector_signed_in() is False:
-        out.append(_finding("not_signed_in", "the datastash connector is not signed in, so its tools can't be used "
-                            "(Claude Code marks it \"needs authentication\" and waits; it doesn't open the sign-in by "
-                            "itself).", f'tell the person, in plain words: "{SIGN_IN_HINT}"'))
+    if not signed_in():
+        out.append(_finding("not_signed_in", "this computer is not signed in to datastash, so the datastash connector "
+                            "can't connect.", f'run datastash login, then tell the person, in plain words: "{LOGIN_HINT}"'))
     # Key files: every key here must be a private file of this user; the folder's agent needs one.
     try:
         names = sorted(n for n in os.listdir(CONF) if n.endswith(".key"))
@@ -1958,12 +2107,8 @@ def cmd_doctor(_args):
         print("ok: keys: every datastash key file here is private to this user (mode 600).")
     if "no_reach" not in ids:
         print("ok: network: https://getdatastash.com answers.")
-    signed = connector_signed_in()
-    if signed:
-        print("ok: sign-in: the datastash connector is signed in.")
-    elif signed is None:
-        print("note: sign-in: can't tell whether the datastash connector is signed in on this machine. If its tools are "
-              f'missing or ask for authentication, tell the person: "{SIGN_IN_HINT}"')
+    if signed_in():
+        print("ok: sign-in: this computer is signed in to datastash (datastash login).")
     print(_listener_line(project, me))
     for f in found:
         print("problem: " + finding_line(f))
@@ -2110,38 +2255,9 @@ def person_setup(args):
 
 
 def _trade_watch_code(args):
-    """args: WORKBOOK_ID [-|CODE]. Trades a one-time watch pickup code at datastash for the person's watch key and saves
-    it (never printed). datastash issues that code only to the person's own connection (its person-scope check), so a
-    trade that succeeds is the person's. Returns the workbook id."""
-    workbook = args[0].strip()
-    if not re.fullmatch(r"[0-9a-fA-F\-]{36}", workbook):
-        die("WORKBOOK_ID is the agent workbook's id (from ledger_person_watch or ledger_agent_workbook)")
-    code = sys.stdin.readline(512).strip() if len(args) == 1 or args[1] == "-" else args[1].strip()
-    if not re.fullmatch(r"dspw_[A-Za-z0-9_\-]{6,200}", code):
-        die("that does not look like a watch pickup code (ledger_person_watch, action \"key\")")
-    ensure_dirs()
-    try:
-        status, _ctype, text = http("POST", PICKUP_PATH, form=pickup_form(code, read_verifier("watch")), timeout=30)
-    except ApiError as e:
-        die(f"pickup refused (HTTP {e.status}): the code is unknown, used or expired, or was asked for on another machine. Ask for a new one (ledger_person_watch, action \"key\").")
-    except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
-        die(f"could not reach datastash ({type(e).__name__}); the code may not have been used, try again")
-    key = text.strip()
-    if status != 200 or not re.fullmatch(PERSON_KEY_RE, key):
-        die("datastash answered something that is not a watch key; nothing saved")
-    write_private(key_path(PERSON_SLUG), key + "\n")
-    key = None
-    _drop(verifier_path("watch"))
-    c = read_json(conf_path(PERSON_SLUG), {})
-    reset = c.get("workbook_id") != workbook
-    c["workbook_id"] = workbook
-    c.setdefault("projects", [])
-    write_private(conf_path(PERSON_SLUG), json.dumps(c, indent=2))
-    if reset:
-        p = person_for(None)
-        if p is not None:
-            reset_cursor(p)
-    return workbook
+    """The earlier watch code (ledger_person_watch action "key"). XLI-278: datastash gives no such code any more."""
+    die('watch keys are not made from a chat tool any more: the person types "datastash main" (this computer signs in with datastash login)')
+
 
 
 def make_main_dir():
@@ -2209,22 +2325,24 @@ def auto_name(here, me, after=None):
     die("no free agent name for this folder")
 
 
-MAIN_KEY_FIRST = ('first: this machine\'s first agent gets the person\'s main key before registering (once per machine; it is '
-                  'saved, never shown, and never used by an agent): call the datastash connector\'s ledger_person_watch with '
-                  'exactly {"action": "main"}, pipe its main_pickup_code into: printf \'%s\\n\' \'<main_pickup_code>\' | '
-                  'datastash main --key -   then run datastash auto-name again. If the connector refuses that call, run '
-                  'datastash auto-name --no-main-key instead.')
+LOGIN_FIRST = ('first: this computer is not signed in to datastash yet. Run datastash login, then tell the person in plain '
+               'words: "A datastash page opened in your browser. Type the code shown there and press Approve." (the code '
+               'is in the command\'s answer). When the person says it is done, run datastash login --check, then run '
+               'datastash auto-name again.')
+LOGIN_STEP = ('this computer is not signed in to datastash yet: run datastash login, tell the person in plain words: "A '
+              'datastash page opened in your browser. Type the code shown there and press Approve." (the code is in the '
+              'command\'s answer); when the person says it is done, run datastash main --on again.')
 
 
 def cmd_auto_name(args):
     """Self-registration helper: which agent name this session registers (see auto_name). AI-facing lines."""
     after = None
-    no_main_key = "--no-main-key" in args
-    args = [a for a in args if a != "--no-main-key"]
+    no_login = "--no-login" in args or "--no-main-key" in args
+    args = [a for a in args if a not in ("--no-login", "--no-main-key")]
     if args[:1] == ["--after"] and len(args) == 2:
         after = args[1].strip()[:44] or None
     elif args:
-        die("usage: datastash auto-name [--after NAME] [--no-main-key]")
+        die("usage: datastash auto-name [--after NAME]")
     here = os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     me = this_session()
     kind, name = auto_name(here, me, after)
@@ -2232,10 +2350,10 @@ def cmd_auto_name(args):
         mark_agent_use(me, "auto-name")  # self-registration has begun: this session is an agent, never main
     if kind == "main":
         print("main: this is the person's own session; it never registers an agent")
-    elif kind == "name" and not no_main_key and not all_agents() and read_main_key() is None:
-        # The machine's first agent: the person's main key comes first, from the connector while it is still only the
-        # person's sign-in (datastash gives it only to a connection that never registered an agent). Owner ruling 11-19.
-        print(MAIN_KEY_FIRST)
+    elif kind == "name" and not no_login and not signed_in():
+        # XLI-278: this computer's datastash login comes first: the connector then connects signed in (headersHelper),
+        # and the agent's key, asked for through that login with this machine's challenge, has the login's reach.
+        print(LOGIN_FIRST)
     elif kind == "linked":
         print(f'linked: "{disp(name)}" (this folder\'s agent: reuse it; no registration)')
     else:
@@ -2253,9 +2371,10 @@ def cmd_auto_name(args):
 # config, such as a claude.ai connector), it records the session as an agent.
 DATASTASH_HOST = "getdatastash.com"
 # The person's own switch-on steps, run in a clean session before it is main: only these exact one-command forms.
-_DS_CMD = r"(?:python3\s+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/bin/datastash\"|['\"]?[^\s'\";&|`$()<>{}]*datastash['\"]?)"
+_DS_CMD = r"(?:python3\s+)?(?:\"\$\{CLAUDE_PLUGIN_ROOT\}/(?:bin|scripts)/datastash\"|['\"]?[^\s'\";&|`$()<>{}]*datastash['\"]?)"
 MAIN_STEP_RE = re.compile(r"\s*(?:printf\s+'%s\\n'\s+'dsmk_[A-Za-z0-9_\-]{6,200}'\s*\|\s*" + _DS_CMD + r"\s+main\s+--key\s+-"
-                          r"|" + _DS_CMD + r"\s+main(?:\s+--on|\s+--workbook\s+[0-9a-fA-F\-]{36})?)\s*(?:2>&1)?\s*")
+                          r"|" + _DS_CMD + r"\s+main(?:\s+--on|\s+--workbook\s+[0-9a-fA-F\-]{36})?"
+                          r"|" + _DS_CMD + r"\s+login(?:\s+--check)?)\s*(?:2>&1)?\s*")  # XLI-278: the login carries no datastash content
 CLAUDE_USER_CONFIG = os.path.join(HOME, ".claude.json")  # Claude Code's user (and per-project) MCP servers
 FILE_TOOLS = ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Grep", "Glob")
 
@@ -2421,15 +2540,6 @@ def cmd_agent_tool(_args):
 def _agent_tool(inp):
     hook_heartbeat("tool", inp, throttle=TOOL_HEARTBEAT_EVERY)
     try:
-        if (inp.get("hook_event_name") == "PostToolUseFailure" and inp.get("tool_name") == MAIN_CODE_TOOL
-                and is_main_code_input(inp.get("tool_input"))):
-            # The connector refused the "main" call: this machine's connector registered agents, so the next
-            # "datastash main" opens the person's own sign-in instead (the failed call still records this session).
-            ensure_dirs()
-            write_private(MAIN_SIGN_IN_FLAG, json.dumps({"at": int(time.time())}))
-    except (AttributeError, OSError):
-        pass
-    try:
         record, why = tool_carries_datastash(inp)
     except Exception:  # default-deny
         record, why = True, "error"
@@ -2481,10 +2591,12 @@ def cmd_main(args):
     the skill says what to tell the person). With --on WORKBOOK_ID [-|CODE]: trade a fresh watch pickup code from the
     person's own connection and turn THIS session into the person's main session."""
     me = this_session()
-    if args and args[0] in ("--on", "--key", "--workbook"):
-        return {"--on": _main_on, "--key": _main_key, "--workbook": _main_workbook}[args[0]](me, args[1:])
+    if args and args[0] == "--key":
+        die('main keys are not made from a chat tool any more: run datastash login (the person approves this computer in the browser once)')
+    if args and args[0] in ("--on", "--workbook"):
+        return {"--on": _main_on, "--workbook": _main_workbook}[args[0]](me, args[1:])
     if args:
-        die("usage: datastash main  |  datastash main --on  |  datastash main --key -  |  datastash main --workbook ID")
+        die("usage: datastash main  |  datastash main --on  |  datastash main --workbook ID")
     here = os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     c = read_json(conf_path(PERSON_SLUG), None)
     set_up = bool(c and c.get("workbook_id")) and read_key(PERSON_SLUG) is not None
@@ -2492,7 +2604,7 @@ def cmd_main(args):
     why = None if on else main_refusal(me)
     print(f"this session is the person's datastash main: {'yes' if on else 'no'}")
     print(f"person watch set up on this machine: {'yes, agent workbook ' + disp(c['workbook_id']) if set_up else 'no'}")
-    print(f"main key on this machine: {'yes' if read_main_key() is not None else 'no'}")
+    print(f"this computer signed in to datastash (datastash login): {'yes' if signed_in() else 'no'}")
     if not on:
         print(f"the person asked for main in this session: {'yes' if why is None and main_request_ok(me) else 'no'}")
         if why is not None:
@@ -2509,12 +2621,6 @@ def cmd_main(args):
     return 0
 
 
-MAIN_KEY_STEP = ('no main key on this machine yet (made once per machine from the person\'s own sign-in; the person\'s typed '
-                 '"datastash main" is the approval, so there is no step for the person): call the datastash connector\'s '
-                 'ledger_person_watch with exactly {"action": "main"} and nothing else, then pipe its main_pickup_code, '
-                 "never shown, into: printf '%s\\n' '<main_pickup_code>' | datastash main --key -")
-
-
 def _main_gate(me):
     """Main mode is switched on only for the person's own typed phrase in this very session, never in an agent session."""
     why = main_refusal(me)
@@ -2526,9 +2632,8 @@ def _main_gate(me):
 
 
 def _main_on(me, args):
-    """Turn this session into the person's main session. With the main key on this machine: at once. Without it, on a
-    machine whose connector already registered agents: the standard datastash sign-in opens in the browser once and the
-    person's fresh sign-in makes the key. Otherwise: say how to get it (once per machine; `main --key -` then finishes)."""
+    """Turn this session into the person's main session, signed in by this computer's datastash login (XLI-278). Not
+    signed in: say to run datastash login first (an earlier main key on this machine still works until it is stopped)."""
     if args:
         die("usage: datastash main --on")
     _main_gate(me)
@@ -2539,10 +2644,9 @@ def _main_on(me, args):
             die("could not reach datastash; try again")
         if ok:
             return _main_finish(me, key)
-        _set_aside(MAIN_KEY_FILE)  # stopped or unknown: get a new one
-    if _main_needs_sign_in():
-        return _take_main_code(me, *_sign_in_main_code())
-    print(MAIN_KEY_STEP)
+        if os.path.exists(MAIN_KEY_FILE) and not signed_in():
+            _set_aside(MAIN_KEY_FILE)  # an earlier main key that was stopped
+    print(LOGIN_STEP)
     return 0
 
 
@@ -2553,89 +2657,6 @@ def _set_aside(path):
         os.replace(path, os.path.join(OFF, f"{os.path.basename(path)}.{time.strftime('%Y%m%d-%H%M%S')}"))
     except OSError:
         pass
-
-
-class MainKeyLock:
-    """One main-key step at a time on this machine (two first agents at once must not both pick up a key)."""
-
-    def __enter__(self):
-        ensure_dirs()
-        self.fd = os.open(os.path.join(STATE, "main-key.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *a):
-        fcntl.flock(self.fd, fcntl.LOCK_UN)
-        os.close(self.fd)
-
-
-def _main_key(me, args):
-    """Trade a one-time main pickup code (stdin) for the person's main key and save it (never printed). A working main key
-    already on the machine is never replaced. Then, in a clean session where the person typed "datastash main", finish the
-    switch-on; anywhere else the key is only saved (an agent session gets it once per machine, before the first agent
-    registers on the machine's connector, and never uses it)."""
-    if args not in (["-"], []):
-        die("usage: printf '%s\\n' '<main_pickup_code>' | datastash main --key -   (the code on stdin)")
-    code = sys.stdin.readline(512).strip()
-    if not re.fullmatch(MAIN_PICKUP_RE, code):
-        die('that does not look like a main pickup code (ledger_person_watch, action "main")')
-    return _take_main_code(me, code)
-
-
-def _take_main_code(me, code, verifier=None):
-    """Pick up the main key for a one-time main pickup code, save it, and finish the switch-on in a clean requested
-    session. A session that acted as an agent never reads the main key already on the machine."""
-    with MainKeyLock():
-        refused = main_refusal(me)
-        if os.path.exists(MAIN_KEY_FILE) and refused is not None:
-            die(f"this machine already has a main key, and this session can't use it: {refused}")
-        old = read_main_key()
-        if old is not None:
-            ok = _main_key_works(old)
-            if ok is None:
-                die("could not reach datastash; try again")
-            if ok:
-                die("this machine already has a working main key; nothing changed")
-            _set_aside(MAIN_KEY_FILE)
-        try:
-            status, _ctype, text = http("POST", PICKUP_PATH, form=pickup_form(code, verifier or read_verifier("main")), timeout=30)
-        except ApiError as e:
-            die(f'pickup refused (HTTP {e.status}): the code is unknown, used or expired, or was asked for on another machine. Ask for a new one (ledger_person_watch, action "main").')
-        except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
-            die(f"could not reach datastash ({type(e).__name__})")
-        key = text.strip()
-        if status != 200 or not re.fullmatch(MAIN_KEY_RE, key):
-            die("datastash answered something that is not a main key; nothing saved")
-        ensure_dirs()
-        write_private(MAIN_KEY_FILE, key + "\n")
-        _drop(MAIN_SIGN_IN_FLAG)
-        if verifier is None:
-            _drop(verifier_path("main"))
-    if main_refusal(me) is None and (is_main_session(me) or main_request_ok(me)):
-        return _main_finish(me, key)
-    print("saved the person's main key on this machine (never shown). This session is not the person's main; "
-          "if you were registering an agent, run datastash auto-name again")
-    return 0
-
-
-# PM ruling 11-19 (machines whose connector already registered agents): datastash gives the main pickup code only to a
-# connection that never registered an agent, so on such a machine the person's own typed "datastash main", in a clean
-# session, opens the standard datastash sign-in (the same page the connector's sign-in shows) once. That fresh sign-in
-# is a new connection with no agents: the plugin asks it for the main pickup code itself, trades it for the main key,
-# and keeps neither the sign-in nor the code. The AI never sees either.
-SIGN_IN_CLIENT_NAME = "Claude Code"  # the name the standard sign-in page shows; the same as Claude Code's own sign-in
-OAUTH_REG_PATH = "/oauth/reg"
-OAUTH_AUTH_PATH = "/oauth/auth"
-OAUTH_TOKEN_PATH = "/oauth/token"
-MCP_PATH = "/mcp"
-SIGN_IN_WAIT_SECONDS = float(os.environ.get("DATASTASH_SIGN_IN_WAIT_SECONDS", "280"))
-MAIN_SIGN_IN_FLAG = os.path.join(STATE, "main-needs-sign-in")  # the connector refused the "main" call on this machine
-
-
-def _main_needs_sign_in():
-    """True when this machine's connector already registered agents: agents on this machine, or the connector refused
-    the "main" call here. A machine with neither keeps the one connector call (no sign-in)."""
-    return bool(all_agents()) or os.path.exists(MAIN_SIGN_IN_FLAG)
 
 
 def _open_browser(url):
@@ -2656,109 +2677,6 @@ def _open_browser(url):
         return True
     except OSError:
         return False
-
-
-def _wait_for_sign_in(state, port_box, ready):
-    """A one-shot loopback listener for the sign-in's return (RFC 8252). Returns the authorization code or None."""
-    got = {}
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            u = urllib.parse.urlsplit(self.path)
-            q = urllib.parse.parse_qs(u.query)
-            if u.path != "/callback" or not secrets.compare_digest((q.get("state") or [""])[0], state):
-                self.send_response(404)
-                self.end_headers()
-                return
-            got["code"] = (q.get("code") or [None])[0]
-            got["done"] = True
-            self.send_response(302)  # back to datastash's own page: no page of the plugin's own
-            self.send_header("Location", ORIGIN + "/")
-            self.end_headers()
-
-        def log_message(self, *a):
-            pass
-
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    server.timeout = 1
-    port_box.append(server.server_address[1])
-    deadline = time.time() + SIGN_IN_WAIT_SECONDS
-    try:
-        ready()
-        while not got.get("done") and time.time() < deadline:
-            server.handle_request()
-    finally:
-        server.server_close()
-    return got.get("code")
-
-
-def _sign_in_main_code():
-    """The person's fresh datastash sign-in (browser, once) and, from it, a one-time main pickup code bound to a verifier
-    kept in memory only (security review H7). Returns (code, verifier). Neither is printed."""
-    def fail(why):
-        die(f"the datastash sign-in for the person's main key did not finish: {why}. Nothing was saved")
-
-    try:
-        _st, _ct, text = http("POST", OAUTH_REG_PATH, body={
-            "client_name": SIGN_IN_CLIENT_NAME, "application_type": "native", "redirect_uris": ["http://127.0.0.1/callback"],
-            "token_endpoint_auth_method": "none", "grant_types": ["authorization_code"], "response_types": ["code"]}, timeout=30)
-        client_id = json.loads(text).get("client_id")
-    except (ApiError, ValueError, AttributeError, urllib.error.URLError, httpclient.HTTPException, OSError):
-        client_id = None
-    if not isinstance(client_id, str) or not client_id:
-        fail("could not reach datastash")
-    state = secrets.token_urlsafe(32)
-    verifier = secrets.token_urlsafe(64)
-    main_verifier = secrets.token_urlsafe(48)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    resource = ORIGIN + MCP_PATH
-    port_box, opened = [], {}
-
-    def ready():
-        redirect = f"http://127.0.0.1:{port_box[0]}/callback"
-        opened["redirect"] = redirect
-        opened["ok"] = _open_browser(ORIGIN + OAUTH_AUTH_PATH + "?" + urllib.parse.urlencode({
-            "response_type": "code", "client_id": client_id, "redirect_uri": redirect, "scope": "mcp:tools",
-            "resource": resource, "state": state, "code_challenge": challenge, "code_challenge_method": "S256"}))
-        if not opened["ok"]:
-            raise _NoBrowser()
-
-    try:
-        code = _wait_for_sign_in(state, port_box, ready)
-    except _NoBrowser:
-        fail("no browser could be opened on this machine (the sign-in needs the person's browser on this computer)")
-    if not code:
-        fail(f"no sign-in came back within {int(SIGN_IN_WAIT_SECONDS)} seconds (or it was cancelled)")
-    try:
-        _st, _ct, text = http("POST", OAUTH_TOKEN_PATH, form={
-            "grant_type": "authorization_code", "code": code, "redirect_uri": opened["redirect"], "client_id": client_id,
-            "code_verifier": verifier, "resource": resource}, timeout=30)
-        token = json.loads(text).get("access_token")
-    except (ApiError, ValueError, AttributeError, urllib.error.URLError, httpclient.HTTPException, OSError):
-        token = None
-    if not isinstance(token, str) or not token:
-        fail("datastash did not accept the sign-in")
-    try:
-        _st, ctype, text = http("POST", MCP_PATH, key=token, accept="application/json, text/event-stream", timeout=30, body={
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": MAIN_CODE_TOOL.rsplit("__", 1)[1], "arguments": dict(MAIN_CODE_INPUT, code_challenge=challenge_of(main_verifier))}})
-    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError):
-        fail("could not reach datastash")
-    if "text/event-stream" in (ctype or ""):
-        text = "\n".join(line[5:].strip() for line in text.splitlines() if line.startswith("data:"))
-    try:
-        result = json.loads(text).get("result") or {}
-        body = json.loads(((result.get("content") or [{}])[0]).get("text") or "")
-    except (ValueError, AttributeError, IndexError, TypeError):
-        result, body = {"isError": True}, {}
-    main_code = body.get("main_pickup_code") if isinstance(body, dict) else None
-    if result.get("isError") or not isinstance(main_code, str) or not re.fullmatch(MAIN_PICKUP_RE, main_code):
-        fail("datastash gave no main key for that sign-in (it gives one only to the person's own sign-in)")
-    return main_code, main_verifier
-
-
-class _NoBrowser(Exception):
-    pass
 
 
 def _main_key_works(key):
@@ -2921,13 +2839,153 @@ def cmd_send(args):
     return _person_post(body)
 
 
+# ------------------------------------------------------------------ datastash login commands (XLI-278)
+
+def _device_name():
+    try:
+        return socket.gethostname()[:60] or "computer"
+    except OSError:
+        return "computer"
+
+
+def _device_os():
+    if sys.platform == "darwin":
+        v = platform.mac_ver()[0]
+        return f"macOS {v}".strip()
+    if sys.platform.startswith("linux"):
+        return "Linux"
+    if sys.platform.startswith("win"):
+        return "Windows"
+    return platform.system() or "unknown"
+
+
+LOGIN_POLL_MAX = 15 * 60
+
+
+def cmd_login(args):
+    """Start this computer's datastash login: print the code, open the approval page, and leave a background helper to
+    finish it. AI-facing lines. --check: signed in yes / waiting / no. --poll: the background helper itself."""
+    if args == ["--check"]:
+        if signed_in():
+            print("signed in: yes (this computer is signed in to datastash)")
+            print('if the datastash connector\'s tools are not in this session, tell the person in plain words: '
+                  f'"{RESTART_LINE}" (Claude Code connects its connectors when a session starts)')
+        elif _read_private_json(LOGIN_PENDING_FILE):
+            print("signed in: waiting (the person has not approved the code yet)")
+        else:
+            print("signed in: no (run datastash login)")
+        return 0
+    if args == ["--poll"]:
+        return _login_poll()
+    if args:
+        die("usage: datastash login  |  datastash login --check")
+    try:
+        _st, _ct, text = http("POST", DEVICE_START_PATH, body={"device_name": _device_name(), "os": _device_os()}, timeout=30)
+        got = json.loads(text)
+    except ApiError as e:
+        die(f"datastash did not start the login (HTTP {e.status}): {e.body.get('message') or 'try again in a few minutes'}")
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+        die(f"could not reach datastash ({type(e).__name__}); try again")
+    code, url, dev = got.get("user_code"), got.get("verification_uri"), got.get("device_code")
+    if not (isinstance(code, str) and re.fullmatch(r"[A-Z]{4}-[A-Z]{4}", code) and isinstance(dev, str) and isinstance(url, str)
+            and url.startswith(ORIGIN + "/")):
+        die("datastash answered something unexpected; nothing changed")
+    ensure_dirs()
+    write_private(LOGIN_PENDING_FILE, json.dumps({"device_code": dev, "interval": got.get("interval", 5),
+                                                  "until": int(time.time()) + int(got.get("expires_in", 600))}))
+    opened = _open_browser(url)
+    try:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "login", "--poll"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        die("could not start the background helper that finishes the login")
+    print(f"code: {code}")
+    print(f"page: {url}" + (" (opened in the person's browser)" if opened else " (no browser opened here: the person opens it)"))
+    print(f'tell the person, in plain words: "A datastash page opened in your browser. Type the code {code} there and '
+          'press Approve." The code works for 10 minutes. When the person says it is done, run datastash login --check.')
+    return 0
+
+
+def _login_poll():
+    """Background: poll datastash until the person approves (or the code ends), then save the login. Prints nothing."""
+    p = _read_private_json(LOGIN_PENDING_FILE)
+    if not p or not isinstance(p.get("device_code"), str):
+        return 1
+    interval = p.get("interval") if _num_ok(p.get("interval")) else 5
+    interval = max(5, min(int(interval), 30))
+    until = p.get("until") if _num_ok(p.get("until")) else time.time() + 600
+    deadline = min(until, time.time() + LOGIN_POLL_MAX)
+    while time.time() < deadline:
+        time.sleep(interval)
+        cur = _read_private_json(LOGIN_PENDING_FILE)
+        if not cur or cur.get("device_code") != p["device_code"]:
+            return 0  # a newer login took over
+        try:
+            _st, _ct, text = http("POST", DEVICE_TOKEN_PATH, body={"device_code": p["device_code"]}, timeout=30)
+            got = json.loads(text)
+        except ApiError as e:
+            err = e.body.get("error")
+            if err == "authorization_pending":
+                continue
+            if err == "slow_down":
+                interval = min(interval + 5, 30)
+                continue
+            break  # denied, expired or unknown
+        except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+            continue
+        rt, at = got.get("refresh_token"), got.get("access_token")
+        if isinstance(rt, str) and re.fullmatch(REFRESH_RE, rt) and isinstance(at, str) and re.fullmatch(ACCESS_RE, at):
+            _save_login(rt, at, got.get("expires_in"))
+        break
+    _drop(LOGIN_PENDING_FILE)
+    return 0
+
+
+def cmd_logout(args):
+    """Sign this computer out: datastash revokes the login (its refresh token and every access token stop at once) and
+    the keychain item and local files go."""
+    if args:
+        die("usage: datastash logout")
+    rt = refresh_token()
+    revoked = None
+    if rt is not None:
+        try:
+            _st, _ct, text = http("POST", DEVICE_LOGOUT_PATH, body={"refresh_token": rt}, timeout=30)
+            revoked = bool(json.loads(text).get("revoked"))
+        except (ApiError, ValueError, AttributeError, urllib.error.URLError, httpclient.HTTPException, OSError):
+            revoked = None
+    _forget_login()
+    if rt is None:
+        print("signed out: this computer was not signed in")
+    elif revoked is None:
+        print("signed out on this computer; datastash could not be reached, so also sign it out on the account page "
+              f"({ORIGIN}/account, Signed-in computers)")
+    else:
+        print("signed out: this computer's datastash login is stopped")
+    return 0
+
+
+def cmd_token(args):
+    """The datastash connector's headersHelper: {"Authorization": "Bearer <15-minute token>"} on stdout, only when
+    stdout is not a terminal; {} when not signed in or datastash can't be reached (the connector then shows its usual
+    sign-in). Never logs, never prints the refresh token."""
+    if args != ["--header"]:
+        die("usage: datastash token --header   (for the datastash connector only)")
+    if sys.stdout.isatty():
+        die("datastash token --header prints only into the datastash connector, never to a terminal")
+    tok = login_token()
+    sys.stdout.write(json.dumps({"Authorization": f"Bearer {tok}"} if tok else {}) + "\n")
+    return 0
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     args = sys.argv[2:]
     table = {"fetch": cmd_fetch, "link": cmd_link, "status": cmd_status, "api": cmd_api, "off": cmd_off,
              "watch": cmd_watch, "check": cmd_check, "listen": cmd_listen, "end": cmd_end, "reply": cmd_reply,
              "send": cmd_send, "main": cmd_main, "prompt": cmd_prompt, "auto-name": cmd_auto_name, "list": cmd_list,
-             "read": cmd_read, "filter": cmd_filter, "agent-tool": cmd_agent_tool, "doctor": cmd_doctor, "unfilter": lambda a: cmd_filter(a, hidden=False)}
+             "read": cmd_read, "filter": cmd_filter, "agent-tool": cmd_agent_tool, "doctor": cmd_doctor,
+             "login": cmd_login, "logout": cmd_logout, "token": cmd_token, "unfilter": lambda a: cmd_filter(a, hidden=False)}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

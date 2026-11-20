@@ -61,8 +61,8 @@ if [[ "$ANYWHERE" == 1 ]]; then
   # The throwaway workbook is the one this main watches (the account may hold others).
   ( umask 077; printf '{"workbook_id": "%s", "projects": []}\n' "$WID" > "$DATASTASH_CONFIG_DIR/person.json" )
 else
-  printf '%s\n' "$CODE" | python3 "$PLUGIN/bin/datastash" watch --person --setup "$WID" - --project "$PROJ" >/dev/null || { echo "FAIL: setup"; exit 1; }
-  python3 "$PLUGIN/bin/datastash" main | grep -q "person watch set up on this machine: yes" || { echo "FAIL: datastash main does not see the setup"; exit 1; }
+  printf '%s\n' "$CODE" | python3 "$PLUGIN/scripts/datastash" watch --person --setup "$WID" - --project "$PROJ" >/dev/null || { echo "FAIL: setup"; exit 1; }
+  python3 "$PLUGIN/scripts/datastash" main | grep -q "person watch set up on this machine: yes" || { echo "FAIL: datastash main does not see the setup"; exit 1; }
 fi
 CODE=""
 
@@ -77,12 +77,12 @@ if [[ "$ANYWHERE" == 1 ]]; then
   ls "$DATASTASH_CONFIG_DIR"/state/main-request-* >/dev/null 2>&1 || { echo "FAIL: the prompt hook did not record the person's request"; exit 1; }
   # Let the session's AI finish its reply to the phrase (it can't reach a connector here), then interrupt anything left.
   sleep 40; tmux send-keys -t "$TMUX_S" Escape; sleep 2
-  tmux send-keys -t "$TMUX_S" -l "!python3 '$PLUGIN/bin/datastash' main --on"; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
+  tmux send-keys -t "$TMUX_S" -l "!python3 '$PLUGIN/scripts/datastash' main --on"; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
   for _ in $(seq 1 30); do ls "$DATASTASH_CONFIG_DIR"/state/main-session-* >/dev/null 2>&1 && break; sleep 1; done
   ls "$DATASTASH_CONFIG_DIR"/state/main-session-* >/dev/null 2>&1 || { echo "FAIL: the session did not become the person's main"; tmux capture-pane -t "$TMUX_S" -p | grep -v '^$' | tail -8; exit 1; }
   SID="$(basename "$(ls "$DATASTASH_CONFIG_DIR"/state/main-session-* | head -1)" .json)"; SID="${SID#main-session-}"
   # The same session id from a plain process (not that session's Claude Code) is not the person.
-  ( cd "$PROJ" && CLAUDE_CODE_SESSION_ID="$SID" python3 "$PLUGIN/bin/datastash" main | grep -q "person's datastash main: no" ) || { echo "FAIL: a copied session id was taken as main"; exit 1; }
+  ( cd "$PROJ" && CLAUDE_CODE_SESSION_ID="$SID" python3 "$PLUGIN/scripts/datastash" main | grep -q "person's datastash main: no" ) || { echo "FAIL: a copied session id was taken as main"; exit 1; }
   # The person listener starts when that turn ends (Stop hook).
   tmux send-keys -t "$TMUX_S" -l "Say OK."; sleep 0.5; tmux send-keys -t "$TMUX_S" Enter
 fi
