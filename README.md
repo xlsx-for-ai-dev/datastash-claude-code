@@ -26,20 +26,23 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
 
 ## Install
 
-From GitHub, in your shell:
+1. **Install.** In your shell:
 
-```
-claude plugin marketplace add xlsx-for-ai-dev/datastash-claude-code
-claude plugin install datastash@datastash
-```
+   ```
+   claude plugin marketplace add xlsx-for-ai-dev/datastash-claude-code
+   claude plugin install datastash@datastash
+   ```
 
-Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
-`/plugin install datastash@datastash`. Start a new session (or run `/reload-plugins`) to load it.
+   (Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
+   `/plugin install datastash@datastash`.)
+2. **Restart Claude Code.**
+3. **First use opens a browser sign-in.** The first time you use datastash, a datastash page opens in your browser and
+   Claude tells you a code. Type it on the page (signed in with Google) and press **Approve**. Restart Claude Code once
+   more so the connector picks up the sign-in; from then on every session connects to datastash already signed in.
+   There is no `/mcp` step.
 
-Restart Claude Code. The first time you use datastash, Claude runs `datastash login`: a datastash page opens in your
-browser, and Claude tells you the code. Type that code on the page (signed in with Google) and press **Approve**.
-Claude Code connects its connectors when a session starts, so restart it once more after approving; from then on
-every session connects to datastash already signed in. There is no `/mcp` step.
+In Claude chat on claude.ai, the desktop app and Cowork, nothing changes: the datastash connector signs in with its
+usual **Connect** button. The plugin needs no shell or keychain there.
 
 About `datastash login`:
 
@@ -66,6 +69,8 @@ About `datastash login`:
 - Your account page lists every signed-in computer (name, last used, country, network) with **Sign out**, which stops it
   at once. `datastash logout` does the same from the computer and removes the keychain item.
 - Claude chat and Cowork use the connector's normal **Connect** sign-in; `datastash login` is for Claude Code.
+- Once per account, after your first datastash use in Claude Code, datastash itself adds one line to its answer:
+  "Want datastash in the Claude app and on claude.ai too?" with the connector address. The plugin passes it on as is.
 
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
@@ -178,7 +183,7 @@ Claude plugins load in every Claude app (chat on claude.ai and the desktop app, 
 the skill and the connector, while hooks run only in Cowork and Claude Code. So the skill `datastash-agent` has two
 parts: Part 1 works everywhere, chat included (modes, files through the upload link, downloads, help topics,
 automations). Part 2 applies only where a shell and hooks run: agents, keys and pickup codes, the inbox listener,
-sign-in through `/mcp`, and "datastash main". Detailed how-tos stay one call away through the connector's
+signing the computer in (`datastash login`), and "datastash main". Detailed how-tos stay one call away through the connector's
 `ledger_help` topics ("formulas", "cursor").
 
 ## Untrusted text and permissions

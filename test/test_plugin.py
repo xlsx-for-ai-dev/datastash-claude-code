@@ -1084,6 +1084,33 @@ class MainAnySession(MainBase):
         self.assertEqual(ds.read_json(ds.conf_path(ds.PERSON_SLUG), {})["workbook_id"], WID)
         self.assertNotIn(ds.PICKUP_PATH, [p for _, p, _ in self.sent])
 
+    def test_a_new_login_waiting_for_the_person_gives_the_confirm_link_not_the_login_step(self):
+        """XLI-290: a new login is not the person until one click on /confirm; main --on passes the link on."""
+        self.be("sess-C", (1201, "tC"))
+        self.prompt("sess-C")
+        url = ds.ORIGIN + "/confirm?r=abc"
+        fake = ds.http
+
+        def waiting(method, path, key=None, body=None, form=None, timeout=40):
+            if path == ds.PERSON_WORKBOOKS_PATH:
+                self.sent.append((method, path, key))
+                raise ds.ApiError(400, {"error": "person_approval_needed", "code": "person_approval_needed", "approve_url": url})
+            return fake(method, path, key=key, body=body, form=form, timeout=timeout)
+        ds.http = waiting
+        rc, out, err = self.main_cmd("--on")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), ds.APPROVAL_STEP.format(url=url))
+        self.assertNotIn("dsat_", out + err)
+        self.assertFalse(ds.is_main_session(self.be("sess-C", (1201, "tC"))))
+        # A link to anywhere else is never passed on.
+        self.assertIsNone(ds.approval_url({"code": "person_approval_needed", "approve_url": "https://evil.example/confirm"}))
+        self.assertIsNone(ds.approval_url({"code": "not_allowed", "approve_url": url}))
+        ds.http = fake  # the person approved
+        rc, out, err = self.main_cmd("--on")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("confirmation for the person: " + ds.MAIN_READY, out)
+        self.assertTrue(ds.is_main_session(self.be("sess-C", (1201, "tC"))))
+
     def test_the_earlier_key_step_is_refused_and_saves_nothing(self):
         self.be("sess-K", (1101, "tK"))
         self.prompt("sess-K")
@@ -2199,6 +2226,24 @@ class Login(Base):
         with redirect_stdout(buf):
             ds.cmd_token(["--header"])
         self.assertEqual(json.loads(buf.getvalue()), {})
+
+    def test_token_header_never_fails_the_connector(self):
+        """No keychain, no file locks, or anything unexpected: {} (the connector's usual sign-in), never a crash."""
+        def boom(force=False):
+            raise RuntimeError("no keychain here")
+        self.saved.setdefault("login_token", ds.login_token)
+        ds.login_token = boom
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(ds.cmd_token(["--header"]), 0)
+        self.assertEqual(json.loads(buf.getvalue()), {})
+        ds.login_token = self.saved["login_token"]
+        self.finish_login()
+        self.expire_access()
+        self.saved.setdefault("fcntl", ds.fcntl)
+        ds.fcntl = None
+        self.assertIsNone(ds.login_token())  # no locks: no refresh at all (a rotating token is never sent twice)
+        self.assertEqual(self.refresh_bodies, [])
 
     def expire_access(self):
         a = json.load(open(ds.LOGIN_ACCESS_FILE))

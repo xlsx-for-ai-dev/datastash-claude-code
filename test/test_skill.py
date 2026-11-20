@@ -50,7 +50,7 @@ class SkillText(unittest.TestCase):
         part2 = body.split("# Part 2:")[1]
         self.assertIn("In app chat (no shell, no hooks), skip it.", part2)
         for needle in ("## Self-registration", "## Inbox", "background listener", "datastash fetch",
-                       "type /mcp, pick datastash, choose Authenticate, and sign in with Google"):
+                       "## Sign this computer in (datastash login)", "datastash login --check"):
             self.assertIn(needle, part2, needle)
 
 if __name__ == "__main__":

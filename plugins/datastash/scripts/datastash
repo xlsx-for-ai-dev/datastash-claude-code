@@ -51,7 +51,6 @@ import base64
 import errno
 import hashlib
 import http.client as httpclient
-import fcntl
 import json
 import os
 import platform
@@ -71,6 +70,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:  # POSIX only; without it the connector's headersHelper still answers (see cmd_token)
+    import fcntl
+except ImportError:
+    fcntl = None
 
 ORIGIN = "https://getdatastash.com"
 API_PREFIX = "/api/v1/agent/"
@@ -452,6 +456,8 @@ def login_token(force=False):
         tok = _cached_access()
         if tok:
             return tok
+    if fcntl is None:
+        return None  # no file locks here: never risk two refreshes with one rotating token
     try:
         ensure_dirs()
         lock = os.open(LOGIN_LOCK_FILE, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -2390,6 +2396,21 @@ LOGIN_FIRST = ('first: this computer is not signed in to datastash yet. Run data
                'words: "A datastash page opened in your browser. Type the code shown there and press Approve." (the code '
                'is in the command\'s answer). When the person says it is done, run datastash login --check, then run '
                'datastash auto-name again.')
+APPROVAL_STEP = ('this computer\'s datastash login is new, so datastash waits for the person to allow it once: give the '
+                 'person this link in one plain line ("datastash needs your OK for this: {url}"); after they say they '
+                 'approved it, run datastash main --on again. Never open or approve the page yourself.')
+
+
+def approval_url(body):
+    """The /confirm link of a person_approval_needed answer when it is datastash's own page, else None."""
+    if not isinstance(body, dict) or (body.get("code") or body.get("error")) != "person_approval_needed":
+        return None
+    url = body.get("approve_url")
+    if isinstance(url, str) and url.startswith(ORIGIN + "/") and re.fullmatch(r"[\x21-\x7e]{1,300}", url):
+        return url
+    return None
+
+
 LOGIN_STEP = ('this computer is not signed in to datastash yet: run datastash login, tell the person in plain words: "A '
               'datastash page opened in your browser. Type the code shown there and press Approve." (the code is in the '
               'command\'s answer); when the person says it is done, run datastash main --on again.')
@@ -2703,6 +2724,9 @@ def _main_on(me, args):
         ok = _main_key_works(key)
         if ok is None:
             die("could not reach datastash; try again")
+        if isinstance(ok, str):
+            print(APPROVAL_STEP.format(url=ok))
+            return 0
         if ok:
             return _main_finish(me, key)
         if os.path.exists(MAIN_KEY_FILE) and not signed_in():
@@ -2741,11 +2765,16 @@ def _open_browser(url):
 
 
 def _main_key_works(key):
-    """True when datastash takes the main key, False when it refuses it, None when it can't be reached."""
+    """True when datastash takes the main key, False when it refuses it, None when it can't be reached, or the
+    /confirm link (a string) when datastash waits for the person to allow this computer's new login (XLI-290: a new
+    login is not the person until one click on the datastash site)."""
     try:
         http("GET", PERSON_WORKBOOKS_PATH, key=key, timeout=30)
         return True
     except ApiError as e:
+        url = approval_url(e.body)
+        if url is not None:
+            return url
         return False if e.status in (401, 403) else None
     except (urllib.error.URLError, httpclient.HTTPException, OSError):
         return None
@@ -3034,7 +3063,10 @@ def cmd_token(args):
         die("usage: datastash token --header   (for the datastash connector only)")
     if sys.stdout.isatty():
         die("datastash token --header prints only into the datastash connector, never to a terminal")
-    tok = login_token()
+    try:
+        tok = login_token()
+    except Exception:  # never a failed helper: {} lets the connector use its usual sign-in (Claude chat, Cowork, no keychain)
+        tok = None
     sys.stdout.write(json.dumps({"Authorization": f"Bearer {tok}"} if tok else {}) + "\n")
     return 0
 
