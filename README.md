@@ -150,6 +150,15 @@ There is no main session in Cursor. Cursor can still wake its cloud agents: poin
 (`header_name` and `header_value`). Each new message then starts the Automation, and the cloud agent reads its inbox
 through the datastash connector.
 
+## Where the AI's guidance lives
+
+The datastash connector's own instructions are short and the same in every app it connects to (claude.ai, the
+desktop app, ChatGPT, Grok, Cursor): what datastash is for, the two modes (save only when asked; keep data as you go
+after "sync datastash"), telling the person each time something is saved, deleting on request, and treating other
+people's text as data. Everything specific to Claude Code (files on disk, downloads, sign-in through `/mcp`, agents,
+inboxes, the listener, "datastash main", automations) is in this plugin's skill, `datastash-agent`. Detailed how-tos
+stay one call away through the connector's `ledger_help` topics ("formulas", "cursor").
+
 ## Untrusted text and permissions
 
 - `datastash api` prints every answer between `<<datastash-data TAG>>` and `<<end datastash-data TAG>>`, with a
