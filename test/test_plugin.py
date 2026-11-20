@@ -2044,6 +2044,8 @@ class SignInHint(Base):
         ds._login_recorded = self.saved["_login_recorded"]
         ds.login_present = self.saved["login_present"]
         ds.imported_connector_hint = self.saved["imported_connector_hint"]
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a terminal Claude Code session (where the hooks offer the sign-in)
+        self.addCleanup(os.environ.pop, "CLAUDE_CODE_ENTRYPOINT", None)
         for k in ("STATE", "HEARTBEAT", "CONF", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE"):
             self.saved.setdefault(k, getattr(ds, k))
         root = tempfile.mkdtemp(dir=TMP)
@@ -2678,6 +2680,7 @@ class Transition(Base):
         self.spawned = []
         ds._spawn_poller = lambda: self.spawned.append(1) or True
         self.token_answers = []
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"
 
         def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
             if path == ds.DEVICE_START_PATH:
@@ -3014,6 +3017,9 @@ class Transition(Base):
         ds.subprocess.Popen = lambda cmd, **k: opened.append(cmd)
         ds.shutil.which = lambda c: "/usr/bin/" + c
         os.environ.setdefault("DISPLAY", ":0")
+        self.saved.setdefault("stdin", ds.sys.stdin)
+        ds.sys.stdin = io.StringIO()  # as in a hook (piped), even when this suite runs from a terminal
+        self.addCleanup(setattr, ds.sys, "stdin", self.saved["stdin"])
         try:
             for entry in ("sdk-cli", "sdk-py", "local-agent", None):
                 if entry:
@@ -3027,6 +3033,49 @@ class Transition(Base):
         finally:
             ds.subprocess.Popen = self.saved.pop("Popen")
             ds.shutil.which = self.saved.pop("which")
+
+    def test_other_hosts_start_no_code_and_say_nothing(self):
+        """Problem 2 / review: on the desktop app, Cowork, IDEs and -p/SDK runs the host's own sign-in is the way in:
+        no device code is started, no line for the person or the AI, and the helper sends nothing."""
+        self.new_computer()
+        started = []
+        ds._spawn_starter = lambda: started.append(1) or True
+        for entry in ("claude-desktop", "local-agent", "claude-vscode", "sdk-cli", None):
+            with self.subTest(entry=entry):
+                if entry:
+                    os.environ["CLAUDE_CODE_ENTRYPOINT"] = entry
+                else:
+                    os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+                got = self.check(f"sess-H-{entry}")
+                self.assertNotIn("systemMessage", got)
+                self.assertNotIn(ds.SIGN_IN_NOTE, got["hookSpecificOutput"]["additionalContext"])
+                self.assertEqual(self.token_out(entry), {})
+        self.assertEqual(started, [])
+
+    def test_a_late_sign_in_check_never_gives_a_wrong_note(self):
+        self.new_computer(updated=True, oauth=True)  # legacy: the connector works, no fallback line
+        self.assertEqual(ds._late_sign_in_note(), (None, None))
+        self.new_computer()  # device mode, not signed in: the fallback line is true
+        self.assertEqual(ds._late_sign_in_note(), (None, ds.AI_FALLBACK_NOTE))
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "keychain", "at": 1}))  # signed in: nothing
+        self.assertEqual(ds._late_sign_in_note(), (None, None))
+
+    def test_a_locked_keyring_is_not_a_missing_item(self):
+        self.saved.setdefault("which", ds.shutil.which)
+        self.saved.setdefault("run", ds.subprocess.run)
+        self.saved.setdefault("_platform_sys", ds.sys.platform)
+        ds.shutil.which = lambda c: "/usr/bin/secret-tool" if c == "secret-tool" else None
+        answers = {"locked": (1, "", "secret-tool: Cannot create an item in a locked collection\n"),
+                   "gone": (1, "", ""), "there": (0, "dsrt_" + "r" * 43 + "\n", "")}
+        try:
+            for name, want in (("locked", "unknown"), ("gone", "missing"), ("there", "present")):
+                rc, out, err = answers[name]
+                ds.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], rc, out, err)
+                if sys.platform != "darwin":
+                    self.assertEqual(ds._keychain_state(), want, name)
+        finally:
+            ds.shutil.which = self.saved.pop("which")
+            ds.subprocess.run = self.saved.pop("run")
 
 
 if __name__ == "__main__":

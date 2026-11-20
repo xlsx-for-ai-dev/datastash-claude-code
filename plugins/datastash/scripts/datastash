@@ -357,15 +357,24 @@ def _keychain_get():
 
 def _keychain_state():
     """"present", "missing" (the item is gone, or no keychain tool is left to read it) or "unknown" (the tool did not
-    answer). macOS: attributes only (no -w), so no secret is read and no keychain prompt."""
+    answer). macOS: attributes only (no -w), so no secret is read and no keychain prompt. Linux: secret-tool has no
+    attributes-only lookup; its answer is reduced to yes/no at once."""
     if sys.platform == "darwin" and shutil.which("security"):
         rc, _ = _run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
         return "present" if rc == 0 else "missing" if rc == 44 else "unknown"
     if shutil.which("secret-tool"):
-        rc, out = _run(["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "account", KEYCHAIN_ACCOUNT])
-        found = rc == 0 and bool((out or "").strip())
-        out = None
-        return "present" if found else "missing" if rc in (0, 1) else "unknown"
+        # secret-tool exits 1 both for "no such item" and for a locked keyring or no D-Bus session; only a quiet
+        # answer means the item is gone. Its stdout (the value, when present) is dropped at once, never kept.
+        try:
+            r = subprocess.run(["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "account", KEYCHAIN_ACCOUNT],
+                               capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        found, quiet = bool((r.stdout or "").strip()), not (r.stderr or "").strip()
+        r = None
+        if found:
+            return "present"
+        return "missing" if quiet else "unknown"
     return "missing"
 
 
@@ -501,8 +510,7 @@ def login_token(force=False):
                 return tok
         rt = refresh_token()
         if rt is None:
-            login_present()  # a keychain item or token file that is gone: the stale record goes (EPM L4)
-            return None
+            return None  # the session start's check (login_present) removes a stale record and offers the sign-in
         left = start + LOGIN_DEADLINE - LOGIN_SAVE_RESERVE - time.time()
         if left < 1.5:
             return None  # no request sent, nothing rotated: the next call refreshes
@@ -1324,14 +1332,14 @@ def cmd_check(_args):
         try:
             signin["v"] = session_sign_in(inp)
         except Exception:
-            signin["v"] = (None, AI_FALLBACK_NOTE)
+            signin["v"] = _late_sign_in_note()
     t_signin = threading.Thread(target=_signin, daemon=True)
     t_signin.start()
     t0 = time.time()
 
     def emit(ctx):
         t_signin.join(max(0.0, t0 + HOOK_START_SECONDS + 0.5 - time.time()))
-        person, ai = signin.get("v", (None, AI_FALLBACK_NOTE))
+        person, ai = signin["v"] if "v" in signin else _late_sign_in_note()
         if ai:
             ctx = ai + (" " + ctx if ctx else "")
         out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}
@@ -2009,6 +2017,8 @@ def _change_signin(to, by):
     try:
         ensure_dirs()
         lock = _try_lock(_signin_lock_file(), wait=2)
+        if lock is None and fcntl is not None:
+            return False  # never write without the lock (a lost race could undo a flip)
         rec = _read_private_json(_signin_file())
         if not _signin_ok(rec) or rec.get("mode") != SIGNIN_LEGACY or to != SIGNIN_DEVICE:
             return False
@@ -2048,8 +2058,10 @@ def placeholder_applies():
 
 
 def hooks_offer_sign_in():
-    """The hooks start and show a device sign-in: never without file locking (it could not be kept alive)."""
-    return fcntl is not None and signin_state().get("mode") != SIGNIN_OLD
+    """The hooks start and show a device sign-in only on a terminal Claude Code (DEVICE_HOSTS) with file locking: never
+    where it could not be kept alive, and not on other hosts, where the host's own sign-in door is the way in (and
+    `claude -p` / SDK runs start no code)."""
+    return fcntl is not None and device_host() and signin_state().get("mode") != SIGNIN_OLD
 
 
 def legacy_warning():
@@ -2063,6 +2075,8 @@ def legacy_warning():
     lock = None
     try:
         lock = _try_lock(_signin_lock_file(), wait=2)
+        if lock is None:
+            return None
         cur = _read_private_json(_signin_file())
         if not _signin_ok(cur) or cur.get("warned_at"):
             return None
@@ -2335,6 +2349,18 @@ def person_sign_in_text(info, legacy=False):
                 f"{info['user_code']} and press Approve. Your current connector sign-in keeps working in the meantime.\n{tail}")
     return (f"datastash isn't signed in on this computer. To sign in, open {info['url']} (on any device), enter code "
             f"{info['user_code']} and press Approve.\n{tail}")
+
+
+def _late_sign_in_note():
+    """The session start's sign-in work ran late or broke: the fallback line for the AI only where it is true (a
+    device-mode, terminal session with no login on file); otherwise nothing. Cheap file checks only."""
+    try:
+        if (hooks_offer_sign_in() and not _login_recorded()
+                and signin_state().get("mode") == SIGNIN_DEVICE):
+            return None, AI_FALLBACK_NOTE
+    except Exception:
+        pass
+    return None, None
 
 
 def session_sign_in(inp):
