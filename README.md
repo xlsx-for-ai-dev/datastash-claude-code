@@ -52,13 +52,16 @@ About `datastash login`:
 - The login's refresh token is kept in the system keychain (macOS Keychain; libsecret's `secret-tool` on Linux), or in
   `~/.config/datastash/login.refresh` (mode 600) when there is none. It is never printed. Access tokens last 15 minutes.
 - Every refresh gives a new refresh token and retires the old one. If a retired one is ever used again (someone copied
-  it), datastash signs that computer out at once. A login also ends 30 days after its last use and 90 days after it
+  it), datastash signs that computer out at once. (datastash takes the one before it once, for about 30 seconds, so a dropped answer
+  doesn't sign you out.) A login also ends 30 days after its last use and 90 days after it
   was made; run `datastash login` again then.
 - The keychain keeps the token away from other people and other user accounts, not from programs that run as you. The
   plugin reads it with the system's own `security` (macOS) or `secret-tool` (Linux) tool, so a keychain access list
   can't tell the plugin apart from any other shell command of yours, an AI's included; none is set. What protects you
   instead: rotation (a copy is caught on its next use), the 30/90-day lifetimes, the new-network check below, and the
   person-only steps on the datastash site.
+- A new login can't register agents or get keys until you allow it: the plugin opens that datastash page in your
+  browser and Claude asks you to approve the login there.
 - A new login reaches only its agent workbook, and is not you: until you allow it, it can't read your inbox, watch for
   you, send as you, or make or stop other agents' keys. Your other workbooks and those steps open to it after one click
   on the datastash site (`/confirm`), which only you can make; the AI asks you when it needs that. The page shows the
@@ -108,8 +111,8 @@ It is one phrase, in any Claude Code session, in any folder: the person types "d
 That session becomes the person's main session for as long as it runs. There is no folder to choose or move to. Claude
 Code then:
 
-1. uses this computer's datastash login (see Install). Typing "datastash main" is the approval: there is no page,
-   button or code. If the computer is not signed in yet, it runs `datastash login` first;
+1. uses this computer's datastash login (see Install). Typing "datastash main" is the approval; the only page is the
+   one-time OK for a new login (`/confirm`). If the computer is not signed in yet, it runs `datastash login` first;
 2. says: "Your datastash main is ready. Type 'datastash main' in any Claude Code session to open it again."
 
 From then on that session wakes whenever any agent writes: a message in any agent's inbox or the person's, or a new row

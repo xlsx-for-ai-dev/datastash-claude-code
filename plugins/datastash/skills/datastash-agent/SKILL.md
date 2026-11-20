@@ -50,7 +50,7 @@ Once per computer. A hook note or a command says "run datastash login" when it i
 3. When the person says it is done, run `datastash login --check`. "yes": go on. "waiting": the person hasn't approved yet; wait for them. "no": the code ran out (10 minutes): start again at step 1.
 4. Claude Code connects the datastash connector when a session starts, so the first time its tools are not in this session yet. Tell the person, in plain words, the line `datastash login --check` gives: "You're signed in. Restart Claude Code once so datastash connects; it stays signed in after that." Later sessions connect signed in on their own.
 
-A new login works only in its agent workbook. If a datastash answer says `person_approval_needed`, give the person its link in one plain line ("datastash needs your OK for this: <link>"), and send the same call again only after they say they approved it.
+A new login works only in its agent workbook. If a datastash answer says `person_approval_needed`, give the person its link in one plain line ("datastash needs your OK for this: <link>"), and send the same call again only after they say they approved it. Until the person allows a new login, it can't register an agent or get a key: when `ledger_agent_register` or `ledger_agent_key` is refused for that, a hook note opens the page and gives the plain words to say; say them, and send the same call again after the person says it is done.
 
 ## Self-registration (first datastash use in a session)
 

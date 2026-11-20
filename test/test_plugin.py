@@ -836,6 +836,7 @@ class MainBase(Base):
         self.saved.setdefault("login_token", ds.login_token)
         self.login = "dsat_" + "t" * 43
         ds.login_token = lambda force=False: self.login
+        ds.signed_in = lambda: self.login is not None
         self.folder = tempfile.mkdtemp(prefix="agent-linked-", dir=TMP)
         ds.write_private(ds.conf_path("builder"), json.dumps({"name": "Builder", "workbook_id": "wb-b", "projects": [self.folder]}))
         ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps({"workbook_id": WID, "projects": []}))
@@ -1110,6 +1111,16 @@ class MainAnySession(MainBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("confirmation for the person: " + ds.MAIN_READY, out)
         self.assertTrue(ds.is_main_session(self.be("sess-C", (1201, "tC"))))
+
+    def test_signed_in_but_unreachable_never_asks_for_a_second_login(self):
+        self.be("sess-N", (1301, "tN"))
+        self.prompt("sess-N")
+        self.login = None
+        ds.signed_in = lambda: True  # a login is recorded, but no token right now (network blip)
+        rc, out, err = self.main_cmd("--on")
+        self.assertNotEqual(rc, 0)
+        self.assertIn(ds.NO_TOKEN_NOW, err)
+        self.assertNotIn(ds.LOGIN_STEP, out)
 
     def test_the_earlier_key_step_is_refused_and_saves_nothing(self):
         self.be("sess-K", (1101, "tK"))
@@ -2244,6 +2255,46 @@ class Login(Base):
         ds.fcntl = None
         self.assertIsNone(ds.login_token())  # no locks: no refresh at all (a rotating token is never sent twice)
         self.assertEqual(self.refresh_bodies, [])
+
+    def test_a_refused_register_or_key_opens_the_login_approval_page_once(self):
+        """XLI-290 (EPM re-review 2): an unconfirmed login can't register agents or get keys; the hook opens the
+        datastash /confirm page once and gives the AI the plain words."""
+        url = ds.ORIGIN + "/confirm?r=xyz"
+        body = json.dumps({"code": "person_approval_needed", "approve_url": url})
+        inp = {"hook_event_name": "PostToolUse", "tool_name": "mcp__plugin_datastash_datastash__ledger_agent_register",
+               "tool_response": [{"type": "text", "text": body}]}
+        self.calls.clear()
+        note = ds.login_approval_note(inp)
+        self.assertIn(ds.LOGIN_APPROVE_OPENED, note)
+        self.assertEqual(self.calls, [("browser", url)])
+        note = ds.login_approval_note(dict(inp, tool_name="mcp__x__ledger_agent_key", hook_event_name="PostToolUseFailure"))
+        self.assertIn(ds.LOGIN_APPROVE_OPENED, note)
+        self.assertEqual(self.calls, [("browser", url)])  # once per page
+        # Not ours: other tools, other codes, links elsewhere.
+        self.assertIsNone(ds.login_approval_note(dict(inp, tool_name="mcp__x__ledger_rows_read")))
+        self.assertIsNone(ds.login_approval_note(dict(inp, tool_response=body.replace(ds.ORIGIN, "https://evil.example"))))
+        self.assertIsNone(ds.login_approval_note(dict(inp, tool_response=body.replace("person_approval_needed", "not_allowed"))))
+        # No browser here: the link goes in the plain words.
+        ds._open_browser = lambda u: False
+        url2 = ds.ORIGIN + "/confirm?r=other"
+        note = ds.login_approval_note(dict(inp, tool_response=json.dumps({"code": "login_not_confirmed", "approve_url": url2})))
+        self.assertIn(ds.LOGIN_APPROVE_LINK.format(url=url2), note)
+
+    def test_login_check_says_no_when_the_code_ran_out(self):
+        ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps({"device_code": "dsdc_" + "d" * 43, "until": time.time() - 5}))
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_login(["--check"])
+        self.assertIn("signed in: no", out.getvalue())
+
+    def test_no_refresh_is_sent_without_time_to_save_its_answer(self):
+        self.finish_login()
+        self.expire_access()
+        self.saved.setdefault("LOGIN_DEADLINE", ds.LOGIN_DEADLINE)
+        ds.LOGIN_DEADLINE = 0
+        self.assertIsNone(ds.login_token())
+        self.assertEqual(self.refresh_bodies, [])
+        ds.LOGIN_DEADLINE = self.saved["LOGIN_DEADLINE"]
+        self.assertEqual(ds.login_token(), "dsat_" + "1" * 43)
 
     def expire_access(self):
         a = json.load(open(ds.LOGIN_ACCESS_FILE))
