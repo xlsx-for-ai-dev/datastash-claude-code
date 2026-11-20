@@ -25,6 +25,8 @@ os.environ["DATASTASH_MAIN_DIR"] = MAIN
 os.environ.pop("DATASTASH_AGENT", None)
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)  # each test names its own session
 os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(TMP, "claude-config")  # never the real Claude Code folder or sign-ins
+os.environ["DATASTASH_NO_NETWORK"] = "1"  # every datastash process these tests start, too, stays off the network
+os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)  # each test names its host
 
 loader = importlib.machinery.SourceFileLoader("datastash_bin", BIN)
 spec = importlib.util.spec_from_loader("datastash_bin", loader)
@@ -92,10 +94,13 @@ class Base(unittest.TestCase):
                                                     "_sleep", "WAKE_GATHER_SECONDS", "WAKE_MIN_SECONDS", "random",
                                                     "announce_ids", "WAKE_IDLE_MAX_SECONDS", "_claude_chain",
                                                     "signed_in", "imported_connector_hint", "http", "_spawn_poller",
-                                                    "_open_browser", "_login_recorded")}
+                                                    "_open_browser", "_login_recorded", "_spawn_starter",
+                                                    "login_present", "fcntl")}
         # Offline: no test ever reaches datastash, starts a background poll or opens a browser unless it fakes them.
         ds.http = _offline_http
         ds._spawn_poller = lambda: True
+        ds._spawn_starter = self.thread_starter  # the hooks' detached starter, as a thread of this test (never a process)
+        ds.login_present = lambda: ds._login_recorded()
         ds._open_browser = lambda url: False
         ds._login_recorded = lambda: True
         ds.signed_in = lambda: True  # XLI-278: this computer's datastash login (SignInHint and Login test the real one)
@@ -106,6 +111,11 @@ class Base(unittest.TestCase):
         ds.hook_input = lambda: {"session_id": "s1"}
         ds._session_pid = lambda: os.getpid()
         ds.hook_heartbeat("check", {})  # the plugin's hooks run on this test machine (see SetupDoctor for when not)
+
+    @staticmethod
+    def thread_starter():
+        threading.Thread(target=lambda: ds._start_code(hook=True, timeout=20), daemon=True).start()
+        return True
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -269,6 +279,7 @@ class CheckTimeout(Base):
             "d.read_key = lambda s: 'ldgr_ag_test'\n"
             "d.signed_in = lambda: True\n"
             "d._login_recorded = lambda: True\n"
+            "d.login_present = lambda: True\n"
             "d.http = lambda *a, **k: (_ for _ in ()).throw(OSError('offline test'))\n"
             "d.imported_connector_hint = lambda: None\n"
             "d.resolve = lambda p, me=None: ({'name': 'Tester', 'slug': 'tester', 'workbook_id': 'wb1'}, [])\n"
@@ -2031,6 +2042,7 @@ class SignInHint(Base):
         super().setUp()
         ds.signed_in = self.saved["signed_in"]
         ds._login_recorded = self.saved["_login_recorded"]
+        ds.login_present = self.saved["login_present"]
         ds.imported_connector_hint = self.saved["imported_connector_hint"]
         for k in ("STATE", "HEARTBEAT", "CONF", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE"):
             self.saved.setdefault(k, getattr(ds, k))
@@ -2089,7 +2101,7 @@ class SignInHint(Base):
             self.assertNotIn("dsdc_", text)
             self.assertNotIn("dsrt_", text)
         self.assertNotIn("BCDF-GHJK", ctx)  # the code goes to the person only
-        self.assertEqual(self.starts, [ds.HOOK_START_SECONDS])
+        self.assertEqual(self.starts, [20])  # the detached starter's own wait, never the hook's
         self.assertEqual(len(self.spawned), 1)  # a detached poll finishes it
         self.assertEqual(os.stat(ds.LOGIN_PENDING_FILE).st_mode & 0o777, 0o600)
         again = self.check_out("sess-A")  # a second start in that session (compact, resume): quiet
@@ -2277,6 +2289,8 @@ class Login(Base):
 
     def setUp(self):
         super().setUp()
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a terminal Claude Code session; a fresh computer: the device mode
+        self.addCleanup(os.environ.pop, "CLAUDE_CODE_ENTRYPOINT", None)
         ds.signed_in = self.saved["signed_in"]
         ds._login_recorded = self.saved["_login_recorded"]
         for k in ("CONF", "STATE", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE", "http",
@@ -2508,13 +2522,17 @@ class Login(Base):
                         setattr(ds, k, self.saved[k])
                 setup()
                 out = self.token_out()
+                if name == "no file locks":  # EPM M1: no placeholder where the login can't refresh
+                    self.assertEqual(json.loads(out), {}, name)
+                    continue
                 self.assertEqual(json.loads(out), placeholder, name)
                 self.assertNotIn("{}", out)
 
     def test_token_header_as_a_real_process_in_a_signed_out_home(self):
         """The helper as Claude Code runs it (a pipe, a fresh config folder): exit 0 and the placeholder header."""
         home = tempfile.mkdtemp(dir=TMP)
-        env = dict(os.environ, DATASTASH_CONFIG_DIR=os.path.join(home, "conf"), HOME=home)
+        env = dict(os.environ, DATASTASH_CONFIG_DIR=os.path.join(home, "conf"), HOME=home, CLAUDE_CODE_ENTRYPOINT="cli",
+                   CLAUDE_CONFIG_DIR=os.path.join(home, ".claude"))
         r = subprocess.run([sys.executable, "-I", BIN, "token", "--header"], capture_output=True, text=True, env=env, timeout=20)
         self.assertEqual(r.returncode, 0)
         self.assertEqual(json.loads(r.stdout), {"Authorization": "Bearer signed-out"})
@@ -2636,6 +2654,379 @@ class Login(Base):
         self.assertIn("scripts/datastash", cfg["headersHelper"])
         self.assertTrue(cfg["headersHelper"].endswith("token --header"))
         self.assertFalse(os.path.exists(os.path.join(HERE, "..", "plugins", "datastash", "bin")))  # chat and Cowork refuse a top-level bin/
+
+
+class Transition(Base):
+    """EPM ruling 11-20: the sign-in transition. Legacy (an install signed in through Claude Code's /mcp Authenticate)
+    keeps the 0.1.x helper (no header while signed out); only the person's completed device sign-in, or the 30-day
+    deadline, moves it to the device mode (the placeholder), one way. Plus: hosts that can't show the device sign-in,
+    no file locking (M1), the poller's retries (L1), a hook that ends mid-start (L2), a vanished keychain item (L4)
+    and no browser in non-interactive runs (INFO)."""
+
+    FAKE_OAUTH = "fake-oauth-value-for-tests"
+
+    def setUp(self):
+        super().setUp()
+        ds.signed_in = self.saved["signed_in"]
+        ds._login_recorded = self.saved["_login_recorded"]
+        ds.login_present = self.saved["login_present"]
+        for k in ("CONF", "STATE", "HEARTBEAT", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE",
+                  "LOGIN_PENDING_FILE", "LOGIN_LOCK_FILE", "_platform", "_keychain_state", "HOOK_START_SECONDS"):
+            self.saved.setdefault(k, getattr(ds, k))
+        self.env_saved = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT")}
+        self.starts = []
+        self.spawned = []
+        ds._spawn_poller = lambda: self.spawned.append(1) or True
+        self.token_answers = []
+
+        def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
+            if path == ds.DEVICE_START_PATH:
+                self.starts.append(timeout)
+                return 200, "application/json", json.dumps({"device_code": "dsdc_" + "d" * 43, "user_code": "BCDF-GHJK",
+                                                            "verification_uri": ds.ORIGIN + "/device", "expires_in": 600, "interval": 5})
+            if path == ds.DEVICE_TOKEN_PATH and self.token_answers:
+                a = self.token_answers.pop(0)
+                if isinstance(a, BaseException):
+                    raise a
+                return 200, "application/json", json.dumps(a)
+            raise ds.urllib.error.URLError("offline test")
+        ds.http = fake_http
+        self.new_computer()
+
+    def tearDown(self):
+        for k, v in self.env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def new_computer(self, updated=False, oauth=None, entry=None):
+        """A fresh plugin folder (updated: an earlier version left its files) and Claude Code config folder (oauth:
+        True plants a connector sign-in for this plugin, False an entry without one)."""
+        root = tempfile.mkdtemp(dir=TMP)
+        ds.CONF = os.path.join(root, "conf")
+        ds.STATE = os.path.join(ds.CONF, "state")
+        ds.HEARTBEAT = os.path.join(ds.STATE, "hooks-heartbeat.json")
+        for k, n in (("LOGIN_FILE", "login.json"), ("LOGIN_REFRESH_FILE", "login.refresh"), ("LOGIN_ACCESS_FILE", "login.access.json"),
+                     ("LOGIN_PENDING_FILE", "login.pending.json"), ("LOGIN_LOCK_FILE", "login.lock")):
+            setattr(ds, k, os.path.join(ds.CONF, n))
+        ds.ensure_dirs()
+        if updated:
+            ds.write_private(ds.HEARTBEAT, json.dumps({"at": 1}))  # 0.1.x hooks ran here
+        self.claude = os.path.join(root, "claude")
+        os.makedirs(self.claude, mode=0o700)
+        os.environ["CLAUDE_CONFIG_DIR"] = self.claude
+        if oauth is not None or entry is not None:
+            e = entry or {"serverName": ds.CLAUDE_SERVER_NAME, "serverUrl": "https://getdatastash.com/mcp",
+                          "accessToken": self.FAKE_OAUTH if oauth else "", "clientId": "c1"}
+            store = {"claudeAiOauth": {"accessToken": "other-" + self.FAKE_OAUTH},
+                     "mcpOAuth": {ds.CLAUDE_SERVER_NAME + "|0123456789abcdef": e,
+                                  "other|fedcba9876543210": {"serverName": "other", "serverUrl": "https://example.com/mcp",
+                                                             "accessToken": "x"}}}
+            with open(os.path.join(self.claude, ".credentials.json"), "w") as f:
+                json.dump(store, f)
+        return root
+
+    def token_out(self, entry="cli"):
+        if entry is None:
+            os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        else:
+            os.environ["CLAUDE_CODE_ENTRYPOINT"] = entry
+        buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+            self.assertEqual(ds.cmd_token(["--header"]), 0)
+        return json.loads(buf.getvalue())
+
+    def mode(self):
+        return ds.signin_state()["mode"]
+
+    def run_bin(self, *args, entry="cli"):
+        env = dict(os.environ, DATASTASH_CONFIG_DIR=ds.CONF, CLAUDE_CONFIG_DIR=self.claude, DATASTASH_NO_NETWORK="1",
+                   CLAUDE_CODE_ENTRYPOINT=entry, HOME=os.path.dirname(ds.CONF))
+        return subprocess.run([sys.executable, "-I", BIN] + list(args), capture_output=True, text=True, env=env,
+                              timeout=30, stdin=subprocess.DEVNULL)
+
+    # 1. legacy from a local fact only; presence only
+    def test_the_store_check_sees_only_whether_this_connector_has_a_sign_in(self):
+        self.assertIs(ds.claude_store_has_oauth(), False)  # Linux: no file means no connector sign-in
+        self.new_computer(oauth=True)
+        self.assertIs(ds.claude_store_has_oauth(), True)
+        self.new_computer(oauth=False)  # registered once, never signed in (empty token)
+        self.assertIs(ds.claude_store_has_oauth(), False)
+        self.new_computer(entry={"serverName": "datastash", "serverUrl": "https://getdatastash.com/mcp/", "refreshToken": "r"})
+        self.assertIs(ds.claude_store_has_oauth(), True)  # added by hand under another name: the URL counts
+        with open(os.path.join(self.claude, ".credentials.json"), "w") as f:
+            f.write("{not json")
+        self.assertIsNone(ds.claude_store_has_oauth())
+        ds._platform = lambda: "darwin"  # macOS keeps them in the keychain, which is never read: can't tell
+        self.new_computer()
+        self.assertIsNone(ds.claude_store_has_oauth())
+
+    def test_the_decision_and_every_line_carry_no_token(self):
+        self.new_computer(updated=True, oauth=True)
+        rec = ds.signin_state()
+        self.assertEqual(rec["mode"], ds.SIGNIN_LEGACY)
+        with open(ds._signin_file()) as f:
+            raw = f.read()
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"
+        line = ds.signin_doctor_line()
+        for text in (raw, line, json.dumps(self.token_out())):
+            self.assertNotIn(self.FAKE_OAUTH, text)
+            self.assertNotIn("accessToken", text)
+
+    def test_fresh_gets_the_placeholder_updated_keeps_legacy_never_the_reverse(self):
+        cases = [  # (updated, oauth in Claude Code's store, platform) -> mode
+            (False, None, "linux", ds.SIGNIN_DEVICE), (True, None, "linux", ds.SIGNIN_DEVICE),
+            (False, True, "linux", ds.SIGNIN_LEGACY), (True, True, "linux", ds.SIGNIN_LEGACY),
+            (True, False, "linux", ds.SIGNIN_DEVICE),
+            (False, None, "darwin", ds.SIGNIN_DEVICE), (True, None, "darwin", ds.SIGNIN_LEGACY),  # can't tell
+            (True, True, "darwin", ds.SIGNIN_LEGACY),
+        ]
+        for updated, oauth, plat, want in cases:
+            with self.subTest(updated=updated, oauth=oauth, plat=plat):
+                ds._platform = lambda: plat
+                self.new_computer(updated=updated, oauth=oauth)
+                self.assertEqual(self.mode(), want)
+        ds._platform = lambda: "darwin"
+        self.new_computer(updated=True)
+        ds.write_private(ds.LOGIN_REFRESH_FILE, "dsrt_" + "r" * 43 + "\n")
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": 1}))
+        self.assertEqual(self.mode(), ds.SIGNIN_DEVICE)  # already signed in by device code: the new mode
+
+    def test_the_decision_comes_before_this_run_writes_anything(self):
+        """A fresh install's first hook writes its heartbeat; it must not read that as an earlier version's files."""
+        self.new_computer()
+        r = self.run_bin("check")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.mode(), ds.SIGNIN_DEVICE)
+        self.new_computer(updated=True, oauth=True)
+        self.run_bin("check")
+        self.assertEqual(self.mode(), ds.SIGNIN_LEGACY)
+
+    # 2. the helper per mode; an updated install with a stored OAuth sign-in keeps its tools
+    def test_an_updated_install_with_a_connector_sign_in_keeps_it(self):
+        self.new_computer(updated=True, oauth=True)
+        r = self.run_bin("token", "--header")  # as Claude Code runs it on a terminal session
+        self.assertEqual((r.returncode, r.stdout.strip(), r.stderr), (0, "{}", ""))  # no header: the stored sign-in is used
+        self.new_computer()
+        r = self.run_bin("token", "--header")
+        self.assertEqual(json.loads(r.stdout), {"Authorization": "Bearer signed-out"})  # fresh: one door
+
+    def test_a_token_is_sent_in_every_mode_and_host(self):
+        self.new_computer(updated=True, oauth=True)
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": 1}))
+        ds.write_private(ds.LOGIN_ACCESS_FILE, json.dumps({"token": "dsat_" + "a" * 43, "exp": int(time.time()) + 900}))
+        for entry in ("cli", "claude-desktop", "local-agent", None):
+            self.assertEqual(self.token_out(entry), {"Authorization": "Bearer " + "dsat_" + "a" * 43})
+
+    # Problem 2: never remove a Connect button where the device sign-in can't run
+    def test_hosts_that_cant_show_the_device_sign_in_keep_their_own_door(self):
+        self.new_computer()
+        self.assertEqual(self.mode(), ds.SIGNIN_DEVICE)
+        self.assertEqual(self.token_out("cli"), {"Authorization": "Bearer signed-out"})
+        for entry in ("claude-desktop", "local-agent", "claude-vscode", "sdk-cli", "sdk-ts", "remote_cowork", None):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.token_out(entry), {})
+
+    # 3. only the person's completed device sign-in flips it; one way; no command switches it back
+    def approve(self, answers):
+        ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps({"device_code": "dsdc_" + "d" * 43, "interval": 5,
+                                                            "until": time.time() + 600}))
+        self.token_answers = list(answers)
+        self.saved.setdefault("time_sleep", ds.time.sleep)
+        ds.time.sleep = lambda s: None
+        try:
+            ds._login_poll()
+        finally:
+            ds.time.sleep = self.saved.pop("time_sleep")
+
+    GOOD = {"access_token": "dsat_" + "a" * 43, "refresh_token": "dsrt_" + "r" * 43, "expires_in": 900}
+
+    def test_only_a_completed_device_sign_in_flips_legacy(self):
+        self.new_computer(updated=True, oauth=True)
+        self.saved.setdefault("_keychain_set", ds._keychain_set)
+        ds._keychain_set = lambda t: False
+        self.approve([ds.ApiError(400, {"error": "access_denied"})])  # the person said no
+        self.assertEqual(self.mode(), ds.SIGNIN_LEGACY)
+        self.approve([self.GOOD])
+        rec = ds.signin_state()
+        self.assertEqual((rec["mode"], rec["changed_by"]), (ds.SIGNIN_DEVICE, "device sign-in"))
+        self.assertGreaterEqual(rec["changed_at"], rec["first_run_at"])
+
+    def test_no_command_switches_it_back(self):
+        self.new_computer(updated=True, oauth=True)
+        self.assertEqual(self.mode(), ds.SIGNIN_LEGACY)
+        self.assertFalse(ds._change_signin(ds.SIGNIN_LEGACY, "anything"))
+        rec = dict(ds.signin_state(), mode=ds.SIGNIN_DEVICE, changed_by="device sign-in")
+        ds.write_private(ds._signin_file(), json.dumps(rec))
+        self.assertFalse(ds._change_signin(ds.SIGNIN_LEGACY, "anything"))
+        for args in (["logout"], ["login", "--check"], ["doctor"], ["status"], ["token", "--header"], ["help"],
+                     ["login", "--legacy"], ["token", "--legacy"], ["off", "x"]):
+            self.run_bin(*args)
+            self.assertEqual(self.mode(), ds.SIGNIN_DEVICE, args)
+        r = self.run_bin("token", "--header")
+        self.assertEqual(json.loads(r.stdout), {"Authorization": "Bearer signed-out"})
+        with open(BIN) as f:  # nothing but the first decision ever writes the legacy mode
+            src = f.read()
+        self.assertEqual(src.count("mode=SIGNIN_LEGACY"), 2)  # the two first-decision cases in _decide_signin
+
+    # 4. legacy still sees the device link; the deadline and its one warning
+    def check(self, sid):
+        ds.hook_input = lambda: {"session_id": sid}
+        ds.resolve = lambda p, me=None: (None, [])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ds.cmd_check([])
+        return json.loads(out.getvalue())
+
+    def test_legacy_sees_the_device_link_at_session_start(self):
+        self.new_computer(updated=True, oauth=True)
+        got = self.check("sess-L")
+        msg, ctx = got["systemMessage"], got["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("datastash has a new sign-in for this computer. Open https://getdatastash.com/device", msg)
+        self.assertIn("enter code BCDF-GHJK", msg)
+        self.assertIn("Your current connector sign-in keeps working in the meantime.", msg)
+        self.assertTrue(ctx.startswith(ds.AI_LEGACY_NOTE))
+        self.assertNotIn("BCDF-GHJK", ctx)
+        self.assertNotIn("In ", msg.split("\n")[0][:3])  # no warning before the last week
+
+    def test_the_deadline_applies_the_placeholder_with_one_warning_a_week_before(self):
+        self.new_computer(updated=True, oauth=True)
+        rec = ds.signin_state()
+        ds.write_private(ds._signin_file(), json.dumps(dict(rec, first_run_at=time.time() - 24 * 86400)))
+        got = self.check("sess-W1")
+        first = got["systemMessage"].split("\n")[0]
+        self.assertEqual(first, "In 6 days, the datastash connector stops using its old sign-in. Sign in with the code "
+                                "below to keep it working.")
+        self.assertIn("enter code BCDF-GHJK", got["systemMessage"])
+        again = self.check("sess-W2")
+        self.assertNotIn("stops using its old sign-in", again["systemMessage"])  # said once
+        self.assertEqual(self.token_out("cli"), {})  # still legacy
+        rec = ds.signin_state()
+        ds.write_private(ds._signin_file(), json.dumps(dict(rec, first_run_at=time.time() - 30 * 86400 - 5)))
+        self.assertEqual(self.token_out("cli"), {"Authorization": "Bearer signed-out"})
+        rec = ds.signin_state()
+        self.assertEqual((rec["mode"], rec["changed_by"]), (ds.SIGNIN_DEVICE, "deadline"))
+        got = self.check("sess-W3")
+        self.assertTrue(got["hookSpecificOutput"]["additionalContext"].startswith(ds.AI_SHOWN_NOTE))
+
+    # 5. kept in the plugin's own private file; doctor shows it
+    def test_the_mode_is_kept_private_and_doctor_shows_it(self):
+        self.new_computer(updated=True, oauth=True)
+        ds.signin_state()
+        self.assertEqual(os.stat(ds._signin_file()).st_mode & 0o777, 0o600)
+        r = self.run_bin("doctor")
+        self.assertIn("note: sign-in mode: legacy since ", r.stdout)
+        self.assertIn("in 30 days", r.stdout)
+        self.assertIn("Connector header on this host (cli) when signed out: no header", r.stdout)
+        self.new_computer()
+        r = self.run_bin("doctor")
+        self.assertIn("note: sign-in mode: device since ", r.stdout)
+        self.assertIn("when signed out: placeholder (device sign-in only)", r.stdout)
+
+    # M1: no file locking: the old behaviour for good
+    def test_without_file_locking_the_old_behaviour_stays_for_good(self):
+        ds.fcntl = None
+        self.new_computer()
+        self.assertEqual(self.mode(), ds.SIGNIN_OLD)
+        self.assertEqual(self.token_out("cli"), {})
+        started = []
+        ds._spawn_starter = lambda: started.append(1) or True
+        got = self.check("sess-N")
+        self.assertNotIn("systemMessage", got)
+        self.assertNotIn(ds.SIGN_IN_NOTE, got["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual((started, self.spawned, self.starts), ([], [], []))
+        self.approve([self.GOOD])  # even a typed sign-in that completes keeps it (no refresh is possible here)
+        self.assertEqual(self.mode(), ds.SIGNIN_OLD)
+        ds.write_private(ds.LOGIN_ACCESS_FILE, json.dumps({"token": "x", "exp": 0}))  # its 15 minutes ran out
+        self.assertEqual(self.token_out("cli"), {})  # the connector's own sign-in door, never the placeholder
+
+    # L1: the poller keeps waiting through 5xx and a plain 429
+    def test_the_poller_retries_until_the_code_ends(self):
+        self.new_computer()
+        self.saved.setdefault("_keychain_set", ds._keychain_set)
+        ds._keychain_set = lambda t: False
+        busy = ds.ApiError(429, {"error": "rate_limited"})
+        busy.retry_after = 7
+        self.approve([ds.ApiError(503, {}), ds.ApiError(500, {"error": "server_error"}), busy,
+                      ds.ApiError(400, {"error": "authorization_pending"}), self.GOOD])
+        self.assertTrue(ds._login_recorded())
+        self.assertFalse(os.path.exists(ds.LOGIN_PENDING_FILE))
+        self.new_computer()
+        self.approve([ds.ApiError(400, {"error": "expired_token"}), self.GOOD])
+        self.assertFalse(ds._login_recorded())  # a final answer ends it
+
+    # L2: a hook that ends mid-start never strands the code
+    def test_a_code_issued_after_the_hook_gave_up_is_shown_next_time(self):
+        self.new_computer()
+        ds.HOOK_START_SECONDS = 0.2
+        go = threading.Event()
+        fake = ds.http
+
+        def slow(*a, **k):
+            go.wait(5)
+            return fake(*a, **k)
+        ds.http = slow
+        t = time.time()
+        got = self.check("sess-K1")
+        self.assertLess(time.time() - t, 2)
+        self.assertNotIn("systemMessage", got)
+        go.set()
+        for _ in range(50):  # the starter carries on by itself and saves the code
+            if os.path.exists(ds.LOGIN_PENDING_FILE):
+                break
+            time.sleep(0.05)
+        got = self.check("sess-K2")
+        self.assertIn("enter code BCDF-GHJK", got["systemMessage"])
+        self.assertEqual(len(self.starts), 1)  # no second code
+
+    def test_the_hooks_start_runs_in_a_detached_process(self):
+        self.saved.setdefault("Popen", ds.subprocess.Popen)
+        seen = []
+        ds.subprocess.Popen = lambda cmd, **k: seen.append((cmd[-2:], k.get("start_new_session")))
+        try:
+            self.assertTrue(self.saved["_spawn_starter"]())
+        finally:
+            ds.subprocess.Popen = self.saved.pop("Popen")
+        self.assertEqual(seen, [(["login", "--start"], True)])
+
+    # L4: a keychain item that is gone means signed out
+    def test_a_vanished_keychain_item_means_signed_out(self):
+        self.new_computer()
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "keychain", "at": 1}))
+        ds._keychain_state = lambda: "unknown"  # a keychain that can't answer just now: still signed in
+        self.assertNotIn("systemMessage", self.check("sess-V0"))
+        ds._keychain_state = lambda: "missing"
+        got = self.check("sess-V1")
+        self.assertIn("enter code BCDF-GHJK", got["systemMessage"])
+        self.assertFalse(os.path.exists(ds.LOGIN_FILE))
+        ds.write_private(ds.LOGIN_REFRESH_FILE, "x\n")  # a token file that is no token
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": 1}))
+        self.assertFalse(ds.login_present())
+
+    # INFO: no browser in a non-interactive run
+    def test_no_browser_without_a_person_at_the_session(self):
+        ds._open_browser = self.saved["_open_browser"]
+        self.saved.setdefault("Popen", ds.subprocess.Popen)
+        self.saved.setdefault("which", ds.shutil.which)
+        opened = []
+        ds.subprocess.Popen = lambda cmd, **k: opened.append(cmd)
+        ds.shutil.which = lambda c: "/usr/bin/" + c
+        os.environ.setdefault("DISPLAY", ":0")
+        try:
+            for entry in ("sdk-cli", "sdk-py", "local-agent", None):
+                if entry:
+                    os.environ["CLAUDE_CODE_ENTRYPOINT"] = entry
+                else:
+                    os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+                self.assertFalse(ds._open_browser(ds.ORIGIN + "/device"), entry)
+            self.assertEqual(opened, [])
+            os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"
+            self.assertTrue(ds._open_browser(ds.ORIGIN + "/device"))
+        finally:
+            ds.subprocess.Popen = self.saved.pop("Popen")
+            ds.shutil.which = self.saved.pop("which")
 
 
 if __name__ == "__main__":

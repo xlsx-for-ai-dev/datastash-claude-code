@@ -53,5 +53,10 @@ class SkillText(unittest.TestCase):
                        "## Sign this computer in (datastash login)", "datastash login --check"):
             self.assertIn(needle, part2, needle)
 
+    def test_the_ai_never_opens_or_approves_the_sign_in_page(self):
+        _, body = parts()
+        self.assertIn("Never open or approve the sign-in page yourself", body)
+
+
 if __name__ == "__main__":
     unittest.main()

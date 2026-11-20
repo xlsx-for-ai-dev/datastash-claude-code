@@ -43,8 +43,9 @@ This computer's datastash login (XLI-278; the person approves it once in their b
   login --check             signed in: yes, waiting or no
   logout                    sign this computer out at datastash and remove the keychain item
   token --header            for the datastash connector's headersHelper only: prints {"Authorization": "Bearer ..."} (a
-                            15-minute token when stdout is not a terminal; the fixed placeholder "signed-out" in every
-                            other case, so Claude Code never offers its OAuth sign-in). Always exits 0. Never logs.
+                            15-minute token when stdout is not a terminal); when there is none, the fixed placeholder
+                            "signed-out" in the device sign-in mode on a terminal Claude Code (so Claude Code offers no
+                            OAuth sign-in), else {} (the connector's own sign-in keeps working). Always exits 0.
 Hook entry points (run by Claude Code, not by hand): check, listen, end, prompt, agent-tool.
 
 The key is read from its file and sent only to https://getdatastash.com, never printed, logged or put on a
@@ -354,6 +355,20 @@ def _keychain_get():
     return out if rc == 0 and re.fullmatch(REFRESH_RE, out) else None
 
 
+def _keychain_state():
+    """"present", "missing" (the item is gone, or no keychain tool is left to read it) or "unknown" (the tool did not
+    answer). macOS: attributes only (no -w), so no secret is read and no keychain prompt."""
+    if sys.platform == "darwin" and shutil.which("security"):
+        rc, _ = _run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
+        return "present" if rc == 0 else "missing" if rc == 44 else "unknown"
+    if shutil.which("secret-tool"):
+        rc, out = _run(["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "account", KEYCHAIN_ACCOUNT])
+        found = rc == 0 and bool((out or "").strip())
+        out = None
+        return "present" if found else "missing" if rc in (0, 1) else "unknown"
+    return "missing"
+
+
 def _keychain_del():
     if sys.platform == "darwin" and shutil.which("security"):
         _run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT])
@@ -486,6 +501,7 @@ def login_token(force=False):
                 return tok
         rt = refresh_token()
         if rt is None:
+            login_present()  # a keychain item or token file that is gone: the stale record goes (EPM L4)
             return None
         left = start + LOGIN_DEADLINE - LOGIN_SAVE_RESERVE - time.time()
         if left < 1.5:
@@ -578,6 +594,8 @@ _opener = urllib.request.build_opener(_NoRedirect())
 
 
 def http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
+    if os.environ.get("DATASTASH_NO_NETWORK") == "1":  # the offline tests set it, so no process they start goes out
+        raise urllib.error.URLError("network off (DATASTASH_NO_NETWORK=1)")
     if not path.startswith("/"):
         path = "/" + path
     url = ORIGIN + path
@@ -1836,6 +1854,10 @@ AI_SHOWN_NOTE = (f"{SIGN_IN_NOTE}: this computer is not signed in to datastash y
 AI_FALLBACK_NOTE = (f"{SIGN_IN_NOTE}: this computer is not signed in to datastash and the plugin could not start the "
                     "sign-in just now. Before the first datastash use, run datastash login and tell the person, in plain "
                     "words, what it says to do. Never ask the person for the code or any token.")
+AI_LEGACY_NOTE = (f"{SIGN_IN_NOTE}: this computer's datastash connector still uses its older sign-in, which keeps "
+                  "working for now. The plugin itself has shown the person a link and code for the new sign-in; there is "
+                  "nothing for you to start or repeat. Never ask the person for the code or any token, and never open or "
+                  "approve the sign-in page yourself.")
 AI_CONNECT_NOTE = (f"{SIGN_IN_NOTE}: this computer is now signed in to datastash. The plugin told the person to type "
                    "/mcp reconnect all so the datastash connector connects in this session; until then use the datastash "
                    "command.")
@@ -1844,6 +1866,227 @@ START_FAIL_GAP = 60  # after a failed start, hooks wait this long before trying 
 BROWSER_EVERY = 24 * 3600  # hooks open the browser by themselves at most once a day; the link is always shown
 USER_CODE_RE = r"[A-Z]{4}-[A-Z]{4}"
 SIGNED_OUT_BEARER = "signed-out"  # the connector's fixed header while signed out: datastash answers 401, no OAuth offer
+
+
+# ------------------------------------------------------------------ sign-in transition (0.2.0; EPM ruling 11-20)
+# An install that signed in through Claude Code's own /mcp Authenticate keeps that working ("legacy": the helper sends
+# no header while this computer has no datastash login, as 0.1.x did) until the person's own completed device sign-in,
+# or the deadline, moves it to the new mode ("device": the fixed placeholder, so the device sign-in is the only door).
+# Nothing the AI can run moves it back: no command, flag or setting writes "legacy" after the first decision.
+SIGNIN_LEGACY = "legacy"
+SIGNIN_DEVICE = "device"
+SIGNIN_OLD = "old-for-good"  # no file locking on this computer (e.g. Windows): the 0.1.x behaviour for good (M1)
+LEGACY_DAYS = 30  # from the first run of 0.2.0; then the placeholder applies anyway
+LEGACY_WARN_DAYS = 7  # one warning line to the person in the last week
+CLAUDE_SERVER_NAME = "plugin:datastash:datastash"  # how Claude Code names this plugin's connector
+# CLAUDE_CODE_ENTRYPOINT values where the session-start hook shows the person the device link and the placeholder
+# was proven on a real Claude Code (2.1.329/2.1.330, terminal). Every other host (Claude desktop app, Cowork, IDEs,
+# SDK and `claude -p` runs) keeps the 0.1.x behaviour, so its own Connect / Authenticate door is never removed.
+DEVICE_HOSTS = ("cli",)
+
+
+def _signin_file():
+    return os.path.join(CONF, "signin-mode.json")
+
+
+def _signin_lock_file():
+    return os.path.join(CONF, "signin-mode.lock")
+
+
+def _datastash_url(u):
+    try:
+        p = urllib.parse.urlsplit(u) if isinstance(u, str) else None
+    except ValueError:
+        return False
+    return bool(p) and p.scheme == "https" and (p.hostname or "") == "getdatastash.com" and p.path.rstrip("/") == "/mcp"
+
+
+def _platform():
+    return sys.platform
+
+
+def claude_store_has_oauth():
+    """Whether Claude Code's own credential store lists this plugin's connector as signed in through OAuth: True,
+    False, or None (can't tell). Presence only: it looks at whether an entry for this connector has a non-empty token
+    field and keeps nothing but that yes/no; no token is copied, kept, printed or logged. Claude Code keeps these in
+    <its config folder>/.credentials.json (Linux, Windows); on macOS in the login keychain, which this never reads,
+    so there a missing entry is "can't tell"."""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+    unsure_if_absent = None if _platform() == "darwin" else False
+    try:
+        with open(os.path.join(cfg, ".credentials.json"), "rb") as f:
+            raw = f.read(8 * 1024 * 1024)
+    except FileNotFoundError:
+        return unsure_if_absent
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    finally:
+        raw = None
+    found = False
+    entries = data.get("mcpOAuth") if isinstance(data, dict) else None
+    if isinstance(entries, dict):
+        for k, v in entries.items():
+            if not isinstance(v, dict):
+                continue
+            ours = ((isinstance(k, str) and k.startswith(CLAUDE_SERVER_NAME + "|")) or v.get("serverName") == CLAUDE_SERVER_NAME
+                    or _datastash_url(v.get("serverUrl")))
+            if ours and (bool(v.get("accessToken")) or bool(v.get("refreshToken"))):
+                found = True
+                break
+    data = entries = None
+    return True if found else unsure_if_absent
+
+
+def _installed_before():
+    """This plugin ran on this computer before its first 0.2.0 run (its folder holds anything but this record)."""
+    try:
+        names = os.listdir(CONF)
+    except OSError:
+        return False
+    mine = {os.path.basename(_signin_file()), os.path.basename(_signin_lock_file()), os.path.basename(STATE)}
+    if any(n not in mine and not n.startswith(os.path.basename(_signin_file()) + ".") for n in names):
+        return True
+    try:
+        return bool(os.listdir(STATE))
+    except OSError:
+        return False
+
+
+def _decide_signin():
+    """The first decision (once per computer). Never "legacy" for a fresh install, never the new mode for an updated
+    install that may hold an OAuth sign-in."""
+    now = int(time.time())
+    rec = {"first_run_at": now, "decided_at": now, "changed_at": now}
+    if fcntl is None:
+        return dict(rec, mode=SIGNIN_OLD, why="no file locking on this computer: the connector keeps its own sign-in")
+    if _login_recorded():
+        return dict(rec, mode=SIGNIN_DEVICE, why="this computer already had a datastash device sign-in")
+    has = claude_store_has_oauth()
+    if has:
+        return dict(rec, mode=SIGNIN_LEGACY, why="Claude Code lists a connector sign-in for datastash")
+    if has is False:
+        return dict(rec, mode=SIGNIN_DEVICE, why="Claude Code lists no connector sign-in for datastash")
+    if _installed_before():
+        return dict(rec, mode=SIGNIN_LEGACY, why="can't tell, and the plugin ran here before (updated install)")
+    return dict(rec, mode=SIGNIN_DEVICE, why="can't tell, and the plugin is new here (fresh install)")
+
+
+def _signin_ok(rec):
+    return (isinstance(rec, dict) and rec.get("mode") in (SIGNIN_LEGACY, SIGNIN_DEVICE, SIGNIN_OLD)
+            and _num_ok(rec.get("first_run_at")))
+
+
+def signin_state():
+    """This computer's sign-in mode record {mode, why, first_run_at, decided_at, changed_at[, changed_by, warned_at]},
+    decided on the first call and kept in a private file (mode 600). Never raises; without a writable folder it answers
+    the decision without keeping it."""
+    rec = _read_private_json(_signin_file())
+    if _signin_ok(rec):
+        return rec
+    lock = None
+    try:
+        ensure_dirs()
+        lock = _try_lock(_signin_lock_file(), wait=2)
+        rec = _read_private_json(_signin_file())  # another process decided while this one waited
+        if _signin_ok(rec):
+            return rec
+        rec = _decide_signin()
+        write_private(_signin_file(), json.dumps(rec))
+        return rec
+    except Exception:
+        return rec if _signin_ok(rec) else _decide_signin()
+    finally:
+        _unlock(lock)
+
+
+def _change_signin(to, by):
+    """legacy -> device only (one way): by the person's completed device sign-in or the deadline. True when changed."""
+    lock = None
+    try:
+        ensure_dirs()
+        lock = _try_lock(_signin_lock_file(), wait=2)
+        rec = _read_private_json(_signin_file())
+        if not _signin_ok(rec) or rec.get("mode") != SIGNIN_LEGACY or to != SIGNIN_DEVICE:
+            return False
+        rec = dict(rec, mode=to, changed_at=int(time.time()), changed_by=by)
+        write_private(_signin_file(), json.dumps(rec))
+        return True
+    except Exception:
+        return False
+    finally:
+        _unlock(lock)
+
+
+def _legacy_deadline(rec):
+    return rec["first_run_at"] + LEGACY_DAYS * 86400
+
+
+def effective_signin():
+    """The mode in force now: legacy past its deadline becomes device (and is recorded as changed by the deadline)."""
+    rec = signin_state()
+    if rec.get("mode") == SIGNIN_LEGACY and time.time() >= _legacy_deadline(rec):
+        _change_signin(SIGNIN_DEVICE, "deadline")
+        return SIGNIN_DEVICE
+    return rec.get("mode")
+
+
+def device_host():
+    """This Claude Code host shows the person the device sign-in (see DEVICE_HOSTS)."""
+    return os.environ.get("CLAUDE_CODE_ENTRYPOINT") in DEVICE_HOSTS
+
+
+def placeholder_applies():
+    """The connector's helper sends the placeholder when signed out: only in the device mode, only with file locking
+    (the login can refresh), only on a host where the person sees the device sign-in."""
+    if fcntl is None or not device_host():
+        return False
+    return effective_signin() == SIGNIN_DEVICE
+
+
+def hooks_offer_sign_in():
+    """The hooks start and show a device sign-in: never without file locking (it could not be kept alive)."""
+    return fcntl is not None and signin_state().get("mode") != SIGNIN_OLD
+
+
+def legacy_warning():
+    """The one-time line for the person in the legacy mode's last week, or None. Marks it said."""
+    rec = signin_state()
+    if rec.get("mode") != SIGNIN_LEGACY or rec.get("warned_at"):
+        return None
+    left = _legacy_deadline(rec) - time.time()
+    if left <= 0 or left > LEGACY_WARN_DAYS * 86400:
+        return None
+    lock = None
+    try:
+        lock = _try_lock(_signin_lock_file(), wait=2)
+        cur = _read_private_json(_signin_file())
+        if not _signin_ok(cur) or cur.get("warned_at"):
+            return None
+        write_private(_signin_file(), json.dumps(dict(cur, warned_at=int(time.time()))))
+    except Exception:
+        return None
+    finally:
+        _unlock(lock)
+    days = max(1, int((left + 86399) // 86400))
+    return (f"In {days} day{'s' if days != 1 else ''}, the datastash connector stops using its old sign-in. "
+            "Sign in with the code below to keep it working.")
+
+
+def signin_doctor_line():
+    rec = signin_state()
+    mode = rec.get("mode")
+    since = time.strftime("%Y-%m-%d", time.localtime(rec.get("changed_at") or rec["first_run_at"]))
+    host = os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "unknown"
+    door = "placeholder (device sign-in only)" if placeholder_applies() else "no header while signed out (the host's own sign-in stays)"
+    line = f"sign-in mode: {mode} since {since} ({rec.get('changed_by') or rec.get('why')})"
+    if mode == SIGNIN_LEGACY:
+        left = max(0, int((_legacy_deadline(rec) - time.time() + 86399) // 86400))
+        line += f"; the new sign-in applies when the person approves a device code, or in {left} days"
+    return line + f". Connector header on this host ({host}) when signed out: {door}."
 
 
 def _sid(inp):
@@ -1903,6 +2146,25 @@ def _login_recorded():
     return read_json(LOGIN_FILE, {}).get("store") in ("keychain", "file")
 
 
+def login_present():
+    """A login is recorded AND its refresh token is still where the record says (EPM L4): a keychain item that is gone,
+    or a missing token file, means signed out; the stale record is removed so the sign-in is offered again. A keychain
+    that can't answer just now counts as present (the next check sees it). Presence only: no token is read here
+    beyond the yes/no."""
+    store = read_json(LOGIN_FILE, {}).get("store")
+    if store not in ("keychain", "file"):
+        return False
+    if store == "file":
+        gone = _read_key_file(LOGIN_REFRESH_FILE, REFRESH_RE, PERSON_SLUG) is None
+    else:
+        gone = _keychain_state() == "missing"
+    if gone:
+        for f in (LOGIN_FILE, LOGIN_ACCESS_FILE):
+            _drop(f)
+        return False
+    return True
+
+
 def _pending_code():
     """The device sign-in this computer is waiting on, to show again: {user_code, url, until}, or None (none, ended, or
     an older pending file without a code to show)."""
@@ -1913,7 +2175,7 @@ def _pending_code():
     if not (isinstance(code, str) and re.fullmatch(USER_CODE_RE, code) and isinstance(url, str) and url.startswith(ORIGIN + "/")
             and re.fullmatch(r"[\x21-\x7e]{1,200}", url)):
         return None
-    return {"user_code": code, "url": url, "until": p["until"]}
+    return {"user_code": code, "url": url, "until": p["until"], "opened": p.get("opened") is True}
 
 
 def _start_blocked(hook):
@@ -1968,7 +2230,7 @@ def _hook_browser(url):
     return True
 
 
-def device_sign_in(hook=False, timeout=30):
+def _start_code(hook=False, timeout=30):
     """This computer's device sign-in: the waiting code when one is still good (never a second code), else a new one
     from datastash, with a detached background poll that finishes the login. Returns (info, why): info is
     {"user_code", "url", "until", "new", "opened"}, or None with a short reason. hook=True: the session-start and
@@ -2015,26 +2277,75 @@ def device_sign_in(hook=False, timeout=30):
         if not _spawn_poller():
             return None, "could not start the background helper that finishes the login"
         opened = _hook_browser(url) if hook else _open_browser(url)
+        if opened:  # for the hook that waits on this file (L2: the code is saved before anyone is shown it)
+            try:
+                write_private(LOGIN_PENDING_FILE, json.dumps({"device_code": dev, "interval": got.get("interval", 5),
+                                                              "until": until, "user_code": code, "verification_uri": url,
+                                                              "opened": True}))
+            except OSError:
+                pass
         return {"user_code": code, "url": url, "until": until, "new": True, "opened": opened}, None
     finally:
         _unlock(lock)
 
 
-def person_sign_in_text(info):
+def _spawn_starter():
+    """The hooks' start runs in its own detached process, so a hook that ends on its time limit never strands a code
+    datastash already issued: the starter saves it, and this or the next hook shows it (EPM L2)."""
+    try:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "login", "--start"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
+def device_sign_in(hook=False, timeout=30):
+    """This computer's device sign-in: (info, why) as _start_code. A typed datastash login starts in this process; the
+    hooks hand the start to a detached starter and wait at most timeout seconds for the code it saves."""
+    if not hook:
+        return _start_code(False, timeout)
+    cur = _pending_code()
+    if cur:
+        _ensure_poller()
+        return dict(cur, new=False, opened=False), None
+    if _start_blocked(True):
+        return None, "paused"
+    if not _spawn_starter():
+        return None, "could not start the background helper that starts the login"
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.1)
+        cur = _pending_code()
+        if cur:
+            return dict(cur, new=True), None
+        if _start_blocked(True):
+            return None, "datastash did not start the login"
+    return None, "no answer in time (the code, if datastash sends one, is shown at the next session start)"
+
+
+def person_sign_in_text(info, legacy=False):
     """The two lines the person sees (Claude Code shows a hook's systemMessage to the person, not to the AI's task)."""
     mins = max(1, int((info["until"] - time.time() + 59) // 60))
     tail = f"The code works for {mins} more minute{'s' if mins != 1 else ''}."
     if info.get("opened"):
         tail = "A datastash page opened in your browser. " + tail
+    if legacy:
+        return (f"datastash has a new sign-in for this computer. Open {info['url']} (on any device), enter code "
+                f"{info['user_code']} and press Approve. Your current connector sign-in keeps working in the meantime.\n{tail}")
     return (f"datastash isn't signed in on this computer. To sign in, open {info['url']} (on any device), enter code "
             f"{info['user_code']} and press Approve.\n{tail}")
 
 
 def session_sign_in(inp):
-    """SessionStart: (line for the person, line for the AI), or (None, None) when signed in or already said in this
-    session. Not signed in: starts (or reuses) the device sign-in itself; no AI step. Never reads or prints a token."""
-    if _login_recorded():  # the recorded login, not a keychain read that a slow or locked keychain could fail
+    """SessionStart: (line for the person, line for the AI), or (None, None) when signed in, already said in this
+    session, or on a computer without file locking (no device code it could not keep alive; the connector's own sign-in
+    stays). Not signed in: starts (or reuses) the device sign-in itself; no AI step. Never reads or prints a token."""
+    if not hooks_offer_sign_in():
         return None, None
+    if login_present():
+        return None, None
+    legacy = effective_signin() == SIGNIN_LEGACY
     sid = _sid(inp)
     if sid is not None:
         ensure_dirs()
@@ -2045,7 +2356,10 @@ def session_sign_in(inp):
         write_private(mark, json.dumps({"at": int(time.time())}))
     info, _why = device_sign_in(hook=True, timeout=HOOK_START_SECONDS)
     if info is None:
-        return None, AI_FALLBACK_NOTE
+        return None, (None if legacy else AI_FALLBACK_NOTE)
+    if legacy:
+        warn = legacy_warning()
+        return (warn + "\n" if warn else "") + person_sign_in_text(info, legacy=True), AI_LEGACY_NOTE
     return person_sign_in_text(info), AI_SHOWN_NOTE
 
 
@@ -2060,8 +2374,8 @@ def sign_in_followup(inp, uses_datastash):
     if _login_recorded():
         _drop(_signed_out_mark(sid))
         return CONNECT_LINE, AI_CONNECT_NOTE
-    if not uses_datastash:
-        return None, None
+    if not uses_datastash or effective_signin() != SIGNIN_DEVICE:
+        return None, None  # the legacy mode's connector still works: the session start's one line is enough
     mark = os.path.join(STATE, f"sign-in-use-sid-{sid}")
     if os.path.exists(mark):
         return None, None
@@ -2451,6 +2765,10 @@ def cmd_doctor(_args):
         print("ok: network: https://getdatastash.com answers.")
     if signed_in():
         print("ok: sign-in: this computer is signed in to datastash (datastash login).")
+    try:
+        print("note: " + signin_doctor_line())
+    except Exception:
+        pass
     print(_listener_line(project, me))
     for f in found:
         print("problem: " + finding_line(f))
@@ -3113,8 +3431,25 @@ def _set_aside(path):
         pass
 
 
+INTERACTIVE_HOSTS = ("cli", "claude-desktop", "claude-vscode")  # CLAUDE_CODE_ENTRYPOINT of sessions a person sits at
+
+
+def interactive_run():
+    for f in (sys.stdin, sys.stdout):
+        try:
+            if f is not None and f.isatty():
+                return True
+        except (ValueError, OSError):
+            pass
+    return os.environ.get("CLAUDE_CODE_ENTRYPOINT") in INTERACTIVE_HOSTS
+
+
 def _open_browser(url):
-    """Open url in the person's own browser (a graphical one only: never a terminal browser). True when started."""
+    """Open url in the person's own browser (a graphical one only: never a terminal browser), and only for a person
+    at a terminal or an interactive Claude Code session: never in a non-interactive run (`claude -p`, SDK, CI), even
+    with a display set (EPM INFO). True when started."""
+    if not interactive_run():
+        return False
     if sys.platform == "darwin":
         cmd = ["open", url]
     elif sys.platform.startswith("win"):
@@ -3323,7 +3658,7 @@ def _device_os():
     return platform.system() or "unknown"
 
 
-LOGIN_POLL_MAX = 15 * 60
+LOGIN_POLL_MAX = 30 * 60  # the longest code life datastash gives (the poll waits until the code ends)
 
 
 def cmd_login(args):
@@ -3338,6 +3673,12 @@ def cmd_login(args):
             print("signed in: waiting (the person has not approved the code yet)")
         else:
             print("signed in: no (run datastash login)")
+        return 0
+    if args == ["--start"]:  # the hooks' detached starter (see _spawn_starter); prints nothing
+        try:
+            _start_code(hook=True, timeout=20)
+        except Exception:
+            pass
         return 0
     if args == ["--poll"]:
         return _login_poll()
@@ -3413,6 +3754,9 @@ def _login_poll():
         _unlock(lock)
 
 
+POLL_FINAL_ERRORS = ("access_denied", "expired_token", "invalid_grant")
+
+
 def _login_poll_loop(p, interval, deadline):
     while time.time() < deadline:
         time.sleep(interval)
@@ -3429,7 +3773,12 @@ def _login_poll_loop(p, interval, deadline):
             if err == "slow_down":
                 interval = min(interval + 5, 30)
                 continue
-            break  # denied, expired or unknown
+            if err in POLL_FINAL_ERRORS:
+                break  # the person denied it, or the code ended
+            # A 5xx, a 429 that is not slow_down, or anything else: back off and keep waiting until the code ends;
+            # a waiting code is never dropped early (EPM L1).
+            interval = min(max(interval * 2, int(e.retry_after or 0)), 60)
+            continue
         except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
             continue
         if not isinstance(got, dict):
@@ -3438,6 +3787,7 @@ def _login_poll_loop(p, interval, deadline):
         if isinstance(rt, str) and re.fullmatch(REFRESH_RE, rt) and isinstance(at, str) and re.fullmatch(ACCESS_RE, at):
             with _login_lock():  # never interleaved with a refresh of an older login on this computer
                 _save_login(rt, at, got.get("expires_in"))
+            _change_signin(SIGNIN_DEVICE, "device sign-in")  # the person's own approval: legacy ends here, for good
         break
     lock = _try_lock(_start_lock_file(), wait=10)  # never between a hook's check and its new code
     try:
@@ -3474,12 +3824,12 @@ def cmd_logout(args):
 
 
 def cmd_token(args):
-    """The datastash connector's headersHelper. Always prints an Authorization header and exits 0: the login's 15-minute
-    token, or, when this computer is not signed in, the sign-in is waiting, the refresh failed, the keychain can't be
-    read or anything else goes wrong, the fixed placeholder "Bearer signed-out". datastash answers that with 401, and
-    Claude Code then marks the connector failed without offering its OAuth sign-in (a helper that supplies Authorization
-    turns OAuth off), so the only sign-in door is the device sign-in the session-start hook shows the person. Never a
-    token on a terminal (the placeholder only), never logs, never the refresh token."""
+    """The datastash connector's headersHelper. Always exits 0. Prints the login's 15-minute token when there is one;
+    otherwise (not signed in, sign-in waiting, refresh failed, keychain unreadable, anything else): in the device mode
+    on a host that shows the device sign-in, the fixed placeholder "Bearer signed-out" (datastash answers 401 and
+    Claude Code, since the helper supplied Authorization, offers no OAuth sign-in, so the device sign-in is the only
+    door); in every other case {} as in 0.1.x, so a stored OAuth sign-in keeps working and the host's own door stays.
+    Never a token on a terminal, never logs, never the refresh token."""
     if args != ["--header"]:
         die("usage: datastash token --header   (for the datastash connector only)")
     tok = None
@@ -3491,10 +3841,18 @@ def cmd_token(args):
                   file=sys.stderr)
     except BaseException:  # never a failed helper, never {} (an empty answer would bring back the OAuth door)
         tok = None
-    if not (isinstance(tok, str) and re.fullmatch(ACCESS_RE, tok)):
-        tok = SIGNED_OUT_BEARER
+    if isinstance(tok, str) and re.fullmatch(ACCESS_RE, tok):
+        head = {"Authorization": f"Bearer {tok}"}
+    else:
+        try:
+            placeholder = placeholder_applies()
+        except BaseException:
+            placeholder = False  # can't tell: never remove a sign-in door that may be the only one working
+        # The legacy mode, a computer without file locking, or a host that can't show the device sign-in: no header,
+        # as in 0.1.x, so Claude Code keeps its stored OAuth sign-in and its own Authenticate / Connect door.
+        head = {"Authorization": f"Bearer {SIGNED_OUT_BEARER}"} if placeholder else {}
     try:
-        sys.stdout.write(json.dumps({"Authorization": f"Bearer {tok}"}) + "\n")
+        sys.stdout.write(json.dumps(head) + "\n")
         sys.stdout.flush()
     except Exception:
         pass
@@ -3512,6 +3870,10 @@ def main():
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
+    try:
+        signin_state()  # decided before anything of this run writes into the plugin's folder (fresh vs updated)
+    except Exception:
+        pass
     return table[cmd](args)
 
 
