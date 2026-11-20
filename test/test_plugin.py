@@ -1704,6 +1704,14 @@ class PickupBinding(MainBase):
         self.tool_hook(sid, "mcp__plugin_datastash_datastash__ledger_inbox_read", {"name": "x"}, event="PreToolUse")
         self.tool_hook(sid, self.AGENT_KEY_TOOL, {"name": "Res One"}, event="PostToolUse")
         self.tool_hook(sid, self.AGENT_KEY_TOOL, {"name": "!!"}, event="PreToolUse")
+        # Fail closed: a call whose challenge can't be set never carries the AI's own (review LOW).
+        self.assertEqual(self.tool_hook(sid, self.AGENT_KEY_TOOL, {"name": "!!", "code_challenge": planted}, event="PreToolUse"), {"name": "!!"})
+        real = ds.new_challenge
+        ds.new_challenge = lambda kind: (_ for _ in ()).throw(OSError("read-only"))
+        try:
+            self.assertEqual(self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "main", "code_challenge": planted}, event="PreToolUse"), {"action": "main"})
+        finally:
+            ds.new_challenge = real
 
     def test_fetch_sends_the_verifier_and_drops_it_once_the_key_is_saved(self):
         self.be("sess-F7", (8802, "tF7"))

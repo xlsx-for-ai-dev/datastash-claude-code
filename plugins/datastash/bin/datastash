@@ -235,7 +235,7 @@ def pickup_binding(inp):
     if name.endswith("__ledger_agent_key"):
         agent = args.get("name")
         if not isinstance(agent, str) or not re.sub(r"[^a-z0-9]+", "", agent.lower()):
-            return None
+            return strip_challenge(inp)  # no file name to keep a verifier under: never pass the AI's own challenge
         kind = f"agent-{slug(agent)}"
     elif args.get("action") == "main":
         kind = "main"
@@ -244,6 +244,15 @@ def pickup_binding(inp):
     else:
         return None
     return dict(args, code_challenge=new_challenge(kind))
+
+
+def strip_challenge(inp):
+    """Fail closed: a code-asking connector call whose challenge this machine can't set goes out without the AI's
+    code_challenge (an agent code is then unbound; main and watch codes are refused by datastash). None otherwise."""
+    name, args = (inp.get("tool_name"), inp.get("tool_input")) if isinstance(inp, dict) else (None, None)
+    if not isinstance(name, str) or not isinstance(args, dict) or not PICKUP_TOOL_RE.fullmatch(name) or "code_challenge" not in args:
+        return None
+    return {k: v for k, v in args.items() if k != "code_challenge"}
 
 
 def log_path(s):
@@ -2399,12 +2408,14 @@ def cmd_agent_tool(_args):
     try:
         bound = pickup_binding(inp)
     except (Exception, SystemExit):
-        bound = None
-    try:
-        return _agent_tool(inp)
-    finally:
-        if bound is not None:
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": bound}}))
+        try:
+            bound = strip_challenge(inp) if isinstance(inp, dict) and inp.get("hook_event_name") == "PreToolUse" else None
+        except Exception:
+            bound = None
+    if bound is not None:
+        # Printed first, so the rewrite stands even if the recording below is slow or fails.
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": bound}}), flush=True)
+    return _agent_tool(inp)
 
 
 def _agent_tool(inp):
