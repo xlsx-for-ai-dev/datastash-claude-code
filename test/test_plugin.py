@@ -2134,8 +2134,36 @@ class SetupDoctor(Base):
         self.write(p, "ldgr_pm_x")
         self.others.add(p)
         f = self.found()["other_owner"]
-        self.assertEqual(f["cmd"], f"sudo chown {ds._user()} {p} && chmod u+rw {p}")
+        self.assertEqual(f["cmd"], f"sudo chown {ds._user()} {p} && chmod 600 {p}")
         self.assertNotIn("can't wake", f["problem"])
+
+    def test_project_settings_of_another_owner_are_fine_when_readable(self):
+        # Claude Code only reads a project's settings: a shared checkout's file owned by someone else is no problem.
+        self.beat()
+        os.makedirs(os.path.join(self.proj, ".claude"))
+        p = os.path.join(self.proj, ".claude", "settings.json")
+        self.write(p, {}, mode=0o644)
+        self.others.add(p)
+        self.assertEqual(self.found(), {})
+
+    def test_read_only_user_settings_while_hooks_fire(self):
+        self.beat()
+        os.chmod(self.settings, 0o444)
+        self.assertEqual(self.found(), {})
+
+    def test_plugin_disabled_in_project_scope_fix_matches(self):
+        os.makedirs(os.path.join(self.proj, ".claude"))
+        self.write(os.path.join(self.proj, ".claude", "settings.local.json"),
+                   {"enabledPlugins": {"datastash@my-mirror": False}})
+        f = self.found()["plugin_disabled"]
+        self.assertEqual(f["cmd"], "claude plugin enable datastash@my-mirror --scope local")
+
+    def test_key_of_another_owner_fix_makes_it_private(self):
+        self.beat()
+        p = os.path.join(ds.CONF, "agent-tester.key")
+        self.write(p, "ldgr_ag_x", mode=0o644)
+        self.others.add(p)
+        self.assertEqual(self.found()["other_owner"]["cmd"], f"sudo chown {ds._user()} {p} && chmod 600 {p}")
 
     def test_config_folder_owned_by_another_user(self):
         self.others.add(ds.CONF)

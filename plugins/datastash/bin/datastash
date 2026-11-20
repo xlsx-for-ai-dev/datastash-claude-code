@@ -1600,7 +1600,18 @@ def _file_findings(path, label, wake_broken, kind="file", mode=None):
     want = mode or ("u+rwx" if is_dir else "u+rw")
     rec = " -R" if is_dir else ""
     restart = "Then the person restarts Claude Code." if kind != "key" else ""
-    if st.st_uid != me:
+    if kind == "key":
+        want = "600"
+    if kind == "project_settings":
+        # Claude Code only reads a project's settings: another owner (a shared checkout, a container mount) is fine
+        # as long as this user can read it and it is valid JSON.
+        if not os.access(path, os.R_OK):
+            return [_finding("unreadable", f"{label} ({_tilde(path)}) can't be read by this user, so Claude Code "
+                             "skips it.", f"have the file's owner or the machine's admin let this user read "
+                             f"{_tilde(path)}, then restart Claude Code.", cmd=f"sudo chmod a+r {qp}", sudo=True,
+                             wake=wake_broken, after=restart)]
+        return _json_findings(path, label, wake_broken)
+    if st.st_uid != me and (me != 0 or kind == "key"):  # root can use any settings file; keys must be its own
         effect = ("so the plugin's automatic parts are off" if wake_broken else
                   "so Claude Code can't save settings there and the plugin's automatic parts can stop working")
         if kind == "key":
@@ -1626,37 +1637,46 @@ def _file_findings(path, label, wake_broken, kind="file", mode=None):
     # The owner's mode bits, not os.access: Claude Code's sandbox mounts its own settings read-only for commands, which
     # must not read as a problem (the file is this user's and Claude Code itself can write it).
     need = 0o700 if is_dir else 0o600
-    if st.st_mode & need != need:
+    if kind == "settings" and not wake_broken:
+        need = 0o400  # a deliberately read-only settings file is fine while the hooks fire
+    if st.st_mode & need != need and me != 0:
         lead = "datastash can't wake this session: " if wake_broken else ""
         return [_finding("no_access", f"{lead}{label} ({_tilde(path)}) isn't readable and writable by this user, so "
                          "Claude Code can't use it fully and the plugin's automatic parts can be off.",
                          f"give this user read and write access: chmod {want} {qp}, then restart Claude Code.",
                          cmd=f"chmod {want} {qp}", wake=wake_broken, after=restart)]
     if kind == "settings":
-        try:
-            with open(path) as fh:
-                json.load(fh)
-        except ValueError as e:
-            where = f" (line {e.lineno})" if hasattr(e, "lineno") else ""
-            return [_finding("bad_json", f"{label} ({_tilde(path)}) is not valid JSON{where}, so Claude Code can ignore "
-                             "it and the plugin's automatic parts can be off.",
-                             f"fix the JSON syntax error{where} in {_tilde(path)}, keeping every setting, then restart "
-                             "Claude Code.", wake=wake_broken)]
-        except OSError:
-            pass
+        return _json_findings(path, label, wake_broken)
     return []
 
 
-def _plugin_enabled(project):
-    """(value, path): the effective enabledPlugins entry for datastash (local over project over user), or (None, None)."""
-    val, where = None, None
-    for p in _settings_files(project):
+def _json_findings(path, label, wake_broken):
+    try:
+        with open(path) as fh:
+            json.load(fh)
+    except ValueError as e:
+        where = f" (line {e.lineno})" if hasattr(e, "lineno") else ""
+        return [_finding("bad_json", f"{label} ({_tilde(path)}) is not valid JSON{where}, so Claude Code can ignore "
+                         "it and the plugin's automatic parts can be off.",
+                         f"fix the JSON syntax error{where} in {_tilde(path)}, keeping every setting, then restart "
+                         "Claude Code.", wake=wake_broken)]
+    except OSError:
+        pass
+    return []
+
+
+def _plugin_enabled(project, full=False):
+    """(value, path): the effective enabledPlugins entry for datastash (local over project over user), or (None, None).
+    With full: (value, path, plugin id, scope) for the fix command."""
+    val, where, pid, scope = None, None, None, None
+    for i, p in enumerate(_settings_files(project)):
         plugs = read_json(p, {}).get("enabledPlugins")
         if isinstance(plugs, dict):
             for k, v in plugs.items():
                 if isinstance(k, str) and k.split("@", 1)[0] == "datastash":
-                    val, where = v, p
-    return val, where
+                    val, where, pid = v, p, k
+                    scope = "user" if i == 0 else ("local" if p.endswith("settings.local.json") else "project")
+    return (val, where, pid, scope) if full else (val, where)
 
 
 def setup_findings(project, me=None, deep=False):
@@ -1669,15 +1689,16 @@ def setup_findings(project, me=None, deep=False):
     out += _file_findings(CLAUDE_DIR, "Claude Code's settings folder", wake_broken, kind="dir")
     for i, p in enumerate(_settings_files(project)):
         label = "Claude Code's settings file" if i == 0 else "this project's Claude Code settings file"
-        out += _file_findings(p, label, wake_broken, kind="settings")
+        out += _file_findings(p, label, wake_broken, kind="settings" if i == 0 else "project_settings")
     out += _file_findings(CONF, "datastash's own folder", wake_broken, kind="dir", mode="u+rwx")
     if not hooks_ok:
-        val, where = _plugin_enabled(project)
+        val, where, pid, scope = _plugin_enabled(project, full=True)
         if val is False:
             out.append(_finding("plugin_disabled", f"datastash can't wake this session: the datastash plugin is turned off "
                                 f"in Claude Code ({_tilde(where)} has it disabled), so its automatic parts don't run.",
                                 "turn it on with /plugin (Installed, datastash, Enable), then restart Claude Code.",
-                                cmd="claude plugin enable datastash@datastash", wake=True,
+                                cmd=f"claude plugin enable {_q(pid)}" + ("" if scope == "user" else f" --scope {scope}"),
+                                wake=True,
                                 after="Then the person restarts Claude Code."))
         causes = bool(out)
         if not causes and not ever:
@@ -1776,13 +1797,15 @@ def cmd_doctor(_args):
         age = int(time.time() - (rec or {}).get("at", time.time()))
         print(f"ok: hooks: the plugin's hooks last ran {age} s ago on this machine"
               + ("" if here is None else ("; in this session: yes" if here else "; in this session: no")) + ".")
-    if not ids & {"other_owner", "no_access", "bad_json", "unreadable"}:
+    settings_ids = {f["id"] for f in found
+                    if f["id"] in ("other_owner", "no_access", "bad_json", "unreadable") and "settings" in f["problem"]}
+    if not settings_ids:
         print("ok: settings: Claude Code's settings files are this user's, readable and writable.")
     if "plugin_disabled" not in ids:
         val, where = _plugin_enabled(project)
         print("ok: plugin: enabled in " + _tilde(where) + "." if val is True else
               "ok: plugin: no setting turns it off.")
-    if not ids & {"key_mode", "key_missing", "key_not_file"}:
+    if not any(f["id"].startswith("key_") or "key file" in f["problem"] for f in found):
         print("ok: keys: every datastash key file here is private to this user (mode 600).")
     if "no_reach" not in ids:
         print("ok: network: https://getdatastash.com answers.")
