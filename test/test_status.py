@@ -1328,7 +1328,7 @@ class Relayed(Base):
 
     def test_every_option_is_kept_and_only_the_screen_is_bounded(self):
         """No new size cap: 14 options and a long one go up and stay whole; one screen shows 10, every one can be picked."""
-        opts = [f"choice {i}" for i in range(13)] + ["a very long option " + "w" * 150]
+        opts = [f"choice {i}" for i in range(13)] + ["a very long option " + "w" * 450]
         row = ds.build_status({"doing": "Waiting.", "asks": [{"text": "Which one?", "options": opts}]}, self.folder,
                               "web-app", "web-app")
         self.assertEqual(ds.status_body(row, WB)["asks"][0]["options"], opts)
@@ -1336,8 +1336,11 @@ class Relayed(Base):
         ctx = self.prompt("status of all my agents")
         self.assertIn("j) choice 9. (4 more options; type the one you want in its own words.)", ctx)
         self.assertNotIn("choice 10", ctx)
+        api = next(r for r in ds.read_status_cache(WB)["agents"] if r["agent"] == "api")
+        self.assertEqual(api["asks"][0]["options"], opts)  # the local copy keeps them whole too
         self.prompt("4: choice 12")
         self.assertEqual(self.answers()[-1][3]["answer"], "choice 12")
+
 
     def test_a_sent_line_with_numbered_items_is_not_skipped(self):
         for between in (True, False):  # its own turn after the list, or in the list's turn

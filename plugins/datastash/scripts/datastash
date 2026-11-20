@@ -3373,7 +3373,7 @@ def _norm_ask(a):
     # set by the asking agent or the server; nothing here ever clears it)
     opts = []
     for o in (a.get("options") if isinstance(a.get("options"), list) else []):  # all of them: no cap on what is stored
-        o = _clean(o, 300) if isinstance(o, str) else ""
+        o = _clean(o, 10 ** 9) if isinstance(o, str) else ""  # whole: the answer must match the agent's option exactly
         if o and _phrase(o) and _phrase(o) not in {_phrase(x) for x in opts}:
             opts.append(o)
     if len(opts) >= 2:
