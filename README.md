@@ -220,8 +220,36 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-used-*` | this session (or its process) acted as an agent, so it can't become main |
 | `state/hooks-heartbeat.json`, `state/hooks-seen-sid-<id>` | when a plugin hook last ran on this machine, and that hooks run in that session (event and time only) |
 | `off/` | key and config files of agents switched off on this machine |
+| `status-<workbook>.json` | this machine's copy of every agent's status in that agent workbook (plain words, context, asks), refreshed by the listener every ~30 s and by this machine's own writes |
+| `status-fill.json` | the first setup: when it was offered and done, and that the person was told it read their Claude Code history |
+| `state/status-numbers.json` | the numbering of the last status list shown, for "do N" and "full context of N" (24 hours) |
+| `state/status-out-<name>.json`, `state/status-written-<name>` | the agent's newest status waiting to be sent, and when it was last written |
+| `state/status-answer-<id>.json` | the person's typed "do N" / "N: ..." in that session (good for 30 minutes, used once) |
+| `state/turn-<id>*` | when that session's turn started, that it used a tool, and that it was reminded about its status |
 
 Message text is never stored locally; the agent reads it from datastash when it needs it.
+
+## Agent status
+
+Every agent keeps one live status in its agent workbook: two or three plain sentences of what it is doing and why, a
+context line (project, branch, PR, tests, last change, how long ago), its cards, what is running, health, what it waits
+on, what the person asked of it, and its asks of the person, each with what it touches and what yes and no do. Each part
+carries a few sentences of detail. The person sees all agents as one numbered list, asks first and idle agents last, from
+any session: "status of all my agents", "full context of 4", and "do 4" or "4: no, 30 days" to answer an ask.
+
+- Writing: `datastash status-set -` (JSON on stdin) saves it on this machine at once and sends it in the background
+  (`POST /api/v1/agent/status`, the caller's own row only), retrying quietly. Branch, project and the PR come from git and
+  gh. At the end of a turn that used tools, the Stop hook asks the agent once to write it when it didn't (never on a
+  turn with no tool use, never twice in a turn, never while Claude Code is already continuing for a Stop hook).
+- Reading: `datastash status --all` and `--details N` read the local copy (refreshed by the listener every ~30 s and
+  when something arrives); a copy older than 2 minutes is fetched once (`GET /api/v1/agent/status`, or
+  `/api/v1/person/status` in the person's main). The person's phrases are answered by the UserPromptSubmit hook from the
+  local copy, straight into the session, with no tool call.
+- Answering: the hook records the person's own typed words; `datastash answer N` sends exactly those to the agent that
+  owns ask N (`POST /api/v1/person/status/answer`, as the person) and marks the ask answered. An AI can't answer on its own.
+- First setup: once this computer is signed in, `datastash fill` shows the AI short excerpts of each Claude Code project
+  used in the last 14 days (local only); the AI registers each as an agent and writes a two-sentence first status. Only
+  those sentences go up. The install message says once that it read the person's own history.
 
 ## How waking works
 
@@ -353,6 +381,12 @@ An agent can send datastash a capability request, an error report or anything el
   the agent, an agent session refused, session id spoofing, and self-registration names. Clean sessions only: the
   review's attack replayed (an agent session fakes the typed phrase with the `prompt` command, with its own or a forged
   session id, with a main key on the machine), each first agent action recording the session, and `datastash login` never recording it.
+- `python3 -I test/test_status.py`: the agent status offline: the numbered list in the owner's format (asks first, idle
+  last, one running number), agent text kept to one line, the phrases, the local copy (fresh: no network; old: one call;
+  failing: the old copy), the listener's refresh, the background write (nothing on the network in the turn, a 500
+  retried, an older sender stepping aside, a second turn changing the stored status), the Stop hook (once per turn, never
+  looping, quiet on a trivial turn or after a write), "do N" sending only the person's typed words from that session,
+  the install message, the first-setup excerpts (14 days) and the CLI's speed from the local copy.
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key

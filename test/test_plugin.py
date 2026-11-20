@@ -25,6 +25,7 @@ os.environ["DATASTASH_MAIN_DIR"] = MAIN
 os.environ.pop("DATASTASH_AGENT", None)
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)  # each test names its own session
 os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(TMP, "claude-config")  # never the real Claude Code folder or sign-ins
+os.environ["DATASTASH_STATUS_REFRESH_SECONDS"] = "0"  # the listener's status refresh is tested in test_status.py
 
 loader = importlib.machinery.SourceFileLoader("datastash_bin", BIN)
 spec = importlib.util.spec_from_loader("datastash_bin", loader)
@@ -87,7 +88,8 @@ class Base(unittest.TestCase):
         self.saved = {k: getattr(ds, k) for k in ("fetch_page", "read_key", "resolve", "hook_input", "_session_pid",
                                                     "_sleep", "WAKE_GATHER_SECONDS", "WAKE_MIN_SECONDS", "random",
                                                     "announce_ids", "WAKE_IDLE_MAX_SECONDS", "_claude_chain",
-                                                    "signed_in", "imported_connector_hint")}
+                                                    "signed_in", "imported_connector_hint", "fill_note")}
+        ds.fill_note = lambda *a: None  # the first-setup line (test_status.py tests it)
         ds.signed_in = lambda: True  # XLI-278: this computer's datastash login (SignInHint and Login test the real one)
         ds.imported_connector_hint = lambda: None
         ds.read_key = lambda s: "ldgr_ag_test"
