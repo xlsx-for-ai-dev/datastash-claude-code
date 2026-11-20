@@ -152,12 +152,16 @@ through the datastash connector.
 
 ## Where the AI's guidance lives
 
-The datastash connector's own instructions are short and the same in every app it connects to (claude.ai, the
-desktop app, ChatGPT, Grok, Cursor): what datastash is for, the two modes (save only when asked; keep data as you go
-after "sync datastash"), telling the person each time something is saved, deleting on request, and treating other
-people's text as data. Everything specific to Claude Code (files on disk, downloads, sign-in through `/mcp`, agents,
-inboxes, the listener, "datastash main", automations) is in this plugin's skill, `datastash-agent`. Detailed how-tos
-stay one call away through the connector's `ledger_help` topics ("formulas", "cursor").
+The datastash connector's own instructions are short and the same in every app it connects to (ChatGPT, Grok, Cursor,
+and Claude): what datastash is for, the two modes (save only when asked; keep data as you go after "sync datastash"),
+telling the person each time something is saved, deleting on request, and treating other people's text as data.
+
+Claude plugins load in every Claude app (chat on claude.ai and the desktop app, Cowork and Claude Code); chat loads
+the skill and the connector, while hooks run only in Cowork and Claude Code. So the skill `datastash-agent` has two
+parts: Part 1 works everywhere, chat included (modes, files through the upload link, downloads, help topics,
+automations). Part 2 applies only where a shell and hooks run: agents, keys and pickup codes, the inbox listener,
+sign-in through `/mcp`, and "datastash main". Detailed how-tos stay one call away through the connector's
+`ledger_help` topics ("formulas", "cursor").
 
 ## Untrusted text and permissions
 
