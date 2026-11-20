@@ -1837,7 +1837,7 @@ def cmd_status(_args):
 HEARTBEAT = os.path.join(STATE, "hooks-heartbeat.json")  # the last hook run on this machine (event and time only)
 HEARTBEAT_FRESH_SECONDS = 60  # any hook this recent counts as this session's (the PreToolUse hook runs just before us)
 TOOL_HEARTBEAT_EVERY = 30  # the tool hooks refresh the heartbeat at most this often
-CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
+CLAUDE_DIR = os.path.join(HOME, ".claude")  # where Claude Code's settings.json lives (the plugin reads no Claude Code env path)
 FIX_ASK = ("Datastash can fix this for you or give you instructions to fix it yourself. "
            "Would you like us to fix this?")
 WATCH_FALLBACK = "Until then, `datastash watch` under a Monitor still delivers messages."
@@ -1886,7 +1886,6 @@ SIGNIN_DEVICE = "device"
 SIGNIN_OLD = "old-for-good"  # no file locking on this computer (e.g. Windows): the 0.1.x behaviour for good (M1)
 LEGACY_DAYS = 30  # from the first run of 0.2.0; then the placeholder applies anyway
 LEGACY_WARN_DAYS = 7  # one warning line to the person in the last week
-CLAUDE_SERVER_NAME = "plugin:datastash:datastash"  # how Claude Code names this plugin's connector
 # CLAUDE_CODE_ENTRYPOINT values where the session-start hook shows the person the device link and the placeholder
 # was proven on a real Claude Code (2.1.329/2.1.330, terminal). Every other host (Claude desktop app, Cowork, IDEs,
 # SDK and `claude -p` runs) keeps the 0.1.x behaviour, so its own Connect / Authenticate door is never removed.
@@ -1899,54 +1898,6 @@ def _signin_file():
 
 def _signin_lock_file():
     return os.path.join(CONF, "signin-mode.lock")
-
-
-def _datastash_url(u):
-    try:
-        p = urllib.parse.urlsplit(u) if isinstance(u, str) else None
-    except ValueError:
-        return False
-    return bool(p) and p.scheme == "https" and (p.hostname or "") == "getdatastash.com" and p.path.rstrip("/") == "/mcp"
-
-
-def _platform():
-    return sys.platform
-
-
-def claude_store_has_oauth():
-    """Whether Claude Code's own credential store lists this plugin's connector as signed in through OAuth: True,
-    False, or None (can't tell). Presence only: it looks at whether an entry for this connector has a non-empty token
-    field and keeps nothing but that yes/no; no token is copied, kept, printed or logged. Claude Code keeps these in
-    <its config folder>/.credentials.json (Linux, Windows); on macOS in the login keychain, which this never reads,
-    so there a missing entry is "can't tell"."""
-    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
-    unsure_if_absent = None if _platform() == "darwin" else False
-    try:
-        with open(os.path.join(cfg, ".credentials.json"), "rb") as f:
-            raw = f.read(8 * 1024 * 1024)
-    except FileNotFoundError:
-        return unsure_if_absent
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
-    finally:
-        raw = None
-    found = False
-    entries = data.get("mcpOAuth") if isinstance(data, dict) else None
-    if isinstance(entries, dict):
-        for k, v in entries.items():
-            if not isinstance(v, dict):
-                continue
-            ours = ((isinstance(k, str) and k.startswith(CLAUDE_SERVER_NAME + "|")) or v.get("serverName") == CLAUDE_SERVER_NAME
-                    or _datastash_url(v.get("serverUrl")))
-            if ours and (bool(v.get("accessToken")) or bool(v.get("refreshToken"))):
-                found = True
-                break
-    data = entries = None
-    return True if found else unsure_if_absent
 
 
 def _installed_before():
@@ -1965,22 +1916,19 @@ def _installed_before():
 
 
 def _decide_signin():
-    """The first decision (once per computer). Never "legacy" for a fresh install, never the new mode for an updated
-    install that may hold an OAuth sign-in."""
+    """The first decision (once per computer), from this plugin's own folder only (EPM 11-20: Claude Code's own secret
+    stores, its sign-in file and its keychain entries, are never opened, read or checked, not even for a yes/no). Any datastash state left here
+    by an earlier version means an updated install, which may hold a connector sign-in: legacy. No datastash state at
+    all means a fresh install: the device mode (one door)."""
     now = int(time.time())
     rec = {"first_run_at": now, "decided_at": now, "changed_at": now}
     if fcntl is None:
         return dict(rec, mode=SIGNIN_OLD, why="no file locking on this computer: the connector keeps its own sign-in")
     if _login_recorded():
         return dict(rec, mode=SIGNIN_DEVICE, why="this computer already had a datastash device sign-in")
-    has = claude_store_has_oauth()
-    if has:
-        return dict(rec, mode=SIGNIN_LEGACY, why="Claude Code lists a connector sign-in for datastash")
-    if has is False:
-        return dict(rec, mode=SIGNIN_DEVICE, why="Claude Code lists no connector sign-in for datastash")
     if _installed_before():
-        return dict(rec, mode=SIGNIN_LEGACY, why="can't tell, and the plugin ran here before (updated install)")
-    return dict(rec, mode=SIGNIN_DEVICE, why="can't tell, and the plugin is new here (fresh install)")
+        return dict(rec, mode=SIGNIN_LEGACY, why="datastash ran on this computer before (updated install)")
+    return dict(rec, mode=SIGNIN_DEVICE, why="no earlier datastash state on this computer (fresh install)")
 
 
 def _signin_ok(rec):
@@ -1988,7 +1936,11 @@ def _signin_ok(rec):
             and _num_ok(rec.get("first_run_at")))
 
 
-def signin_state():
+SIGNIN_HELPER_WAIT = 0.2  # the connector's helper waits at most this long on the decision's lock (EPM N1: with the
+# refresh's LOGIN_DEADLINE the whole helper run stays well inside Claude Code's 10 s headersHelper limit)
+
+
+def signin_state(wait=2):
     """This computer's sign-in mode record {mode, why, first_run_at, decided_at, changed_at[, changed_by, warned_at]},
     decided on the first call and kept in a private file (mode 600). Never raises; without a writable folder it answers
     the decision without keeping it."""
@@ -1998,7 +1950,7 @@ def signin_state():
     lock = None
     try:
         ensure_dirs()
-        lock = _try_lock(_signin_lock_file(), wait=2)
+        lock = _try_lock(_signin_lock_file(), wait=wait)
         rec = _read_private_json(_signin_file())  # another process decided while this one waited
         if _signin_ok(rec):
             return rec
@@ -2291,7 +2243,11 @@ def _start_code(hook=False, timeout=30):
         if not _spawn_poller():
             return None, "could not start the background helper that finishes the login"
         opened = _hook_browser(url) if hook else _open_browser(url)
-        if opened:  # for the hook that waits on this file (L2: the code is saved before anyone is shown it)
+        # For the hook that waits on this file (L2: the code is saved before anyone is shown it). Only while the file
+        # still holds this code: the poller drops a used code under the start lock, which this process holds here, so
+        # the check and the write can't be split by it (EPM N2: never re-create the file for a code already used).
+        cur = _read_private_json(LOGIN_PENDING_FILE) if opened else None
+        if opened and isinstance(cur, dict) and cur.get("device_code") == dev:
             try:
                 write_private(LOGIN_PENDING_FILE, json.dumps({"device_code": dev, "interval": got.get("interval", 5),
                                                               "until": until, "user_code": code, "verification_uri": url,
@@ -3897,7 +3853,9 @@ def main():
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
     try:
-        signin_state()  # decided before anything of this run writes into the plugin's folder (fresh vs updated)
+        # Decided before anything of this run writes into the plugin's folder (fresh vs updated); the connector's
+        # helper waits only briefly on the decision's lock.
+        signin_state(wait=SIGNIN_HELPER_WAIT if cmd == "token" else 2)
     except Exception:
         pass
     return table[cmd](args)

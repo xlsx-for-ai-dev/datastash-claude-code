@@ -59,12 +59,13 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
 In Claude chat on claude.ai, the desktop app and Cowork, nothing changes: the datastash connector signs in with its
 usual **Connect** button. The plugin needs no shell or keychain there.
 
-**Updating from 0.1.x.** An install that signed in through `/mcp` Authenticate keeps that sign-in working (the plugin
-checks only whether Claude Code lists a sign-in for this connector; it never reads the token). Its session start shows
-the same device link and code, worded as "datastash has a new sign-in for this computer"; once you approve one, the new
-sign-in takes over for good. Thirty days after the first run of 0.2.0 it takes over anyway, with one line a week before.
-On macOS, where Claude Code keeps connector sign-ins in the keychain, an updated install is treated as signed in that
-way. `datastash doctor` shows the mode, since when, and what the connector gets on this host.
+**Updating from 0.1.x.** An install that signed in through `/mcp` Authenticate keeps that sign-in working. The plugin
+decides this from its own files only: if an earlier datastash version left any state on this computer, it is an
+updated install and keeps the connector's own sign-in; with no datastash state at all it is a fresh install and gets
+the device sign-in. It never opens, reads or checks Claude Code's own sign-in file or keychain entries. An updated
+install's session start shows the same device link and code, worded as "datastash has a new sign-in for this
+computer"; once you approve one, the new sign-in takes over for good. Thirty days after the first run of 0.2.0 it
+takes over anyway, with one line a week before. `datastash doctor` shows the mode, since when, and what the connector gets on this host.
 
 About `datastash login`:
 
