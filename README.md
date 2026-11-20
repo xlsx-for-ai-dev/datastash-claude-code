@@ -40,6 +40,16 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
    Claude tells you a code. Type it on the page (signed in with Google) and press **Approve**. Restart Claude Code once
    more so the connector picks up the sign-in; from then on every session connects to datastash already signed in.
    There is no `/mcp` step.
+4. **See the difference.** In a Claude Code session, ask "What's the status of all my agents?" (the agent goes and
+   looks). Then type:
+
+   ```
+   Keep my agents' status and what I tell them to remember in datastash
+   ```
+
+   Ask for the status again: it comes back at once, from datastash. Then ask for the status once in each of your other
+   Claude Code sessions, so each saves its own. From then on "What's the status of all my agents?" in any session shows
+   them all, numbered.
 
 In Claude chat on claude.ai, the desktop app and Cowork, nothing changes: the datastash connector signs in with its
 usual **Connect** button. The plugin needs no shell or keychain there.
@@ -221,7 +231,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/hooks-heartbeat.json`, `state/hooks-seen-sid-<id>` | when a plugin hook last ran on this machine, and that hooks run in that session (event and time only) |
 | `off/` | key and config files of agents switched off on this machine |
 | `status-<workbook>.json` | this machine's copy of every agent's status in that agent workbook (plain words, context, asks), one row per agent and project, refreshed by the listener every ~30 s and by this machine's own writes; notes when the last refresh failed |
-| `status-consent.json` | the person's yes or no per project folder for keeping its status in datastash (first setup) |
+| `status-consent.json` | the person's yes or no for keeping this computer's agents' status in datastash (and per project folder, from the history list) |
 | `state/status-view-<id>.json`, `state/status-prompts-<id>.json`, `state/status-typed-<id>.json` | what that session showed last (number -> agent, project, ask id and version, or the first-setup list), its prompt count, and the typed transcript entries already used once |
 | `state/status-out-<name>.json`, `state/status-sent-<name>.json`, `state/status-written-<name>`, `state/status-snap-<name>.json`, `state/status-reminded-<name>` | the agent's newest status waiting to be sent and whether it was, when it was last written, the commit and changed-files hash at that write, and when it was last reminded |
 | `state/status-answer-out-<id>.json` | a person's answer that could not reach datastash yet, with its answer id (sent again with the same id) |
@@ -238,14 +248,27 @@ on, what the person asked of it, and its asks of the person, each with what it t
 person sees all agents as one numbered list, asks first and idle agents last, from any session: "status of all my
 agents", "full context of 4", "more on api", and "do 4" or "4: no, 30 days" to answer an ask.
 
-- First setup (one yes): right after this computer is signed in, or when the person asks for their agents' status,
-  `datastash fill` reads the person's recent Claude Code projects (last 14 days) locally and shows them numbered, with
-  one question: "Keep these in datastash so all your agents, on any computer, can see them? Say yes, or name the ones
-  to keep." and what goes up for each kept one. Nothing is sent, registered or linked before the answer. The plugin
-  reads the answer itself (only the very next prompt, only right after the question was shown, only the person's own
-  typed entry, checked as below); `datastash fill --kept` then tells the AI which were kept. A no is remembered per project
-  and not asked again unless the person asks. Only kept projects are registered, get a first summary, and send status or
-  background facts; a project the person did not keep sends nothing, ever.
+- Keeping (one yes per computer): the person types "Keep my agents' status and what I tell them to remember in
+  datastash" (the last install step). The prompt hook recognizes that line in plain code (case, punctuation and
+  "my agent's" / "my agents'" don't matter) and acts only once the checker below confirms it as the person's own typed
+  prompt; an AI's tool call can't turn it on. Then `datastash keep --on` signs the computer in if it isn't yet, says
+  which agents are kept, and has the agent save the status it already worked out in that session as its first one (no
+  history read). From then on every agent on this computer saves its status, and a session in a new project joins on
+  its first status. Nothing is sent before that yes.
+- Where the yes can also come from: if the status read's reply carries `keep` (true or false) for the account, the
+  plugin follows it when the person has not answered on this computer. With neither, asking for status ends with one
+  question, "Keep my agents' status and what I tell them to remember in datastash?", and what goes up: a short summary
+  of what each agent is doing, its branch, last change, PR and test state, refreshed as it works, and what the person
+  tells it to remember. The person's very next typed "yes" or "no" answers it (checked the same way); a no is remembered
+  and not asked again unless they ask.
+- First status per session: when keeping is on and a session's agent has no saved status yet, the first "status of all
+  my agents" there has the agent save its own status in that turn, then show the list. After that the list comes from
+  the local copy at once.
+- Recent projects from history, only when the person asks for it by name: `datastash fill` reads the person's recent
+  Claude Code projects (last 14 days) locally and shows them numbered, with one question: "Keep these in datastash so
+  all your agents, on any computer, can see them? Say yes, or name the ones to keep." Nothing is sent, registered or
+  linked before the answer, which the plugin reads and checks itself; a project the person did not name is never read
+  or registered this way, and a no is remembered per project and wins over the computer's yes.
 - Writing: `datastash status-set -` (JSON on stdin) saves it on this machine at once and, for a kept project, sends it in
   the background (`POST /api/v1/agent/status` with `project`, the caller's own row only), retrying quietly; an unsent
   write is sent again by the listener once datastash answers. `--project` only for this folder's own agent.

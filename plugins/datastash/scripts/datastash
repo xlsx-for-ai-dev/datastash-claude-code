@@ -23,6 +23,8 @@ Subcommands (run `datastash help`):
                             --project only for another folder of this folder's own agent
   fill [--again]            first setup: the person's recent Claude Code projects (read locally, nothing sent) and the
                             one question; the person's answer is read by the prompt hook, never taken from the AI
+  keep [--on]               keeping agents' status in datastash: this computer's answer; --on after the person typed
+                            the keep phrase (checked by the plugin, never taken from the AI): sign in if needed, next steps
   fill --kept               the folders the person's last answer kept (after the plugin checked it was typed by them)
   fill --excerpts DIR       short excerpts of a kept project's history (local), for its first summary
   fill --status DIR         that first summary (JSON on stdin) for a kept project whose agent has no status yet
@@ -2472,9 +2474,9 @@ def cmd_auto_name(args):
         if not os.path.isdir(project):
             die(f"{project} is not a folder")
         if (os.path.realpath(project) != os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-                and not consent_for(project)):
+                and not named_consent(project)):
             die(f"{os.path.realpath(project)} is not a project the person said yes to keeping in datastash; register "
-                "another folder only after their yes (datastash-agent skill, \"First setup\")")
+                "another folder only after their yes (datastash-agent skill, \"Recent projects from history\")")
     if args[:1] == ["--after"] and len(args) == 2:
         after = args[1].strip()[:44] or None
     elif args:
@@ -3286,6 +3288,10 @@ STATUS_BIG = 2500  # characters of plain words per row above which the writer is
 INSTALL_HEAD = "datastash is connected to your agents:"
 INSTALL_TAIL = ("Ask any of them about the others, from any project.",
                 "Want your agents to share something? Just say so — it works now.")
+KEEP_PHRASE = "Keep my agents' status and what I tell them to remember in datastash"  # owner's words (11-20)
+KEEP_QUESTION = KEEP_PHRASE + "?"
+KEEP_WHAT = ("If you say yes, datastash gets, for each agent on this computer, a short summary of what it is doing, its "
+             "branch, last change, PR and test state, refreshed as it works, and what you tell it to remember. Say yes or no.")
 FILL_HEAD = "Your recent projects on this computer, from your own Claude Code history (read here; nothing has been sent):"
 FILL_QUESTION = ("Keep these in datastash so all your agents, on any computer, can see them? Say yes, or name the ones "
                  "to keep.")
@@ -3579,6 +3585,11 @@ def fetch_status(sess, timeout=10):
         note_refresh_failed(wb)
         raise ApiError(_status, {"error": "not_json"})
     note_door(True)
+    if isinstance(body, dict) and isinstance(body.get("keep"), bool):
+        try:
+            record_keep_all(body["keep"], "server")  # the account's keep value, when the server sends one
+        except OSError:
+            pass
     return save_status_cache(wb, _status_rows(body), time.time())
 
 
@@ -3591,8 +3602,48 @@ def read_consent():
     return {"keep": {k: v for k, v in keep.items() if isinstance(k, str)}, "no": {k: v for k, v in no.items() if isinstance(k, str)}}
 
 
+def keep_state():
+    """This computer's answer for all its agents: "yes", "no" or None (not asked yet). The person's own typed answer
+    here (the keep phrase, or yes / no to the question) wins; else the account's `keep` value from the status read."""
+    c = read_json(CONSENT_PATH, {})
+    for k in ("all", "server"):
+        v = c.get(k)
+        if isinstance(v, dict) and isinstance(v.get("keep"), bool):
+            return "yes" if v["keep"] else "no"
+    return None
+
+
+def record_keep_all(keep, how):
+    """Record this computer's yes or no for all its agents: how is "typed" (the person here) or "server" (the
+    account's flag; never overrides a typed answer)."""
+    c = read_json(CONSENT_PATH, {})
+    c = c if isinstance(c, dict) else {}
+    key = "all" if how == "typed" else "server"
+    old = c.get(key)
+    if isinstance(old, dict) and old.get("keep") is keep:
+        return
+    c[key] = {"keep": bool(keep), "at": int(time.time())}
+    ensure_dirs()
+    write_private(CONSENT_PATH, json.dumps(c))
+
+
 def consent_for(folder):
-    """True when the person said yes to keeping this folder (or the folder it is in) in datastash."""
+    """True when this folder (or the folder it is in) may be kept in datastash: a project the person named stays as
+    they said (a no is never overridden); otherwise this computer's yes for all its agents."""
+    if not folder:
+        return False
+    here = os.path.realpath(folder)
+    c = read_consent()
+    if any(_within(here, os.path.realpath(k)) for k in c["keep"]):
+        return True
+    if any(_within(here, os.path.realpath(k)) for k in c["no"]):
+        return False
+    return keep_state() == "yes"
+
+
+def named_consent(folder):
+    """True only when the person named this folder (or one it is in) in their answer to the history list: the
+    history-reading steps and registering another folder need that, not this computer's yes for its agents."""
     if not folder:
         return False
     here = os.path.realpath(folder)
@@ -3600,7 +3651,9 @@ def consent_for(folder):
 
 
 def record_consent(keep, no):
+    whole = read_json(CONSENT_PATH, {})
     c = read_consent()
+    c.update({k: v for k, v in (whole if isinstance(whole, dict) else {}).items() if k in ("all", "server")})
     now = int(time.time())
     for f in keep:
         c["keep"][os.path.realpath(f)] = now
@@ -4033,7 +4086,7 @@ def count_prompt(sid):
         pass
 
 
-def save_view(sid, wb, numbers, fill=None):
+def save_view(sid, wb, numbers, fill=None, keepq=False):
     """What this session just showed the person: the numbered list (and the first-setup projects, if shown). It replaces
     any earlier view: only the most recent one answers."""
     if not sid:
@@ -4041,7 +4094,7 @@ def save_view(sid, wb, numbers, fill=None):
     try:
         ensure_dirs()
         write_private(_view_path(sid), json.dumps({"workbook_id": wb, "at": time.time(), "prompt_n": prompt_count(sid),
-                                                   "numbers": numbers, "fill": fill}))
+                                                   "numbers": numbers, "fill": fill, "keepq": bool(keepq)}))
     except OSError:
         pass
 
@@ -4703,6 +4756,8 @@ def shown_ok(kind, data, turns):
         seen = " ".join(lines)
         if kind == "fill":
             return _norm_seen(FILL_QUESTION) in seen[-800:]
+        if kind == "keepq":
+            return _norm_seen(KEEP_QUESTION) in seen[-800:]
         ask = _norm_seen(str(data.get("text") or "").rstrip("?"))[:40]
         return bool(ask) and ask in seen
     return False
@@ -4811,12 +4866,22 @@ def cmd_status_verify(args):
     except OSError:
         return 0
     data = rec.get("data") or {}
-    if not shown_ok(rec.get("kind"), data, turns):
+    if rec.get("kind") != "keep" and not shown_ok(rec.get("kind"), data, turns):
         log("status", "verify: that list or question was not the last thing shown")
         if rec.get("kind") == "fill":
             _save_fill_decision(sid, None)
         return 0
-    if rec.get("kind") == "fill":
+    if rec.get("kind") == "keep" or (rec.get("kind") == "keepq" and data.get("keep") is True):
+        try:
+            record_keep_all(True, "typed")
+        except OSError:
+            return 0
+    elif rec.get("kind") == "keepq":
+        try:
+            record_keep_all(False, "typed")
+        except OSError:
+            return 0
+    elif rec.get("kind") == "fill":
         fill_record(sid, data["fill"], data["keep"])
     elif rec.get("kind") == "answer":
         add_outcome(sid, deliver_answer(data))
@@ -5040,15 +5105,79 @@ def cmd_status_answer_send(args):
     return 0
 
 
+def _keep_norm(text):
+    t = re.sub(r"[\u2018\u2019`]", "'", text.lower())
+    t = re.sub(r"\bagent(?:'s|s'|s)(?=\W|$)", "agents", t)
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", t)).strip()
+
+
+def keep_phrase(text):
+    """True when the person's whole prompt is the keep phrase (forgiving: case, punctuation, quotes, "my agent's" /
+    "my agents'", a trailing period)."""
+    if not isinstance(text, str) or len(text) > 200 or "\n" in text.strip():
+        return False
+    return _keep_norm(text) == _keep_norm(KEEP_PHRASE)
+
+
+KEEP_NOTE = (f"{STATUS_NOTE}: the person typed \"{KEEP_PHRASE}\". The plugin checks it was typed by them. Run "
+             "`datastash keep --on` once now and do what it prints.")
+
+
+def keep_question_lines():
+    """The fallback question, for a computer with no answer yet (the person never typed the keep phrase)."""
+    return [KEEP_QUESTION, KEEP_WHAT]
+
+
+def own_status_missing(here, me):
+    """(agent, True) when keeping is on for this folder and its agent has no saved status from this computer yet;
+    (None, True) when keeping is on and this folder has no agent yet; else (agent or None, False)."""
+    if main_root(os.path.realpath(here)) is not None:
+        return None, False
+    try:
+        agent = agent_for(here, me=me)
+    except Exception:
+        agent = None
+    if agent is None:
+        return None, keep_state() == "yes"
+    if is_person(agent) or not consent_for(linked_folder(agent, here)):
+        return agent, False
+    return agent, not os.path.exists(_written_path(agent["slug"]))
+
+
+SEED_NOTE = ("Keeping is on and this agent has no saved status yet: in this same turn, first work out your own status "
+             "from what you already know in this session and pipe it to `datastash status-set -` (datastash-agent skill, "
+             "\"Your status line\"; register first if this folder has no agent, \"Self-registration\"), then run "
+             "`datastash status --all` and show the person what it prints, as it is. Nothing else first.")
+
+
 def status_prompt_context(inp):
     """The UserPromptSubmit line for a status phrase or a first-setup answer the person typed, or None. Showing is
     read-only. A "do N" is an answer only against the list this session showed last (at most 3 prompts and 30 minutes
     ago, N an ask in it); it and a first-setup answer are acted on only by the checker, once the session transcript shows
     them as the person's own typed prompt right after that list or question. The AI never sends either."""
     text = inp.get("prompt")
+    if keep_phrase(text):
+        shape = hook_shape(inp)
+        if shape is None or not start_check(shape, "keep", text, {}):
+            return None  # not the hook's input: nothing
+        return KEEP_NOTE
     ph = status_phrase(text)
     sid = inp.get("session_id") if isinstance(inp.get("session_id"), str) and re.fullmatch(SID_RE, inp.get("session_id")) else None
     view = read_view(sid)
+    if ph is None and view and view.get("keepq") and prompt_count(sid) - view["prompt_n"] == 1:
+        t = _phrase(text) if isinstance(text, str) and len(text) <= 60 else ""
+        yes = True if t in FILL_ALL else False if t in FILL_NONE else None
+        if yes is None:
+            return None
+        shape = hook_shape(inp)
+        if shape is None or not shown_ok("keepq", {}, transcript_turns(shape[1])):
+            return None  # the question was not the last thing the person saw: an ordinary prompt
+        if not start_check(shape, "keepq", text, {"keep": yes}):
+            return None
+        if yes:
+            return KEEP_NOTE.replace(f'typed "{KEEP_PHRASE}"', "said yes to keeping their agents' status in datastash")
+        return (f"{STATUS_NOTE}: the person said no to keeping their agents' status in datastash; the plugin records it "
+                "itself and does not ask again unless they ask. Tell them in one plain line: \"OK, nothing is kept.\"")
     fr = None
     if ph is None and view and view.get("fill") and prompt_count(sid) - view["prompt_n"] == 1:
         fr = fill_reply(text, view["fill"])  # only the very next prompt after the question answers it
@@ -5063,7 +5192,7 @@ def status_prompt_context(inp):
             return None
         return (f"{STATUS_NOTE}: the person may have answered the first-setup question; the plugin checks it itself. Run "
                 "`datastash fill --kept` once: it says which folders the person kept (if any). Then follow the "
-                "datastash-agent skill's \"First setup\" for those folders only.")
+                "datastash-agent skill's \"Recent projects from history\" for those folders only.")
     kind, arg = ph
     if kind == "answer":
         target = (view or {}).get("numbers", {}).get(str(arg[0]))
@@ -5071,10 +5200,21 @@ def status_prompt_context(inp):
             return None  # not an ask of the list this session just showed: an ordinary prompt
         return answer_from_prompt(inp, arg[0], arg[1], view)
     if kind == "all":
+        me = lazy_me(inp)
+        if not os.path.exists(_main_path(sid)):
+            _agent, missing = own_status_missing(here, me(False))
+            if missing:
+                return f"{STATUS_NOTE}: the person asked for all agents' status. {SEED_NOTE}"
+        if (keep_state() is None and not named_consent(here) and not os.path.exists(_main_path(sid))
+                and main_root(here) is None):
+            # not kept yet: the ordinary answer (the agent finds out), then the one question; nothing is sent
+            save_view(sid, None, {}, keepq=True)
+            return (f"{STATUS_NOTE}: the person asked for their agents' status; datastash is not keeping it on this "
+                    "computer yet. Answer the ordinary way (find out where this session's work stands). End your answer "
+                    "with these two lines, as they are, and nothing after them:\n" + "\n".join(keep_question_lines()))
         return (f"{STATUS_NOTE}: the person asked for all agents' status. Show them this exactly as below (the names, "
                 "paragraphs, context lines and numbered asks), with no tool calls first:\n"
-                + "\n".join(render_status_all(here, lazy_me(inp), live_timeout=4,
-                                             fill=not os.path.exists(_main_path(sid)) and main_root(here) is None)))
+                + "\n".join(render_status_all(here, me, live_timeout=4)))
     if kind == "more":
         return (f"{STATUS_NOTE}: the person asked for more on the agent \"{_clean(arg, 64)}\". Show them this exactly as "
                 "below, with no tool calls first:\n" + "\n".join(render_status_all(here, lazy_me(inp), live_timeout=4, only=arg)))
@@ -5245,6 +5385,54 @@ def fill_record(sid, fill, keep):
     _save_fill_decision(sid, keep)
 
 
+def _checks_pending(sid, kinds):
+    for n in os.listdir(STATE):
+        if n.startswith("status-pending-"):
+            r = read_json(os.path.join(STATE, n), {}) or {}
+            if r.get("sid") == sid and r.get("kind") in kinds:
+                return True
+    return False
+
+
+def cmd_keep(args):
+    """`datastash keep --on`: after the person typed the keep phrase (or said yes to the question), once the plugin's
+    checker confirmed it: sign this computer in if needed, and tell the AI what to do next (AI-facing lines).
+    `datastash keep`: this computer's answer. The AI can't turn keeping on: only the person's checked typed words do."""
+    if args == []:
+        st = keep_state()
+        print("keeping agents' status in datastash on this computer: " + {"yes": "yes", "no": "no"}.get(st, "not asked yet"))
+        return 0
+    if args != ["--on"]:
+        die("usage: datastash keep  |  datastash keep --on")
+    sid = lazy_me()(True)
+    deadline = time.time() + 10
+    while sid and _checks_pending(sid, ("keep", "keepq")) and time.time() < deadline:
+        time.sleep(0.2)
+    if keep_state() != "yes":
+        print(f"{STATUS_NOTE}: no typed yes from the person was confirmed; nothing changed. Don't ask again on your own.")
+        return 0
+    if not signed_in():
+        print(f"{STATUS_NOTE}: keeping is on for this computer, but it is not signed in to datastash yet. Sign it in now:")
+        try:
+            cmd_login([])
+        except SystemExit:
+            pass
+        print("When the person says it is done, run `datastash login --check`, then `datastash keep --on` again.")
+        return 0
+    names = sorted({disp(a["name"]) for a in all_agents() if not is_person(a)})
+    line = ("Keeping status for: " + ", ".join(names) + ".") if names else \
+        "Keeping status for this computer's agents; each one joins when it saves its first status."
+    here = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    _agent, missing = own_status_missing(here, this_session())
+    print(f"{STATUS_NOTE}: keeping is on for this computer's agents. Tell the person in one plain line: \"{line}\" "
+          "From now on, also save in datastash what the person asks you to remember (datastash-agent skill).")
+    if missing:
+        print(SEED_NOTE)
+    else:
+        print("Then run `datastash status --all` and show the person what it prints, as it is.")
+    return 0
+
+
 def fill_kept(sid, wait=10.0):
     """For `datastash fill --kept`: the folders the person's last answer kept, once the checker is done."""
     deadline = time.time() + wait
@@ -5274,13 +5462,13 @@ def cmd_fill(args):
         else:
             names = ", ".join(_project_name(f) for f in keep)
             print(f'{STATUS_NOTE}: the person kept: {names}. Tell them in one plain line: "Keeping {names}." Then set up '
-                  'these folders only, as the datastash-agent skill\'s "First setup" says: ' + "; ".join(keep))
+                  'these folders only, as the datastash-agent skill\'s "Recent projects from history" says: ' + "; ".join(keep))
         return 0
     if args[:1] in (["--excerpts"], ["--status"]):
         if len(args) != 2:
             die(f"usage: datastash fill {args[0]} DIR")
         folder = os.path.realpath(args[1])
-        if not consent_for(folder):
+        if not named_consent(folder):
             die(f"{folder} is not a project the person said yes to keeping in datastash; nothing done")
         if args[0] == "--excerpts":
             x = next((p for p in recent_projects(excerpts=True) if p["folder"] == folder), None)
@@ -5295,7 +5483,7 @@ def cmd_fill(args):
             return 0
         agent = resolve(folder)[0]
         if agent is None or is_person(agent):
-            die(f"no agent is linked to {folder} yet (register it first, as \"First setup\" says)")
+            die(f"no agent is linked to {folder} yet (register it first, as \"Recent projects from history\" says)")
         if read_key(agent["slug"]) is None:
             die(f"no usable key file for \"{agent['name']}\"")
         if read_json(_outbox_path(agent["slug"]), None):
@@ -5334,7 +5522,7 @@ def main():
              "login": cmd_login, "logout": cmd_logout, "token": cmd_token, "unfilter": lambda a: cmd_filter(a, hidden=False),
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
              "answer": cmd_answer, "fill": cmd_fill, "status-answer-send": cmd_status_answer_send,
-             "status-verify": cmd_status_verify}
+             "status-verify": cmd_status_verify, "keep": cmd_keep}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

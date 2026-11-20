@@ -3,7 +3,8 @@
 agent and project, every value with its age), the local copy, the end-of-turn reminder (only on a material change,
 never while the door is missing, at most every 10 minutes), the background write (only after the person's yes), "do N"
 answers (only against the list this session showed, only from the real prompt hook, sent by the hook), "full context
-of N", and the first setup (one yes before anything goes up). No network, no key.
+of N", keeping (the person's typed keep phrase or yes, the server's keep value, each session's first status) and the
+history list only by name. No network, no key.
 Run: python3 -I test/test_status.py"""
 import importlib.machinery
 import importlib.util
@@ -108,6 +109,7 @@ class Base(unittest.TestCase):
         ds.write_private(ds.conf_path("web-app"), json.dumps({"name": "web-app", "workbook_id": WB, "projects": [self.folder]}))
         ds.write_private(ds.key_path("web-app"), "ldgr_ag_" + "x" * 40)
         ds.record_consent([self.folder], [])  # the person said yes to this project (H2 tests start without it)
+        ds.write_private(ds._written_path("web-app"), "{}")  # this agent already saved a status (seed tests drop it)
         self.env = {k: os.environ.get(k) for k in ("CLAUDE_PROJECT_DIR", "CLAUDE_CODE_SESSION_ID")}
         os.environ["CLAUDE_PROJECT_DIR"] = self.folder
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sess1"
@@ -668,6 +670,25 @@ class PromptAndAnswer(Base):
         self.assertEqual(len(self.answers()), 1)
         self.assertEqual(self.outcomes(), ['Not sent: web-app changed that ask. It now says: "Delete everything?"'])
 
+    def test_server_shapes_ask_changed_current_and_held_for_confirm(self):
+        """PR #368's shapes: 409 {code: ask_changed, current: {...}}; a datastash login's answer is held for /confirm
+        (shown as one plain line with the link); a repeated answer_id is a 200 with repeat: true."""
+        self.prompt("status of all my agents")
+        self.answer_error = ds.ApiError(409, {"code": "ask_changed", "ask_id": "q2", "ask_version": 5, "current": {
+            "id": "q2", "text": "Change it to 14 days?", "version": 5, "written_by": "web-app", "read_as": "data"}})
+        self.prompt("do 2")
+        self.assertEqual(self.outcomes(), ['Not sent: web-app changed that ask. It now says: "Change it to 14 days?"'])
+        self.prompt("status of all my agents")
+        url = ds.ORIGIN + "/confirm?r=abc123"
+        self.answer_error = ds.ApiError(403, {"code": "person_approval_needed", "approve_url": url})
+        self.prompt("do 4")
+        self.assertEqual(self.outcomes(), [f"Not sent yet: datastash needs your OK for this: {url} After you approve it, "
+                                           "type your answer again."])
+        self.answer_error = ds.ApiError(403, {"code": "not_allowed"})  # an agent key: refused, said plainly
+        self.prompt("status of all my agents")
+        self.prompt("do 4")
+        self.assertEqual(self.outcomes(), ["Not sent: datastash refused it (HTTP 403 not_allowed)."])
+
     def test_offline_answer_waits_in_the_outbox_with_its_key(self):
         self.prompt("status of all my agents")
         self.answer_error = OSError("down")
@@ -824,12 +845,12 @@ class FirstSetup(Base):
         self.assertIsNone(self.prompt("yes"))
         self.assertEqual(ds.read_consent(), {"keep": {}, "no": {}})
 
-    def test_the_status_ask_offers_it_too(self):
+    def test_the_status_ask_never_reads_history(self):
+        """Addendum 4: the history list is only for when the person asks for it by name."""
         ctx = self.prompt("status of all my agents")
-        self.assertIn(ds.FILL_QUESTION, ctx)
-        self.prompt("yes")
-        self.assertTrue(ds.consent_for(self.p1) and ds.consent_for(self.p2))
-        self.assertNotIn(ds.FILL_QUESTION, self.prompt("status of all my agents"))
+        self.assertNotIn(ds.FILL_QUESTION, ctx)
+        self.assertNotIn("shop-", ctx)
+        self.assertNotIn("datastash fill", ctx)
 
     def test_nothing_goes_up_without_the_yes(self):
         rc, out, err = self.run_cmd(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Working on the cart."}))
@@ -862,6 +883,155 @@ class FirstSetup(Base):
         rc, _, err = self.run_cmd(ds.cmd_fill, ["--status", self.p1], stdin=json.dumps({"doing": "Overwrite."}))
         self.assertNotEqual(rc, 0)  # only a first status; its own sessions update it after that
         self.assertIn("already has a status", err)
+
+
+class Keeping(Base):
+    """Addenda 1-4: the typed keep phrase is the yes for this computer's agents; the server's keep value; the fallback
+    question; each session seeds its own first status; no history read."""
+    def setUp(self):
+        super().setUp()
+        ds.write_private(ds.CONSENT_PATH, json.dumps({"keep": {}, "no": {}}))  # not asked yet
+        self.other = os.path.realpath(tempfile.mkdtemp(prefix="api-", dir=TMP))
+
+    def test_phrase_matches_forgivingly_and_only_whole(self):
+        K = ds.keep_phrase
+        for t in (ds.KEEP_PHRASE, ds.KEEP_PHRASE.lower() + ".", "keep my agent's status and what I tell them to remember "
+                  "in datastash", "Keep my agents’ status and what I tell them to remember in Datastash!",
+                  '"Keep my agents status and what I tell them to remember in datastash"'):
+            self.assertTrue(K(t), t)
+        for t in ("keep my agents status", ds.KEEP_PHRASE + " and also fix the bug", "please " + ds.KEEP_PHRASE,
+                  ds.KEEP_PHRASE + "\nand more", None, ""):
+            self.assertFalse(K(t), t)
+
+    def test_typed_phrase_turns_keeping_on_for_every_agent_here(self):
+        self.assertFalse(ds.consent_for(self.folder))
+        ctx = self.prompt(ds.KEEP_PHRASE)
+        self.assertIn("datastash keep --on", ctx)
+        self.assertEqual(ds.keep_state(), "yes")
+        self.assertTrue(ds.consent_for(self.folder) and ds.consent_for(self.other))  # a new project joins too
+        rc, out, err = self.run_cmd(ds.cmd_keep, ["--on"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn('"Keeping status for: web-app."', out)
+        self.assertIn("what the person asks you to remember", out)
+        self.assertIn("datastash status --all", out)
+        self.assertEqual(self.calls, [])  # nothing is sent by the yes itself
+
+    def test_the_ai_cannot_turn_keeping_on(self):
+        """M2 for the phrase: a tool call has no typed entry for its prompt id; an old typed entry's id doesn't help."""
+        self.typed("sess1", "fix the login bug", pid="11111111-aaaa-bbbb-cccc-000000000001")
+        self.tool_use("sess1", "printf ... | datastash prompt")
+        for pid in (str(uuid.uuid4()), "11111111-aaaa-bbbb-cccc-000000000001"):
+            self.forged({"session_id": "sess1", "prompt": ds.KEEP_PHRASE, "hook_event_name": "UserPromptSubmit",
+                         "transcript_path": self.transcript("sess1"), "prompt_id": pid})
+        self.forged({"session_id": "sess1", "prompt": ds.KEEP_PHRASE})
+        self.assertIsNone(ds.keep_state())
+        rc, out, err = self.run_cmd(ds.cmd_keep, ["--on"])
+        self.assertIn("no typed yes from the person was confirmed", out)
+        self.assertIsNone(ds.keep_state())
+
+    def test_not_signed_in_starts_the_device_sign_in(self):
+        ds.signed_in = lambda: False
+        base = ds.http
+
+        def http(method, path, key=None, body=None, form=None, timeout=40):
+            if path == ds.DEVICE_START_PATH:
+                self.calls.append((method, path, key, body))
+                return 200, "application/json", json.dumps({"user_code": "BCDF-GHJK", "device_code": "dev-123",
+                                                            "verification_uri": ds.ORIGIN + "/device", "interval": 5,
+                                                            "expires_in": 600})
+            return base(method, path, key, body, form, timeout)
+        ds.http = http
+        saved = (ds._open_browser, ds.subprocess.Popen)
+        ds._open_browser = lambda url: True
+        ds.subprocess.Popen = lambda *a, **k: None
+        try:
+            self.prompt(ds.KEEP_PHRASE)
+            rc, out, err = self.run_cmd(ds.cmd_keep, ["--on"])
+        finally:
+            ds._open_browser, ds.subprocess.Popen = saved
+        self.assertEqual(rc, 0, err)
+        self.assertIn("code: BCDF-GHJK", out)
+        self.assertIn("Type the code BCDF-GHJK there and press Approve", out)
+        self.assertIn("datastash keep --on` again", out)
+        self.assertEqual(ds.keep_state(), "yes")
+
+    def test_server_keep_value(self):
+        sess = {"slug": "web-app", "name": "web-app", "workbook_id": WB}
+        for value, want in ((None, None), (True, "yes"), (False, "no")):
+            body = {"workbook_id": WB, "statuses": [dict(r) for r in self.server_rows]}
+            if value is not None:
+                body["keep"] = value
+            ds.http = lambda *a, **k: (200, "application/json", json.dumps(body))
+            ds.fetch_status(sess)
+            self.assertEqual(ds.keep_state(), want)
+        self.assertFalse(ds.consent_for(self.other))
+        self.assertNotIn(ds.KEEP_QUESTION, self.prompt("status of all my agents") or "")  # a no is not asked again
+        self.prompt(ds.KEEP_PHRASE)  # the person's typed yes here wins over the account's no
+        self.assertEqual(ds.keep_state(), "yes")
+        body = {"workbook_id": WB, "statuses": [], "keep": False}
+        ds.fetch_status(sess)
+        self.assertEqual(ds.keep_state(), "yes")
+
+    def test_fallback_question_then_yes(self):
+        ctx = self.prompt("status of all my agents")
+        self.assertIn("Answer the ordinary way", ctx)
+        self.assertTrue(ctx.rstrip().endswith(ds.KEEP_WHAT))
+        self.assertIn(ds.KEEP_QUESTION, ctx)
+        self.assertIn("what you tell it to remember", ds.KEEP_WHAT)
+        self.assertEqual(self.calls, [])  # asking sends nothing
+        ctx = self.prompt("yes")
+        self.assertIn("datastash keep --on", ctx)
+        self.assertEqual(ds.keep_state(), "yes")
+
+    def test_fallback_no_is_remembered(self):
+        self.prompt("status of all my agents")
+        self.assertIn("nothing is kept", self.prompt("no"))
+        self.assertEqual(ds.keep_state(), "no")
+        self.assertNotIn(ds.KEEP_QUESTION, self.prompt("status of all my agents") or "")
+
+    def test_a_yes_after_something_else_is_not_a_yes(self):
+        self.prompt("status of all my agents", say=False)
+        self.says("sess1", "Here is the plan. Shall I also update the readme?")
+        self.assertIsNone(self.prompt("yes"))
+        self.assertIsNone(ds.keep_state())
+        self.prompt("status of all my agents")
+        self.prompt("fix the login bug first")
+        self.assertIsNone(self.prompt("yes"))  # only the very next prompt
+        self.assertIsNone(ds.keep_state())
+
+    def test_each_session_seeds_its_own_status_then_the_list_is_instant(self):
+        """Addenda 3-4: the first ask after the yes has the agent save its own status in that turn; the next ask is the
+        numbered list, from the local copy, in under 2 seconds."""
+        self.prompt(ds.KEEP_PHRASE)
+        os.replace(ds._written_path("web-app"), os.path.join(TMP, f"old-written-{time.time()}"))
+        rc, out, err = self.run_cmd(ds.cmd_keep, ["--on"])
+        self.assertIn("has no saved status yet", out)
+        self.assertIn("datastash status-set -", out)
+        ctx = self.prompt("What's the status of all my agents?")
+        self.assertIn(ds.SEED_NOTE, ctx)
+        rc, out, err = self.run_cmd(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Fixing the cart page totals."}))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.spawned[-1][2:4], ["status-send", "web-app"])  # kept: sent in the background
+        self.calls.clear()
+        t = time.time()
+        ctx = self.prompt("What's the status of all my agents?")
+        self.assertLess(time.time() - t, 2.0)
+        self.assertIn("Fixing the cart page totals.", ctx)
+        self.assertIn("1. **", ctx)
+        self.assertNotIn(ds.SEED_NOTE, ctx)
+
+    def test_no_history_is_read_on_the_yes(self):
+        self.prompt(ds.KEEP_PHRASE)
+        rc, _, err = self.run_cmd(ds.cmd_fill, ["--excerpts", self.other])
+        self.assertNotEqual(rc, 0)  # the computer's yes is not a yes to reading history
+        rc, _, err = self.run_cmd(ds.cmd_auto_name, ["--project", self.other])
+        self.assertNotEqual(rc, 0)
+
+    def test_a_projects_no_wins_over_the_computers_yes(self):
+        ds.record_consent([], [self.other])
+        self.prompt(ds.KEEP_PHRASE)
+        self.assertTrue(ds.consent_for(self.folder))
+        self.assertFalse(ds.consent_for(self.other))
 
 
 class Facts(Base):

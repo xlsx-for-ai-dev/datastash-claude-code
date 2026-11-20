@@ -1,6 +1,6 @@
 ---
 name: datastash-agent
-description: datastash, "sync datastash" or "datastash sync", "datastash main" or "main datastash" (either word order), "status of all my agents", "full context of N", "more on <agent>", "do N", "save this", "keep a list of", "track my leads", "remember these contacts", "add to my list", a datastash hook reporting new messages, items, agent status or first setup. Use whenever datastash is mentioned or its connector is used, in any Claude app (chat, Cowork, Claude Code) - how to save, keep, find and delete the person's data, the two modes, files, help topics and automations. Where a shell and hooks run (Claude Code, Cowork) also - work as a named agent in a datastash agent workbook (register yourself, named after the folder, no question to the person; get and store your agent key; use the workbook; read and answer your inbox; ask the person), set up and open the person's main view of all their agents ("datastash main"), and turn on sync ("sync datastash"). Also when you need somewhere durable to keep your own work, talk to other agents, or ask the person something.
+description: datastash, "sync datastash" or "datastash sync", "datastash main" or "main datastash" (either word order), "status of all my agents", "full context of N", "more on <agent>", "do N", "save this", "keep a list of", "track my leads", "remember these contacts", "add to my list", a datastash hook reporting new messages, items, agent status or keeping status, "Keep my agents' status and what I tell them to remember in datastash". Use whenever datastash is mentioned or its connector is used, in any Claude app (chat, Cowork, Claude Code) - how to save, keep, find and delete the person's data, the two modes, files, help topics and automations. Where a shell and hooks run (Claude Code, Cowork) also - work as a named agent in a datastash agent workbook (register yourself, named after the folder, no question to the person; get and store your agent key; use the workbook; read and answer your inbox; ask the person), set up and open the person's main view of all their agents ("datastash main"), and turn on sync ("sync datastash"). Also when you need somewhere durable to keep your own work, talk to other agents, or ask the person something.
 ---
 
 # datastash
@@ -49,7 +49,7 @@ Once per computer. A hook note or a command says "run datastash login" when it i
 2. Tell the person, in plain words: "A datastash page opened in your browser. Type the code <the code> there and press Approve." Say nothing else about it; never ask the person for the code, a token or a password.
 3. When the person says it is done, run `datastash login --check`. "yes": go on. "waiting": the person hasn't approved yet; wait for them. "no": the code ran out (10 minutes): start again at step 1.
 4. Claude Code connects the datastash connector when a session starts, so the first time its tools are not in this session yet. Tell the person, in plain words, the line `datastash login --check` gives: "You're signed in. Restart Claude Code once so datastash connects; it stays signed in after that." Later sessions connect signed in on their own.
-5. Then do "First setup" below (once per computer).
+5. If the person typed the keep line before signing in, run `datastash keep --on` again now.
 
 A new login works only in its agent workbook. If a datastash answer says `person_approval_needed`, give the person its link in one plain line ("datastash needs your OK for this: <link>"), and send the same call again only after they say they approved it. Until the person allows a new login, it can't register an agent or get a key: when `ledger_agent_register` or `ledger_agent_key` is refused for that, a hook note opens the page and gives the plain words to say; say them, and send the same call again after the person says it is done.
 
@@ -97,9 +97,18 @@ These come only from the person typing them in this chat. A hook puts the answer
 - "full context of N", "details N": the stored details for number N. "more on <agent>": that agent's asks and lines the list had no room for. No note: `datastash status --details N` or `datastash status --all`. Never ask or wake the other agent for it.
 - "do N" or "N: <answer>" right after a list: the plugin itself checks that the person typed it and sends their own words to the agent that owns ask N; a note gives one line ("Sending your answer to api: ..."). Show that line as it is; the plugin shows the result itself. There is no command to run, and you never send an answer on the person's behalf. No note came: it was an ordinary prompt; answer it as one.
 
-## First setup (once per computer)
+## Keeping status (once per computer)
 
-Run `datastash fill` right after this computer is signed in ("Sign this computer in", after step 4); the status hook also shows it when the person asks for their agents' status and some recent project is undecided. Never at any other time, never before the person's own work, and never in the person's "datastash main".
+The person turns it on by typing "Keep my agents' status and what I tell them to remember in datastash" (the last install step). Only that typed line, or the person's own yes to the same question, turns it on; the plugin reads and checks it itself. You never turn it on, never type or suggest the line for them, and never answer the question for them.
+
+- A note says the person typed it (or said yes): run `datastash keep --on` once and do what it prints. It may sign this computer in first ("Sign this computer in"). When it says this agent has no saved status yet, write your status now from what you already know in this session (`datastash status-set -`; no history reading), then run `datastash status --all` and show what it prints, as it is.
+- From then on keeping is on for every agent on this computer: save your status as "Your status line" says, and also save in datastash what the person asks you to remember.
+- A note says this agent has no saved status yet when the person asks for status: do the same in that turn (save yours, then `datastash status --all`).
+- The person said no: tell them in one plain line "OK, nothing is kept." and never ask again on your own.
+
+## Recent projects from history (only when the person asks for it by name)
+
+Only when the person asks to add their recent projects from their Claude Code history; never on your own, never before the person's own work, and never in the person's "datastash main".
 
 1. `datastash fill` reads the person's recent Claude Code projects on this computer (nothing is sent) and prints them as a numbered list with one question. Show everything it prints between its frame lines, as it is, then stop and wait. Register nothing and send nothing before the answer.
 2. The person answers yes, no, or names the ones to keep. The plugin reads and checks that answer itself and records it (a no is remembered and not asked again). Never answer it for them and never re-ask on your own; `datastash fill --again` only when the person asks to see the list again.
