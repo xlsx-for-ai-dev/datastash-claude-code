@@ -53,7 +53,10 @@ first datastash use, with no question and no step for the person. The skill make
 3. get a one-time pickup code (`ledger_agent_key`) and run `printf '%s\n' '<code>' | datastash fetch "<name>" -`,
    which reads the code from stdin (so it stays out of the process list), trades it for the agent key over HTTPS
    and writes it to a mode-600 file without printing it. If another agent's name maps to the same file name, fetch
-   refuses unless `--force` is given;
+   refuses unless `--force` is given. The code is bound to this machine: before the connector call, the plugin's hook
+   makes a random verifier, keeps it in `~/.config/datastash/pending/` (mode 600, never shown to the AI) and puts only
+   its hash in the call (`code_challenge`, replacing any the AI sent); the pickup sends the verifier, so a code that
+   leaks from the chat is useless elsewhere. The main key and watch codes are bound the same way;
 4. use the account's agent workbook (if there is none, it says so in one line: making one is a paid workbook with the
    usual approve-and-pay step);
 5. run `datastash link "<name>" --workbook <id> --agent-id <id>`, which links the current folder to the agent.

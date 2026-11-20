@@ -125,6 +125,12 @@ MAIN_CONF = os.path.join(CONF, "main.json")  # private record of that folder and
 MAIN_KEY_FILE = os.path.join(CONF, "main.key")  # the person's main key (from the person's own sign-in)
 STATE = os.path.join(CONF, "state")
 OFF = os.path.join(CONF, "off")
+# Security review H7: pickup codes bound to this machine (PKCE-style). Before a connector call that asks for a pickup code
+# (ledger_agent_key, ledger_person_watch action "main" or "key"), the PreToolUse hook makes a random verifier, keeps it
+# here (mode 600, never printed or shown to the AI) and writes only its hash into the call as code_challenge, replacing any
+# the AI sent. The pickup then sends the verifier, so a code that leaks from the chat is useless anywhere else.
+PENDING = os.path.join(CONF, "pending")
+PICKUP_TOOL_RE = re.compile(r"mcp__.+__(ledger_agent_key|ledger_person_watch)")
 
 
 class ApiError(Exception):
@@ -180,6 +186,64 @@ def state_path(s):
 
 def lock_path(s):
     return os.path.join(STATE, f"agent-{s}.listener.lock")
+
+
+def challenge_of(verifier):
+    """S256: base64url(SHA-256(verifier)) with no padding (43 characters)."""
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+
+def verifier_path(kind):
+    return os.path.join(PENDING, f"{kind}.verifier")
+
+
+def new_challenge(kind):
+    """A fresh verifier for the next pickup code of `kind` ("agent-<slug>", "main" or "watch"), kept in a private file
+    (the newest replaces any earlier one); returns its challenge. The verifier itself is never printed."""
+    ensure_dirs()
+    os.makedirs(PENDING, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(PENDING, 0o700)
+    except OSError:
+        pass
+    v = secrets.token_urlsafe(48)
+    write_private(verifier_path(kind), v + "\n")
+    return challenge_of(v)
+
+
+def read_verifier(kind):
+    try:
+        with open(verifier_path(kind)) as f:
+            v = f.read(256).strip()
+    except OSError:
+        return None
+    return v if re.fullmatch(r"[A-Za-z0-9_\-]{43,128}", v) else None
+
+
+def pickup_form(code, verifier):
+    return {"code": code, **({"verifier": verifier} if verifier else {})}
+
+
+def pickup_binding(inp):
+    """PreToolUse: the tool input with this machine's code_challenge written in, for a connector call that asks for a
+    pickup code; None for any other call. Any code_challenge the AI sent is replaced."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse":
+        return None
+    name, args = inp.get("tool_name"), inp.get("tool_input")
+    if not isinstance(name, str) or not isinstance(args, dict) or not PICKUP_TOOL_RE.fullmatch(name):
+        return None
+    if name.endswith("__ledger_agent_key"):
+        agent = args.get("name")
+        if not isinstance(agent, str) or not re.sub(r"[^a-z0-9]+", "", agent.lower()):
+            return None
+        kind = f"agent-{slug(agent)}"
+    elif args.get("action") == "main":
+        kind = "main"
+    elif args.get("action") == "key":
+        kind = "watch"
+    else:
+        return None
+    return dict(args, code_challenge=new_challenge(kind))
 
 
 def log_path(s):
@@ -1392,10 +1456,12 @@ def cmd_fetch(args):
     if other and other != name and not force:
         die(f'"{name}" and the agent "{disp(other)}" share the file name agent-{s}; nothing fetched, the code was not '
             "used. Pick a different name, or add --force to replace that agent's key on this machine.")
+    verifier = read_verifier(f"agent-{s}")
     try:
-        status, _ctype, text = http("POST", PICKUP_PATH, form={"code": code}, timeout=30)
+        status, _ctype, text = http("POST", PICKUP_PATH, form=pickup_form(code, verifier), timeout=30)
     except ApiError as e:
-        die(f"pickup refused (HTTP {e.status}): the code is unknown, used or expired. Ask for a new one (ledger_agent_key).")
+        die(f"pickup refused (HTTP {e.status}): the code is unknown, used or expired, or was asked for on another machine "
+            "or another name. Ask for a new one (ledger_agent_key) in this session.")
     except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
         die(f"could not reach datastash ({type(e).__name__}); the code may not have been used, try again")
     key = text.strip()
@@ -1403,6 +1469,7 @@ def cmd_fetch(args):
         die("datastash answered something that is not an agent key; nothing saved")
     write_private(key_path(s), key + "\n")
     key = None
+    _drop(verifier_path(f"agent-{s}"))
     c = read_json(conf_path(s), {})
     c["name"] = name
     write_private(conf_path(s), json.dumps(c, indent=2))
@@ -2045,9 +2112,9 @@ def _trade_watch_code(args):
         die("that does not look like a watch pickup code (ledger_person_watch, action \"key\")")
     ensure_dirs()
     try:
-        status, _ctype, text = http("POST", PICKUP_PATH, form={"code": code}, timeout=30)
+        status, _ctype, text = http("POST", PICKUP_PATH, form=pickup_form(code, read_verifier("watch")), timeout=30)
     except ApiError as e:
-        die(f"pickup refused (HTTP {e.status}): the code is unknown, used or expired. Ask for a new one (ledger_person_watch, action \"key\").")
+        die(f"pickup refused (HTTP {e.status}): the code is unknown, used or expired, or was asked for on another machine. Ask for a new one (ledger_person_watch, action \"key\").")
     except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
         die(f"could not reach datastash ({type(e).__name__}); the code may not have been used, try again")
     key = text.strip()
@@ -2055,6 +2122,7 @@ def _trade_watch_code(args):
         die("datastash answered something that is not a watch key; nothing saved")
     write_private(key_path(PERSON_SLUG), key + "\n")
     key = None
+    _drop(verifier_path("watch"))
     c = read_json(conf_path(PERSON_SLUG), {})
     reset = c.get("workbook_id") != workbook
     c["workbook_id"] = workbook
@@ -2257,11 +2325,23 @@ def main_code_answer_ok(resp):
             and all(isinstance(body.get(k, ""), str) for k in ("expires_at", "note")))
 
 
+def is_main_code_input(ti):
+    """Exactly {"action": "main"}, or (after the binding hook rewrote it, as PostToolUse may show it) that plus this
+    machine's own code_challenge for the main code."""
+    if ti == MAIN_CODE_INPUT:
+        return True
+    if not isinstance(ti, dict) or set(ti) != set(MAIN_CODE_INPUT) | {"code_challenge"}:
+        return False
+    v = read_verifier("main")
+    return (v is not None and all(ti.get(k) == MAIN_CODE_INPUT[k] for k in MAIN_CODE_INPUT)
+            and secrets.compare_digest(str(ti.get("code_challenge")), challenge_of(v)))
+
+
 def is_main_code_call(inp):
     """True for the one connector call a clean session makes on its way to main: the plugin's own connector's
     ledger_person_watch with exactly {"action": "main"}, in a session where the person typed "datastash main" and that
     never acted as an agent; after the call (PostToolUse), only when its answer carries nothing but the code."""
-    if inp.get("tool_name") != MAIN_CODE_TOOL or inp.get("tool_input") != MAIN_CODE_INPUT:
+    if inp.get("tool_name") != MAIN_CODE_TOOL or not is_main_code_input(inp.get("tool_input")):
         return False
     event = inp.get("hook_event_name")
     if event not in ("PreToolUse", "PostToolUse"):
@@ -2311,13 +2391,27 @@ def tool_carries_datastash(inp):
 
 def cmd_agent_tool(_args):
     """PreToolUse, PostToolUse and PostToolUseFailure hook, every tool: a call that could carry datastash content records this session as an
-    agent (never main; see tool_carries_datastash). Never blocks the call and prints nothing. The session id's mark is
-    written first, before the process walk, so a slow box can't skip it; the person's main session is never marked."""
+    agent (never main; see tool_carries_datastash). Never blocks the call. It prints nothing, except (PreToolUse, security
+    review H7) for a connector call that asks for a pickup code: then it rewrites the call's input with this machine's
+    code_challenge (pickup_binding). The session id's mark is written first, before the process walk, so a slow box
+    can't skip it; the person's main session is never marked."""
     inp = hook_input()
+    try:
+        bound = pickup_binding(inp)
+    except (Exception, SystemExit):
+        bound = None
+    try:
+        return _agent_tool(inp)
+    finally:
+        if bound is not None:
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": bound}}))
+
+
+def _agent_tool(inp):
     hook_heartbeat("tool", inp, throttle=TOOL_HEARTBEAT_EVERY)
     try:
         if (inp.get("hook_event_name") == "PostToolUseFailure" and inp.get("tool_name") == MAIN_CODE_TOOL
-                and inp.get("tool_input") == MAIN_CODE_INPUT):
+                and is_main_code_input(inp.get("tool_input"))):
             # The connector refused the "main" call: this machine's connector registered agents, so the next
             # "datastash main" opens the person's own sign-in instead (the failed call still records this session).
             ensure_dirs()
@@ -2436,7 +2530,7 @@ def _main_on(me, args):
             return _main_finish(me, key)
         _set_aside(MAIN_KEY_FILE)  # stopped or unknown: get a new one
     if _main_needs_sign_in():
-        return _take_main_code(me, _sign_in_main_code())
+        return _take_main_code(me, *_sign_in_main_code())
     print(MAIN_KEY_STEP)
     return 0
 
@@ -2477,7 +2571,7 @@ def _main_key(me, args):
     return _take_main_code(me, code)
 
 
-def _take_main_code(me, code):
+def _take_main_code(me, code, verifier=None):
     """Pick up the main key for a one-time main pickup code, save it, and finish the switch-on in a clean requested
     session. A session that acted as an agent never reads the main key already on the machine."""
     with MainKeyLock():
@@ -2493,9 +2587,9 @@ def _take_main_code(me, code):
                 die("this machine already has a working main key; nothing changed")
             _set_aside(MAIN_KEY_FILE)
         try:
-            status, _ctype, text = http("POST", PICKUP_PATH, form={"code": code}, timeout=30)
+            status, _ctype, text = http("POST", PICKUP_PATH, form=pickup_form(code, verifier or read_verifier("main")), timeout=30)
         except ApiError as e:
-            die(f'pickup refused (HTTP {e.status}): the code is unknown, used or expired. Ask for a new one (ledger_person_watch, action "main").')
+            die(f'pickup refused (HTTP {e.status}): the code is unknown, used or expired, or was asked for on another machine. Ask for a new one (ledger_person_watch, action "main").')
         except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
             die(f"could not reach datastash ({type(e).__name__})")
         key = text.strip()
@@ -2504,6 +2598,8 @@ def _take_main_code(me, code):
         ensure_dirs()
         write_private(MAIN_KEY_FILE, key + "\n")
         _drop(MAIN_SIGN_IN_FLAG)
+        if verifier is None:
+            _drop(verifier_path("main"))
     if main_refusal(me) is None and (is_main_session(me) or main_request_ok(me)):
         return _main_finish(me, key)
     print("saved the person's main key on this machine (never shown). This session is not the person's main; "
@@ -2586,7 +2682,8 @@ def _wait_for_sign_in(state, port_box, ready):
 
 
 def _sign_in_main_code():
-    """The person's fresh datastash sign-in (browser, once) and, from it, a one-time main pickup code. Never printed."""
+    """The person's fresh datastash sign-in (browser, once) and, from it, a one-time main pickup code bound to a verifier
+    kept in memory only (security review H7). Returns (code, verifier). Neither is printed."""
     def fail(why):
         die(f"the datastash sign-in for the person's main key did not finish: {why}. Nothing was saved")
 
@@ -2601,6 +2698,7 @@ def _sign_in_main_code():
         fail("could not reach datastash")
     state = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(64)
+    main_verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     resource = ORIGIN + MCP_PATH
     port_box, opened = [], {}
@@ -2632,7 +2730,7 @@ def _sign_in_main_code():
     try:
         _st, ctype, text = http("POST", MCP_PATH, key=token, accept="application/json, text/event-stream", timeout=30, body={
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": MAIN_CODE_TOOL.rsplit("__", 1)[1], "arguments": dict(MAIN_CODE_INPUT)}})
+            "params": {"name": MAIN_CODE_TOOL.rsplit("__", 1)[1], "arguments": dict(MAIN_CODE_INPUT, code_challenge=challenge_of(main_verifier))}})
     except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError):
         fail("could not reach datastash")
     if "text/event-stream" in (ctype or ""):
@@ -2645,7 +2743,7 @@ def _sign_in_main_code():
     main_code = body.get("main_pickup_code") if isinstance(body, dict) else None
     if result.get("isError") or not isinstance(main_code, str) or not re.fullmatch(MAIN_PICKUP_RE, main_code):
         fail("datastash gave no main key for that sign-in (it gives one only to the person's own sign-in)")
-    return main_code
+    return main_code, main_verifier
 
 
 class _NoBrowser(Exception):

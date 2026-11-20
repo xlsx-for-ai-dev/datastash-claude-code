@@ -1235,6 +1235,13 @@ class CleanSessionOnly(MainBase):
         ds.hook_input = lambda: inp
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ds.cmd_agent_tool([]), 0)
+        if out.getvalue() and event == "PreToolUse" and ds.PICKUP_TOOL_RE.fullmatch(str(tool)):
+            # Security review H7: the only output is the pickup binding (the same input plus this machine's challenge).
+            got = json.loads(out.getvalue())["hookSpecificOutput"]
+            self.assertEqual(set(got), {"hookEventName", "updatedInput"})
+            self.assertEqual({k: v for k, v in got["updatedInput"].items() if k != "code_challenge"},
+                             {k: v for k, v in (tool_input or {}).items() if k != "code_challenge"})
+            return got["updatedInput"]
         self.assertEqual(out.getvalue(), "")  # never blocks or talks
 
     def test_reviewer_attack_replayed_an_agent_session_fakes_the_typed_phrase(self):
@@ -1657,6 +1664,95 @@ class SelfRegistration(MainBase):
 TOKEN = "eyJ.fresh-sign-in-token.sig"
 
 
+class PickupBinding(MainBase):
+    """Security review H7: every pickup code is bound to this machine. The PreToolUse hook writes this machine's
+    code_challenge into the connector call (replacing any the AI sent) and keeps the verifier in a private file that is
+    never printed; the pickup sends it."""
+
+    AGENT_KEY_TOOL = "mcp__plugin_datastash_datastash__ledger_agent_key"
+    tool_hook = CleanSessionOnly.tool_hook
+    recorded = CleanSessionOnly.recorded
+    main_answer = CleanSessionOnly.main_answer
+
+    def setUp(self):
+        super().setUp()
+        self.saved.setdefault("CLAUDE_USER_CONFIG", ds.CLAUDE_USER_CONFIG)
+        self.saved.setdefault("http", ds.http)
+        ds.CLAUDE_USER_CONFIG = os.path.join(tempfile.mkdtemp(dir=TMP), ".claude.json")
+
+    def test_the_hook_binds_each_code_asking_call_and_replaces_a_planted_challenge(self):
+        sid = "sess-H7"
+        self.be(sid, (8801, "tH7"))
+        planted = "A" * 43
+        out = self.tool_hook(sid, self.AGENT_KEY_TOOL, {"name": "Res One", "code_challenge": planted}, event="PreToolUse")
+        v = ds.read_verifier("agent-res-one")
+        self.assertIsNotNone(v)
+        self.assertEqual(out, {"name": "Res One", "code_challenge": ds.challenge_of(v)})
+        self.assertNotEqual(out["code_challenge"], planted)
+        self.assertNotIn(v, json.dumps(out))
+        self.assertEqual(oct(os.stat(ds.verifier_path("agent-res-one")).st_mode & 0o777), "0o600")
+        self.assertEqual(oct(os.stat(ds.PENDING).st_mode & 0o777), "0o700")
+        # Any connector's name for the tool (a claude.ai connector too), and main and watch codes.
+        other = self.tool_hook(sid, "mcp__claude_ai_Datastash__ledger_agent_key", {"name": "Res One"}, event="PreToolUse")
+        self.assertEqual(other["code_challenge"], ds.challenge_of(ds.read_verifier("agent-res-one")))
+        main = self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "main"}, event="PreToolUse")
+        self.assertEqual(main["code_challenge"], ds.challenge_of(ds.read_verifier("main")))
+        watch = self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "key", "workbook_id": "w"}, event="PreToolUse")
+        self.assertEqual(watch["code_challenge"], ds.challenge_of(ds.read_verifier("watch")))
+        # No binding (and no output) for anything else: other actions, other tools, after the call, a name with no letter.
+        self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "list"}, event="PreToolUse")
+        self.tool_hook(sid, "mcp__plugin_datastash_datastash__ledger_inbox_read", {"name": "x"}, event="PreToolUse")
+        self.tool_hook(sid, self.AGENT_KEY_TOOL, {"name": "Res One"}, event="PostToolUse")
+        self.tool_hook(sid, self.AGENT_KEY_TOOL, {"name": "!!"}, event="PreToolUse")
+
+    def test_fetch_sends_the_verifier_and_drops_it_once_the_key_is_saved(self):
+        self.be("sess-F7", (8802, "tF7"))
+        self.tool_hook("sess-F7", self.AGENT_KEY_TOOL, {"name": "Res Two"}, event="PreToolUse")
+        v = ds.read_verifier("agent-res-two")
+        forms = []
+        ds.http = lambda method, path, key=None, body=None, form=None, timeout=40: (forms.append(form) or (200, "text/plain", "ldgr_ag_" + "k" * 43 + "\n"))
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ds.cmd_fetch(["Res Two", "dspk_code123"]), 0)
+        self.assertEqual(forms, [{"code": "dspk_code123", "verifier": v}])
+        self.assertNotIn(v, out.getvalue())
+        self.assertFalse(os.path.exists(ds.verifier_path("agent-res-two")))
+        # A refused pickup keeps the verifier (the code was not used up) and says to ask again here.
+        self.tool_hook("sess-F7", self.AGENT_KEY_TOOL, {"name": "Res Two"}, event="PreToolUse")
+        ds.http = lambda *a, **k: (_ for _ in ()).throw(ds.ApiError(400, {}))
+        with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            ds.cmd_fetch(["Res Two", "dspk_code456"])
+        self.assertIn("another machine", err.getvalue())
+        self.assertTrue(os.path.exists(ds.verifier_path("agent-res-two")))
+
+    def test_main_and_watch_pickups_send_their_verifiers(self):
+        self.be("sess-W7", (8803, "tW7"))
+        self.tool_hook("sess-W7", ds.MAIN_CODE_TOOL, {"action": "key", "workbook_id": PERSON["workbook_id"]}, event="PreToolUse")
+        v = ds.read_verifier("watch")
+        forms = []
+        ds.http = lambda method, path, key=None, body=None, form=None, timeout=40: (forms.append(form) or (200, "text/plain", "ldgr_pw_" + "k" * 43 + "\n"))
+        import sys as _s
+        _s.stdin = io.StringIO("dspw_watchcode123\n")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ds.person_setup([PERSON["workbook_id"], "-"]), 0)
+        self.assertEqual(forms, [{"code": "dspw_watchcode123", "verifier": v}])
+        self.assertFalse(os.path.exists(ds.verifier_path("watch")))
+
+    def test_the_rewritten_main_call_still_counts_as_the_one_clean_call_but_a_foreign_challenge_does_not(self):
+        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        os.environ["CLAUDE_PROJECT_DIR"] = plain
+        sid, proc = "sess-R7", (8804, "tR7")
+        self.be(sid, proc)
+        self.prompt(sid)
+        bound = self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "main"}, event="PreToolUse")
+        self.tool_hook(sid, ds.MAIN_CODE_TOOL, bound, response=self.main_answer())  # PostToolUse may show the rewritten input
+        self.assertFalse(self.recorded(sid, proc))
+        sid2, proc2 = "sess-R8", (8805, "tR8")
+        self.be(sid2, proc2)
+        self.prompt(sid2)
+        self.tool_hook(sid2, ds.MAIN_CODE_TOOL, {"action": "main", "code_challenge": "B" * 43}, response=self.main_answer())
+        self.assertTrue(self.recorded(sid2, proc2))
+
+
 class SignInOnce(MainBase):
     """PM ruling 11-19: on a machine whose connector already registered agents, the person's first "datastash main" in a
     clean session opens the standard datastash sign-in once; that fresh sign-in (a new connection with no agents) makes
@@ -1695,6 +1791,8 @@ class SignInOnce(MainBase):
                 else:
                     res = {"content": [{"type": "text", "text": json.dumps({"main_pickup_code": MAIN_CODE, "expires_at": "x", "note": "n"})}]}
                 return 200, "text/event-stream", "event: message\ndata: " + json.dumps({"jsonrpc": "2.0", "id": 1, "result": res}) + "\n\n"
+            if path == ds.PICKUP_PATH:
+                self.pickup_form = form
             return base(method, path, key=key, body=body, form=form, timeout=timeout)
         ds.http = fake_http
 
@@ -1754,7 +1852,11 @@ class SignInOnce(MainBase):
         self.assertEqual(self.token_form["code_verifier"] and len(self.token_form["code_verifier"]) >= 43, True)
         self.assertEqual(self.token_form["redirect_uri"], q["redirect_uri"])
         # The fresh sign-in asks for the code itself (exactly {"action": "main"}), then the pickup makes the key.
-        self.assertEqual(self.mcp_body["params"], {"name": "ledger_person_watch", "arguments": {"action": "main"}})
+        args = self.mcp_body["params"]["arguments"]
+        self.assertEqual((self.mcp_body["params"]["name"], set(args), args["action"]), ("ledger_person_watch", {"action", "code_challenge"}, "main"))
+        # Security review H7: the code is bound to a verifier held in memory only, and the pickup sends it.
+        self.assertEqual(ds.challenge_of(self.pickup_form["verifier"]), args["code_challenge"])
+        self.assertNotEqual(ds.read_verifier("main"), self.pickup_form["verifier"])  # never written to a file
         self.assertIn("text/event-stream", self.mcp_accept)
         paths = [p for _, p, _ in self.sent]
         self.assertEqual(paths[:4], [ds.OAUTH_REG_PATH, ds.OAUTH_TOKEN_PATH, ds.MCP_PATH, ds.PICKUP_PATH])
