@@ -241,6 +241,10 @@ any session: "status of all my agents", "full context of 4", and "do 4" or "4: n
   (`POST /api/v1/agent/status`, the caller's own row only), retrying quietly. Branch, project and the PR come from git and
   gh. At the end of a turn that used tools, the Stop hook asks the agent once to write it when it didn't (never on a
   turn with no tool use, never twice in a turn, never while Claude Code is already continuing for a Stop hook).
+- Project facts with no model: while it runs, the listener reads the folder's git branch and last commit and, when `gh`
+  is installed and signed in, the branch's PR (state, review decision, CI) about every 60 s, and writes them into the
+  agent's status (`context`, `cards`), the local copy and datastash, only when something changed. gh missing or failing
+  is skipped quietly; GitHub's rate limit pauses gh for 15 minutes.
 - Reading: `datastash status --all` and `--details N` read the local copy (refreshed by the listener every ~30 s and
   when something arrives); a copy older than 2 minutes is fetched once (`GET /api/v1/agent/status`, or
   `/api/v1/person/status` in the person's main). The person's phrases are answered by the UserPromptSubmit hook from the
@@ -385,7 +389,8 @@ An agent can send datastash a capability request, an error report or anything el
   last, one running number), agent text kept to one line, the phrases, the local copy (fresh: no network; old: one call;
   failing: the old copy), the listener's refresh, the background write (nothing on the network in the turn, a 500
   retried, an older sender stepping aside, a second turn changing the stored status), the Stop hook (once per turn, never
-  looping, quiet on a trivial turn or after a write), "do N" sending only the person's typed words from that session,
+  looping, quiet on a trivial turn or after a write), "do N" sending only the person's typed words from that session (explicit shapes only; the list that session saw),
+  the listener's git and gh facts written only when they change,
   the install message, the first-setup excerpts (14 days) and the CLI's speed from the local copy.
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.

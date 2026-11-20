@@ -1632,6 +1632,7 @@ def cmd_end(_args):
         for part in ("", ".tools", ".asked"):
             _drop(os.path.join(STATE, f"turn-{me['sid']}{part}"))
         _drop(os.path.join(STATE, f"status-answer-{me['sid']}.json"))
+        _drop(os.path.join(STATE, f"status-numbers-{me['sid']}.json"))
     if agent is None:
         return 0
     info = read_json(lock_path(agent["slug"]), {})
@@ -3432,6 +3433,10 @@ def _merge_rows(old, new):
     for r in new:
         o = mine.get(r["agent"].lower())
         out.append(o if o is not None and (o.get("updated_at") or 0) > (r.get("updated_at") or 0) else r)
+    seen = {r["agent"].lower() for r in new}
+    local = {a["name"].lower() for a in all_agents()}
+    out += [r for r in old if r["agent"].lower() not in seen and r["agent"].lower() in local
+            and time.time() - (r.get("updated_at") or 0) < 600]  # this machine's own write the server hasn't got yet
     return out
 
 
@@ -3504,12 +3509,94 @@ def status_refresher(sess, wake, stop=None):
         wake.clear()
 
 
+FACTS_SECONDS = float(os.environ.get("DATASTASH_FACTS_SECONDS", "60"))  # 0: no project facts refresh
+FACTS_LIMITED_PAUSE = 900  # GitHub's rate limit: ask gh again this much later
+
+
+def merge_facts(body, facts, flags):
+    """body (the agent's last status as sent) with the project's facts from plain code: branch always from git; the PR
+    from gh unless the agent gave its own; last change from git unless the agent gave its own; gh's card replaces the
+    card with the same id (or is added). Returns the new body, or None when nothing changed."""
+    new = json.loads(json.dumps(body))
+    ctx = dict(new.get("context") or {})
+    if facts.get("branch"):
+        ctx["branch"] = facts["branch"]
+    if not flags.get("last_given") and facts.get("last_commit"):
+        ctx["last_change"] = _clean(facts["last_commit"], 80)
+    gh = facts.get("gh") or {}
+    if not flags.get("pr_given"):
+        if gh.get("pr"):
+            ctx["pr"] = gh["pr"]
+        elif gh.get("none"):
+            ctx["pr"] = "no PR"
+    new["context"] = ctx
+    card = _norm_card(gh.get("card")) if gh.get("card") else None
+    if card is not None:
+        cards = [c for c in (new.get("cards") or []) if isinstance(c, dict)]
+        same = [i for i, c in enumerate(cards) if str(c.get("id", "")).upper() == card["id"].upper()]
+        if same:
+            old = cards[same[0]]
+            cards[same[0]] = dict(old, step=card["step"], review=card["review"])
+        elif not flags.get("cards_given") or cards:
+            cards.append(card)
+        new["cards"] = cards
+    return None if new == body else new
+
+
+def project_facts(here, with_gh=True):
+    g = git_context(here)
+    return {"branch": g["branch"], "last_commit": g["last_commit"], "gh": gh_pr(here) if with_gh else {}}
+
+
+def facts_refresh_once(agent, gh_ok=True):
+    """One plain-code pass (no model): git and gh facts for this agent's folder into its status, the local copy and the
+    server. Returns gh's answer (to back off on its rate limit). Nothing happens before the agent's first status."""
+    s = agent["slug"]
+    out = read_json(_outbox_path(s), None)
+    if not out or not isinstance(out.get("body"), dict) or not isinstance(out.get("here"), str) or not os.path.isdir(out["here"]):
+        return {}
+    facts = project_facts(out["here"], with_gh=gh_ok)
+    new = merge_facts(out["body"], facts, out)
+    if new is not None:
+        seq = secrets.token_hex(6)
+        cur = read_json(_outbox_path(s), {})
+        if cur.get("seq") != out.get("seq"):
+            return facts["gh"]  # the agent wrote a newer status meanwhile; the next pass uses it
+        write_private(_outbox_path(s), json.dumps(dict(out, seq=seq, body=new)))
+        row = norm_status_row(dict(new, agent=agent["name"], updated_at=time.time()))
+        if row:
+            put_own_row(new["workbook_id"], row)
+        cmd_status_send([s, seq])
+    return facts["gh"]
+
+
+def facts_refresher(agent, stop=None):
+    """The listener's plain-code part: refresh the project's git and gh facts about every FACTS_SECONDS (zero tokens).
+    gh missing or failing is skipped quietly; GitHub's rate limit backs gh off for FACTS_LIMITED_PAUSE."""
+    gh_after = 0.0
+    while stop is None or not stop.is_set():
+        try:
+            gh = facts_refresh_once(agent, gh_ok=time.time() >= gh_after)
+            if gh.get("limited"):
+                gh_after = time.time() + FACTS_LIMITED_PAUSE
+                log(agent["slug"], "facts: GitHub rate limit; gh paused")
+        except Exception as e:  # never stops the listener
+            log(agent["slug"], f"facts: {type(e).__name__}")
+        if stop is not None:
+            if stop.wait(FACTS_SECONDS * random.uniform(0.9, 1.1)):
+                return
+        else:
+            time.sleep(FACTS_SECONDS * random.uniform(0.9, 1.1))
+
+
 def start_status_refresher(sess):
     """A daemon thread beside the listener; returns the Event that asks it to refresh now (None when switched off)."""
     if STATUS_REFRESH_SECONDS <= 0:
         return None
     wake = threading.Event()
     threading.Thread(target=status_refresher, args=(sess, wake), daemon=True).start()
+    if not is_person(sess) and FACTS_SECONDS > 0:
+        threading.Thread(target=facts_refresher, args=(sess,), daemon=True).start()
     return wake
 
 
@@ -3617,7 +3704,7 @@ def status_list(rows, now):
         lines += [f"   {x}" for x in extra_lines(r)]
         for a in r["asks"]:
             n += 1
-            numbers[str(n)] = {"agent": r["agent"], "ask": a["id"]}
+            numbers[str(n)] = {"agent": r["agent"], "ask": a["id"], "text": a["text"]}
             lines.append(f"   {n}. Ask: {ask_line(a)}")
     for r in rest:
         n += 1
@@ -3662,7 +3749,7 @@ def _status_where(here, me):
     return None, best
 
 
-def load_status(here, me, max_age=STATUS_FRESH_SECONDS, live_timeout=10):
+def load_status(here, me, max_age=STATUS_FRESH_SECONDS, live_timeout=10):  # noqa: the hook passes a short live_timeout
     """(copy, note): the local copy when it is fresh, else ONE live call (falling back to the older copy)."""
     sess, wb = _status_where(here, me)
     if wb is None:
@@ -3683,20 +3770,38 @@ def load_status(here, me, max_age=STATUS_FRESH_SECONDS, live_timeout=10):
     return c, f"{why}; showing the copy on this machine" if c is not None else why
 
 
-def _save_numbers(wb, numbers):
+def _sid_of(me):
+    if callable(me):
+        return me(True)
+    sid = (me or {}).get("sid")
+    return sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None
+
+
+def _numbers_path(sid):
+    return os.path.join(STATE, f"status-numbers-{sid}.json") if sid else STATUS_NUMBERS
+
+
+def _save_numbers(wb, numbers, sid=None):
+    """The numbering of a list just shown: for its session (what that session's person saw), and machine-wide (the list
+    shown last anywhere, for a session that never showed one)."""
+    rec = json.dumps({"workbook_id": wb, "at": time.time(), "numbers": numbers})
     try:
         ensure_dirs()
-        write_private(STATUS_NUMBERS, json.dumps({"workbook_id": wb, "at": time.time(), "numbers": numbers}))
+        write_private(STATUS_NUMBERS, rec)
+        if sid:
+            write_private(_numbers_path(sid), rec)
     except OSError:
         pass
 
 
-def read_numbers():
-    rec = _read_private_big(STATUS_NUMBERS)
-    if (not isinstance(rec, dict) or not isinstance(rec.get("numbers"), dict) or not _num_ok(rec.get("at"))
-            or time.time() - rec["at"] > STATUS_NUMBERS_MAX_AGE):
-        return None
-    return rec
+def read_numbers(sid=None):
+    """This session's last list, else the last list shown on this machine (24 hours)."""
+    for p in ((_numbers_path(sid),) if sid else ()) + (STATUS_NUMBERS,):
+        rec = _read_private_big(p)
+        if (isinstance(rec, dict) and isinstance(rec.get("numbers"), dict) and _num_ok(rec.get("at"))
+                and time.time() - rec["at"] <= STATUS_NUMBERS_MAX_AGE):
+            return rec
+    return None
 
 
 def _framed_block(lines):
@@ -3706,14 +3811,15 @@ def _framed_block(lines):
             + [f"<<end datastash-data {tag}>>"])
 
 
-def render_status_all(here, me, install=False):
+def render_status_all(here, me, install=False, live_timeout=10):
     """The numbered list, framed as agent-written data, with how fresh the copy is. Saves the numbering for "do N"."""
-    c, note = load_status(here, me)
+    sid = _sid_of(me)
+    c, note = load_status(here, me, live_timeout=live_timeout)
     if c is None:
         return [f"{STATUS_NOTE}: {note}."]
     now = time.time()
     lines, numbers = status_list(c["agents"], now)
-    _save_numbers(c["workbook_id"], numbers)
+    _save_numbers(c["workbook_id"], numbers, sid)
     out = []
     if install:
         fill = read_json(FILL_MARK, {})
@@ -3733,14 +3839,17 @@ def render_status_all(here, me, install=False):
     return out
 
 
-def render_status_details(here, me, n):
+def render_status_details(here, me, n, live_timeout=10):
     """'full context of N': straight from the stored row (the local copy, or one live call when it is old)."""
-    nums = read_numbers()
+    nums = read_numbers(_sid_of(me))
     target = (nums or {}).get("numbers", {}).get(str(n))
+    again = (f'{STATUS_NOTE}: there is no number {n} in the last agent status list; show the list again '
+             '(datastash status --all) and use its numbers.')
     if target is None:
-        return [f'{STATUS_NOTE}: there is no number {n} in the last agent status list; show the list again '
-                '(datastash status --all) and use its numbers.']
-    c, note = load_status(here, me)
+        return [again]
+    c, note = load_status(here, me, live_timeout=live_timeout)
+    if c is not None and c.get("workbook_id") != nums.get("workbook_id"):
+        return [again]
     row = next((r for r in (c or {}).get("agents", []) if r["agent"].lower() == str(target["agent"]).lower()), None)
     if row is None:
         return [f'{STATUS_NOTE}: {n} was "{_clean(target["agent"], 64)}", which has no status now.']
@@ -3777,15 +3886,24 @@ def git_context(here):
 
 
 def gh_pr(here):
-    """This branch's PR from the GitHub CLI: {"pr": "#41 open", "card": {...}} or {} (no gh, no PR, not signed in, slow).
-    Only what GitHub says: the card id from the PR title's leading id (like XLI-12), CI from the checks."""
+    """This branch's PR from the GitHub CLI, only what GitHub says: {"pr": "#41 open", "card": {...}}; {"none": True} when
+    gh answered that the branch has no PR; {"limited": True} on GitHub's rate limit (403/429); {} when gh is missing,
+    not signed in, slow or failing. The card id comes from the PR title's leading id (like XLI-12)."""
     if not shutil.which("gh"):
         return {}
     try:
-        r = subprocess.run(["gh", "pr", "view", "--json", "number,state,title,statusCheckRollup,headRefOid"], cwd=here,
-                           capture_output=True, text=True, timeout=6, stdin=subprocess.DEVNULL)
-        v = json.loads(r.stdout) if r.returncode == 0 else {}
-    except (OSError, subprocess.SubprocessError, ValueError):
+        r = subprocess.run(["gh", "pr", "view", "--json", "number,state,title,statusCheckRollup,headRefOid,reviewDecision"],
+                           cwd=here, capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if r.returncode != 0:
+        err = (r.stderr or "").lower()
+        if "rate limit" in err or "http 403" in err or "http 429" in err:
+            return {"limited": True}
+        return {"none": True} if "no pull requests found" in err else {}
+    try:
+        v = json.loads(r.stdout)
+    except ValueError:
         return {}
     n, st = v.get("number"), v.get("state")
     if not isinstance(n, int) or not isinstance(st, str):
@@ -3793,13 +3911,20 @@ def gh_pr(here):
     out = {"pr": f"#{n} {st.lower()}"}
     checks = [c for c in (v.get("statusCheckRollup") or []) if isinstance(c, dict)]
     states = {str(c.get("conclusion") or c.get("state") or c.get("status") or "").upper() for c in checks}
-    ci = ("" if not checks else "CI red" if states & {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT"} else
-          "CI running" if states & {"PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", ""} else "CI green")
+    ci = ("" if not checks else "CI red" if states & {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"} else
+          "CI running" if states & {"PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", "WAITING", ""} else "CI green")
+    decision = {"APPROVED": "approved", "CHANGES_REQUESTED": "changes requested",
+                "REVIEW_REQUIRED": "review required"}.get(str(v.get("reviewDecision") or "").upper(), "")
+    if decision:
+        out["pr"] += f", {decision}"
+    if ci:
+        out["pr"] += f", {ci}"
     m = re.match(r"\s*([A-Z][A-Z0-9]{1,9}-\d{1,6})\b", str(v.get("title") or ""))
     sha = str(v.get("headRefOid") or "")[:7]
     step = "merged" if st.upper() == "MERGED" else "review" if st.upper() == "OPEN" else ""
     if m and step:
-        out["card"] = {"id": m.group(1), "step": step, "review": ", ".join(x for x in (f"at {sha}" if sha else "", ci) if x)}
+        out["card"] = {"id": m.group(1), "step": step,
+                       "review": ", ".join(x for x in (decision, f"at {sha}" if sha else "", ci) if x)}
     return out
 
 
@@ -3883,7 +4008,8 @@ def cmd_status_set(args):
     ensure_dirs()
     seq = secrets.token_hex(6)
     write_private(_outbox_path(s), json.dumps({"seq": seq, "here": here, "body": status_body(row, agent["workbook_id"]),
-                                               "pr_given": bool(row["context"]["pr"]), "cards_given": bool(row["cards"])}))
+                                               "pr_given": bool(row["context"]["pr"]), "cards_given": bool(row["cards"]),
+                                               "last_given": bool(_clean(data.get("last_change") or (data.get("context") or {}).get("last_change") if isinstance(data.get("context"), dict) else data.get("last_change"), 80))}))
     put_own_row(agent["workbook_id"], row)
     write_private(_written_path(s), json.dumps({"at": time.time()}))
     try:
@@ -3913,6 +4039,7 @@ def cmd_status_send(args):
         return 0
     if not (out.get("pr_given") and out.get("cards_given")) and isinstance(out.get("here"), str):
         g = gh_pr(out["here"])
+        g = g if g.get("pr") else {}
         if g and not out.get("pr_given"):
             body["context"] = dict(body.get("context") or {}, pr=g["pr"])
         if g.get("card") and not out.get("cards_given"):
@@ -4049,7 +4176,7 @@ STATUS_ALL_RES = [re.compile(p) for p in (
 STATUS_DETAILS_RE = re.compile(r"(give me |show me |show )?(the )?(full context|context|more|details|detail) (of|on|for|about) #?(\d{1,3})"
                                r"|(details|more) #?(\d{1,3})")
 ANSWER_DO_RE = re.compile(r"do #?(\d{1,3})")
-ANSWER_TEXT_RE = re.compile(r"#?(\d{1,3}) ?[:)\-–—] ?(.{1,500})", re.S)
+ANSWER_TEXT_RE = re.compile(r"#?(\d{1,3}):\s+(\S.{0,299})")  # "4: no, 30 days" (a colon and a space: never "2:30")
 
 
 def _phrase(text):
@@ -4091,13 +4218,13 @@ def status_prompt_context(inp):
     if kind == "all":
         return (f"{STATUS_NOTE}: the person asked for all agents' status. Show them this list exactly as below (the "
                 "names, paragraphs, context lines and numbered asks), with no tool calls first:\n"
-                + "\n".join(render_status_all(here, lazy_me(inp))))
+                + "\n".join(render_status_all(here, lazy_me(inp), live_timeout=4)))
     if kind == "details":
         return (f"{STATUS_NOTE}: the person asked for the full context of {arg}. Show them this as below, in plain "
-                "words, with no tool calls first:\n" + "\n".join(render_status_details(here, lazy_me(inp), arg)))
+                "words, with no tool calls first:\n" + "\n".join(render_status_details(here, lazy_me(inp), arg, live_timeout=4)))
     me = this_session(inp)
     n, answer = arg
-    nums = read_numbers()
+    nums = read_numbers(me["sid"])
     target = (nums or {}).get("numbers", {}).get(str(n))
     if target is None or not target.get("ask"):
         return None  # not an ask number of the last list: an ordinary prompt
@@ -4110,7 +4237,8 @@ def status_prompt_context(inp):
             "answer": answer, "agent": target["agent"], "ask": target["ask"], "workbook_id": nums.get("workbook_id")}))
     except OSError:
         return None
-    return (f'{STATUS_NOTE}: the person answered ask {n} of the agent status list (agent "{_clean(target["agent"], 64)}"). '
+    return (f'{STATUS_NOTE}: the person answered ask {n} of the agent status list (agent "{_clean(target["agent"], 64)}": '
+            f'"{_clean(target.get("text"), 300)}"). '
             f"Run `datastash answer {n}` now: it sends the person's own words to that agent. Then tell the person in "
             "one plain line that it was delivered.")
 

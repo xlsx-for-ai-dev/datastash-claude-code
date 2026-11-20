@@ -139,8 +139,8 @@ class ListFormat(Base):
         self.assertIn("3. **api** — Billing refactor done; cleaning up two leftover TODOs.", lines)
         self.assertIn("   main · no PR · tests all pass · last: moved invoices to the new table · 1 h ago", lines)
         self.assertTrue(lines[-1].startswith("5. **docs** — Nothing in flight since Monday. · 3 d ago"), text)  # idle: last, one line
-        self.assertEqual(numbers["2"], {"agent": "web-app", "ask": "q2"})
-        self.assertEqual(numbers["4"], {"agent": "api", "ask": "q1"})
+        self.assertEqual((numbers["2"]["agent"], numbers["2"]["ask"]), ("web-app", "q2"))
+        self.assertEqual((numbers["4"]["agent"], numbers["4"]["ask"]), ("api", "q1"))
         self.assertEqual(numbers["5"], {"agent": "docs", "ask": None})
 
     def test_agent_text_is_one_line_and_answered_asks_drop(self):
@@ -164,6 +164,9 @@ class Phrases(unittest.TestCase):
         self.assertEqual(P("do 4"), ("answer", (4, "Yes, do it.")))
         self.assertEqual(P("4: no, 30 days"), ("answer", (4, "no, 30 days")))
         self.assertIsNone(P("2) update the readme\n3) bump the version"))
+        for t in ("2-3 more tests please", "2:30 works for me", "5-star ratings only", "1) fix the login bug",
+                  "10 - 15 minutes is fine"):  # review 1: ordinary prompts that start with a number
+            self.assertIsNone(P(t), t)
         for t in ("fix the agent status bug in api", "do 4 things for me please", "the status of my agents table is wrong "
                   "and needs a fix", "4", ""):
             self.assertIsNone(P(t), t)
@@ -361,6 +364,18 @@ class PromptAndAnswer(Base):
         rc, _, err = self.run_cmd(ds.cmd_answer, ["4"])  # used up
         self.assertNotEqual(rc, 0)
 
+    def test_do_n_follows_the_list_this_session_saw(self):
+        self.prompt("status of all my agents")  # this session: 2 = web-app's ask, 4 = api's ask
+        self.server_rows = [row("ops", "New urgent thing.", ago=1, asks=[{"id": "z9", "text": "Restart prod?"}])] + self.server_rows
+        ds.save_status_cache(WB, [ds.norm_status_row(r) for r in self.server_rows], time.time(), merge=False)
+        self.prompt("status of all my agents", sid="other")  # another session renumbers: 2 = ops' ask there
+        ctx = self.prompt("do 2")
+        self.assertIn('"web-app"', ctx)
+        self.assertIn("Change the session length", ctx)
+        rc, out, err = self.run_cmd(ds.cmd_answer, ["2"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls[-1][3]["ask_id"], "q2")
+
     def test_answer_needs_the_persons_typed_words_in_this_session(self):
         self.prompt("status of all my agents")
         rc, _, err = self.run_cmd(ds.cmd_answer, ["2"])  # the AI on its own
@@ -412,6 +427,52 @@ class Fill(Base):
         self.assertIn("--project <folder>", out)
         self.assertTrue(os.path.exists(ds.FILL_MARK))
         self.assertIsNone(ds.fill_note(self.folder, ds.this_session()))  # offered once
+
+
+class Facts(Base):
+    def test_listener_facts_are_written_only_when_they_change(self):
+        orig = ds.spawn_detached
+        ds.spawn_detached = lambda *a: None
+        try:
+            self.run_cmd(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Working on the cart."}))
+        finally:
+            ds.spawn_detached = orig
+        agent = {"slug": "web-app", "name": "web-app", "workbook_id": WB}
+        facts = {"branch": "cart", "last_commit": "add cart page", "gh": {"pr": "#7 open, approved, CI green",
+                 "card": {"id": "XLI-7", "step": "review", "review": "approved, at abc1234, CI green"}}}
+        ds.project_facts = lambda here, with_gh=True: facts
+        try:
+            ds.facts_refresh_once(agent)
+            posts = [c for c in self.calls if c[0] == "POST"]
+            self.assertEqual(len(posts), 1)
+            self.assertEqual(posts[0][1], ds.STATUS_PATH)
+            body = posts[0][3]
+            self.assertEqual((body["context"]["branch"], body["context"]["pr"], body["context"]["last_change"]),
+                             ("cart", "#7 open, approved, CI green", "add cart page"))
+            self.assertEqual(body["cards"][0]["id"], "XLI-7")
+            self.assertEqual(body["doing"], "Working on the cart.")
+            mine = next(r for r in ds.read_status_cache(WB)["agents"] if r["agent"] == "web-app")
+            self.assertEqual(mine["context"]["pr"], "#7 open, approved, CI green")
+            ds.facts_refresh_once(agent)  # nothing moved: no write
+            self.assertEqual(len([c for c in self.calls if c[0] == "POST"]), 1)
+            facts["gh"] = {"pr": "#7 merged", "card": {"id": "XLI-7", "step": "merged", "review": ""}}
+            ds.facts_refresh_once(agent)
+            posts = [c for c in self.calls if c[0] == "POST"]
+            self.assertEqual(len(posts), 2)
+            self.assertEqual(posts[1][3]["cards"][0]["step"], "merged")
+            facts["gh"] = {"limited": True}  # rate limited: nothing changes, nothing written
+            self.assertTrue(ds.facts_refresh_once(agent).get("limited"))
+            self.assertEqual(len([c for c in self.calls if c[0] == "POST"]), 2)
+        finally:
+            ds.project_facts = self.saved_facts
+
+    def setUp(self):
+        super().setUp()
+        self.saved_facts = ds.project_facts
+
+    def test_nothing_before_the_agents_first_status(self):
+        self.assertEqual(ds.facts_refresh_once({"slug": "web-app", "name": "web-app", "workbook_id": WB}), {})
+        self.assertEqual(self.calls, [])
 
 
 class CliSpeed(Base):
