@@ -255,8 +255,8 @@ agents", "full context of 4", "more on api", and "do 4" or "4: no, 30 days" to a
   which agents are kept, and has the agent save the status it already worked out in that session as its first one (no
   history read). From then on every agent on this computer saves its status, and a session in a new project joins on
   its first status. Nothing is sent before that yes.
-- Where the yes can also come from: if the status read's reply carries `keep` (true or false) for the account, the
-  plugin follows it when the person has not answered on this computer. With neither, asking for status ends with one
+- Where the yes can also come from: a `keep` value in the status read's reply is ignored for now (only a person-only
+  action on the site may set it, and none exists yet). Without the typed phrase, asking for status ends with one
   question, "Keep my agents' status and what I tell them to remember in datastash?", and what goes up: a short summary
   of what each agent is doing, its branch, last change, PR and test state, refreshed as it works, and what the person
   tells it to remember. The person's very next typed "yes" or "no" answers it (checked the same way); a no is remembered
@@ -292,10 +292,22 @@ agents", "full context of 4", "more on api", and "do 4" or "4: no, 30 days" to a
   checker, which waits for the transcript's typed entry carrying the hook's `prompt_id` with exactly those words (each
   prompt id used once, recent). Only then is it sent (`POST /api/v1/person/status/answer` with the ask's id and version
   and a fresh answer id). The session shows `Sending your answer to api: "..." → yes`, then the result as one line at the
-  end of the turn, like `Answered api: "Delete the old /invoices endpoint?" → yes`. If the ask changed, it shows the new
-  text and sends nothing. An AI's tool call can't make a typed entry, so it never qualifies; `datastash answer` sends
-  nothing. A program running as the same user can still rewrite the transcript or read the login, so answers are sent
-  marked `relayed` and datastash asks for the person's OK on its site before it accepts one from a computer login.
+  end of the turn, like `Sent to api: yes ("Delete the old /invoices endpoint?"). Type "undo 4" to take it back.`; the
+  status view in any session shows the same `Sent to` lines for 30 minutes. If the ask changed, it shows the new text and
+  sends nothing. An AI's tool call can't make a typed entry, so it never qualifies; `datastash answer` sends nothing.
+  A program running as the same user can still rewrite the transcript or read the login, so answers are sent marked
+  `relayed` (the receiving agent treats one as an agent message, and asks in its own session before anything
+  irreversible).
+- Only the person: the keep phrase, the yes to the keep question, the answer to the history question, "do N" and
+  "undo N" count only when the transcript entry carries `origin.kind` "human" and `promptSource` "typed" or "queued". A
+  headless `claude -p` prompt, a notification, a peer message or an entry without those fields (an older Claude Code)
+  does nothing, and the session says so in one line. A `keep` value in a status read is ignored until the site has a
+  person-only action that sets it.
+- "do N" counts only when the list is the last thing shown: a numbered item or a quoted ask after the list ends it. An
+  ask with `options` takes only one of them ("4: b" or the option's words); `needs_person: true` (set by the agent or
+  the server, never cleared here) is sent with the answer so datastash asks for the person's OK on its site. "undo N"
+  takes back this session's answer N until the agent acts on it (`POST /api/v1/person/status/answer/undo`; a queued
+  answer is simply not sent).
 
 ## How waking works
 

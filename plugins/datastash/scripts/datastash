@@ -1749,6 +1749,14 @@ def cmd_link(args):
             opts[a] = next(it, None)
         else:
             die(f"unknown option {a}")
+    proj_opt = opts.get("--project")
+    if proj_opt is not None:  # Addendum 6 N3: the same named-yes gate as `auto-name --project`
+        if not os.path.isdir(proj_opt):
+            die(f"{proj_opt} is not a folder")
+        if (os.path.realpath(proj_opt) != os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+                and not named_consent(proj_opt)):
+            die(f"{os.path.realpath(proj_opt)} is not a project the person said yes to keeping in datastash; link "
+                "another folder only after their yes (datastash-agent skill, \"Recent projects from history\")")
     s = slug(name)
     me = this_session()
     _no_agent_in_main(me, "links an agent")
@@ -3264,6 +3272,8 @@ def cmd_token(args):
 STATUS_PATH = "/api/v1/agent/status"
 PERSON_STATUS_PATH = "/api/v1/person/status"
 PERSON_STATUS_ANSWER_PATH = "/api/v1/person/status/answer"
+PERSON_STATUS_UNDO_PATH = "/api/v1/person/status/answer/undo"  # Addendum 5 f: the server half lands in x-live (404 until then)
+UNDO_MAX_AGE = 1800  # "undo N" takes back this session's answer N for at most 30 minutes (the server says if it is too late)
 STATUS_FRESH_SECONDS = 120  # an older local copy is fetched live once before it is shown
 STATUS_REFRESH_SECONDS = float(os.environ.get("DATASTASH_STATUS_REFRESH_SECONDS", "30"))  # 0: the listener never refreshes
 STATUS_NOT_FOUND_PAUSE = 600  # the server has no status door (yet): the listener asks again this much later
@@ -3356,9 +3366,24 @@ def _norm_ask(a):
     text = _clean(a.get("text"), 300)
     if not text:
         return None
-    return {"id": _clean(a.get("id"), 64) or ask_id(text), "text": text, "touches": _clean(a.get("touches"), 160),
-            "if_yes": _clean(a.get("if_yes"), 240), "if_no": _clean(a.get("if_no"), 240),
-            "details": _clean(a.get("details"), 2000), "version": _version(a.get("version"))}
+    out = {"id": _clean(a.get("id"), 64) or ask_id(text), "text": text, "touches": _clean(a.get("touches"), 160),
+           "if_yes": _clean(a.get("if_yes"), 240), "if_no": _clean(a.get("if_no"), 240),
+           "details": _clean(a.get("details"), 2000), "version": _version(a.get("version"))}
+    # Addendum 5 c, d: the choices the ask offers (an answer can only pick one), and "needs the person" (stricter only:
+    # set by the asking agent or the server; nothing here ever clears it)
+    opts = []
+    for o in (a.get("options") if isinstance(a.get("options"), list) else [])[:ASK_OPTIONS_MAX]:
+        o = _clean(o, 80) if isinstance(o, str) else ""
+        if o and _phrase(o) and _phrase(o) not in {_phrase(x) for x in opts}:
+            opts.append(o)
+    if len(opts) >= 2:
+        out["options"] = opts
+    if a.get("needs_person") is True:
+        out["needs_person"] = True
+    return out
+
+
+ASK_OPTIONS_MAX = 10  # a display bound for one ask's choices (layout, not a limit on what is stored)
 
 
 CARD_STEPS = ("built", "review", "merged", "epm_pass", "live", "live_check")
@@ -3585,11 +3610,8 @@ def fetch_status(sess, timeout=10):
         note_refresh_failed(wb)
         raise ApiError(_status, {"error": "not_json"})
     note_door(True)
-    if isinstance(body, dict) and isinstance(body.get("keep"), bool):
-        try:
-            record_keep_all(body["keep"], "server")  # the account's keep value, when the server sends one
-        except OSError:
-            pass
+    # Addendum 6 N2: a `keep` value in this reply is ignored. Until the site has a person-only action that sets it (never
+    # an agent key, the sync tool or anything an agent can call), only the person's typed words here turn keeping on.
     return save_status_cache(wb, _status_rows(body), time.time())
 
 
@@ -3603,22 +3625,21 @@ def read_consent():
 
 
 def keep_state():
-    """This computer's answer for all its agents: "yes", "no" or None (not asked yet). The person's own typed answer
-    here (the keep phrase, or yes / no to the question) wins; else the account's `keep` value from the status read."""
-    c = read_json(CONSENT_PATH, {})
-    for k in ("all", "server"):
-        v = c.get(k)
-        if isinstance(v, dict) and isinstance(v.get("keep"), bool):
-            return "yes" if v["keep"] else "no"
+    """This computer's answer for all its agents: "yes", "no" or None (not asked yet), from the person's own typed answer
+    here only (the keep phrase, or yes / no to the question). A server value is never read (Addendum 6 N2)."""
+    v = read_json(CONSENT_PATH, {}).get("all")
+    if isinstance(v, dict) and isinstance(v.get("keep"), bool):
+        return "yes" if v["keep"] else "no"
     return None
 
 
 def record_keep_all(keep, how):
-    """Record this computer's yes or no for all its agents: how is "typed" (the person here) or "server" (the
-    account's flag; never overrides a typed answer)."""
+    """Record this computer's yes or no for all its agents; how must be "typed" (the person's checked typed words here)."""
+    if how != "typed":
+        return
     c = read_json(CONSENT_PATH, {})
     c = c if isinstance(c, dict) else {}
-    key = "all" if how == "typed" else "server"
+    key = "all"
     old = c.get(key)
     if isinstance(old, dict) and old.get("keep") is keep:
         return
@@ -3939,6 +3960,10 @@ def ask_line(a):
     for word, v in (("If yes", a["if_yes"]), ("If no", a["if_no"])):
         if v:
             out += f" {word}: {v}" + ("" if v[-1] in ".!?" else ".")
+    if a.get("options"):
+        out += " Options: " + "; ".join(f"{chr(97 + i)}) {o}" for i, o in enumerate(a["options"])) + "."
+    if a.get("needs_person"):
+        out += " (needs your OK on the datastash site)"
     return out
 
 
@@ -4017,6 +4042,10 @@ def _agent_block(group, n, now, screen, item_cap, numbers):
             n += 1
             numbers[str(n)] = {"agent": name, "project": r.get("project") or "", "ask": a["id"], "ask_version": a["version"],
                                "text": a["text"]}
+            if a.get("options"):
+                numbers[str(n)]["options"] = list(a["options"])
+            if a.get("needs_person"):
+                numbers[str(n)]["needs_person"] = True
             screen.add([line])
             items_left -= 1
         for x in extra_lines(r):
@@ -4210,6 +4239,7 @@ def render_status_all(here, me, install=False, live_timeout=10, only=None, fill=
             out.append(INSTALL_HEAD)
         if only is not None and not lines:
             lines = [f'(no agent named "{_clean(only, 64)}" has a status)']
+        lines = sent_lines(wb) + lines  # Addendum 5 f: what was sent from here, before the numbered list
         out += _framed_block(lines or ["(no agent has written a status yet)"])
         if install:
             out += list(INSTALL_TAIL)
@@ -4349,7 +4379,8 @@ def status_body(row, workbook_id):
     """POST /api/v1/agent/status: the caller's own row for one project."""
     return {"workbook_id": workbook_id, "project": row["project"], "doing": row["doing"], "details": row["details"],
             "context": row["context"],
-            "asks": [{k: a[k] for k in ("id", "text", "touches", "if_yes", "if_no", "details")} for a in row["asks"]],
+            "asks": [dict({k: a[k] for k in ("id", "text", "touches", "if_yes", "if_no", "details")},
+                          **{k: a[k] for k in ("options", "needs_person") if a.get(k)}) for a in row["asks"]],
             "cards": row["cards"], "running": row["running"], "health": row["health"],
             "done_asked": row["done_asked"], "waiting_on": row["waiting_on"]}
 
@@ -4568,7 +4599,8 @@ STATUS_REMINDER = (
     "sentences (what was tried, what blocks, the files and lines involved, options considered, the exact decision "
     "needed); \"tests\": e.g. \"38 pass, 2 fail\" or \"not run\" (leave it out if you don't know); \"last_change\": a "
     "short phrase; \"asks\": what you need from the person, each {\"text\": the suggested action as a yes/no question, "
-    "\"touches\": file or area, \"if_yes\", \"if_no\": one short sentence each, \"details\": a few sentences}, or []; "
+    "\"touches\": file or area, \"if_yes\", \"if_no\": one short sentence each, \"details\": a few sentences, for a choice "
+    "\"options\": [short choices], \"needs_person\": true when only the person may answer it}, or []; "
     "\"waiting_on\": each {\"what\", \"who\"}; \"done_asked\": the person's recent requests to you, each {\"request\", "
     "\"done\": true/false, \"proof\"}; \"cards\": each {\"id\", \"step\": built|review|merged|epm_pass|live|live_check, "
     "\"review\", \"blocker\"}; \"running\": each {\"what\", \"on\", \"stuck\"}; \"health\": {\"new_errors\", "
@@ -4701,6 +4733,18 @@ def _typed_text(v):
     return None
 
 
+def _person_origin(v):
+    """Addendum 6 N1: True only when Claude Code marked the entry as the person's own: origin.kind "human" and
+    promptSource "typed" or "queued". A headless `claude -p` prompt ("sdk"), a task notification or a peer message
+    ("system"), or an entry without these fields (an older Claude Code) is refused: fail closed."""
+    o = v.get("origin")
+    return isinstance(o, dict) and o.get("kind") == "human" and v.get("promptSource") in ("typed", "queued")
+
+
+NOT_PERSON_LINE = ("Not done: Claude Code did not mark that prompt as typed by you (a headless run or an older Claude "
+                   "Code), so datastash did nothing. If you typed it, update Claude Code and type it again.")
+
+
 def _typed_used_path(sid):
     return os.path.join(STATE, f"status-typed-{sid}.json")
 
@@ -4741,7 +4785,31 @@ def _said_turns(entries, end, most=4):
     return turns
 
 
-ANSWER_ONLY_RE = re.compile(r"(sending your answer to|answered|not sent|saved your answer)\b")
+ANSWER_ONLY_RE = re.compile(r"(sending your answer to|sent to|answered|not sent|saved your answer|taking back|undone|"
+                            r"not undone|too late to undo)\b")
+NUMBERED_RE = re.compile(r"(#?\d{1,3}[.):]|\(\d{1,3}\))\s")  # a numbered item ("2. ...", "2) ...", "(2) ...", "2: ...")
+
+
+def _ask_key(text):
+    return _norm_seen(str(text or "").rstrip("?"))[:40]
+
+
+def _list_last(lines, data):
+    """Addendum 6 (do-N scope): True when the list holding ask n (data: n, text, last_n = the list's last number,
+    ask_keys = every ask's text in it) is in these lines AND is the last thing in them: after the list's last item no
+    numbered item and no quoted ask text."""
+    n, last = data.get("n"), data.get("last_n")
+    key = _ask_key(data.get("text"))
+    keys = [k for k in (data.get("ask_keys") or []) if isinstance(k, str) and k] + [key]
+    if not key or not isinstance(n, int) or not isinstance(last, int) or last < n:
+        return False
+    i_ask = next((i for i, x in enumerate(lines) if re.match(rf"#?{n}[.)]\s", x) and key in x), None)
+    if i_ask is None:
+        return False
+    i_end = i_ask if last == n else next((i for i in range(i_ask + 1, len(lines)) if re.match(rf"#?{last}[.)]\s", lines[i])), None)
+    if i_end is None:
+        return False
+    return not any(NUMBERED_RE.match(x) or any(k in x for k in keys) for x in lines[i_end + 1:])
 
 
 def shown_ok(kind, data, turns):
@@ -4758,8 +4826,7 @@ def shown_ok(kind, data, turns):
             return _norm_seen(FILL_QUESTION) in seen[-800:]
         if kind == "keepq":
             return _norm_seen(KEEP_QUESTION) in seen[-800:]
-        ask = _norm_seen(str(data.get("text") or "").rstrip("?"))[:40]
-        return bool(ask) and ask in seen
+        return _list_last(lines, data)
     return False
 
 
@@ -4773,8 +4840,9 @@ def transcript_turns(tp):
 
 def find_typed(tp, pid, prompt):
     """(entry, the assistant's last turns before it) when the session transcript holds the person's typed entry for
-    this prompt id with exactly this text, else None. Claude Code writes that entry only for a prompt the person really
-    submitted, right after the prompt hooks ran; a tool call can't make one (short of rewriting the file)."""
+    this prompt id with exactly this text, else None; "not person" when that entry is there but Claude Code did not mark
+    it as typed by a person (N1: `claude -p`, a notification, or no origin fields). Claude Code writes the entry right
+    after the prompt hooks ran; a tool call can't make one (short of rewriting the file)."""
     entries = _jsonl_tail(tp, 1024 * 1024)
     for i in range(len(entries) - 1, -1, -1):
         v = entries[i]
@@ -4783,6 +4851,8 @@ def find_typed(tp, pid, prompt):
             continue
         if t.strip() != prompt.strip():
             return None
+        if not _person_origin(v):
+            return "not person"
         return v, _said_turns(entries, i)
     return None
 
@@ -4849,10 +4919,12 @@ def cmd_status_verify(args):
             time.sleep(0.2)
     _drop(path)
     sid = rec["sid"]
-    if found is None:
-        log("status", f"verify: no typed entry for {rec.get('kind')}")
+    if found is None or found == "not person":
+        log("status", f"verify: {'not marked as typed by a person' if found else 'no typed entry'} for {rec.get('kind')}")
         if rec.get("kind") == "fill":
             _save_fill_decision(sid, None)
+        if found:
+            add_outcome(sid, NOT_PERSON_LINE)
         return 0
     v, turns = found
     t = _when(v.get("timestamp"))
@@ -4866,7 +4938,7 @@ def cmd_status_verify(args):
     except OSError:
         return 0
     data = rec.get("data") or {}
-    if rec.get("kind") != "keep" and not shown_ok(rec.get("kind"), data, turns):
+    if rec.get("kind") not in ("keep", "undo") and not shown_ok(rec.get("kind"), data, turns):
         log("status", "verify: that list or question was not the last thing shown")
         if rec.get("kind") == "fill":
             _save_fill_decision(sid, None)
@@ -4884,7 +4956,9 @@ def cmd_status_verify(args):
     elif rec.get("kind") == "fill":
         fill_record(sid, data["fill"], data["keep"])
     elif rec.get("kind") == "answer":
-        add_outcome(sid, deliver_answer(data))
+        add_outcome(sid, deliver_answer(data, sid))
+    elif rec.get("kind") == "undo":
+        add_outcome(sid, undo_answer(data))
     return 0
 
 
@@ -4900,6 +4974,7 @@ STATUS_DETAILS_RE = re.compile(r"(give me |show me |show )?(the )?(full context|
                                r"|(details|more) #?(\d{1,3})")
 STATUS_MORE_ON_RE = re.compile(r"more (on|about|for) ([a-z0-9][a-z0-9 ._\-]{0,63})")
 ANSWER_DO_RE = re.compile(r"do #?(\d{1,3})")
+UNDO_RE = re.compile(r"undo #?(\d{1,3})")
 ANSWER_TEXT_RE = re.compile(r"#?(\d{1,3}):\s+(\S.{0,299})")  # "4: no, 30 days" (a colon and a space: never "2:30")
 
 
@@ -4924,6 +4999,9 @@ def status_phrase(text):
     m = ANSWER_DO_RE.fullmatch(t)
     if m:
         return "answer", (int(m.group(1)), "yes")
+    m = UNDO_RE.fullmatch(t)
+    if m:
+        return "undo", int(m.group(1))
     one = text.strip()
     m = ANSWER_TEXT_RE.fullmatch(one) if "\n" not in one and len(one) <= 300 else None  # one short line, not a pasted list
     if m and m.group(2).strip():
@@ -4978,6 +5056,8 @@ def post_answer(rec, timeout):
     if key is None:
         return ("offline", None) if signed_in() else ("refused", "this computer is not signed in to datastash")
     body = {k: rec[k] for k in ("workbook_id", "agent", "project", "ask_id", "ask_version", "answer", "answer_id")}
+    if rec.get("needs_person"):
+        body["needs_person"] = True  # Addendum 5 d: stricter only; the server sends it to the person's /confirm
     body["relayed"] = True  # M2: not verified on the server as typed by the person; it requires its /confirm until then
     try:
         http("POST", PERSON_STATUS_ANSWER_PATH, key=key, body=body, timeout=timeout)
@@ -5024,6 +5104,58 @@ def _answer_line(lines):
             + "\n".join(_framed_block(lines, what="Answer")))
 
 
+def pick_option(answer, options):
+    """Addendum 5 c: the one option an answer picks (its letter "b", "option b", or its own words), else None."""
+    t = re.sub(r"^option\s+", "", _phrase(answer))
+    for i, o in enumerate(options):
+        if t == chr(97 + i) or t == _phrase(o):
+            return o
+    return None
+
+
+def _answers_sent_path():
+    return os.path.join(STATE, "status-answers-sent.json")
+
+
+def record_sent(sid, rec):
+    """What was sent from this computer (Addendum 5 f): echoed in the status view, and "undo N" in the session that sent it."""
+    try:
+        items = read_json(_answers_sent_path(), {}).get("items")
+        items = [x for x in (items if isinstance(items, list) else []) if isinstance(x, dict)]
+        keep = {k: rec.get(k) for k in ("workbook_id", "agent", "project", "ask_id", "answer_id", "said", "text", "n")}
+        write_private(_answers_sent_path(), json.dumps({"items": (items + [dict(keep, sid=sid, at=time.time())])[-20:]}))
+    except OSError:
+        pass
+
+
+def sent_items(wb=None, sid=None):
+    """Answers sent from this computer in the last UNDO_MAX_AGE seconds, newest first (not the ones taken back)."""
+    items = read_json(_answers_sent_path(), {}).get("items")
+    now = time.time()
+    out = [x for x in (items if isinstance(items, list) else []) if isinstance(x, dict) and _num_ok(x.get("at"))
+           and now - x["at"] <= UNDO_MAX_AGE and not x.get("undone") and (wb is None or x.get("workbook_id") == wb)
+           and (sid is None or x.get("sid") == sid)]
+    return list(reversed(out))
+
+
+def _mark_undone(answer_id):
+    try:
+        rec = read_json(_answers_sent_path(), {})
+        items = rec.get("items") if isinstance(rec.get("items"), list) else []
+        for x in items:
+            if isinstance(x, dict) and x.get("answer_id") == answer_id:
+                x["undone"] = True
+        write_private(_answers_sent_path(), json.dumps({"items": items}))
+    except OSError:
+        pass
+
+
+def sent_lines(wb):
+    """The status view's echo of what was sent from here (inside the data frame: ask text is agent-written)."""
+    return [f'Sent to {_clean(x.get("agent"), 64)}: {_clean(x.get("said"), 300)} ("{_clean(x.get("text"), 300)}")'
+            for x in sent_items(wb)[:5]]
+
+
 def answer_from_prompt(inp, n, answer, view):
     """The real hook only: send the person's typed answer to ask n of this session's view, then return the note."""
     target = view["numbers"].get(str(n))
@@ -5036,8 +5168,11 @@ def answer_from_prompt(inp, n, answer, view):
     shape = hook_shape(inp)
     if shape is None:
         return None  # not the hook's input: nothing
-    if not shown_ok("answer", target, transcript_turns(shape[1])):
-        return None  # the assistant said other things after that list: an ordinary prompt
+    nums = [int(k) for k in view["numbers"] if str(k).isdigit()]
+    seen = {"n": n, "text": target.get("text"), "last_n": max(nums) if nums else n,
+            "ask_keys": [_ask_key(v.get("text")) for v in view["numbers"].values() if isinstance(v, dict) and v.get("ask")]}
+    if not shown_ok("answer", seen, transcript_turns(shape[1])):
+        return None  # the list was not the last thing shown: an ordinary prompt
     shown = f'"{_clean(target.get("text"), 300)}"'
     c = read_status_cache(wb)
     row = next((r for r in (c or {}).get("agents", []) if _row_key(r) == (agent.lower(), project.lower())), None)
@@ -5047,21 +5182,30 @@ def answer_from_prompt(inp, n, answer, view):
             return _answer_line([f"Not sent: {agent}'s ask {shown} is already answered or gone."])
         if a["version"] != target.get("ask_version") or a["text"] != target.get("text"):
             return _answer_line([f'Not sent: {agent} changed that ask. It now says: "{a["text"]}"'])
-    rec = {"workbook_id": wb, "agent": agent, "project": project, "ask_id": target["ask"],
-           "ask_version": target.get("ask_version"), "answer": _clean(answer, 300), "answer_id": secrets.token_hex(12),
-           "shown": shown, "text": target.get("text"), "said": "yes" if answer == "yes" else _clean(answer, 300)}
+    said = "yes" if answer == "yes" else _clean(answer, 300)
+    options = target.get("options") if isinstance(target.get("options"), list) else []
+    if options:
+        said = pick_option(answer, options)
+        if said is None:
+            return _answer_line([f'Not sent: {agent}\'s ask takes one of its options; type "{n}: a" (or the option\'s words).'])
+    rec = dict(seen, workbook_id=wb, agent=agent, project=project, ask_id=target["ask"],
+               ask_version=target.get("ask_version"), answer=said, answer_id=secrets.token_hex(12), shown=shown, said=said)
+    if target.get("needs_person"):
+        rec["needs_person"] = True
     if not start_check(shape, "answer", inp.get("prompt") or "", rec):
         return None
-    return _answer_line([f"Sending your answer to {agent}: {shown} → {rec['said']}"])
+    return _answer_line([f"Sending your answer to {agent}: {shown} → {said}"])
 
 
-def deliver_answer(rec):
+def deliver_answer(rec, sid=None):
     """Send a checked answer once (offline: kept with its answer id and retried); the line for the person."""
     agent, shown, said, wb = rec["agent"], rec["shown"], rec["said"], rec["workbook_id"]
     got, detail = post_answer(rec, timeout=10)
+    undo = f' Type "undo {rec["n"]}" to take it back.' if isinstance(rec.get("n"), int) else ""
     if got == "ok":
         _mark_answered_locally(wb, agent, rec["project"], rec["ask_id"])
-        return f"Answered {agent}: {shown} → {said}"
+        record_sent(sid, rec)
+        return f"Sent to {agent}: {said} ({shown}).{undo}"
     if got == "changed":
         return f"Not sent: {agent} changed that ask." + (f' It now says: "{detail}"' if detail else
                                                          ' Say "status of all my agents" to see it now.')
@@ -5078,8 +5222,49 @@ def deliver_answer(rec):
             spawn_detached([sys.executable, os.path.abspath(__file__), "status-answer-send", rec["answer_id"]], CONF)
         except OSError:
             return "Not sent: datastash can't be reached right now. Type your answer again in a minute."
-        return f"Saved your answer for {agent}: {shown} → {said}. datastash can't be reached right now; it is sent as soon as it can be."
+        record_sent(sid, rec)
+        return (f"Saved your answer for {agent}: {shown} → {said}. datastash can't be reached right now; it is sent as "
+                f"soon as it can be.{undo}")
     return f"Not sent: datastash refused it ({detail})."
+
+
+def undo_from_prompt(inp, n, sid):
+    """The real hook only: "undo N" takes back this session's recent answer N (checked as the person's typed words)."""
+    item = next((x for x in sent_items(sid=sid) if x.get("n") == n), None) if sid else None
+    shape = hook_shape(inp) if item else None
+    if shape is None or not start_check(shape, "undo", inp.get("prompt") or "", item):
+        return None  # no answer N sent from this session lately, or not the hook's input: an ordinary prompt
+    return _answer_line([f"Taking back your answer to {_clean(item.get('agent'), 64)}: {_clean(item.get('said'), 300)}"])
+
+
+def undo_answer(item):
+    """Take back a sent answer before the agent acts on it: a queued one is simply not sent; else the server's undo."""
+    agent = _clean(item.get("agent"), 64)
+    aid = str(item.get("answer_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{24}", aid):
+        return "Not undone: that answer can't be found."
+    if os.path.exists(_answer_out_path(aid)):
+        _drop(_answer_out_path(aid))
+        _mark_undone(aid)
+        return f"Undone: your answer to {agent} was never sent."
+    key = read_key(PERSON_SLUG)
+    if key is None:
+        return "Not undone: this computer is not signed in to datastash."
+    body = {k: item.get(k) for k in ("workbook_id", "agent", "project", "ask_id", "answer_id")}
+    try:
+        http("POST", PERSON_STATUS_UNDO_PATH, key=key, body=body, timeout=10)
+    except ApiError as e:
+        if e.status in (409, 410):
+            return f"Too late to undo: {agent} already acted on your answer."
+        if e.status == 404:
+            return f"Not undone: datastash can't take answers back yet. Tell {agent} in its own session."
+        if e.status >= 500 or e.status == 429:
+            return f'Not undone: datastash can\'t be reached right now. Type "undo {item.get("n")}" again in a minute.'
+        return f"Not undone: datastash refused it (HTTP {e.status} {_code(e)})."
+    except (urllib.error.URLError, httpclient.HTTPException, OSError):
+        return f'Not undone: datastash can\'t be reached right now. Type "undo {item.get("n")}" again in a minute.'
+    _mark_undone(aid)
+    return f"Undone: your answer to {agent} was taken back."
 
 
 def cmd_status_answer_send(args):
@@ -5199,6 +5384,8 @@ def status_prompt_context(inp):
         if not isinstance(target, dict) or not target.get("ask"):
             return None  # not an ask of the list this session just showed: an ordinary prompt
         return answer_from_prompt(inp, arg[0], arg[1], view)
+    if kind == "undo":
+        return undo_from_prompt(inp, arg, sid)
     if kind == "all":
         me = lazy_me(inp)
         if not os.path.exists(_main_path(sid)):
