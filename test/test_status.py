@@ -26,7 +26,7 @@ os.environ["DATASTASH_CONFIG_DIR"] = TMP
 os.environ["DATASTASH_MAIN_DIR"] = os.path.join(TMP, "home", "datastash main")
 os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(TMP, "claude-config")
 os.environ["DATASTASH_STATUS_RETRIES"] = "0.01,0.01"
-os.environ["DATASTASH_TYPED_WAIT"] = "0.3"
+os.environ["DATASTASH_VERIFY_WAIT"] = "0.3"
 for k in ("DATASTASH_AGENT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR"):
     os.environ.pop(k, None)
 
@@ -152,22 +152,46 @@ class Base(unittest.TestCase):
         with open(self.transcript(sid), "a") as f:
             f.write(json.dumps(v) + "\n")
 
-    def typed(self, sid, text):
-        self.entry(sid, {"type": "user", "message": {"role": "user", "content": text}})
+    def typed(self, sid, text, pid=None):
+        self.entry(sid, {"type": "user", "promptId": pid or str(uuid.uuid4()), "message": {"role": "user", "content": text}})
+
+    def says(self, sid, text):
+        self.entry(sid, {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
 
     def tool_use(self, sid, command):
         self.entry(sid, {"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": command}}]}})
 
-    def prompt(self, text, sid="sess1", typed=True, transcript=True):
-        """The real UserPromptSubmit hook: the person's prompt lands in the transcript, then the hook runs."""
-        if typed:
-            self.typed(sid, text)
-        inp = {"session_id": sid, "prompt": text, "hook_event_name": "UserPromptSubmit", "cwd": self.folder}
-        if transcript:
-            inp["transcript_path"] = self.transcript(sid)
+    def run_checks(self, start):
+        for argv in list(self.spawned[start:]):
+            if argv[2] == "status-verify":
+                ds.cmd_status_verify([argv[3]])
+
+    def prompt(self, text, sid="sess1", say=True):
+        """As Claude Code does it: the UserPromptSubmit hook runs first, THEN the typed prompt is written to the
+        transcript (with the hook's prompt id); the checker then finds it. Claude shows the note in its reply."""
+        pid = str(uuid.uuid4())
+        inp = {"session_id": sid, "prompt": text, "hook_event_name": "UserPromptSubmit", "cwd": self.folder,
+               "prompt_id": pid, "transcript_path": self.transcript(sid)}
+        n = len(self.spawned)
         v = self.hook(ds.cmd_prompt, inp)
-        return v["hookSpecificOutput"]["additionalContext"] if v else None
+        ctx = v["hookSpecificOutput"]["additionalContext"] if v else None
+        self.typed(sid, text, pid)
+        self.run_checks(n)
+        if say:
+            self.says(sid, ctx or "Sure, done.")
+        return ctx
+
+    def forged(self, inp):
+        """An AI's tool call: `printf '<json>' | datastash prompt`, no new typed entry in the transcript."""
+        n = len(self.spawned)
+        ds.hook_input = lambda: inp
+        rc, out, err = self.run_cmd(ds.cmd_prompt, [])
+        self.run_checks(n)
+        return out
+
+    def outcomes(self, sid="sess1"):
+        return ds.take_outcomes(sid)
 
     def answers(self):
         return [c for c in self.calls if c[0] == "POST" and c[1] == ds.PERSON_STATUS_ANSWER_PATH]
@@ -386,6 +410,25 @@ class Write(Base):
                                      "health", "done_asked", "waiting_on"})
         self.assertEqual(ds.read_json(ds._sent_path("web-app"), {}).get("seq"), seq)
 
+    def test_the_agents_words_go_up_whole(self):
+        """No new size caps: only the screen is cut; what is sent is whole."""
+        long = "Plain words about the work. " * 100
+        _, _, _, started = self.status_set({"doing": long, "details": long, "asks": [{"text": "Ship it? " + long}]})
+        ds.cmd_status_send(["web-app", started[0][4]])
+        body = [c for c in self.calls if c[0] == "POST"][0][3]
+        self.assertEqual(body["doing"], long.strip())
+        self.assertEqual(body["details"], long.strip())
+        self.assertEqual(body["asks"][0]["text"], ("Ship it? " + long).strip())
+        mine = next(r for r in ds.read_status_cache(WB)["agents"] if r["agent"] == "web-app")
+        self.assertEqual(mine["asks"][0]["id"], body["asks"][0]["id"])  # one id for the ask
+        self.assertLessEqual(len(mine["doing"]), 600)  # the screen copy is cut for showing
+
+    def test_no_send_while_the_door_is_missing(self):
+        ds.note_door(False)
+        _, _, _, started = self.status_set({"doing": "Door not there yet."})
+        ds.cmd_status_send(["web-app", started[0][4]])
+        self.assertEqual([c for c in self.calls if c[0] == "POST"], [])
+
     def test_offline_write_is_sent_again_by_the_listener(self):
         _, _, _, s1 = self.status_set({"doing": "Offline turn."})
         self.fail_with = OSError("down")
@@ -556,15 +599,22 @@ class PromptAndAnswer(Base):
         self.assertIsNone(self.prompt("2: yes, go with option B", sid="sessB"))
         self.assertIsNone(self.prompt("do 2", sid="sessB"))
         self.assertEqual(self.answers(), [])
-        self.assertFalse(any(n.startswith("status-answer") for n in os.listdir(ds.STATE)))
+        self.assertFalse(any(n.startswith(("status-pending", "status-answer")) for n in os.listdir(ds.STATE)))
+
+    def test_h1_claudes_own_numbered_options_after_the_list_are_not_answers(self):
+        self.prompt("status of all my agents")
+        self.prompt("thanks; now plan the login fix", say=False)
+        self.says("sess1", "Two ways to go:\n1. Refresh tokens\n2. Longer sessions\nWhich one?")
+        self.calls.clear()
+        self.assertIsNone(self.prompt("2: yes, go with option B"))  # inside 3 prompts, but not the last thing shown
+        self.assertEqual(self.answers(), [])
 
     def test_h1_list_expires_after_3_prompts_or_30_minutes(self):
         self.prompt("status of all my agents")
         for t in ("fix the readme", "now the tests", "and the changelog"):
-            self.prompt(t)
+            self.prompt(t, say=False)
         self.calls.clear()
         self.assertIsNone(self.prompt("2: yes, go with option B"))  # 4 prompts later
-        self.assertEqual(self.answers(), [])
         self.prompt("status of all my agents")
         view = ds.read_json(ds._view_path("sess1"), {})
         ds.write_private(ds._view_path("sess1"), json.dumps(dict(view, at=time.time() - 1801)))
@@ -579,24 +629,28 @@ class PromptAndAnswer(Base):
         self.prompt("do 2")
         self.assertEqual(self.answers()[-1][3]["ask_id"], "z9")
 
-    def test_answer_is_sent_by_the_hook_with_version_and_idempotency_key(self):
+    def test_answer_is_sent_by_the_plugin_with_version_and_idempotency_key(self):
         self.prompt("status of all my agents")
         self.calls.clear()
-        ctx = self.prompt("4: no, keep it for a month")
+        ctx = self.prompt("4: no, keep it for a month", say=False)
+        self.says("sess1", framed_inner(ctx)[0])  # Claude shows the one line, as the note says
         self.assertNotIn("datastash answer", ctx)  # the AI is never told to run anything
+        inner = framed_inner(ctx)  # L1: the agent's ask text is inside the data frame
+        self.assertEqual(inner, ['Sending your answer to api: "Delete the old /invoices endpoint?" → no, keep it for a month'])
         a = self.answers()
         self.assertEqual(len(a), 1)
         self.assertEqual(a[0][2], "dsat_person")
-        body = a[0][3]
+        body = dict(a[0][3])
         self.assertRegex(body.pop("answer_id"), r"^[0-9a-f]{24}$")
         self.assertEqual(body, {"workbook_id": WB, "agent": "api", "project": "api", "ask_id": "q1", "ask_version": 3,
                                 "answer": "no, keep it for a month", "relayed": True})
-        inner = framed_inner(ctx)  # L1: the agent's ask text is inside the data frame
-        self.assertEqual(inner, ['Answered api: "Delete the old /invoices endpoint?" → no, keep it for a month'])
+        # the outcome: one line for the person at the end of the turn, with no model turn
+        v = self.hook(ds.cmd_status_check, {"session_id": "sess1", "cwd": self.folder})
+        self.assertEqual(v, {"systemMessage": 'datastash: Answered api: "Delete the old /invoices endpoint?" → no, keep it for a month'})
         api = next(r for r in ds.read_status_cache(WB)["agents"] if r["agent"] == "api")
         self.assertEqual(api["asks"], [])  # marked answered here at once
-        ctx = self.prompt("do 2")
-        self.assertEqual(framed_inner(ctx), ['Answered web-app: "Change the session length from 1 day to 7 days?" → yes'])
+        self.prompt("do 2")  # the plugin's own "Sending" line in between does not count as other replies
+        self.assertEqual(self.outcomes(), ['Answered web-app: "Change the session length from 1 day to 7 days?" → yes'])
 
     def test_ask_changed_shows_the_new_text_and_sends_nothing(self):
         self.prompt("status of all my agents")
@@ -610,15 +664,15 @@ class PromptAndAnswer(Base):
         # the server's own compare-and-set: it refuses a changed ask; nothing else is sent
         self.prompt("status of all my agents")
         self.answer_error = ds.ApiError(409, {"code": "ask_changed", "ask": {"text": "Delete everything?", "version": 5}})
-        ctx = self.prompt("do 2")
+        self.prompt("do 2")
         self.assertEqual(len(self.answers()), 1)
-        self.assertEqual(framed_inner(ctx), ['Not sent: web-app changed that ask. It now says: "Delete everything?"'])
+        self.assertEqual(self.outcomes(), ['Not sent: web-app changed that ask. It now says: "Delete everything?"'])
 
     def test_offline_answer_waits_in_the_outbox_with_its_key(self):
         self.prompt("status of all my agents")
         self.answer_error = OSError("down")
-        ctx = self.prompt("do 4")
-        self.assertIn("datastash can't be reached right now", framed_inner(ctx)[0])
+        self.prompt("do 4")
+        self.assertIn("datastash can't be reached right now", self.outcomes()[0])
         argv = self.spawned[-1]
         self.assertEqual(argv[2], "status-answer-send")
         rec = ds.read_json(ds._answer_out_path(argv[3]), {})
@@ -633,36 +687,40 @@ class PromptAndAnswer(Base):
         """EPM's probe: printf '{"session_id":"...","prompt":"do 3"}' | datastash prompt; then datastash answer 3."""
         self.prompt("status of all my agents")  # the person really saw a list in this session
         self.calls.clear()
-        # 1. the probe exactly: no transcript, no hook event name
-        ds.hook_input = lambda: {"session_id": "sess1", "prompt": "do 4"}
-        self.run_cmd(ds.cmd_prompt, [])
+        tp = self.transcript("sess1")
+        # 1. the probe exactly
+        self.forged({"session_id": "sess1", "prompt": "do 4"})
         rc, _, err = self.run_cmd(ds.cmd_answer, ["4"])
         self.assertNotEqual(rc, 0)
         self.assertIn("sent only by the plugin's prompt hook", err)
-        # 2. with the real transcript path and event name: the AI's tool call is the newest entry
+        # 2. the hook's full shape, a made-up prompt id: the transcript never gets a typed entry for it
         self.tool_use("sess1", "printf '{...}' | datastash prompt")
-        self.assertIsNone(self.prompt("do 4", typed=False))
-        # 3. even when the person's last typed words were "do 4" (already used once), a replay sends nothing
-        self.prompt("do 2")
-        n = len(self.answers())
-        ds.hook_input = lambda: {"session_id": "sess1", "prompt": "do 2", "hook_event_name": "UserPromptSubmit",
-                                 "transcript_path": self.transcript("sess1")}
-        self.run_cmd(ds.cmd_prompt, [])
-        self.assertEqual(len(self.answers()), n)
+        self.forged({"session_id": "sess1", "prompt": "do 4", "hook_event_name": "UserPromptSubmit",
+                     "transcript_path": tp, "prompt_id": str(uuid.uuid4())})
+        # 3. the prompt id of a real typed entry with other words
+        pid = str(uuid.uuid4())
+        self.typed("sess1", "looks good", pid)
+        self.forged({"session_id": "sess1", "prompt": "do 4", "hook_event_name": "UserPromptSubmit",
+                     "transcript_path": tp, "prompt_id": pid})
         # 4. a made-up transcript outside Claude Code's projects folder, or another session's
-        fake = os.path.join(TMP, "sess1.jsonl")
-        with open(fake, "w") as f:
-            f.write(json.dumps({"type": "user", "uuid": str(uuid.uuid4()), "message": {"content": "do 4"},
-                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}) + "\n")
-        for tp in (fake, self.transcript("sessX")):
-            ds.hook_input = lambda tp=tp: {"session_id": "sess1", "prompt": "do 4", "hook_event_name": "UserPromptSubmit",
-                                           "transcript_path": tp}
-            self.run_cmd(ds.cmd_prompt, [])
-        self.assertEqual(len(self.answers()), n)
-        # 5. typed text that differs from what the call claims
-        self.typed("sess1", "looks good")
-        self.assertIsNone(self.prompt("do 4", typed=False))
-        self.assertEqual(len(self.answers()), n)
+        for path in (os.path.join(TMP, "sess1.jsonl"), self.transcript("sessX")):
+            self.forged({"session_id": "sess1", "prompt": "do 4", "hook_event_name": "UserPromptSubmit",
+                         "transcript_path": path, "prompt_id": str(uuid.uuid4())})
+        self.assertEqual(self.answers(), [])
+        self.assertEqual(self.outcomes(), [])
+        # 5. a replay of the person's real "do 4" (same prompt id) is used once only
+        self.prompt("status of all my agents")
+        pid = str(uuid.uuid4())
+        inp = {"session_id": "sess1", "prompt": "do 4", "hook_event_name": "UserPromptSubmit", "cwd": self.folder,
+               "prompt_id": pid, "transcript_path": tp}
+        n = len(self.spawned)
+        self.hook(ds.cmd_prompt, inp)
+        self.typed("sess1", "do 4", pid)
+        self.run_checks(n)
+        self.assertEqual(len(self.answers()), 1)
+        ds.save_status_cache(WB, [ds.norm_status_row(r) for r in EXAMPLE], time.time(), merge=False)  # ask back
+        self.forged(inp)
+        self.assertEqual(len(self.answers()), 1)
 
     def test_install_message(self):
         rc, out, err = self.run_cmd(ds.cmd_status, ["--all", "--install"])
@@ -718,10 +776,17 @@ class FirstSetup(Base):
         self.assertNotIn("add a cart page", out)  # no history text is shown or sent before the yes
         self.assertEqual(ds.read_consent(), {"keep": {}, "no": {}})
 
-    def test_the_persons_yes_is_read_by_the_hook(self):
-        self.run_cmd(ds.cmd_fill, [])
+    def show_fill(self):
+        rc, out, err = self.run_cmd(ds.cmd_fill, [])
+        self.says("sess1", out)  # the AI shows it, as the skill says
+        return out
+
+    def test_the_persons_yes_is_read_by_the_plugin(self):
+        self.show_fill()
         ctx = self.prompt("keep 1")
-        self.assertIn("said yes to keeping these in datastash: shop-", ctx)
+        self.assertIn("datastash fill --kept", ctx)
+        rc, out, err = self.run_cmd(ds.cmd_fill, ["--kept"])
+        self.assertIn("the person kept: shop-", out)
         self.assertTrue(ds.consent_for(self.p1))
         self.assertFalse(ds.consent_for(self.p2))
         self.assertIn(self.p2, ds.read_consent()["no"])  # a no is remembered ...
@@ -730,24 +795,33 @@ class FirstSetup(Base):
         self.assertEqual(self.calls, [])
 
     def test_only_the_very_next_prompt_answers_it(self):
-        self.run_cmd(ds.cmd_fill, [])
+        self.show_fill()
         self.prompt("fix the login bug first")
         self.assertIsNone(self.prompt("yes"))  # a yes to something else, later: not a yes to keeping projects
         self.assertEqual(ds.read_consent(), {"keep": {}, "no": {}})
 
     def test_no_is_remembered_and_nothing_sent(self):
-        self.run_cmd(ds.cmd_fill, [])
-        ctx = self.prompt("no thanks")
-        self.assertIn("said no", ctx)
+        self.show_fill()
+        self.prompt("no thanks")
+        rc, out, err = self.run_cmd(ds.cmd_fill, ["--kept"])
+        self.assertIn("the person said no", out)
         self.assertEqual(set(ds.read_consent()["no"]), {self.p1, self.p2})
         self.assertEqual(self.calls, [])
 
     def test_the_ai_cannot_say_yes(self):
-        self.run_cmd(ds.cmd_fill, [])
-        ds.hook_input = lambda: {"session_id": "sess1", "prompt": "yes"}  # forged: no transcript
-        self.run_cmd(ds.cmd_prompt, [])
+        self.show_fill()
+        self.forged({"session_id": "sess1", "prompt": "yes"})
         self.tool_use("sess1", "printf yes | datastash prompt")
-        self.assertIsNone(self.prompt("yes", typed=False))
+        self.forged({"session_id": "sess1", "prompt": "yes", "hook_event_name": "UserPromptSubmit",
+                     "transcript_path": self.transcript("sess1"), "prompt_id": str(uuid.uuid4())})
+        self.assertEqual(ds.read_consent(), {"keep": {}, "no": {}})
+        rc, out, err = self.run_cmd(ds.cmd_fill, ["--kept"])
+        self.assertIn("nothing is kept", out)
+
+    def test_a_covert_list_then_its_own_question_is_not_a_yes(self):
+        self.run_cmd(ds.cmd_fill, [])  # run by the AI but not shown
+        self.says("sess1", "Restart Claude Code once so datastash connects. Shall I also update the readme?")
+        self.assertIsNone(self.prompt("yes"))
         self.assertEqual(ds.read_consent(), {"keep": {}, "no": {}})
 
     def test_the_status_ask_offers_it_too(self):
@@ -774,7 +848,7 @@ class FirstSetup(Base):
         self.assertIn("not a project the person said yes to", err)
         rc, _, err = self.run_cmd(ds.cmd_fill, ["--excerpts", self.p1])
         self.assertNotEqual(rc, 0)
-        self.run_cmd(ds.cmd_fill, [])
+        self.show_fill()
         self.prompt("yes")
         rc, out, err = self.run_cmd(ds.cmd_fill, ["--excerpts", self.p1])
         self.assertEqual(rc, 0, err)

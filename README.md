@@ -241,8 +241,9 @@ agents", "full context of 4", "more on api", and "do 4" or "4: no, 30 days" to a
 - First setup (one yes): right after this computer is signed in, or when the person asks for their agents' status,
   `datastash fill` reads the person's recent Claude Code projects (last 14 days) locally and shows them numbered, with
   one question: "Keep these in datastash so all your agents, on any computer, can see them? Say yes, or name the ones
-  to keep." and what goes up for each kept one. Nothing is sent, registered or linked before the answer. The prompt hook
-  reads the answer itself (only the very next prompt, only the person's own typed entry); a no is remembered per project
+  to keep." and what goes up for each kept one. Nothing is sent, registered or linked before the answer. The plugin
+  reads the answer itself (only the very next prompt, only right after the question was shown, only the person's own
+  typed entry, checked as below); `datastash fill --kept` then tells the AI which were kept. A no is remembered per project
   and not asked again unless the person asks. Only kept projects are registered, get a first summary, and send status or
   background facts; a project the person did not keep sends nothing, ever.
 - Writing: `datastash status-set -` (JSON on stdin) saves it on this machine at once and, for a kept project, sends it in
@@ -262,14 +263,16 @@ agents", "full context of 4", "more on api", and "do 4" or "4: no, 30 days" to a
   is fetched once, except while the status door answers 404 (then the copy at once, with its age). A failed refresh is
   said beside the copy's age.
 - Answering: "do N" / "N: ..." is an answer only against the numbered list shown in this same session, at most 3
-  prompts and 30 minutes ago, and only when N is an ask in it; anything else is an ordinary prompt. The prompt hook
-  sends it itself (`POST /api/v1/person/status/answer` with the ask's id and version and a fresh answer id) and the
-  session shows one line, like `Answered api: "Delete the old /invoices endpoint?" → yes`. If the ask changed, it shows
-  the new text and sends nothing. The hook acts only when the session's own transcript ends with the person's typed
-  prompt (a tool call made by the AI comes after the AI's tool-use entry, so it never qualifies), and each typed entry
-  counts once. `datastash answer` sends nothing. A program running as the same user can still rewrite the transcript or
-  read the login, so answers are sent marked `relayed` and datastash asks for the person's OK on its site before it
-  accepts one from a computer login.
+  prompts and 30 minutes ago, only when N is an ask in it, and only when that list was the last thing the assistant
+  showed (the plugin's own answer lines aside); anything else is an ordinary prompt. Claude Code writes the person's
+  prompt to the session transcript only after the UserPromptSubmit hook returns, so the hook hands it to a detached
+  checker, which waits for the transcript's typed entry carrying the hook's `prompt_id` with exactly those words (each
+  prompt id used once, recent). Only then is it sent (`POST /api/v1/person/status/answer` with the ask's id and version
+  and a fresh answer id). The session shows `Sending your answer to api: "..." → yes`, then the result as one line at the
+  end of the turn, like `Answered api: "Delete the old /invoices endpoint?" → yes`. If the ask changed, it shows the new
+  text and sends nothing. An AI's tool call can't make a typed entry, so it never qualifies; `datastash answer` sends
+  nothing. A program running as the same user can still rewrite the transcript or read the login, so answers are sent
+  marked `relayed` and datastash asks for the person's OK on its site before it accepts one from a computer login.
 
 ## How waking works
 
