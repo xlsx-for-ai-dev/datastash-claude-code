@@ -88,8 +88,7 @@ class Base(unittest.TestCase):
         self.saved = {k: getattr(ds, k) for k in ("fetch_page", "read_key", "resolve", "hook_input", "_session_pid",
                                                     "_sleep", "WAKE_GATHER_SECONDS", "WAKE_MIN_SECONDS", "random",
                                                     "announce_ids", "WAKE_IDLE_MAX_SECONDS", "_claude_chain",
-                                                    "signed_in", "imported_connector_hint", "fill_note")}
-        ds.fill_note = lambda *a: None  # the first-setup line (test_status.py tests it)
+                                                    "signed_in", "imported_connector_hint")}
         ds.signed_in = lambda: True  # XLI-278: this computer's datastash login (SignInHint and Login test the real one)
         ds.imported_connector_hint = lambda: None
         ds.read_key = lambda s: "ldgr_ag_test"

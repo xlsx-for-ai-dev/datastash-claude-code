@@ -220,40 +220,56 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-used-*` | this session (or its process) acted as an agent, so it can't become main |
 | `state/hooks-heartbeat.json`, `state/hooks-seen-sid-<id>` | when a plugin hook last ran on this machine, and that hooks run in that session (event and time only) |
 | `off/` | key and config files of agents switched off on this machine |
-| `status-<workbook>.json` | this machine's copy of every agent's status in that agent workbook (plain words, context, asks), refreshed by the listener every ~30 s and by this machine's own writes |
-| `status-fill.json` | the first setup: when it was offered and done, and that the person was told it read their Claude Code history |
-| `state/status-numbers.json` | the numbering of the last status list shown, for "do N" and "full context of N" (24 hours) |
-| `state/status-out-<name>.json`, `state/status-written-<name>` | the agent's newest status waiting to be sent, and when it was last written |
-| `state/status-answer-<id>.json` | the person's typed "do N" / "N: ..." in that session (good for 30 minutes, used once) |
-| `state/turn-<id>*` | when that session's turn started, that it used a tool, and that it was reminded about its status |
+| `status-<workbook>.json` | this machine's copy of every agent's status in that agent workbook (plain words, context, asks), one row per agent and project, refreshed by the listener every ~30 s and by this machine's own writes; notes when the last refresh failed |
+| `status-consent.json` | the person's yes or no per project folder for keeping its status in datastash (first setup) |
+| `state/status-view-<id>.json`, `state/status-prompts-<id>.json`, `state/status-typed-<id>.json` | what that session showed last (number -> agent, project, ask id and version, or the first-setup list), its prompt count, and the typed transcript entries already used once |
+| `state/status-out-<name>.json`, `state/status-sent-<name>.json`, `state/status-written-<name>`, `state/status-snap-<name>.json`, `state/status-reminded-<name>` | the agent's newest status waiting to be sent and whether it was, when it was last written, the commit and changed-files hash at that write, and when it was last reminded |
+| `state/status-answer-out-<id>.json` | a person's answer that could not reach datastash yet, with its answer id (sent again with the same id) |
+| `state/status-door.json` | datastash answered 404 for the status door (it is not on the server yet) |
+| `state/turn-<id>*` | when that session's turn started, that it used a tool, ran tests, and was reminded about its status |
 
 Message text is never stored locally; the agent reads it from datastash when it needs it.
 
 ## Agent status
 
-Every agent keeps one live status in its agent workbook: two or three plain sentences of what it is doing and why, a
-context line (project, branch, PR, tests, last change, how long ago), its cards, what is running, health, what it waits
-on, what the person asked of it, and its asks of the person, each with what it touches and what yes and no do. Each part
-carries a few sentences of detail. The person sees all agents as one numbered list, asks first and idle agents last, from
-any session: "status of all my agents", "full context of 4", and "do 4" or "4: no, 30 days" to answer an ask.
+Every agent keeps one live status per project in its agent workbook: two or three plain sentences of what it is doing
+and why, a context line (branch, PR, tests, last change, how long ago), its cards, what is running, health, what it waits
+on, what the person asked of it, and its asks of the person, each with what it touches and what yes and no do. The
+person sees all agents as one numbered list, asks first and idle agents last, from any session: "status of all my
+agents", "full context of 4", "more on api", and "do 4" or "4: no, 30 days" to answer an ask.
 
-- Writing: `datastash status-set -` (JSON on stdin) saves it on this machine at once and sends it in the background
-  (`POST /api/v1/agent/status`, the caller's own row only), retrying quietly. Branch, project and the PR come from git and
-  gh. At the end of a turn that used tools, the Stop hook asks the agent once to write it when it didn't (never on a
-  turn with no tool use, never twice in a turn, never while Claude Code is already continuing for a Stop hook).
+- First setup (one yes): right after this computer is signed in, or when the person asks for their agents' status,
+  `datastash fill` reads the person's recent Claude Code projects (last 14 days) locally and shows them numbered, with
+  one question: "Keep these in datastash so all your agents, on any computer, can see them? Say yes, or name the ones
+  to keep." and what goes up for each kept one. Nothing is sent, registered or linked before the answer. The prompt hook
+  reads the answer itself (only the very next prompt, only the person's own typed entry); a no is remembered per project
+  and not asked again unless the person asks. Only kept projects are registered, get a first summary, and send status or
+  background facts; a project the person did not keep sends nothing, ever.
+- Writing: `datastash status-set -` (JSON on stdin) saves it on this machine at once and, for a kept project, sends it in
+  the background (`POST /api/v1/agent/status` with `project`, the caller's own row only), retrying quietly; an unsent
+  write is sent again by the listener once datastash answers. `--project` only for this folder's own agent.
+- The end-of-turn reminder (Stop hook) costs a model turn, so it fires only when plain code sees the work changed since
+  the last status (a new commit or changed files, a test run, the turn ending on a question), at most every 10 minutes
+  per agent, never while datastash answers 404 for the status door, and never for a project that was not kept. The skill
+  tells the agent to write its status as the last step of its normal answer, so most turns need no reminder.
 - Project facts with no model: while it runs, the listener reads the folder's git branch and last commit and, when `gh`
   is installed and signed in, the branch's PR (state, review decision, CI) about every 60 s, and writes them into the
-  agent's status (`context`, `cards`), the local copy and datastash, only when something changed. gh missing or failing
-  is skipped quietly; GitHub's rate limit pauses gh for 15 minutes.
-- Reading: `datastash status --all` and `--details N` read the local copy (refreshed by the listener every ~30 s and
-  when something arrives); a copy older than 2 minutes is fetched once (`GET /api/v1/agent/status`, or
-  `/api/v1/person/status` in the person's main). The person's phrases are answered by the UserPromptSubmit hook from the
-  local copy, straight into the session, with no tool call.
-- Answering: the hook records the person's own typed words; `datastash answer N` sends exactly those to the agent that
-  owns ask N (`POST /api/v1/person/status/answer`, as the person) and marks the ask answered. An AI can't answer on its own.
-- First setup: once this computer is signed in, `datastash fill` shows the AI short excerpts of each Claude Code project
-  used in the last 14 days (local only); the AI registers each as an agent and writes a two-sentence first status. Only
-  those sentences go up. The install message says once that it read the person's own history.
+  agent's status, the local copy and datastash, only when something changed, each with when it was read.
+- Reading: one bounded screen (asks first; at most 10 items per agent, 30 agents, about 8 KB; then "N more: say 'more
+  on <agent>'" lines; nothing is dropped from storage). An agent on several projects gets a one-line roll-up. Every value
+  shows its age; the agent's words past 2 minutes and GitHub facts past 5 minutes are dimmed, never shown as current;
+  unknown values are left out. `datastash status --all` and `--details N` read the local copy; one older than 2 minutes
+  is fetched once, except while the status door answers 404 (then the copy at once, with its age). A failed refresh is
+  said beside the copy's age.
+- Answering: "do N" / "N: ..." is an answer only against the numbered list shown in this same session, at most 3
+  prompts and 30 minutes ago, and only when N is an ask in it; anything else is an ordinary prompt. The prompt hook
+  sends it itself (`POST /api/v1/person/status/answer` with the ask's id and version and a fresh answer id) and the
+  session shows one line, like `Answered api: "Delete the old /invoices endpoint?" → yes`. If the ask changed, it shows
+  the new text and sends nothing. The hook acts only when the session's own transcript ends with the person's typed
+  prompt (a tool call made by the AI comes after the AI's tool-use entry, so it never qualifies), and each typed entry
+  counts once. `datastash answer` sends nothing. A program running as the same user can still rewrite the transcript or
+  read the login, so answers are sent marked `relayed` and datastash asks for the person's OK on its site before it
+  accepts one from a computer login.
 
 ## How waking works
 
@@ -385,13 +401,15 @@ An agent can send datastash a capability request, an error report or anything el
   the agent, an agent session refused, session id spoofing, and self-registration names. Clean sessions only: the
   review's attack replayed (an agent session fakes the typed phrase with the `prompt` command, with its own or a forged
   session id, with a main key on the machine), each first agent action recording the session, and `datastash login` never recording it.
-- `python3 -I test/test_status.py`: the agent status offline: the numbered list in the owner's format (asks first, idle
-  last, one running number), agent text kept to one line, the phrases, the local copy (fresh: no network; old: one call;
-  failing: the old copy), the listener's refresh, the background write (nothing on the network in the turn, a 500
-  retried, an older sender stepping aside, a second turn changing the stored status), the Stop hook (once per turn, never
-  looping, quiet on a trivial turn or after a write), "do N" sending only the person's typed words from that session (explicit shapes only; the list that session saw),
-  the listener's git and gh facts written only when they change,
-  the install message, the first-setup excerpts (14 days) and the CLI's speed from the local copy.
+- `python3 -I test/test_status.py`: the agent status offline: the numbered list in the owner's format, grouped by agent
+  and project, ages and dimming, bounded (50 agents x 200 asks stays within one screen, nothing dropped); the local copy
+  (fresh: no network; old: one call; failing: the old copy, said; door 404: the copy at once); the background write
+  (only after the person's yes, `project` sent, offline write sent again, `--project` only for this folder's agent);
+  the Stop hook (only on a material change, at most every 10 minutes, never while the door is 404 or for an unkept
+  project, never looping); answers (EPM's probes: a session that never showed a list sends nothing; expiry after 3
+  prompts or 30 minutes; a forged `datastash prompt` and `datastash answer` send nothing; version and answer id sent;
+  a changed ask shows its new text and sends nothing; the ask text inside the data frame); the first setup (nothing
+  sent before the yes, the AI can't say yes, a no remembered, only kept projects set up); and the CLI's speed.
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key
