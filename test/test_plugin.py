@@ -24,6 +24,7 @@ MAIN = os.path.join(TMP, "home", "datastash main")
 os.environ["DATASTASH_MAIN_DIR"] = MAIN
 os.environ.pop("DATASTASH_AGENT", None)
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)  # each test names its own session
+os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(TMP, "claude-config")  # never the real Claude Code folder or sign-ins
 
 loader = importlib.machinery.SourceFileLoader("datastash_bin", BIN)
 spec = importlib.util.spec_from_loader("datastash_bin", loader)
@@ -2198,6 +2199,141 @@ class SetupDoctor(Base):
         with redirect_stdout(io.StringIO()) as out:
             ds.cmd_status([])
         self.assertIn("belongs to another user", out.getvalue())
+
+
+class SignInHint(Base):
+    """The connector sign-in check (finding 11-20): after install Claude Code marks the datastash connector "needs
+    authentication" and waits; the session start, doctor and the first-use check tell the person to /mcp."""
+
+    def setUp(self):
+        super().setUp()
+        for k in ("CLAUDE_DIR", "STATE", "HEARTBEAT", "CONF"):
+            self.saved.setdefault(k, getattr(ds, k))
+        root = tempfile.mkdtemp(dir=TMP)
+        ds.CONF = os.path.join(root, "conf")
+        ds.STATE = os.path.join(ds.CONF, "state")
+        ds.HEARTBEAT = os.path.join(ds.STATE, "hooks-heartbeat.json")
+        ds.CLAUDE_DIR = os.path.join(root, ".claude")
+        os.makedirs(ds.CLAUDE_DIR, mode=0o700)
+        ds.ensure_dirs()
+        ds.hook_heartbeat("check", {"session_id": "s1"})
+        self.proj = os.path.join(root, "proj")
+        os.makedirs(self.proj)
+        self.saved.setdefault("platform", ds.sys.platform)
+
+    def tearDown(self):
+        ds.sys.platform = self.saved.pop("platform")
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        super().tearDown()
+
+    def creds(self, entry=None, raw=None, name="plugin:datastash:datastash"):
+        data = {"claudeAiOauth": {"accessToken": "SECRET-CLAUDE"}, "mcpOAuth": {}}
+        if entry is not None:
+            e = {"serverName": name, "serverUrl": "https://getdatastash.com/mcp"}
+            e.update(entry)
+            data["mcpOAuth"][name + "|2607c1f407630c0e"] = e
+        p = os.path.join(ds.CLAUDE_DIR, ".credentials.json")
+        with open(p, "w") as f:
+            f.write(raw if raw is not None else json.dumps(data))
+        os.chmod(p, 0o600)
+
+    def check_ctx(self, sid="s1"):
+        ds.hook_input = lambda: {"session_id": sid}
+        ds.resolve = lambda p, me=None: (None, [])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ds.cmd_check([])
+        return json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+
+    def test_detection(self):
+        day = (time.time() + 86400) * 1000
+        past = (time.time() - 60) * 1000
+        ds.sys.platform = "linux"
+        self.assertIsNone(ds.connector_signed_in())  # no file: can't tell
+        self.creds(raw="{not json")
+        self.assertIsNone(ds.connector_signed_in())
+        self.creds(raw="[]")
+        self.assertIsNone(ds.connector_signed_in())
+        self.creds()
+        self.assertFalse(ds.connector_signed_in())  # no entry for the connector yet
+        self.creds({"accessToken": "", "discoveryState": {}})  # what Claude Code writes after install (11-20)
+        self.assertFalse(ds.connector_signed_in())
+        self.creds({"accessToken": "tok", "expiresAt": past})
+        self.assertFalse(ds.connector_signed_in())  # expired, nothing to refresh with
+        self.creds({"accessToken": "tok", "expiresAt": past, "refreshToken": "r"})
+        self.assertTrue(ds.connector_signed_in())  # Claude Code refreshes it
+        self.creds({"accessToken": "tok", "expiresAt": day})
+        self.assertTrue(ds.connector_signed_in())
+        self.creds({"accessToken": "tok"})
+        self.assertTrue(ds.connector_signed_in())
+        self.creds({"accessToken": "tok", "expiresAt": day}, name="some-other-server")
+        self.assertFalse(ds.connector_signed_in())  # another server's sign-in doesn't count
+        ds.sys.platform = "darwin"
+        self.creds({"accessToken": ""})
+        self.assertIsNone(ds.connector_signed_in())  # the keychain may hold it
+        self.creds({"accessToken": "tok"})
+        self.assertTrue(ds.connector_signed_in())
+
+    def test_session_start_says_it_once_per_session(self):
+        ds.sys.platform = "linux"
+        self.creds({"accessToken": ""})
+        ctx = self.check_ctx("sess-A")
+        self.assertTrue(ctx.startswith(ds.SIGN_IN_NOTE), ctx)
+        self.assertIn(ds.SIGN_IN_HINT, ctx)
+        self.assertIn("type /mcp, pick datastash, choose Authenticate, and sign in with Google", ctx)
+        self.assertEqual(ctx.count("/mcp"), 1)
+        self.assertNotIn("SECRET", ctx)
+        self.assertNotIn(ds.SIGN_IN_HINT, self.check_ctx("sess-A"))  # a second start in that session: not again
+        self.assertIn(ds.SIGN_IN_HINT, self.check_ctx("sess-B"))  # a new session: once more
+
+    def test_session_start_silent_when_signed_in_or_unknown(self):
+        ds.sys.platform = "linux"
+        self.assertNotIn("/mcp", self.check_ctx("sess-C"))  # no credential file: can't tell, say nothing
+        self.creds({"accessToken": "tok"})
+        self.assertNotIn("/mcp", self.check_ctx("sess-D"))
+
+    def test_agent_session_start_keeps_its_count(self):
+        ds.sys.platform = "linux"
+        self.creds({"accessToken": ""})
+        ds.hook_input = lambda: {"session_id": "sess-E"}
+        ds.fetch_page = lambda *a, **k: ([{"message_id": 7, "status": "new"}], "1", False)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ds.cmd_check([])
+        ctx = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(ctx.startswith(ds.SIGN_IN_NOTE))
+        self.assertIn(ds.SIGN_IN_HINT, ctx)
+        self.assertIn("1 new message in its inbox", ctx)
+
+    def test_doctor_and_first_use_check(self):
+        ds.sys.platform = "linux"
+        ds.http = lambda *a, **k: (200, "text/html", "")
+        self.saved.setdefault("http", ds.http)
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "s1"
+        ds.resolve = lambda p, me=None: (None, [])
+        self.creds({"accessToken": ""})
+        found = {f["id"]: f for f in ds.setup_findings(self.proj)}
+        self.assertIn("not_signed_in", found)
+        self.assertIsNone(found["not_signed_in"]["cmd"])  # nothing to run: the person signs in through /mcp
+        err = io.StringIO()
+        ds.auto_setup_check(self.proj, stream=err)
+        self.assertIn(ds.SIGN_IN_HINT, err.getvalue())
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_doctor([])
+        self.assertIn("problem: " + ds.SETUP_NOTE + ": the datastash connector is not signed in", out.getvalue())
+        self.assertIn(ds.SIGN_IN_HINT, out.getvalue())
+        self.creds({"accessToken": "tok"})
+        self.assertNotIn("not_signed_in", {f["id"] for f in ds.setup_findings(self.proj)})
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_doctor([])
+        self.assertIn("ok: sign-in: the datastash connector is signed in.", out.getvalue())
+        self.assertNotIn("tok", out.getvalue().replace("token", ""))
+        ds.sys.platform = "darwin"
+        self.creds({"accessToken": ""})
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_doctor([])
+        self.assertIn("note: sign-in: can't tell", out.getvalue())
+        self.assertNotIn("not_signed_in", {f["id"] for f in ds.setup_findings(self.proj)})
 
 
 if __name__ == "__main__":

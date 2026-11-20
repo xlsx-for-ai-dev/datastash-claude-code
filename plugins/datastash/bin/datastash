@@ -999,6 +999,9 @@ def cmd_check(_args):
     inp = hook_input()
     hook_heartbeat("check", inp)
     agent, warn = resolve(project_of(inp), me=this_session(inp))
+    hint = sign_in_hint(inp)
+    if hint:
+        warn = [hint] + list(warn)
     if agent is None:
         if main_root(project_of(inp)) is None:
             warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. On its first datastash use it registers '
@@ -1486,6 +1489,72 @@ WATCH_FALLBACK = "Until then, `datastash watch` under a Monitor still delivers m
 SETUP_NOTE = "datastash setup check (local; information only)"
 
 
+CONNECTOR_SERVER = "plugin:datastash:datastash"  # the name Claude Code gives this plugin's datastash connector
+SIGN_IN_HINT = ("datastash isn't signed in yet: type /mcp, pick datastash, choose Authenticate, and sign in with "
+                "Google.")
+SIGN_IN_NOTE = "datastash note (local sign-in check; information only)"
+
+
+def connector_signed_in():
+    """Is this plugin's datastash connector signed in? True, False, or None (can't tell).
+
+    The signal is Claude Code's own credential file, <Claude config folder>/.credentials.json, where Claude Code keeps
+    each MCP server's sign-in under "mcpOAuth" (key "<server name>|<hash>", with serverName, serverUrl, accessToken,
+    refreshToken, expiresAt in ms). After install Claude Code adds an entry for "plugin:datastash:datastash" with an
+    empty accessToken and shows the server as "needs authentication"; it does not open the sign-in by itself.
+    Signed in = a matching entry with an access token that is not expired, or that has a refresh token.
+    Only presence and expiry are read; no token is kept, compared, logged or printed.
+    Not used: `claude mcp list` (it connects to every server, takes seconds, and does not list plugin servers outside
+    a plugin session) and a 401 from https://getdatastash.com/mcp (the plugin never holds Claude Code's token, so every
+    call it could make is a 401). No file (macOS keeps it in the system keychain, which can't be read without a
+    prompt), an unreadable file or an unknown shape is None: say nothing rather than guess. On macOS a file without a
+    usable entry is None too (the keychain may hold the sign-in)."""
+    try:
+        with open(os.path.join(CLAUDE_DIR, ".credentials.json")) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    entries = data.get("mcpOAuth", {})
+    if not isinstance(entries, dict):
+        return None
+    now_ms = time.time() * 1000
+    for k, v in entries.items():
+        if not isinstance(v, dict):
+            continue
+        if v.get("serverName") != CONNECTOR_SERVER and not (isinstance(k, str) and k.split("|", 1)[0] == CONNECTOR_SERVER):
+            continue
+        access, refresh, exp = v.get("accessToken"), v.get("refreshToken"), v.get("expiresAt")
+        if not (isinstance(access, str) and access):
+            continue
+        if isinstance(refresh, str) and refresh:
+            return True
+        if not isinstance(exp, (int, float)) or isinstance(exp, bool) or exp <= 0 or exp > now_ms:
+            return True
+    return None if sys.platform == "darwin" else False
+
+
+def sign_in_hint(inp):
+    """The SessionStart line telling the AI to walk the person through the connector sign-in, or None. Once per
+    session (a marker per session id); without a session id it is said (SessionStart itself runs once)."""
+    try:
+        if connector_signed_in() is not False:
+            return None
+        sid = inp.get("session_id") if isinstance(inp, dict) else None
+        sid = sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None
+        if sid is not None:
+            mark = os.path.join(STATE, f"sign-in-hint-sid-{sid}")
+            if os.path.exists(mark):
+                return None
+            ensure_dirs()
+            write_private(mark, json.dumps({"at": int(time.time())}))
+        return (f'{SIGN_IN_NOTE}: the datastash connector is not signed in, so its tools can\'t be used, and Claude Code '
+                f'waits for the person instead of opening the sign-in. Tell the person once, in plain words: "{SIGN_IN_HINT}"')
+    except Exception:
+        return None
+
+
 def _seen_path(sid):
     return os.path.join(STATE, f"hooks-seen-sid-{sid}")
 
@@ -1711,6 +1780,10 @@ def setup_findings(project, me=None, deep=False):
                                 "(hooks) have not run in this session (the plugin was likely installed, enabled or "
                                 "updated after the session started).",
                                 "the person restarts Claude Code or types /reload-plugins.", wake=True))
+    if connector_signed_in() is False:
+        out.append(_finding("not_signed_in", "the datastash connector is not signed in, so its tools can't be used "
+                            "(Claude Code marks it \"needs authentication\" and waits; it doesn't open the sign-in by "
+                            "itself).", f'tell the person, in plain words: "{SIGN_IN_HINT}"'))
     # Key files: every key here must be a private file of this user; the folder's agent needs one.
     try:
         names = sorted(n for n in os.listdir(CONF) if n.endswith(".key"))
@@ -1809,6 +1882,12 @@ def cmd_doctor(_args):
         print("ok: keys: every datastash key file here is private to this user (mode 600).")
     if "no_reach" not in ids:
         print("ok: network: https://getdatastash.com answers.")
+    signed = connector_signed_in()
+    if signed:
+        print("ok: sign-in: the datastash connector is signed in.")
+    elif signed is None:
+        print("note: sign-in: can't tell whether the datastash connector is signed in on this machine. If its tools are "
+              f'missing or ask for authentication, tell the person: "{SIGN_IN_HINT}"')
     print(_listener_line(project, me))
     for f in found:
         print("problem: " + finding_line(f))

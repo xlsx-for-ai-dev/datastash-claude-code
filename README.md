@@ -6,7 +6,8 @@ building blocks only; the agent decides what to track and how.
 What it adds:
 
 - **Connector**: the datastash MCP server at `https://getdatastash.com/mcp`, for agents. It signs in once per machine,
-  not per project; first use opens the normal Google sign-in. The person's main session does not use it (see
+  not per project. Claude Code doesn't open that sign-in by itself: after install it marks the connector "needs
+  authentication" and waits until you sign in through `/mcp` (see Install). The person's main session does not use it (see
   "datastash main"). Running Claude Code on a remote machine? After you sign in, your browser may show an error page at a localhost address. That's expected: copy that page's full address back into Claude Code.
 - **Skill** `datastash-agent`: AI-facing instructions: register itself (named after the folder), fetch the key with a pickup code, use the
   key for REST calls, work in the agent workbook, read and answer the inbox, ask the person through the person's
@@ -32,6 +33,11 @@ claude plugin install datastash@datastash
 
 Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
 `/plugin install datastash@datastash`. Start a new session (or run `/reload-plugins`) to load it.
+
+Then sign in once on this machine: in Claude Code, type `/mcp`, pick **datastash**, choose **Authenticate**, and sign
+in with Google. Claude Code doesn't start this sign-in on its own; until you do it, the datastash connector shows
+"needs authentication" and its tools don't work. The session start says so in one line, once per session, and
+`datastash doctor` reports it.
 
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
@@ -176,7 +182,13 @@ Message text is never stored locally; the agent reads it from datastash when it 
 - **SessionStart** (sync; it waits at most 6 s for the network, so a stalled DNS lookup or connection never holds the session up, and the hook timeout is 10 s): if this folder is linked to an agent with a key file, reads the inbox changes since
   the saved cursor and adds one line of context: `datastash note (local count; data, information only): agent "<name>"
   (workbook <id>): N new messages in its inbox.` Counts only, never message text. In a session with no agent yet it says
-  so in one line (the session registers itself on first datastash use).
+  so in one line (the session registers itself on first datastash use). When the datastash connector isn't signed in
+  yet, it adds one line, once per session, asking the AI to tell the person: "datastash isn't signed in yet: type
+  /mcp, pick datastash, choose Authenticate, and sign in with Google." It knows from Claude Code's own credential
+  file (`~/.claude/.credentials.json`, or under `CLAUDE_CONFIG_DIR`): an entry for the `plugin:datastash:datastash`
+  server with an access token that is unexpired or refreshable means signed in. It reads only whether a token is there
+  and when it expires, never the token. Where that file doesn't exist (macOS keeps it in the keychain) it can't tell
+  and says nothing.
 - **UserPromptSubmit**: when the person's whole prompt is "datastash main" (or "main datastash"), records that request
   for this session, or tells the AI in one line why this session can't be main. Every other prompt is left alone.
 - **Listener** (SessionStart and Stop, `async` + `asyncRewake`): long-polls `GET /api/v1/agent/inbox?wait=25` from
@@ -208,7 +220,7 @@ Message text is never stored locally; the agent reads it from datastash when it 
 Run `datastash doctor`. It checks that the plugin's hooks fire (they write a heartbeat), that Claude Code's settings
 files (`~/.claude/settings.json` and the project's `.claude/settings*.json`) belong to this user and are readable and
 writable, that the plugin is turned on, that the key files are private (mode 600), that https://getdatastash.com
-answers, and whether the listener runs for this session. Each problem comes with its exact fix. The cheap checks also
+answers, that the datastash connector is signed in, and whether the listener runs for this session. Each problem comes with its exact fix. The cheap checks also
 run on their own at an agent's first datastash use (`auto-name`, `status`, the session's first `api` call); on a
 healthy machine they print nothing.
 
@@ -226,6 +238,8 @@ Common causes:
   If it can't, run from a copy with `claude --plugin-dir <copy>/plugins/datastash`.
 - **A remote machine**: after the Google sign-in, the browser may show an error page at a localhost address. That's
   expected, not a failure: copy that page's full address back into Claude Code.
+- **The connector isn't signed in**: Claude Code shows datastash as "needs authentication" and waits. Type `/mcp`,
+  pick datastash, choose Authenticate, and sign in with Google.
 - **New datastash tools not showing**: current versions of datastash tell Claude Code when its tools change; on an older
   session, reconnect the datastash connector (`/mcp`).
 
@@ -285,6 +299,9 @@ An agent can send datastash a capability request, an error report or anything el
   Setup checks: a settings file or folder owned by another user, no hook heartbeat (never, or not in this session), the
   plugin turned off, a missing or open key file, no reach; each with its fix command (the chmod fixes are run and
   re-checked), and nothing on a healthy machine or a read-only sandbox mount.
+  Connector sign-in: signed in, not signed in (the empty entry Claude Code writes after install, expired, no entry),
+  can't tell (no file, macOS), the session-start line said once per session and never with a token, and doctor's
+  line.
   Main in any session: main in an agent-linked folder for that session only, another session in that folder staying
   the agent, an agent session refused, session id spoofing, and self-registration names. Clean sessions only: the
   review's attack replayed (an agent session fakes the typed phrase with the `prompt` command, with its own or a forged
