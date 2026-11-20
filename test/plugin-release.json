@@ -2,6 +2,6 @@
   "note": "Content fingerprint of plugins/datastash for each released version (test/test_release.py). Add a line for each new version; never edit an earlier one. 0.1.0 is its last release (a927a01).",
   "versions": {
     "0.1.0": "602fd0cf5ddb625dcb687bc66e6efdb6f46630e416fe4f7a33f3c76cebb62d2a",
-    "0.2.0": "0dfcff3d8933ba3cbef80da9d5b511611d8c4264cd0155ca28915a381b2d7087"
+    "0.2.0": "b7c6fd12669acdab11043fe0bab90753b9f0c0dd7fde0490cc3f638734e545ba"
   }
 }

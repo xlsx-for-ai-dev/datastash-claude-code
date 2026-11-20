@@ -2033,7 +2033,7 @@ def person_sign_in_text(info):
 def session_sign_in(inp):
     """SessionStart: (line for the person, line for the AI), or (None, None) when signed in or already said in this
     session. Not signed in: starts (or reuses) the device sign-in itself; no AI step. Never reads or prints a token."""
-    if signed_in():
+    if _login_recorded():  # the recorded login, not a keychain read that a slow or locked keychain could fail
         return None, None
     sid = _sid(inp)
     if sid is not None:
@@ -2073,11 +2073,20 @@ def sign_in_followup(inp, uses_datastash):
     return person_sign_in_text(info), AI_SHOWN_NOTE
 
 
-def _safe_followup(inp, uses):
-    try:
-        return sign_in_followup(inp, uses)
-    except Exception:
-        return None, None
+def _safe_followup(inp, uses, budget=HOOK_START_SECONDS + 1):
+    """sign_in_followup in a helper thread, waited for at most budget seconds (a stalled DNS lookup is not covered by
+    urllib's timeout), so the prompt and tool hooks always finish inside their limits. (None, None) when late or broken."""
+    box = {}
+
+    def run():
+        try:
+            box["v"] = sign_in_followup(inp, uses)
+        except Exception:
+            pass
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(budget)
+    return box.get("v", (None, None))
 
 
 IMPORTED_HINT_MARK = "imported-connector-hint"
@@ -2873,6 +2882,17 @@ def cmd_agent_tool(_args):
     code_challenge (pickup_binding). The session id's mark is written first, before the process walk, so a slow box
     can't skip it; the person's main session is never marked."""
     inp = hook_input()
+    try:
+        bound = pickup_binding(inp)
+    except (Exception, SystemExit):
+        try:
+            bound = strip_challenge(inp) if isinstance(inp, dict) and inp.get("hook_event_name") == "PreToolUse" else None
+        except Exception:
+            bound = None
+    if bound is not None:
+        # Printed first, so the rewrite stands even if the sign-in line or the recording below is slow or fails.
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": bound}}), flush=True)
+        return _agent_tool(inp)
     person = ai = None
     sid = _sid(inp)
     if sid and inp.get("hook_event_name") == "PreToolUse" and os.path.exists(_signed_out_mark(sid)):
@@ -2881,24 +2901,13 @@ def cmd_agent_tool(_args):
         except Exception:
             why = ""
         person, ai = _safe_followup(inp, why in USE_REASONS)
-    try:
-        bound = pickup_binding(inp)
-    except (Exception, SystemExit):
-        try:
-            bound = strip_challenge(inp) if isinstance(inp, dict) and inp.get("hook_event_name") == "PreToolUse" else None
-        except Exception:
-            bound = None
     out = None
-    if bound is not None:
-        # Printed first, so the rewrite stands even if the recording below is slow or fails.
-        out = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": bound}}
-    else:
-        try:
-            ctx = login_approval_note(inp)
-        except Exception:
-            ctx = None
-        if ctx is not None:
-            out = {"hookSpecificOutput": {"hookEventName": inp["hook_event_name"], "additionalContext": ctx}}
+    try:
+        ctx = login_approval_note(inp)
+    except Exception:
+        ctx = None
+    if ctx is not None:
+        out = {"hookSpecificOutput": {"hookEventName": inp["hook_event_name"], "additionalContext": ctx}}
     if person or ai:
         out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
         if ai:
@@ -3430,9 +3439,13 @@ def _login_poll_loop(p, interval, deadline):
             with _login_lock():  # never interleaved with a refresh of an older login on this computer
                 _save_login(rt, at, got.get("expires_in"))
         break
-    cur = _read_private_json(LOGIN_PENDING_FILE)
-    if cur and cur.get("device_code") == p["device_code"]:
-        _drop(LOGIN_PENDING_FILE)
+    lock = _try_lock(_start_lock_file(), wait=10)  # never between a hook's check and its new code
+    try:
+        cur = _read_private_json(LOGIN_PENDING_FILE)
+        if cur and cur.get("device_code") == p["device_code"]:
+            _drop(LOGIN_PENDING_FILE)
+    finally:
+        _unlock(lock)
     return 0
 
 

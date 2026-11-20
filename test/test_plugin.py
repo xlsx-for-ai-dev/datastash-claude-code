@@ -92,11 +92,12 @@ class Base(unittest.TestCase):
                                                     "_sleep", "WAKE_GATHER_SECONDS", "WAKE_MIN_SECONDS", "random",
                                                     "announce_ids", "WAKE_IDLE_MAX_SECONDS", "_claude_chain",
                                                     "signed_in", "imported_connector_hint", "http", "_spawn_poller",
-                                                    "_open_browser")}
+                                                    "_open_browser", "_login_recorded")}
         # Offline: no test ever reaches datastash, starts a background poll or opens a browser unless it fakes them.
         ds.http = _offline_http
         ds._spawn_poller = lambda: True
         ds._open_browser = lambda url: False
+        ds._login_recorded = lambda: True
         ds.signed_in = lambda: True  # XLI-278: this computer's datastash login (SignInHint and Login test the real one)
         ds.imported_connector_hint = lambda: None
         ds.read_key = lambda s: "ldgr_ag_test"
@@ -267,6 +268,8 @@ class CheckTimeout(Base):
             "d.CHECK_WAIT_SECONDS = 1.0\n"
             "d.read_key = lambda s: 'ldgr_ag_test'\n"
             "d.signed_in = lambda: True\n"
+            "d._login_recorded = lambda: True\n"
+            "d.http = lambda *a, **k: (_ for _ in ()).throw(OSError('offline test'))\n"
             "d.imported_connector_hint = lambda: None\n"
             "d.resolve = lambda p, me=None: ({'name': 'Tester', 'slug': 'tester', 'workbook_id': 'wb1'}, [])\n"
             "d.hook_input = lambda: {}\n"
@@ -2027,6 +2030,7 @@ class SignInHint(Base):
     def setUp(self):
         super().setUp()
         ds.signed_in = self.saved["signed_in"]
+        ds._login_recorded = self.saved["_login_recorded"]
         ds.imported_connector_hint = self.saved["imported_connector_hint"]
         for k in ("STATE", "HEARTBEAT", "CONF", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE"):
             self.saved.setdefault(k, getattr(ds, k))
@@ -2166,6 +2170,32 @@ class SignInHint(Base):
         self.assertNotIn("systemMessage", self.check_out("sess-T"))
         self.assertIsNone(self.run_hook(ds.cmd_prompt, dict(prompt, session_id="sess-T")))
 
+    def test_a_stalled_network_never_holds_the_prompt_or_tool_hook(self):
+        self.check_out("sess-W")
+        p = json.load(open(ds.LOGIN_PENDING_FILE))
+        ds.write_private(ds.LOGIN_PENDING_FILE, json.dumps(dict(p, until=time.time() - 1)))  # a new code is needed
+        self.saved.setdefault("HOOK_START_SECONDS", ds.HOOK_START_SECONDS)
+        ds.HOOK_START_SECONDS = 0.2
+        slow = threading.Event()
+        ds.http = lambda *a, **k: slow.wait(5) and None
+        t = time.time()
+        got = ds._safe_followup({"session_id": "sess-W"}, True, budget=0.3)
+        self.assertLess(time.time() - t, 2)
+        self.assertEqual(got, (None, None))
+        slow.set()
+
+    def test_the_pickup_binding_is_printed_before_any_sign_in_work(self):
+        self.check_out("sess-X")
+        self.saved.setdefault("_agent_tool", ds._agent_tool)
+        self.saved.setdefault("pickup_binding", ds.pickup_binding)
+        self.saved.setdefault("_safe_followup", ds._safe_followup)
+        ds._agent_tool = lambda inp: 0
+        ds.pickup_binding = lambda inp: {"code_challenge": "c"}
+        ds._safe_followup = lambda *a, **k: self.fail("sign-in work before the binding")
+        got = self.run_hook(ds.cmd_agent_tool, {"session_id": "sess-X", "hook_event_name": "PreToolUse",
+                                                "tool_name": "mcp__x__ledger_agent_key", "tool_input": {}})
+        self.assertEqual(got, {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {"code_challenge": "c"}}})
+
     def test_first_datastash_use_shows_the_link_again_once(self):
         self.check_out("sess-U")
         self.saved.setdefault("_agent_tool", ds._agent_tool)
@@ -2248,6 +2278,7 @@ class Login(Base):
     def setUp(self):
         super().setUp()
         ds.signed_in = self.saved["signed_in"]
+        ds._login_recorded = self.saved["_login_recorded"]
         for k in ("CONF", "STATE", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE", "http",
                   "_keychain_set", "_keychain_get", "_keychain_del", "_open_browser", "LOGIN_LOCK_FILE", "fcntl",
                   "login_token"):
