@@ -1987,7 +1987,8 @@ class SignInHint(Base):
         ds.CONF = os.path.join(root, "conf")
         ds.STATE = os.path.join(ds.CONF, "state")
         ds.HEARTBEAT = os.path.join(ds.STATE, "hooks-heartbeat.json")
-        for k, n in (("LOGIN_FILE", "login.json"), ("LOGIN_REFRESH_FILE", "login.refresh"), ("LOGIN_ACCESS_FILE", "login.access.json"), ("LOGIN_PENDING_FILE", "login.pending.json")):
+        for k, n in (("LOGIN_FILE", "login.json"), ("LOGIN_REFRESH_FILE", "login.refresh"), ("LOGIN_ACCESS_FILE", "login.access.json"), ("LOGIN_PENDING_FILE", "login.pending.json"), ("LOGIN_LOCK_FILE", "login.lock")):
+            self.saved.setdefault(k, getattr(ds, k))
             setattr(ds, k, os.path.join(ds.CONF, n))
         ds.ensure_dirs()
         ds.hook_heartbeat("check", {"session_id": "s1"})
@@ -2099,6 +2100,7 @@ class Login(Base):
         self.keychain_works = True
         self.refresh_status = 200
         self.n = 0
+        self.refresh_bodies = []
 
         def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
             self.calls.append((method, path, json.dumps(body)))
@@ -2111,7 +2113,9 @@ class Login(Base):
                 if self.refresh_status != 200:
                     raise ds.ApiError(self.refresh_status, {"error": "invalid_grant"})
                 self.n += 1
-                return 200, "application/json", json.dumps({"access_token": "dsat_" + str(self.n) * 43, "expires_in": 900})
+                # XLI-290: each refresh rotates the refresh token (the old one is retired at datastash).
+                self.refresh_bodies.append(body)
+                return 200, "application/json", json.dumps({"access_token": "dsat_" + str(self.n) * 43, "refresh_token": "dsrt_" + str(self.n) * 43, "expires_in": 900})
             if path == ds.DEVICE_LOGOUT_PATH:
                 return 200, "application/json", json.dumps({"revoked": True})
             raise AssertionError(path)
@@ -2195,6 +2199,43 @@ class Login(Base):
         with redirect_stdout(buf):
             ds.cmd_token(["--header"])
         self.assertEqual(json.loads(buf.getvalue()), {})
+
+    def expire_access(self):
+        a = json.load(open(ds.LOGIN_ACCESS_FILE))
+        ds.write_private(ds.LOGIN_ACCESS_FILE, json.dumps(dict(a, exp=int(time.time()) + 30)))
+
+    def test_each_refresh_keeps_the_rotated_refresh_token_and_sends_it_next_time(self):
+        for works, store in ((True, "keychain"), (False, "file")):
+            self.keychain_works = works
+            self.keychain.clear()
+            self.refresh_bodies.clear()
+            self.n = 0
+            self.finish_login()
+            self.assertEqual(json.load(open(ds.LOGIN_FILE))["store"], store)
+            self.expire_access()
+            self.assertEqual(ds.login_token(), "dsat_" + "1" * 43)
+            self.assertEqual(ds.refresh_token(), "dsrt_" + "1" * 43)
+            self.expire_access()
+            self.assertEqual(ds.login_token(), "dsat_" + "2" * 43)
+            self.assertEqual([b["refresh_token"] for b in self.refresh_bodies], ["dsrt_" + "r" * 43, "dsrt_" + "1" * 43])  # never the retired one again
+            self.assertEqual(ds.refresh_token(), "dsrt_" + "2" * 43)
+
+    def test_a_cached_token_needs_no_refresh_and_one_process_refreshes_at_a_time(self):
+        self.finish_login()
+        self.expire_access()
+        lock = os.open(ds.LOGIN_LOCK_FILE, os.O_WRONLY | os.O_CREAT, 0o600)
+        ds.fcntl.flock(lock, ds.fcntl.LOCK_EX)
+        self.saved.setdefault("LOGIN_LOCK_WAIT", ds.LOGIN_LOCK_WAIT)
+        ds.LOGIN_LOCK_WAIT = 0.3
+        try:
+            self.assertIsNone(ds.login_token())  # another process holds the refresh: no second refresh with the same token
+            self.assertEqual(self.refresh_bodies, [])
+        finally:
+            ds.fcntl.flock(lock, ds.fcntl.LOCK_UN)
+            os.close(lock)
+        self.assertEqual(ds.login_token(), "dsat_" + "1" * 43)
+        self.assertEqual(ds.login_token(), "dsat_" + "1" * 43)
+        self.assertEqual(len(self.refresh_bodies), 1)
 
     def test_revoked_at_datastash_forgets_the_local_login(self):
         self.finish_login()

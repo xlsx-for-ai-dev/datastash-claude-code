@@ -415,36 +415,94 @@ def _forget_login():
 
 
 LOGIN_REFRESH_TIMEOUT = 5  # with the keychain read (3 s), inside the connector helper's 10 s
+LOGIN_LOCK_FILE = os.path.join(CONF, "login.lock")
+LOGIN_LOCK_WAIT = 3  # seconds another process of this computer may hold the refresh
+
+
+def _cached_access():
+    a = _read_private_json(LOGIN_ACCESS_FILE)
+    if a and isinstance(a.get("token"), str) and re.fullmatch(ACCESS_RE, a["token"]) and _num_ok(a.get("exp")) and a["exp"] - 60 > time.time():
+        return a["token"]
+    return None
+
+
+def _store_refresh(refresh):
+    """Keeps a rotated refresh token where the login keeps it (keychain, else the private file). True when kept."""
+    where = read_json(LOGIN_FILE, {}).get("store")
+    if where == "keychain" and _keychain_set(refresh):
+        return True
+    try:
+        write_private(LOGIN_REFRESH_FILE, refresh + "\n")
+        if where != "file":
+            write_private(LOGIN_FILE, json.dumps({"store": "file", "at": int(time.time())}))
+        return True
+    except OSError:
+        return False
 
 
 def login_token(force=False):
     """A live access token of this computer's datastash login (refreshed within a minute of its end), or None: not
     signed in, signed out at datastash (then the local login is removed), or datastash can't be reached. Never printed
-    or logged by this function."""
+    or logged by this function.
+
+    Each refresh hands back a NEW refresh token and retires the old one; using a retired one again signs this computer
+    out (datastash reads it as a copied token). So one process of this computer refreshes at a time (login.lock), the
+    others then use the token it saved, and the new refresh token is kept before the access token is used."""
     if not force:
-        a = _read_private_json(LOGIN_ACCESS_FILE)
-        if a and isinstance(a.get("token"), str) and re.fullmatch(ACCESS_RE, a["token"]) and _num_ok(a.get("exp")) and a["exp"] - 60 > time.time():
-            return a["token"]
-    rt = refresh_token()
-    if rt is None:
-        return None
+        tok = _cached_access()
+        if tok:
+            return tok
     try:
-        _st, _ct, text = http("POST", DEVICE_REFRESH_PATH, body={"refresh_token": rt}, timeout=LOGIN_REFRESH_TIMEOUT)
-        got = json.loads(text)
-    except ApiError as e:
-        if e.status in (400, 401):
-            _forget_login()  # signed out at datastash (account page or logout elsewhere)
-        return None
-    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
-        return None
-    tok = got.get("access_token") if isinstance(got, dict) else None
-    if not isinstance(tok, str) or not re.fullmatch(ACCESS_RE, tok):
-        return None
-    try:
-        _save_access(tok, got.get("expires_in"))
+        ensure_dirs()
+        lock = os.open(LOGIN_LOCK_FILE, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError:
-        pass
-    return tok
+        return None
+    try:
+        deadline = time.time() + LOGIN_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    return None
+                time.sleep(0.1)
+        if not force:
+            tok = _cached_access()  # another process refreshed while this one waited
+            if tok:
+                return tok
+        rt = refresh_token()
+        if rt is None:
+            return None
+        try:
+            _st, _ct, text = http("POST", DEVICE_REFRESH_PATH, body={"refresh_token": rt}, timeout=LOGIN_REFRESH_TIMEOUT)
+            got = json.loads(text)
+        except ApiError as e:
+            if e.status in (400, 401):
+                _forget_login()  # signed out at datastash (account page, logout elsewhere, or a copied token)
+            return None
+        except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+            return None
+        if not isinstance(got, dict):
+            return None
+        new_rt = got.get("refresh_token")
+        if isinstance(new_rt, str) and re.fullmatch(REFRESH_RE, new_rt) and new_rt != rt:
+            if not _store_refresh(new_rt):
+                return None
+        tok = got.get("access_token")
+        if not isinstance(tok, str) or not re.fullmatch(ACCESS_RE, tok):
+            return None
+        try:
+            _save_access(tok, got.get("expires_in"))
+        except OSError:
+            pass
+        return tok
+    finally:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock)
 
 
 def _read_key_file(p, pattern, s):

@@ -48,10 +48,23 @@ About `datastash login`:
   minutes, once.
 - The login's refresh token is kept in the system keychain (macOS Keychain; libsecret's `secret-tool` on Linux), or in
   `~/.config/datastash/login.refresh` (mode 600) when there is none. It is never printed. Access tokens last 15 minutes.
-- A new login reaches only its agent workbook. Your other workbooks open to it after one click on the datastash site
-  (`/confirm`), which only you can make; the AI asks you when it needs that.
-- Your account page lists every signed-in computer (name, last used, country) with **Sign out**, which stops it at
-  once. `datastash logout` does the same from the computer and removes the keychain item.
+- Every refresh gives a new refresh token and retires the old one. If a retired one is ever used again (someone copied
+  it), datastash signs that computer out at once. A login also ends 30 days after its last use and 90 days after it
+  was made; run `datastash login` again then.
+- The keychain keeps the token away from other people and other user accounts, not from programs that run as you. The
+  plugin reads it with the system's own `security` (macOS) or `secret-tool` (Linux) tool, so a keychain access list
+  can't tell the plugin apart from any other shell command of yours, an AI's included; none is set. What protects you
+  instead: rotation (a copy is caught on its next use), the 30/90-day lifetimes, the new-network check below, and the
+  person-only steps on the datastash site.
+- A new login reaches only its agent workbook, and is not you: until you allow it, it can't read your inbox, watch for
+  you, send as you, or make or stop other agents' keys. Your other workbooks and those steps open to it after one click
+  on the datastash site (`/confirm`), which only you can make; the AI asks you when it needs that. The page shows the
+  computer, the network it signed in from and when.
+- An agent key never gets a login's reach: each key needs its own click on `/confirm`.
+- If the login is used from a network (or country) you haven't allowed it from, it drops back to its agent workbook until
+  you allow that network with one more click on `/confirm`, which names it.
+- Your account page lists every signed-in computer (name, last used, country, network) with **Sign out**, which stops it
+  at once. `datastash logout` does the same from the computer and removes the keychain item.
 - Claude chat and Cowork use the connector's normal **Connect** sign-in; `datastash login` is for Claude Code.
 
 For one session only, without installing, from a clone of this repository:
@@ -192,6 +205,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `login.json` | where this computer's datastash login keeps its refresh token (`keychain` or `file`) and when it was made; never a token |
 | `login.refresh` | the login's refresh token, only when no system keychain works (otherwise it is in the keychain, service `datastash`) |
 | `login.access.json` | the current 15-minute access token (so each helper call doesn't refresh); read only by the `datastash` command |
+| `login.lock` | held while one `datastash` process refreshes the login, so two never send the same refresh token; empty |
 | `main.key` | an earlier main key (made before datastash login); still used until it is stopped, read only by a main session |
 | `state/main-session-<id>.json` | which session is the person's main (session id, its Claude Code process id and start time); removed at SessionEnd |
 | `state/main-request-<id>.json` | the person typed "datastash main" in that session (good for 30 minutes) |
