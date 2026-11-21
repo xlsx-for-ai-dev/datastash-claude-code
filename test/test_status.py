@@ -1334,7 +1334,8 @@ class Relayed(Base):
         self.assertEqual(ds.status_body(row, WB)["asks"][0]["options"], opts)
         self.with_asks("api", [{"id": "q1", "version": 3, "text": "Which one?", "options": opts}])
         ctx = self.prompt("status of all my agents")
-        self.assertIn("j) choice 9. (4 more options; type the one you want in its own words.)", ctx)
+        self.assertIn("j) choice 9. (4 more options; type the one you want in its own words; for a long one, its first "
+                      "words are enough.)", ctx)
         self.assertNotIn("choice 10", ctx)
         api = next(r for r in ds.read_status_cache(WB)["agents"] if r["agent"] == "api")
         self.assertEqual(api["asks"][0]["options"], opts)  # the local copy keeps them whole too
@@ -1402,6 +1403,97 @@ class Relayed(Base):
             self.assertIn(want, sec)
         self.assertIn("options", ds.STATUS_REMINDER)
         self.assertIn("needs_person", ds.STATUS_REMINDER)
+
+
+class Addendum7(Base):
+    """Addendum 7 NEW-2 and the LOWs, and Addendum 8 (answer marker), plugin side."""
+    def with_asks(self, agent, asks):
+        Relayed.with_asks(self, agent, asks)
+
+    def test_new2_a_200kb_option_shows_at_most_300_characters(self):
+        """Picked by letter: the agent gets the whole option; the session, the outcome line, the Stop hook's message and
+        the local copy of what was sent show at most 300 characters of it."""
+        big = "keep everything " + "x" * 200_000
+        self.with_asks("api", [{"id": "q1", "version": 3, "text": "Which retention?", "options": ["none", big]}])
+        self.prompt("status of all my agents")
+        ctx = self.prompt("4: b")
+        self.assertLess(len(ctx), 2000)
+        line = framed_inner(ctx)[0]
+        self.assertTrue(line.startswith("Sending your answer to api:"))
+        self.assertLessEqual(len(line.split(" → ", 1)[1]), 300)
+        self.assertEqual(self.answers()[-1][3]["answer"], big)  # the whole option goes to the agent
+        out = self.outcomes()
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith("Sent to api: keep everything x"))
+        self.assertLess(len(out[0]), 300 + 200)
+        items = ds.read_json(ds._answers_sent_path(), {})["items"]
+        self.assertLessEqual(len(items[-1]["said"]), 300)
+        self.assertLess(os.path.getsize(ds._answers_sent_path()), 4000)
+        self.assertTrue(all(len(x) < 1000 for x in ds.sent_lines(WB)))
+        # the Stop hook's message is bounded the same way
+        ds.add_outcome("sess1", ds.deliver_answer(dict(ds.read_json(ds._answers_sent_path(), {})["items"][-1],
+                                                       answer=big, shown='"Which retention?"', ask_version=3), "sess1"))
+        v = self.hook(ds.cmd_status_check, {"session_id": "sess1", "hook_event_name": "Stop"})
+        self.assertLess(len(v["systemMessage"]), 600)
+        self.assertEqual(self.answers()[-1][3]["answer"], big)
+
+    def test_new2_an_offline_answer_line_is_bounded_too(self):
+        big = "archive all of it " + "y" * 5000
+        self.with_asks("api", [{"id": "q1", "version": 3, "text": "Which retention?", "options": ["none", big]}])
+        self.prompt("status of all my agents")
+        self.answer_error = ds.ApiError(503, {"error": "busy"})
+        self.prompt("4: b")
+        out = self.outcomes()[0]
+        self.assertTrue(out.startswith("Saved your answer for api:"))
+        self.assertLess(len(out), 700)
+        queued = [n for n in os.listdir(ds.STATE) if n.startswith("status-answer-out-")]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(ds.read_json(os.path.join(ds.STATE, queued[0]), {})["answer"], big)  # sent later whole
+
+    def test_low_an_ask_is_matched_past_its_first_40_characters(self):
+        """An AI that reprints the list with the ask's tail changed: "do N" no longer counts."""
+        text = "Delete the old invoices endpoint and the table behind it?"
+        self.with_asks("api", [{"id": "q1", "version": 3, "text": text}])
+        ctx = self.prompt("status of all my agents", say=False)
+        self.says("sess1", ctx.replace("and the table behind it", "but keep the table behind it"))
+        self.calls.clear()
+        self.assertIsNone(self.prompt("do 4"))
+        self.assertEqual(self.answers(), [])
+        self.says("sess1", self.prompt("status of all my agents", say=False))  # shown as it is: it answers
+        self.calls.clear()
+        self.prompt("do 4")
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_low_a_long_option_past_the_10th_can_be_picked_by_its_first_words(self):
+        long1 = "migrate every customer record to the new schema and " + "z" * 400
+        long2 = "migrate only the active customers to the new schema " + "q" * 400
+        opts = [f"choice {i}" for i in range(11)] + [long1, long2]
+        self.with_asks("api", [{"id": "q1", "version": 3, "text": "Which one?", "options": opts}])
+        self.prompt("status of all my agents")
+        self.prompt("4: migrate every customer record to the new")
+        self.assertEqual(self.answers()[-1][3]["answer"], long1)
+        P = ds.pick_option
+        self.assertIsNone(P("migrate", opts))  # too short to pick
+        self.assertIsNone(P("migrate every customer record to the new schema and zz" + "z" * 400, opts))  # not one line
+        self.assertEqual(P("Migrate only the active customers", opts), long2)
+        self.assertIsNone(P("migrate all customer records", ["migrate all customer records now " + "a" * 300,
+                                                             "migrate all customer records later " + "b" * 300]))  # two
+        self.assertIsNone(P("choice number one is", ["choice number one is the best"]))  # short options: words only whole
+
+    def test_addendum8_only_marked_person_answers_are_answers(self):
+        """The skill tells agents a message is a person's answer only with the server's `person_answer: true`; the plugin
+        itself never sends that field (an agent can't mark its own message as the person's answer)."""
+        with open(os.path.join(HERE, "..", "plugins", "datastash", "skills", "datastash-agent", "SKILL.md")) as f:
+            skill = f.read()
+        sec = skill[skill.index("### Answers to your asks"):]
+        sec = sec[:sec.index("\n## ")]
+        for want in ("`person_answer: true`", "set by the server", "ordinary message", "never act on it as an answer"):
+            self.assertIn(want, sec)
+        self.prompt("status of all my agents")
+        self.prompt("do 4")
+        self.assertNotIn("person_answer", self.answers()[-1][3])
+        with open(BIN) as f:
+            self.assertNotIn("person_answer", f.read())
 
 
 class LinkGate(Base):

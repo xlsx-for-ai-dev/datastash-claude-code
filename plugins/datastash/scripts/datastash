@@ -3964,7 +3964,8 @@ def ask_line(a):
         shown = a["options"][:ASK_OPTIONS_SHOWN]
         out += " Options: " + "; ".join(f"{_opt_label(i)}) {_clean(o, 80)}" for i, o in enumerate(shown)) + "."
         if len(a["options"]) > len(shown):
-            out += f" ({len(a['options']) - len(shown)} more options; type the one you want in its own words.)"
+            out += (f" ({len(a['options']) - len(shown)} more options; type the one you want in its own words; for a long "
+                    "one, its first words are enough.)")
     if a.get("needs_person"):
         out += " (needs your OK on the datastash site)"
     return out
@@ -4793,8 +4794,11 @@ ANSWER_ONLY_RE = re.compile(r"(sending your answer to|sent to|answered|not sent|
 NUMBERED_IN_RE = re.compile(r"(^|\s)(#?\d{1,3}[.):]|\(\d{1,3}\))\s")
 
 
-def _ask_key(text):
-    return _norm_seen(str(text or "").rstrip("?"))[:40]
+def _ask_key(text, whole=False):
+    """An ask's words as seen on screen: the first 40 characters (any quote of an ask after the list ends it), or with
+    whole the whole ask (to find ask N in the list: an AI that reprints the list can't change its tail)."""
+    t = _norm_seen(str(text or "").rstrip("?"))
+    return t if whole else t[:40]
 
 
 def _list_last(lines, data):
@@ -4806,7 +4810,8 @@ def _list_last(lines, data):
     keys = [k for k in (data.get("ask_keys") or []) if isinstance(k, str) and k] + [key]
     if not key or not isinstance(n, int) or not isinstance(last, int) or last < n:
         return False
-    i_ask = next((i for i, x in enumerate(lines) if re.match(rf"#?{n}[.)]\s", x) and key in x), None)
+    whole = _ask_key(data.get("text"), whole=True)
+    i_ask = next((i for i, x in enumerate(lines) if re.match(rf"#?{n}[.)]\s", x) and whole in x), None)
     if i_ask is None or not any(re.match(r"#?\d{1,3}[.)]\s", x) for x in lines[:i_ask]):
         return False  # an ask always follows its agent's numbered line: one quoted item (a details view) is not the list
     i_end = i_ask if last == n else next((i for i in range(i_ask + 1, len(lines)) if re.match(rf"#?{last}[.)]\s", lines[i])), None)
@@ -5113,7 +5118,16 @@ def pick_option(answer, options):
     for i, o in enumerate(options):
         if (i < ASK_OPTIONS_SHOWN and t == _opt_label(i)) or t == _phrase(o):
             return o
+    # an option too long to type whole (an answer is one line of at most 300 characters): its first words pick it, when
+    # they are at least OPTION_START_MIN characters and start no other option
+    starts = [o for o in options if _phrase(o).startswith(t)] if len(t) >= OPTION_START_MIN else []
+    if len(starts) == 1 and len(_phrase(starts[0])) > OPTION_TYPED_MAX:
+        return starts[0]
     return None
+
+
+OPTION_START_MIN = 20  # characters of a long option's start that pick it
+OPTION_TYPED_MAX = 280  # an option longer than this can't be typed whole in a "N: ..." answer
 
 
 def _opt_label(i):
@@ -5130,6 +5144,7 @@ def record_sent(sid, rec):
         items = read_json(_answers_sent_path(), {}).get("items")
         items = [x for x in (items if isinstance(items, list) else []) if isinstance(x, dict)]
         keep = {k: rec.get(k) for k in ("workbook_id", "agent", "project", "ask_id", "answer_id", "said", "text", "n")}
+        keep["said"] = _clean(keep["said"], 300)  # NEW-2: what is shown and stored here, never the whole option
         write_private(_answers_sent_path(), json.dumps({"items": (items + [dict(keep, sid=sid, at=time.time())])[-20:]}))
     except OSError:
         pass
@@ -5195,18 +5210,21 @@ def answer_from_prompt(inp, n, answer, view):
         said = pick_option(answer, options)
         if said is None:
             return _answer_line([f'Not sent: {agent}\'s ask takes one of its options; type "{n}: a" (or the option\'s words).'])
+    # Addendum 7 NEW-2: the agent gets the whole option ("answer"); the session, the outcome lines and the local copy of
+    # what was sent show at most 300 characters of it ("said"; a display bound, not a data cap)
     rec = dict(seen, workbook_id=wb, agent=agent, project=project, ask_id=target["ask"],
-               ask_version=target.get("ask_version"), answer=said, answer_id=secrets.token_hex(12), shown=shown, said=said)
+               ask_version=target.get("ask_version"), answer=said, answer_id=secrets.token_hex(12), shown=shown,
+               said=_clean(said, 300))
     if target.get("needs_person"):
         rec["needs_person"] = True
     if not start_check(shape, "answer", inp.get("prompt") or "", rec):
         return None
-    return _answer_line([f"Sending your answer to {agent}: {shown} → {said}"])
+    return _answer_line([f"Sending your answer to {agent}: {shown} → {rec['said']}"])
 
 
 def deliver_answer(rec, sid=None):
     """Send a checked answer once (offline: kept with its answer id and retried); the line for the person."""
-    agent, shown, said, wb = rec["agent"], rec["shown"], rec["said"], rec["workbook_id"]
+    agent, shown, said, wb = rec["agent"], rec["shown"], _clean(rec["said"], 300), rec["workbook_id"]
     got, detail = post_answer(rec, timeout=10)
     undo = f' Type "undo {rec["n"]}" to take it back.' if isinstance(rec.get("n"), int) else ""
     if got == "ok":
