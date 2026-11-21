@@ -1800,9 +1800,9 @@ def cmd_link(args):
         if not os.path.isdir(proj_opt):
             die(f"{proj_opt} is not a folder")
         if (os.path.realpath(proj_opt) != os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-                and not named_consent(proj_opt)):
-            die(f"{os.path.realpath(proj_opt)} is not a project the person said yes to keeping in datastash; link "
-                "another folder only after their yes (datastash-agent skill, \"Recent projects from history\")")
+                and not consent_for(proj_opt)):
+            die(f"{os.path.realpath(proj_opt)} is not kept in datastash: keeping is not on for this computer (the person "
+                "turns it on by typing the keep phrase), or the person left that folder off")
     s = slug(name)
     me = this_session()
     _no_agent_in_main(me, "links an agent")
@@ -3043,9 +3043,9 @@ def cmd_auto_name(args):
         if not os.path.isdir(project):
             die(f"{project} is not a folder")
         if (os.path.realpath(project) != os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
-                and not named_consent(project)):
-            die(f"{os.path.realpath(project)} is not a project the person said yes to keeping in datastash; register "
-                "another folder only after their yes (datastash-agent skill, \"Recent projects from history\")")
+                and not consent_for(project)):
+            die(f"{os.path.realpath(project)} is not kept in datastash: keeping is not on for this computer (the person "
+                "turns it on by typing the keep phrase), or the person left that folder off")
     if args[:1] == ["--after"] and len(args) == 2:
         after = args[1].strip()[:44] or None
     elif args:
@@ -3368,7 +3368,12 @@ def cmd_prompt(_args):
             ctx = None
         if isinstance(ctx, dict) and ctx.get("show"):
             # XLI-337: the status answer itself, from the local copy, shown by plain code with no model turn (fast).
-            print(json.dumps({"decision": "block", "reason": ctx["show"]}))
+            # The "signed in now, reconnect" line still shows when it is due (file checks only: no network here).
+            person, _ai = _safe_followup(inp, False)
+            shown = ctx["show"] + (f"\n\n{person}" if person else "")
+            print(json.dumps({"decision": "block", "reason": shown,
+                              "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                                     "suppressOriginalPrompt": True}}))
             return 0
         person, ai = _safe_followup(inp, isinstance(prompt, str) and "datastash" in prompt.lower())
         ctx = " ".join(x for x in (ai, ctx if isinstance(ctx, str) else None) if x)
@@ -4328,15 +4333,6 @@ def consent_for(folder):
     return keep_state() == "yes"
 
 
-def named_consent(folder):
-    """True only when the person named this folder (or one it is in) in their answer to the history list: the
-    history-reading steps and registering another folder need that, not this computer's yes for its agents."""
-    if not folder:
-        return False
-    here = os.path.realpath(folder)
-    return any(_within(here, os.path.realpath(k)) for k in read_consent()["keep"])
-
-
 def record_consent(keep, no):
     whole = read_json(CONSENT_PATH, {})
     c = read_consent()
@@ -5022,6 +5018,9 @@ def cmd_status_set(args):
             opts[a] = True
         else:
             die("usage: printf '%s' '{\"doing\": ..., \"details\": ..., \"asks\": [...]}' | datastash status-set - [--project DIR]")
+    if fcntl is None:  # Windows (no file locking): no agent status there yet, as before 0.3.0; no local copy
+        print("agent status isn't kept on this computer yet (Windows); nothing was saved.")
+        return 0
     cur = os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     here = os.path.realpath(opts["--project"]) if opts.get("--project") else cur
     me = this_session()
@@ -5410,7 +5409,8 @@ def start_check(shape, kind, prompt, data):
 def cmd_status_verify(args):
     """Internal (started by the prompt hook, detached): act on the person's phrase only once the session transcript
     shows it as their own typed entry for that prompt id (used once, recent). Otherwise nothing happens. XLI-337: the
-    keep phrase (turns keeping on) and "leave <name> off" (stops keeping a project; it only makes agents share less)."""
+    keep phrase (turns keeping on). "leave <name> off" is recorded by the prompt hook itself (a blocked prompt is never
+    written to the transcript)."""
     if len(args) != 1 or not re.fullmatch(PROMPT_ID_RE, args[0]):
         return 1
     path = _pending_path(args[0])
@@ -5443,12 +5443,9 @@ def cmd_status_verify(args):
         write_private(_typed_used_path(sid), json.dumps({"ids": (used + [rec["pid"]])[-50:]}))
     except OSError:
         return 0
-    data = rec.get("data") or {}
     try:
         if rec.get("kind") == "keep":
             record_keep_all(True, "typed")
-        elif rec.get("kind") == "leave" and isinstance(data.get("folders"), list):
-            record_left_off([f for f in data["folders"] if isinstance(f, str) and f])
     except OSError:
         return 0
     return 0
@@ -5559,8 +5556,8 @@ def _leave_folders(name):
 def status_prompt_context(inp):
     """The UserPromptSubmit answer for a status phrase, or None (an ordinary prompt). Returns a dict {"show": text} when
     the plugin answers itself from the local copy (XLI-337: no model turn, no network), or a line for the AI.
-    Nothing here sends anything; keeping and "leave off" are acted on only by the checker, once the transcript shows the
-    person's own typed prompt."""
+    Nothing here sends anything. Keeping is acted on only by the checker, once the transcript shows the person's own
+    typed prompt; "leave <name> off" is saved here (it only makes agents share less)."""
     text = inp.get("prompt")
     if keep_phrase(text):
         shape = hook_shape(inp)
@@ -5574,10 +5571,17 @@ def status_prompt_context(inp):
     here = project_of(inp)
     kind, arg = ph
     if kind == "leave":
+        # PM ruling (review 1 HIGH): a blocked prompt is never written to the transcript, so the hook records the
+        # leave-off itself and shows the OK only once it is saved. It only makes agents share less (accepted: an
+        # AI-typed "leave X off" takes effect too, as Partial/Off do).
         folders = _leave_folders(arg)
-        shape = hook_shape(inp)
-        if not folders or shape is None or not start_check(shape, "leave", text, {"folders": folders}):
+        if not folders or hook_shape(inp) is None:
             return None
+        try:
+            record_left_off(folders)
+        except OSError:
+            return {"show": f'"{_clean(arg, 64)}" could not be left off: the datastash config folder is not writable. '
+                            "Nothing changed."}
         return {"show": f'OK: "{_clean(arg, 64)}" is left off datastash. Its status is no longer kept or sent.'}
     if kind == "private":
         if not _leave_folders(arg):
@@ -5594,15 +5598,20 @@ def status_prompt_context(inp):
         lines = render_status_details(here, me, arg, for_person=True)
         return {"show": "\n".join(lines)} if lines else None
     main = bool(sid) and os.path.exists(_main_path(sid))
+    if keep_state() != "yes":
+        # status off: nothing is sent; the agent answers the ordinary way, then the one line to turn keeping on
+        return (f"{STATUS_NOTE}: the person asked for their agents' status; datastash is not keeping it on this "
+                "computer. Answer the ordinary way (find out where this session's work stands). End your answer "
+                f"with this line, as it is, and nothing after it:\n{TURN_ON_LINE}")
     if not main and main_root(here) is None:
-        if keep_state() != "yes":
-            # status off: nothing is sent; the agent answers the ordinary way, then the one line to turn keeping on
-            return (f"{STATUS_NOTE}: the person asked for their agents' status; datastash is not keeping it on this "
-                    "computer. Answer the ordinary way (find out where this session's work stands). End your answer "
-                    f"with this line, as it is, and nothing after it:\n{TURN_ON_LINE}")
         _agent, missing = own_status_missing(here, me(False))
         if missing:
             return f"{STATUS_NOTE}: the person asked for their agents' status. {SEED_NOTE}"
+    else:
+        # the person's main (review 1 LOW 2): fast only when a saved status (the local copy) is there, else ordinary
+        _sess, wb = _status_where(here, me)
+        if wb is None or read_status_cache(wb) is None:
+            return None
     install = kind == "all" and not os.path.exists(INSTALL_ASKED_PATH)
     lines = render_status_all(here, me, install=install, only=arg if kind == "more" else None, for_person=True)
     if not lines:

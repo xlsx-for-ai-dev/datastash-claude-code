@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -206,11 +207,14 @@ class Base(unittest.TestCase):
         n = len(self.spawned)
         v = self.hook(ds.cmd_prompt, inp)
         self.last_hook = v
-        if v and v.get("decision") == "block":
+        blocked = bool(v) and v.get("decision") == "block"
+        if blocked:
             ctx = v["reason"]  # the plugin answered itself (shown to the person; no model turn)
         else:
             ctx = v["hookSpecificOutput"]["additionalContext"] if v else None
-        if writer is not None:
+        if blocked:
+            pass  # Claude Code writes no transcript entry for a blocked prompt (promptKept: false)
+        elif writer is not None:
             writer(sid, text, pid)
         else:
             self.typed(sid, text, pid, **typed_kw)
@@ -796,19 +800,27 @@ class PersonOnly(Base):
 
 class LinkGate(Base):
     """Addendum 6 N3: `link --project DIR` gets the same named-yes gate as `auto-name --project`."""
-    def test_link_another_folder_needs_the_persons_named_yes(self):
+    def test_link_another_folder_needs_keeping_on_and_not_left_off(self):
+        """Review 1 LOW 3: the keep phrase covers all agents on this computer, so it is the yes for its folders; a
+        folder the person left off, or keeping off, refuses (no pointer to a removed skill section)."""
         other = os.path.realpath(tempfile.mkdtemp(prefix="other-", dir=TMP))
-        ds.record_keep_all(True, "typed")  # this computer's yes for its agents is not a yes for any folder
-        rc, _, err = self.run_cmd(ds.cmd_link, ["web-app", "--workbook", WB, "--project", other])
+        left = os.path.realpath(tempfile.mkdtemp(prefix="left-", dir=TMP))
+        ds.record_left_off([left])
+        rc, _, err = self.run_cmd(ds.cmd_link, ["web-app", "--workbook", WB, "--project", left])
         self.assertNotEqual(rc, 0)
-        self.assertIn("not a project the person said yes to", err)
-        self.assertNotIn(other, ds.read_json(ds.conf_path("web-app"), {})["projects"])
-        rc, _, err = self.run_cmd(ds.cmd_link, ["web-app", "--workbook", WB, "--project", self.folder])  # its own folder
-        self.assertEqual(rc, 0, err)
-        ds.record_consent([other], [])
+        self.assertIn("is not kept in datastash", err)
+        self.assertNotIn("Recent projects from history", err)
+        self.assertNotIn(left, ds.read_json(ds.conf_path("web-app"), {})["projects"])
         rc, _, err = self.run_cmd(ds.cmd_link, ["web-app", "--workbook", WB, "--project", other])
         self.assertEqual(rc, 0, err)
         self.assertIn(other, ds.read_json(ds.conf_path("web-app"), {})["projects"])
+        c = ds.read_json(ds.CONSENT_PATH, {})
+        c["all"] = {"keep": False, "at": 1}
+        ds.write_private(ds.CONSENT_PATH, json.dumps(c))
+        third = os.path.realpath(tempfile.mkdtemp(prefix="third-", dir=TMP))
+        rc, _, err = self.run_cmd(ds.cmd_auto_name, ["--project", third])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("keeping is not on for this computer", err)
 
 
 class CliSpeed(Base):
@@ -915,7 +927,8 @@ class FastAnswer(Base):
     def test_status_of_all_my_agents_is_answered_by_the_plugin(self):
         for phrase in ("status of all my agents", "What's the status of all my agents?", "status"):
             text = self.prompt(phrase)
-            self.assertEqual(self.last_hook, {"decision": "block", "reason": text}, phrase)
+            self.assertEqual(self.last_hook, {"decision": "block", "reason": text, "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": True}}, phrase)
             self.assertTrue(text.startswith("Status of your agents (refreshed"), text)
             self.assertIn(ds.STATUS_WORDS_LINE, text)  # each agent's text is its own words
             self.assertIn("1. web-app — ", text)
@@ -956,6 +969,43 @@ class FastAnswer(Base):
         text = self.prompt("status of all my agents")
         self.assertIn("agent status isn't available on datastash yet", text)
         self.assertNotIn("sent", text.lower())
+
+    def test_blocked_answer_still_shows_the_reconnect_line_when_due(self):
+        """Review 1 LOW 1: a status phrase answered by the plugin still shows "signed in now, reconnect" once."""
+        ds.ensure_dirs()
+        ds.write_private(ds._signed_out_mark("sess1"), "{}")
+        saved = ds._login_recorded
+        ds._login_recorded = lambda: True
+        try:
+            text = self.prompt("status of all my agents")
+        finally:
+            ds._login_recorded = saved
+        self.assertTrue(text.startswith(ds.STATUS_HEAD))
+        self.assertTrue(text.rstrip().endswith(ds.CONNECT_LINE), text)
+        self.assertFalse(os.path.exists(ds._signed_out_mark("sess1")))
+        self.assertNotIn(ds.CONNECT_LINE, self.prompt("status of all my agents"))  # once
+        self.assertEqual(self.calls, [])
+
+    def test_main_session_is_fast_only_with_keeping_on_and_a_saved_status(self):
+        """Review 1 LOW 2: the person's main session gets the same checks: keeping on and a saved status (local copy)."""
+        ds.ensure_dirs()
+        ds.write_private(ds._main_path("main1"), "{}")
+        text = self.prompt("status of all my agents", sid="main1")
+        self.assertEqual(self.last_hook["decision"], "block")
+        self.assertTrue(text.startswith(ds.STATUS_HEAD))
+        c = ds.read_json(ds.CONSENT_PATH, {})
+        c["all"] = {"keep": False, "at": 1}
+        ds.write_private(ds.CONSENT_PATH, json.dumps(c))
+        ctx = self.prompt("status", sid="main1")
+        self.assertIsNone(self.last_hook.get("decision"))
+        self.assertTrue(ctx.rstrip().endswith(ds.TURN_ON_LINE))
+        ds.record_keep_all(True, "typed")
+        for n in os.listdir(ds.CONF):
+            if re.fullmatch(r"status-[A-Za-z0-9-]+\.json", n) and n != "status-consent.json":
+                os.replace(os.path.join(ds.CONF, n), os.path.join(TMP, f"gone-{time.time()}-{n}"))
+        self.assertIsNone(self.prompt("status", sid="main1"))  # no saved status: an ordinary prompt
+        self.assertIsNone(self.last_hook)
+        self.assertEqual(self.calls, [])
 
     def test_under_two_seconds_in_process(self):
         t = time.time()
@@ -1001,6 +1051,21 @@ class StatusOff(Base):
             self.assertTrue(ctx.rstrip().endswith(ds.TURN_ON_LINE))
         self.assertEqual(self.calls, [])
 
+    def test_status_set_on_windows_says_one_line_and_keeps_no_copy(self):
+        """Review 1 LOW 4: no file locking (Windows): no crash, no local copy, one plain line."""
+        saved = ds.fcntl
+        ds.fcntl = None
+        try:
+            rc, out, err = self.run_cmd(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Working."}))
+        finally:
+            ds.fcntl = saved
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(out.strip().splitlines()), 1, out)
+        self.assertIn("nothing was saved", out)
+        self.assertIsNone(ds.read_status_cache(WB))
+        self.assertIsNone(ds.read_json(ds._outbox_path("web-app"), None))
+        self.assertEqual(self.spawned, [])
+
     def test_nothing_is_sent(self):
         rc, out, err = self.run_cmd(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Working."}))
         self.assertEqual(rc, 0, err)
@@ -1021,15 +1086,36 @@ class InstallQuestion(Base):
         self.assertTrue(text.rstrip().endswith("Did we miss any of your agents, or is there one you don't want on datastash?"))
         self.assertNotIn(ds.INSTALL_QUESTION, self.prompt("status of all my agents"))
 
-    def test_leave_off_is_the_persons_typed_words(self):
+    def test_leave_off_is_saved_by_the_hook_before_the_ok(self):
+        """Review 1 HIGH (PM ruling): Claude Code writes no transcript entry for a blocked prompt, so the hook saves the
+        leave-off itself, and shows the OK only once it is saved. No checker is started."""
         self.assertTrue(ds.consent_for(self.folder))
-        self.prompt("leave web-app off", writer=self.headless)  # a headless prompt: refused
-        self.assertTrue(ds.consent_for(self.folder))
+        n = len(self.spawned)
         text = self.prompt("leave web-app off")
+        self.assertEqual(self.last_hook["decision"], "block")
         self.assertIn('"web-app" is left off datastash', text)
         self.assertFalse(ds.consent_for(self.folder))
+        self.assertEqual(self.spawned[n:], [])
         self.assertEqual(self.calls, [])
+        # the refresher, the sender and the Stop reminder all read consent_for: off now
+        rc, out, err = self.run_cmd(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Working."}))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("kept on this machine only", out)
+        self.assertEqual([a for a in self.spawned if "status-send" in a], [])
         self.assertIsNone(self.prompt("leave nobody-here off"))
+
+    def test_leave_off_says_ok_only_when_saved(self):
+        saved = ds.record_left_off
+        def fail(_folders):
+            raise OSError("read-only")
+        ds.record_left_off = fail
+        try:
+            text = self.prompt("leave web-app off")
+        finally:
+            ds.record_left_off = saved
+        self.assertNotIn("OK", text)
+        self.assertIn("could not be left off", text)
+        self.assertTrue(ds.consent_for(self.folder))
 
     def test_private_is_coming(self):
         text = self.prompt("keep web-app private")

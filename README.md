@@ -299,7 +299,7 @@ list, asks first and idle agents last, from any session: "status", "status of al
   there has the agent save its own status in that turn, then show the list. After that the plugin answers itself.
 - **After install.** The first "status of all my agents" after keeping is on lists the connected agents and asks "Did we
   miss any of your agents, or is there one you don't want on datastash?". Naming a folder: it joins when first opened.
-  "leave <name> off" (checked as typed by the person) stops keeping that agent's folders. "keep <name> private":
+  "leave <name> off" stops keeping that agent's folders (saved at once; it only makes agents share less). "keep <name> private":
   private mode is coming.
 - **Writing.** `datastash status-set -` (JSON on stdin) saves it on this machine at once and, while keeping is on for
   the project, sends it in the background (`POST /api/v1/agent/status` with `project`; the caller's own row, replaced

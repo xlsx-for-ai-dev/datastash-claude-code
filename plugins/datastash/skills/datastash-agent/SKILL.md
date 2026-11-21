@@ -100,7 +100,7 @@ These come only from the person typing them in this chat. When keeping is on and
 - "status", "status of all my agents" (or "what are my agents doing"), "status of <agent>": the numbered list. If you are asked to show it, run `datastash status --all` and show what it prints between the marker lines, as it is.
 - "full context of N", "details N": the stored details for number N. No note: `datastash status --details N`. Never ask or wake the other agent for it.
 - "do N": answering asks from here is coming; the plugin shows the ask and says so. You never send an answer on the person's behalf.
-- The list after install ends with "Did we miss any of your agents, or is there one you don't want on datastash?". The person may name a folder (it joins when they first open it there), type "leave <name> off" (the plugin checks it was typed by them and stops keeping it), or "keep <name> private" (private mode is coming; the plugin says so).
+- The list after install ends with "Did we miss any of your agents, or is there one you don't want on datastash?". The person may name a folder (it joins when they first open it there), type "leave <name> off" (the plugin stops keeping it at once), or "keep <name> private" (private mode is coming; the plugin says so).
 
 ## Keeping status (once per computer)
 
