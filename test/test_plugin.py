@@ -2053,8 +2053,9 @@ class SetupDoctor(Base):
         ds.resolve = lambda p, me=None: (dict(AGENT), [])
         f = self.found()["key_missing"]
         self.assertIn('"Tester" has no key file', f["problem"])
-        self.assertIn("ledger_agent_key", f["steps"])
-        self.assertNotIn(ds.FIX_ASK, ds.finding_line(f))  # the agent fixes its own key; no person step
+        self.assertNotIn("ledger_agent_key", f["steps"])  # XLI-374: never a key by itself (it stops another computer's)
+        self.assertIn('"Get datastash agent Tester a new key on this computer."', f["steps"])
+        self.assertNotIn(ds.FIX_ASK, ds.finding_line(f))  # no command to run: the person's sentence
 
     def test_open_key_file_fix_command_works(self):
         self.beat()
@@ -3703,6 +3704,53 @@ class Xli374(Base):
             self.listen()
         self.assertTrue(beats)
         self.assertEqual(set(beats), {None})
+
+    def test_a_parked_listener_s_status_refresher_never_sends_the_dead_key(self):
+        """EPM security review of 0.4.0: with the status refresher ON (the other tests turn it off), a listener parked
+        on a refused key makes zero requests with that key: no status read, no resend. With a live key it does read."""
+        for k in ("STATUS_REFRESH_SECONDS", "keep_state", "_copy_fresh"):
+            self.saved[k] = getattr(ds, k)
+        ds.STATUS_REFRESH_SECONDS = 0.05
+        ds.keep_state = lambda: "yes"
+        ds._copy_fresh = lambda wb: False
+        ds.read_key = lambda s: "ldgr_ag_refused"
+        ds.fetch_page = lambda *a, **k: (_ for _ in ()).throw(ds.ApiError(401, {}))
+        ds.raise_notice(ds.notice_cause("dead", "tester"), "x")
+        ds.take_notices([ds.notice_cause("dead", "tester")])  # told already: it parks quietly
+        seen = self.park_sleeps(120, then=lambda i: time.sleep(0.01))  # over a second of real time, 20+ refresh turns
+        with self.assertRaises(Parked):
+            self.listen()
+        self.assertEqual(len(seen), 120)
+        self.assertEqual(self.net.calls, [])  # not one request, with the dead key or any other
+        # The control: the same refresher, with a live key, reads the status door.
+        ds.read_key = lambda s: "ldgr_ag_live"
+        t0 = time.time()
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            if time.time() - t0 > 0.6:
+                raise Stop()
+            time.sleep(0.02)
+            return [], "0", False
+        ds.fetch_page = fetch
+        ds._sleep = lambda sec, parent: time.sleep(0.01)
+        with self.assertRaises(Stop):
+            self.listen()
+        self.assertTrue(any(c[1].startswith(ds.STATUS_PATH) for c in self.net.calls), self.net.calls)
+        n = len(self.net.calls)
+        time.sleep(0.3)
+        self.assertEqual(len(self.net.calls), n)  # the listener ended: its refresher sends nothing more
+
+    def test_the_missing_key_setup_check_never_tells_the_ai_to_get_a_key(self):
+        ds.resolve = lambda p, me=None: (dict(AGENT, projects=[self.proj]), [])
+        found = [f for f in ds.setup_findings(self.proj, me=None) if f["id"] == "key_missing"]
+        self.assertEqual(len(found), 1)
+        line = ds.finding_line(found[0])
+        self.assertNotIn("ledger_agent_key", line)
+        self.assertNotIn("pickup", line)
+        self.assertNotIn("datastash fetch", line)
+        self.assertIn('"Get datastash agent Tester a new key on this computer."', line)
+        self.assertIn(ds.notice_text("missing", AGENT).split("To fix it, the person says to Claude: ")[1].split(" (")[0],
+                      line)
 
     # 5. SessionEnd by session id
     def test_session_end_stops_this_sessions_listener_by_its_session_id(self):

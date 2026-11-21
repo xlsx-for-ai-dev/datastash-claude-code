@@ -1834,7 +1834,9 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
     catching_up = True
     pending_since = None  # when the first arrival not yet woken for was seen
     log(s, f"listen: start session={session_id[:8]} parent={parent}")
-    status_wake = start_status_refresher(agent)  # the local status copy, refreshed beside the inbox poll
+    # The local status copy, refreshed beside the inbox poll; for an agent, only while the listener polls with a live
+    # key (never while parked on a refused or missing key).
+    status_wake = start_status_refresher(agent, live=None if is_person(agent) else live)
 
     def pause(seconds):
         _sleep(seconds, parent)
@@ -1975,6 +1977,7 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
             elif not items and wait > 0 and time.time() - t0 < FAST_POLL_SECONDS:
                 pause(random.uniform(1.0, 2.0))  # an empty long poll came back at once: keep a floor between polls
     finally:
+        live["key"] = None  # the status refresher reads and sends nothing once the listener has ended
         if beat is not None:
             beat.set()  # the heartbeat ends with the listener
 
@@ -3053,8 +3056,10 @@ def setup_findings(project, me=None, deep=False):
     if agent is not None and not os.path.lexists(key_path(agent["slug"])):
         out.append(_finding("key_missing", f'this folder\'s agent "{disp(agent["name"])}" has no key file '
                             f"({_tilde(key_path(agent['slug']))}), so it can't read its inbox.",
-                            "you fix this yourself, with no step for the person: get a new pickup code "
-                            "(ledger_agent_key) and run datastash fetch as the datastash-agent skill says."))
+                            "tell the person once, in one plain line, and give them this sentence to say to Claude: "
+                            f'"Get datastash agent {disp(agent["name"])} a new key on this computer." Never get a key '
+                            "yourself: a new key stops this agent's key on any other computer. The listener goes on by "
+                            "itself once the key is back."))
     if deep:
         why = _reach()
         if why:
@@ -4742,7 +4747,7 @@ def _copy_fresh(workbook_id):
         c.get("failed_at") and c["failed_at"] > c["fetched_at"])
 
 
-def status_refresher(sess, wake, stop=None):
+def status_refresher(sess, wake, stop=None, live=None):
     """Refresh the local copy every ~STATUS_REFRESH_SECONDS, and at once when wake is set (the listener saw something
     new). Quiet: one log line per kind of failure, a long pause while the server has no status door. After a good
     refresh, this agent's status that never got sent (offline) is sent again."""
@@ -4751,6 +4756,15 @@ def status_refresher(sess, wake, stop=None):
     woken = False
     while stop is None or not stop.is_set():
         pause = STATUS_REFRESH_SECONDS * random.uniform(0.9, 1.1)
+        if live is not None and not live.get("key"):
+            # XLI-374: the listener is parked (key refused or missing) or has not polled yet: no status read and no
+            # resend, so a dead key is never sent. It goes on once the listener goes on with a live key.
+            woken = False
+            if stop is not None:
+                stop.wait(min(pause, PARK_CHECK_SECONDS))
+            else:
+                time.sleep(min(pause, PARK_CHECK_SECONDS))
+            continue
         if keep_state() != "yes" or (not woken and _copy_fresh(sess["workbook_id"])):
             # status off on this computer (nothing is read or sent), or another session refreshed the shared copy
             woken = wake.wait(pause)
@@ -4802,12 +4816,13 @@ def resend_unsent(s):
     return True
 
 
-def start_status_refresher(sess):
-    """A daemon thread beside the listener; returns the Event that asks it to refresh now (None when switched off)."""
+def start_status_refresher(sess, live=None, stop=None):
+    """A daemon thread beside the listener; returns the Event that asks it to refresh now (None when switched off).
+    live: the listener's live key holder; while it holds no key the thread reads and sends nothing."""
     if STATUS_REFRESH_SECONDS <= 0:
         return None
     wake = threading.Event()
-    threading.Thread(target=status_refresher, args=(sess, wake), daemon=True).start()
+    threading.Thread(target=status_refresher, args=(sess, wake, stop, live), daemon=True).start()
     return wake
 
 
