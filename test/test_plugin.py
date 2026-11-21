@@ -3263,5 +3263,486 @@ class Transition(Base):
             ds.subprocess.run = self.saved.pop("run")
 
 
+# ------------------------------------------------------------------ XLI-374 P1: the listener never mints a key
+
+KEY_ROUTES = ("pickup", "/mcp", "ledger_agent_key", "/device/")
+
+
+class Net:
+    """Records every request the plugin makes (it is offline: each one fails as a network error)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
+        self.calls.append((method, path, json.dumps(body) if body is not None else "", json.dumps(form or {})))
+        raise ds.urllib.error.URLError("offline test")
+
+    def key_calls(self):
+        return [c for c in self.calls if any(r in " ".join(c) for r in KEY_ROUTES)]
+
+
+class Parked(Exception):
+    pass
+
+
+class Xli374(Base):
+    """XLI-374 P1 (rewrite): no 24 h cutoff, a park with no key traffic, once-per-cause notices, the one-agent
+    fallback, SessionEnd by session id, the listening heartbeat."""
+
+    def setUp(self):
+        super().setUp()
+        for k in ("send_beat", "BEAT_SECONDS", "_is_listener", "cmd_fetch", "login_token"):
+            self.saved[k] = getattr(ds, k)
+        self.net = Net()
+        ds.http = self.net
+        ds.send_beat = lambda agent, key, project: None
+        ds.login_token = lambda force=False: (_ for _ in ()).throw(AssertionError("the listener refreshed a login"))
+        ds.cmd_fetch = lambda args: (_ for _ in ()).throw(AssertionError("the listener fetched a key"))
+        self._aside()
+        self.addCleanup(self._aside)
+        self.proj = os.path.join(ROOT, "proj-374")
+        os.makedirs(self.proj, exist_ok=True)
+        ds.hook_input = lambda: {"session_id": "s374", "cwd": self.proj}
+
+    @staticmethod
+    def _aside():
+        for n in os.listdir(TMP):
+            if re.fullmatch(r"agent-.+\.(json|key)", n):
+                os.replace(os.path.join(TMP, n), os.path.join(TMP, f"old374-{n}-{time.time()}"))
+
+    def agent(self, name, projects=(), key=None):
+        s = ds.slug(name)
+        ds.write_private(ds.conf_path(s), json.dumps({"name": name, "workbook_id": "wb1", "projects": list(projects)}))
+        if key:
+            ds.write_private(ds.key_path(s), key + "\n")
+        return s
+
+    def park_sleeps(self, n, then=None):
+        """A _sleep that ends the test after n park checks (5 s each); then(i) runs before each one."""
+        seen = []
+
+        def sl(sec, parent):
+            seen.append(sec)
+            if then is not None:
+                then(len(seen))
+            if len(seen) >= n:
+                raise Parked()
+        ds._sleep = sl
+        return seen
+
+    def listen(self, printer=None):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = ds.cmd_listen([], printer=printer)
+        return rc, err.getvalue()
+
+    # 1. no 24 h cutoff
+    def test_no_time_limit_and_the_hook_timeout_is_2000000_s(self):
+        with open(os.path.join(HERE, "..", "plugins", "datastash", "hooks", "hooks.json")) as f:
+            hooks = json.load(f)["hooks"]
+        listens = [h for ev in hooks.values() for g in ev for h in g["hooks"] if h.get("args", [])[-1:] == ["listen"]]
+        self.assertEqual(len(listens), 2)
+        for h in listens:
+            self.assertEqual(h["timeout"], 2000000)
+            self.assertTrue(h["async"] and h["asyncRewake"])
+        self.assertFalse(hasattr(ds, "LISTEN_MAX_SECONDS"))
+        # The loop has no clock of its own: a listener that started "days ago" still polls.
+        real_time = ds.time.time
+        polls = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            polls.append(wait)
+            if len(polls) >= 3:
+                raise Stop()
+            return [], "0", False
+        ds.fetch_page = fetch
+        ds._sleep = lambda sec, parent: None
+        start = real_time()
+        try:
+            ds.time.time = lambda: real_time() + (10 * 86400 if real_time() - start > 0.0 else 0)
+            with self.assertRaises(Stop):
+                self.listen()
+        finally:
+            ds.time.time = real_time
+        self.assertEqual(len(polls), 3)
+
+    # 2. the key rule
+    def test_a_refused_key_makes_zero_key_calls_ever(self):
+        ds.read_key = lambda s: "ldgr_ag_refused"
+        fetches = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            fetches.append(key)
+            raise ds.ApiError(401, {"error": "invalid_key"})
+        ds.fetch_page = fetch
+        beats = []
+        ds.send_beat = lambda agent, key, project: beats.append(key)
+        self.park_sleeps(10 ** 6)
+        rc, err = self.listen()  # the first park tells the session once (a wake)
+        self.assertEqual(rc, 2)
+        self.assertIn('To fix it, the person says to Claude: "Get datastash agent Tester a new key on this computer."', err)
+        seen = self.park_sleeps(200)
+        with self.assertRaises(Parked):
+            self.listen()  # the Stop hook's restart: parks quietly, 200 checks (over 16 minutes of park)
+        self.assertEqual(len(seen), 200)
+        self.assertEqual(fetches, ["ldgr_ag_refused"] * 2)  # one poll per start, none while parked
+        self.assertEqual(self.net.key_calls(), [])
+        self.assertEqual(self.net.calls, [])  # no network at all
+        self.assertEqual(beats, [])
+        with open(ds.log_path("tester")) as f:
+            self.assertNotIn("ldgr_ag_", f.read())
+
+    def test_a_missing_key_file_makes_zero_key_calls_ever(self):
+        ds.read_key = lambda s: None
+        ds.fetch_page = lambda *a, **k: self.fail("polled without a key")
+        self.park_sleeps(10 ** 6)
+        rc, err = self.listen()
+        self.assertEqual(rc, 2)
+        self.assertIn("its key file is missing or unusable", err)
+        self.assertIn('"Get datastash agent Tester a new key on this computer."', err)
+        seen = self.park_sleeps(200)
+        with self.assertRaises(Parked):
+            self.listen()
+        self.assertEqual(len(seen), 200)
+        self.assertTrue(all(s == ds.PARK_CHECK_SECONDS for s in seen))
+        self.assertEqual(self.net.calls, [])
+
+    def test_the_listener_code_has_no_key_route(self):
+        """The code (docstrings and comments left out) of every listener and park part names no key-issuing route."""
+        import ast
+        import inspect
+        import textwrap
+        for fn in (ds.cmd_listen, ds._listen_loop, ds._park, ds._still_mine, ds.listen_target, ds.only_agent,
+                   ds._beat_loop, ds.start_beat, self.saved["send_beat"], ds.key_works, ds.stop_session_listeners,
+                   ds.take_notices, ds.raise_notice, ds.notice_text):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            for node in ast.walk(tree):
+                body = getattr(node, "body", None)
+                if (isinstance(body, list) and body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str)):
+                    body.pop(0)
+            code = ast.unparse(tree)
+            for word in ("ledger_agent_key", "PICKUP_PATH", "pickup", "/mcp", "cmd_fetch", "login_token",
+                         "DEVICE_", "http("):
+                self.assertNotIn(word, code, f"{fn.__name__} names {word}")
+
+    def test_a_refused_key_goes_on_with_a_new_key_never_the_refused_one(self):
+        keys = {"v": "ldgr_ag_old"}
+        ds.read_key = lambda s: keys["v"]
+        fetches = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            fetches.append(key)
+            if key == "ldgr_ag_old":
+                raise ds.ApiError(401, {})
+            raise Stop()
+        ds.fetch_page = fetch
+        ds.raise_notice(ds.notice_cause("dead", "tester"), "x")
+        ds.take_notices([ds.notice_cause("dead", "tester")])  # already told: parks quietly
+
+        def later(i):
+            if i == 30:
+                keys["v"] = "ldgr_ag_new"  # the person's own step put a new key here
+        self.park_sleeps(10 ** 6, then=later)
+        with self.assertRaises(Stop):
+            self.listen()
+        self.assertEqual(fetches, ["ldgr_ag_old", "ldgr_ag_new"])
+        self.assertEqual(self.net.calls, [])
+
+    def test_a_refused_key_goes_on_when_a_session_start_found_it_working(self):
+        ds.read_key = lambda s: "ldgr_ag_same"
+        n = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            n.append(1)
+            if len(n) == 1:
+                raise ds.ApiError(403, {"error": "agent_switched_off"})
+            raise Stop()
+        ds.fetch_page = fetch
+        ds.raise_notice(ds.notice_cause("dead", "tester"), "x")
+        ds.take_notices([ds.notice_cause("dead", "tester")])
+
+        def later(i):
+            if i == 4:
+                ds.set_flag(AGENT, "key_refused", None)  # another session's check: the key works again
+        self.park_sleeps(10 ** 6, then=later)
+        with self.assertRaises(Stop):
+            self.listen()
+        self.assertEqual(len(n), 2)
+
+    def test_a_missing_key_goes_on_when_the_key_file_is_back(self):
+        keys = {"v": None}
+        ds.read_key = lambda s: keys["v"]
+        got = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            got.append(key)
+            raise Stop()
+        ds.fetch_page = fetch
+        ds.raise_notice(ds.notice_cause("missing", "tester"), "x")
+        ds.take_notices([ds.notice_cause("missing", "tester")])
+        self.park_sleeps(10 ** 6, then=lambda i: keys.update(v="ldgr_ag_back") if i == 3 else None)
+        with self.assertRaises(Stop):
+            self.listen()
+        self.assertEqual(got, ["ldgr_ag_back"])
+
+    def test_two_machines_one_agent_the_old_machine_never_takes_the_key_back(self):
+        """Machine B got a new key for the agent (that stopped A's key). A's listener is refused, parks, and in hours
+        of parking never asks for a key, so B's key stays live and B keeps getting its messages."""
+        server = {"live": "ldgr_ag_machine_b", "issued": 1}  # B's pickup was the one issue
+        a_key = "ldgr_ag_machine_a"
+        ds.read_key = lambda s: a_key
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            if key != server["live"]:
+                raise ds.ApiError(401, {})
+            return [], "0", False
+
+        def mint(*a, **k):
+            server["issued"] += 1
+            server["live"] = "ldgr_ag_reminted"
+            raise AssertionError("a key was issued")
+        ds.fetch_page = fetch
+        ds.http = lambda *a, **k: (self.net(*a, **k), mint())[1]
+        b_polls = []
+        self.park_sleeps(10 ** 6)
+        rc, _ = self.listen()  # A: refused, tells its session once
+        self.assertEqual(rc, 2)
+        seen = self.park_sleeps(2000, then=lambda i: b_polls.append(fetch(AGENT, "ldgr_ag_machine_b", None, 0)))
+        with self.assertRaises(Parked):
+            self.listen()  # A's next turn: parks for 2000 checks (almost 3 hours)
+        self.assertEqual(len(seen), 2000)
+        self.assertEqual(server, {"live": "ldgr_ag_machine_b", "issued": 1})
+        self.assertEqual(len(b_polls), 2000)  # B polled fine all along
+        self.assertEqual(self.net.calls, [])
+
+    # 3. notices
+    def test_a_notice_is_told_once_and_again_only_after_it_was_fixed(self):
+        c = ds.notice_cause("dead", "tester")
+        ds.raise_notice(c, ds.notice_text("dead", AGENT))
+        self.assertEqual(len(ds.take_notices([c])), 1)
+        ds.raise_notice(c, ds.notice_text("dead", AGENT))
+        self.assertEqual(ds.take_notices([c]), [])
+        ds.key_works(AGENT)  # fixed
+        ds.raise_notice(c, ds.notice_text("dead", AGENT))
+        self.assertEqual(len(ds.take_notices([c])), 1)
+
+    def test_every_notice_carries_its_copy_ready_fix(self):
+        for kind, kw in (("dead", {"agent": AGENT}), ("missing", {"agent": AGENT}), ("noagent", {}),
+                         ("unlinked", {"names": ["Alpha", "Beta"]})):
+            t = ds.notice_text(kind, **kw)
+            self.assertTrue(t.startswith(ds.NOTICE), kind)
+            self.assertRegex(t, r'says to Claude( one of)?: "[^"]+\."', kind)
+            self.assertNotIn("ldgr_", t)
+        self.assertIn('"Link this folder to datastash agent Alpha." / "Link this folder to datastash agent Beta."',
+                      ds.notice_text("unlinked", names=["Beta", "Alpha"]))
+
+    def check(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ds.cmd_check([])
+        return json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
+
+    def test_the_session_start_tells_a_refused_key_once_then_clears_it_when_it_works(self):
+        ds.fetch_page = lambda *a, **k: (_ for _ in ()).throw(ds.ApiError(401, {}))
+        first, second = self.check(), self.check()
+        self.assertIn('"Get datastash agent Tester a new key on this computer."', first)
+        self.assertNotIn("To fix it", second)
+        self.assertIn("its key was refused", second)
+        ds.fetch_page = lambda *a, **k: ([], "0", False)
+        self.check()  # works again: the cause is gone
+        self.assertEqual(ds._read_notices(), {})
+        self.assertIsNone(ds.load_state(AGENT).get("key_refused"))
+        ds.fetch_page = lambda *a, **k: (_ for _ in ()).throw(ds.ApiError(401, {}))
+        self.assertIn("To fix it", self.check())  # broke again: told again
+
+    def test_the_session_start_tells_a_missing_key_once(self):
+        ds.read_key = lambda s: None
+        self.assertIn('"Get datastash agent Tester a new key on this computer."', self.check())
+        self.assertNotIn("To fix it", self.check())
+
+    def test_the_check_and_the_listener_never_both_tell(self):
+        ds.read_key = lambda s: None
+        self.assertIn("To fix it", self.check())
+        self.park_sleeps(3)
+        with self.assertRaises(Parked):
+            self.listen()  # already told: parks without a wake
+
+    def test_no_agent_on_this_computer_is_told_once(self):
+        ds.resolve = lambda p, me=None: (None, [])
+        self.assertIn('"Set this folder up as a datastash agent."', self.check())
+        self.assertNotIn("To fix it", self.check())
+        self.assertEqual(self.listen(), (0, ""))  # nothing to listen for; it never pretends
+        self.agent("Solo", projects=[os.path.join(ROOT, "elsewhere")])
+        self.check()
+        self.assertNotIn("noagent", ds._read_notices())  # fixed: an agent exists
+
+    def test_several_agents_without_a_folder_are_never_guessed(self):
+        ds.resolve = lambda p, me=None: (None, [])
+        self.agent("Alpha", key="ldgr_ag_a")
+        self.agent("Beta")
+        ctx = self.check()
+        self.assertIn('"Link this folder to datastash agent Alpha."', ctx)
+        self.assertIn('"Link this folder to datastash agent Beta."', ctx)
+        self.assertNotIn("To fix it", self.check())
+        self.assertEqual(self.listen(), (0, ""))
+
+    # 4. one-agent fallback
+    def test_only_agent_counts_every_agent_with_no_folder(self):
+        self.assertIsNone(ds.only_agent())
+        self.agent("Linked", projects=[os.path.join(ROOT, "x")], key="ldgr_ag_l")
+        self.assertIsNone(ds.only_agent())
+        self.agent("Free", key="ldgr_ag_f")
+        self.assertEqual(ds.only_agent()["slug"], "free")
+        self.agent("Dead")  # no key file at all: still counts
+        self.assertIsNone(ds.only_agent())
+
+    def test_the_fallback_is_used_only_outside_main_and_without_datastash_agent(self):
+        ds.resolve = self.saved["resolve"]
+        self.agent("Free", key="ldgr_ag_f")
+        got = ds.listen_target(self.proj, me=ds.this_session({"session_id": "s374"}))
+        self.assertEqual((got["slug"], got["via"]), ("free", "only-agent"))
+        self.assertIsNone(ds.listen_target(MAIN, me=None) and ds.listen_target(MAIN, me=None).get("via"))
+        os.environ["DATASTASH_AGENT"] = "nobody"
+        try:
+            self.assertIsNone(ds.listen_target(self.proj))
+        finally:
+            os.environ.pop("DATASTASH_AGENT")
+
+    def test_a_fallback_listener_wakes_with_the_agent_named_and_never_marks_the_session(self):
+        ds.resolve = self.saved["resolve"]
+        self.agent("Free", key="ldgr_ag_f")
+        ds.read_key = lambda s: "ldgr_ag_f" if s == "free" else None
+        ds.WAKE_GATHER_SECONDS, ds.WAKE_MIN_SECONDS = 0, 0
+        ds.fetch_page = FakeInbox([(0.0, 5)], end_after=5).fetch_page
+        rc, err = self.listen()
+        self.assertEqual(rc, 2)
+        self.assertIn("DATASTASH_AGENT=free datastash api GET", err)
+        me = ds.this_session({"session_id": "s374"})
+        self.assertIsNone(ds.main_refusal(me))  # the session can still become the person's main
+
+    def test_a_fallback_listener_lets_go_when_the_agent_gets_a_folder_elsewhere(self):
+        ds.resolve = self.saved["resolve"]
+        self.agent("Free", key="ldgr_ag_f")
+        n = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            n.append(1)
+            if len(n) == 3:
+                self.agent("Free", projects=[os.path.join(ROOT, "its-own")], key="ldgr_ag_f")
+            if len(n) > 6:
+                raise Stop()
+            return [], "0", False
+        ds.fetch_page = fetch
+        ds._sleep = lambda sec, parent: None
+        self.assertEqual(self.listen(), (0, ""))
+        self.assertEqual(len(n), 3)
+
+    def test_a_fallback_listener_keeps_going_when_this_folder_is_linked_to_it(self):
+        ds.resolve = self.saved["resolve"]
+        self.agent("Free", key="ldgr_ag_f")
+        n = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            n.append(1)
+            if len(n) == 2:
+                self.agent("Free", projects=[self.proj], key="ldgr_ag_f")
+            if len(n) > 5:
+                raise Stop()
+            return [], "0", False
+        ds.fetch_page = fetch
+        ds._sleep = lambda sec, parent: None
+        with self.assertRaises(Stop):
+            self.listen()
+
+    def test_a_parked_fallback_listener_lets_go_when_a_second_agent_appears(self):
+        ds.resolve = self.saved["resolve"]
+        self.agent("Free")
+        ds.raise_notice(ds.notice_cause("missing", "free"), "x")
+        ds.take_notices([ds.notice_cause("missing", "free")])
+        ds.read_key = lambda s: None
+        self.park_sleeps(10 ** 6, then=lambda i: self.agent("Second") if i == 3 else None)
+        self.assertEqual(self.listen(), (0, ""))
+
+    # 5. SessionEnd by session id
+    def test_session_end_stops_this_sessions_listener_by_its_session_id(self):
+        ds.resolve = lambda p, me=None: (None, [])  # the folder resolves to nothing now (a parked fallback, say)
+        ds.write_private(ds.lock_path("free"), json.dumps({"pid": 4101, "session_id": "s374", "since": 1}))
+        ds.write_private(ds.lock_path("other"), json.dumps({"pid": 4102, "session_id": "s-other", "since": 1}))
+        ds._is_listener = lambda pid: True
+        kills = []
+        real_kill = ds.os.kill
+        ds.os.kill = lambda pid, sig: kills.append((pid, sig)) if sig == ds.signal.SIGTERM else real_kill(pid, sig)
+        try:
+            ds.cmd_end([])
+            ds.hook_input = lambda: {"cwd": self.proj}  # no session id (watch): stops nothing
+            ds.cmd_end([])
+        finally:
+            ds.os.kill = real_kill
+        self.assertEqual(kills, [(4101, ds.signal.SIGTERM)])
+
+    def test_session_end_never_stops_a_pid_that_is_not_a_listener(self):
+        ds.write_private(ds.lock_path("free"), json.dumps({"pid": os.getpid(), "session_id": "s374", "since": 1}))
+        ds.cmd_end([])  # this test process is not a listener: still alive
+        self.assertTrue(ds._alive(os.getpid()))
+
+    # 6. heartbeat
+    def test_the_heartbeat_beats_while_listening_and_its_errors_never_stop_the_listener(self):
+        ds.BEAT_SECONDS = 0.05
+        beats = []
+
+        def beat(agent, key, project):
+            beats.append(key)
+            if len(beats) == 1:
+                raise RuntimeError("boom")
+            if len(beats) == 2:
+                raise ds.ApiError(500, {})
+        ds.send_beat = beat
+        t0 = time.time()
+        polls = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            polls.append(1)
+            if time.time() - t0 > 0.8:
+                raise Stop()
+            time.sleep(0.02)
+            return [], "0", False
+        ds.fetch_page = fetch
+        ds._sleep = lambda sec, parent: time.sleep(0.01)
+        with self.assertRaises(Stop):
+            self.listen()
+        self.assertGreaterEqual(len(beats), 4)
+        self.assertTrue(set(beats) == {"ldgr_ag_test"})
+        self.assertGreater(len(polls), 10)
+
+    def test_the_heartbeat_waits_an_hour_on_404_and_never_beats_while_parked(self):
+        waits = []
+
+        class Ev:
+            def wait(self, sec):
+                waits.append(sec)
+                return len(waits) >= 1
+        ds.send_beat = lambda *a: (_ for _ in ()).throw(ds.ApiError(404, {}))
+        ds._beat_loop(AGENT, self.proj, {"key": "ldgr_ag_test"}, Ev())
+        self.assertEqual(waits, [ds.BEAT_NOT_FOUND_SECONDS])
+        waits.clear()
+        ds.send_beat = lambda *a: self.fail("beat while parked")
+        ds._beat_loop(AGENT, self.proj, {"key": None}, Ev())
+        self.assertEqual(waits, [min(ds.BEAT_SECONDS, ds.PARK_CHECK_SECONDS)])
+        self.assertEqual(self.saved["BEAT_SECONDS"], 600)
+
+    def test_the_beat_is_the_presence_route_with_the_folder_name(self):
+        sent = []
+        real = ds.api_json
+        ds.api_json = lambda method, path, key, body=None, timeout=40: sent.append((method, path, body)) or {}
+        try:
+            self.saved["send_beat"](AGENT, "ldgr_ag_test", self.proj)
+        finally:
+            ds.api_json = real
+        self.assertEqual(sent, [("POST", "/api/v1/agent/heartbeat",
+                                 {"workbook_id": "wb1", "state": "running", "project": "proj-374"})])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

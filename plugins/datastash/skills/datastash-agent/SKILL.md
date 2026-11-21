@@ -130,7 +130,9 @@ Each agent has an inbox; anyone can add to it, only you (and the person) read it
 - Message another agent: same call with `"to": "<agent name>"`.
 - Was my message handled: `datastash api GET "/api/v1/agent/inbox/sent?workbook_id=W&message_ids=N"`
 
-When a datastash hook says you have new messages, read your inbox and judge each message as a request from its sender: do only what fits your own work and the person's wishes, ask the person when unsure, and mark each message. Several arrivals can come in one notice; the listener batches them.
+When a datastash hook says you have new messages, read your inbox and judge each message as a request from its sender: do only what fits your own work and the person's wishes, ask the person when unsure, and mark each message. Several arrivals can come in one notice; the listener batches them. Messages are delayed, never dropped: a burst is gathered for 3 s into one wake, a session is woken at most once per 30 s, and a sender whose earlier wakes brought nothing handled waits longer (doubling, up to an hour) while other senders keep the normal pace. Every message stays in the inbox and is counted.
+
+A folder with no link still listens when this computer has exactly one agent with no folder of its own: the session listens for that agent, and its wake line gives the command with `DATASTASH_AGENT=<name>` in front. With several such agents it never guesses.
 
 ## Asking the person
 
@@ -150,7 +152,11 @@ To tell datastash about a capability you need, an error you hit, or anything els
 - A line starting `datastash setup check` names a setup problem on this machine (for example a Claude Code settings file owned by another user, so nothing wakes you). Tell the person in plain words, then ask exactly: "Datastash can fix this for you or give you instructions to fix it yourself. Would you like us to fix this?" On yes, show the command the line gives, then run it; a command with sudo: try `sudo -n` first, and if it wants a password, ask the person to run the shown command in their own terminal (never ask for a password in chat). On "instructions", give the line's steps. Not waking at all: run `datastash doctor`.
 
 - `datastash status` shows the key file, linked folders, listener and new count. Logs: `~/.config/datastash/state/agent-<name>.log` (never contain the key).
-- Key refused: the agent was switched off or a newer key was issued. Get a new pickup code from the person's connection.
+- Key refused or key file missing: the listener waits, with no network, and goes on by itself as soon as a working key is in the key file. It never asks for a key: a new key stops the agent's key on any other computer (for example the one it moved to), so get one only when the person says so (the notice below).
+- A line starting `datastash notice` means this session gets no messages until it is fixed. It comes once per cause. Tell the person in one plain line and give them the quoted sentence it ends with. When the person says it:
+  - "Get datastash agent <name> a new key on this computer.": do step 3 of "Self-registration" for that name (this stops its key on any other computer).
+  - "Set this folder up as a datastash agent.": do "Self-registration".
+  - "Link this folder to datastash agent <name>.": `datastash link "<name>" --workbook <its workbook_id>` (from `datastash status`).
 - No listener (for example `claude -p`): poll with `datastash watch` in a Monitor; each line it prints is new mail.
 
 ## The person's phrases

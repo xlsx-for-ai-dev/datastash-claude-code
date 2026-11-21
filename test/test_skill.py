@@ -57,6 +57,17 @@ class SkillText(unittest.TestCase):
         _, body = parts()
         self.assertIn("Never open or approve the sign-in page yourself", body)
 
+    def test_messages_are_delayed_never_dropped_and_the_listener_never_gets_a_key(self):
+        """XLI-374 P1: the pacing is stated as a delay, never a drop; a refused or missing key waits for the person's
+        step, and each notice's fix sentence has its step."""
+        _, body = parts()
+        part2 = body.split("# Part 2:", 1)[1]
+        self.assertIn("Messages are delayed, never dropped", part2)
+        self.assertIn("It never asks for a key", part2)
+        for sentence in ("Get datastash agent <name> a new key on this computer.", "Set this folder up as a datastash agent.",
+                         "Link this folder to datastash agent <name>."):
+            self.assertIn(f'"{sentence}"', part2)
+
 
 if __name__ == "__main__":
     unittest.main()

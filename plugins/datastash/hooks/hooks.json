@@ -22,7 +22,7 @@
             ],
             "async": true,
             "asyncRewake": true,
-            "timeout": 86400
+            "timeout": 2000000
           }
         ]
       }
@@ -63,7 +63,7 @@
             ],
             "async": true,
             "asyncRewake": true,
-            "timeout": 86400
+            "timeout": 2000000
           }
         ]
       }

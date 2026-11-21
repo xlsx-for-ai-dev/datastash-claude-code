@@ -243,6 +243,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-<name>.json` | the inbox cursor, the ids of messages still "new", and the last wake time (no message text) |
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
+| `state/notices.json` | the once-per-cause notices (key refused, key missing, no agent, folder not linked): the line and whether it was told; never a key |
 | `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |
 | `login.json` | where this computer's datastash login keeps its refresh token (`keychain` or `file`) and when it was made; never a token |
 | `login.refresh` | the login's refresh token, only when no system keychain works (otherwise it is in the keychain, service `datastash`) |
@@ -354,12 +355,23 @@ list, asks first and idle agents last, from any session: "status", "status of al
   - The cursor is saved after every answer, so nothing between listeners is skipped; messages the agent leaves
     "new" are counted at the next session start but never re-wake the session on their own (no wake loops). The
     agent's own read/handled marks never wake it.
-  - Errors (HTTP and network) back off from 5 s to 5 minutes, with jitter; a 404 waits 10 minutes; a refused key
-    (switched off or re-issued) stops the listener, and the next session start says so; an expired cursor starts
-    over, and a cursor that keeps expiring (more than 2 times in a row) backs off like any error. An empty long poll
-    that answers at once is followed by a 1-2 s pause.
-  - It stops when its Claude Code process goes away, at SessionEnd, or after about a day idle (the hook timeout);
-    the next turn or session start brings it back.
+  - Errors (HTTP and network) back off from 5 s to 5 minutes, with jitter; a 404 waits 10 minutes; an expired cursor
+    starts over, and a cursor that keeps expiring (more than 2 times in a row) backs off like any error. An empty long
+    poll that answers at once is followed by a 1-2 s pause.
+  - A refused key (switched off or re-issued) or a missing key file parks the listener: it keeps its lock, makes no
+    network call at all, re-reads the key file every 5 s and goes on once a different key is there (or a session start
+    found the same key working again). It never asks datastash for a key or a pickup code: issuing a key stops the
+    agent's live key, which may be another computer's working key. The fix is the person's own step.
+  - Notices: one line per cause (key refused, key file missing, no agent on this computer, a folder that is not linked
+    while several agents have no folder), told once at the next session start or by the listener's next wake, removed
+    when fixed. Each ends with the sentence the person says to Claude to fix it. Kept in `state/notices.json`.
+  - One-agent fallback: in a folder no agent is linked to, the session listens for the one agent on this computer with
+    no folder of its own; with several such agents it never guesses. It re-checks every loop and lets go when that
+    agent gets a folder elsewhere. The fallback never marks the session as an agent (it can still become main).
+  - A listening heartbeat (`POST /api/v1/agent/heartbeat`, state running, the folder name as project) about every 10
+    minutes, in its own thread; none while parked; a 404 waits an hour. Its errors never stop the listener.
+  - It has no time limit (the hook timeout is 2,000,000 s). It stops when its Claude Code process goes away or at
+    SessionEnd (found by its session id in the lock files); the next turn or session start brings it back.
   - It only ever holds one HTTPS request at a time and uses no CPU between answers.
 - `claude -p` ends background hooks when the run ends, so headless runs get the session-start count but no listener.
 
