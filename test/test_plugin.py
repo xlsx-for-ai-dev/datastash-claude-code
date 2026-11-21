@@ -118,6 +118,7 @@ def _run_guarded(self, result=None):
 
 
 unittest.TestCase.run = _run_guarded
+os.environ["DATASTASH_STATUS_REFRESH_SECONDS"] = "0"  # the listener's status refresh is tested in test_status.py
 
 loader = importlib.machinery.SourceFileLoader("datastash_bin", BIN)
 spec = importlib.util.spec_from_loader("datastash_bin", loader)
@@ -727,12 +728,20 @@ class MainFolderIdentity(Base):
         ds.write_private(ds.conf_path(s), json.dumps({"name": name, "workbook_id": "wb-" + s, "projects": projects}))
 
     def link(self, name, proj):
+        """The agent links its own folder (run from it: another folder needs the person's named yes, Addendum 6 N3)."""
+        old = os.environ.get("CLAUDE_PROJECT_DIR")
+        os.environ["CLAUDE_PROJECT_DIR"] = proj
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
             try:
                 ds.cmd_link([name, "--workbook", "wb-x", "--project", proj])
                 return None
             except SystemExit:
                 return err.getvalue()
+            finally:
+                if old is None:
+                    os.environ.pop("CLAUDE_PROJECT_DIR", None)
+                else:
+                    os.environ["CLAUDE_PROJECT_DIR"] = old
 
     def assert_person_everywhere(self, folders):
         for f in folders:
@@ -1116,7 +1125,7 @@ class MainAnySession(MainBase):
         # 3. It linked (or fetched) an agent this session.
         self.be("sess-E", (5005, "tE"))
         with redirect_stdout(io.StringIO()):
-            ds.cmd_link(["Helper", "--workbook", "wb-h", "--project", tempfile.mkdtemp(dir=TMP)])
+            ds.cmd_link(["Helper", "--workbook", "wb-h"])  # its own folder
         self.assertIn("acted as an agent", self.prompt("sess-E"))
         # 4. A Claude Code session started from an agent session (its parent used an agent key).
         self.be("sess-F", (6006, "tF"), parents=[(3003, "tC")])

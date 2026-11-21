@@ -1,5 +1,5 @@
 {
-  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive; the person's typed \"datastash main\" makes that session the person's main session; any tool call that could carry datastash content (a datastash connector by name or URL, the datastash command or its files, a fetch from getdatastash.com, or anything it can't tell) records the session as an agent, which can never become main.",
+  "description": "datastash: inbox count at session start; a background inbox listener that wakes the session when messages arrive; the person's typed \"datastash main\" makes that session the person's main session; any tool call that could carry datastash content (a datastash connector by name or URL, the datastash command or its files, a fetch from getdatastash.com, or anything it can't tell) records the session as an agent, which can never become main; at the end of a turn that used tools, an agent whose work changed (commits, changed files, a test run, a new ask) and whose status line was not updated is asked once to write it: at most every 10 minutes, only for a project the person said yes to, never while datastash has no status door, never looping.",
   "hooks": {
     "SessionStart": [
       {
@@ -45,6 +45,15 @@
     "Stop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/scripts/datastash",
+              "status-check"
+            ],
+            "timeout": 10
+          },
           {
             "type": "command",
             "command": "python3",
