@@ -1378,7 +1378,7 @@ def listen_target(project_dir, me=None):
     return dict(a, via="only-agent") if a is not None else None
 
 
-# Notices (XLI-374): one line per cause, told once (at the next session start, or by the listener's next wake) and
+# Notices (XLI-374): one line per cause, told once (at the next session start, or by a parked listener's one wake) and
 # removed when the cause is fixed, so it is told again only if it breaks again. Each carries the sentence that fixes it.
 # Causes: "dead:<slug>" (key refused), "missing:<slug>" (key file missing), "noagent" (no agent on this computer),
 # "unlinked:<folder hash>" (several agents without a folder, none linked here: never a guess).
@@ -1483,7 +1483,7 @@ def clear_notices(causes):
         pass
 
 
-def notice_causes(agent, project=None):
+def notice_causes(agent):
     """The causes a session of this agent is told about."""
     return [notice_cause("dead", agent["slug"]), notice_cause("missing", agent["slug"])]
 
@@ -1515,7 +1515,7 @@ def _park(agent, s, cause, refused, parent, printer, me=None, mine=None):
     log(s, f"listen: parked ({cause}); re-reads the key file every {PARK_CHECK_SECONDS}s, no network")
     while True:
         _sleep(PARK_CHECK_SECONDS, parent)
-        if parent is not None and not _alive(parent):
+        if parent is not None and not _parent_alive(parent):
             log(s, "listen: session gone; stops")
             return 0
         if me is not None and is_main_session(me):
@@ -1819,11 +1819,14 @@ def _key_digest(key):
 def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     parent = _session_pid() if printer is None else None
+    if parent is not None:
+        _PARENT_START[parent] = _proc_start(parent)
     backoff = BACKOFF_START
     # The heartbeat thread reads `live`: the key while the listener polls with it, None while parked (no beat then).
     live = {"key": None}
     fresh_key = True
-    beat = start_beat(agent, project, live) if not is_person(agent) else None
+    # The fallback's open folder is not the agent's own project: its beat names none.
+    beat = start_beat(agent, None if agent.get("via") else project, live) if not is_person(agent) else None
     gone = 0
     # First catch up without waiting: anything not yet announced (arrived during the last turn, or not counted by the
     # SessionStart check) wakes the session as soon as pacing allows. At worst a message is both counted and woken
@@ -1844,7 +1847,7 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
 
     try:
         while True:
-            if parent is not None and not _alive(parent):
+            if parent is not None and not _parent_alive(parent):
                 log(s, "listen: session gone; stops")
                 return 0
             if me is not None and not is_person(agent) and is_main_session(me):
@@ -1893,9 +1896,6 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
                         log(s, "listen: this session is now the person's datastash main; agent listener stops")
                         return 0
                     msg = wake_text(agent, n, ids)
-                    told = take_notices(notice_causes(agent, project))
-                    if told:
-                        msg += " " + " ".join(told)
                     log(s, f"listen: wake, {len(ids)} arrived, {n} new")
                     if printer is not None:
                         printer(msg)
@@ -1984,10 +1984,23 @@ def _last_wake(agent):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
 
 
+# The start time of each listener's Claude Code process, taken when it starts: with no time limit, a parent pid that a
+# new process reuses (Claude Code killed, its pid handed on) must never keep a listener and its lock alive.
+_PARENT_START = {}
+
+
+def _parent_alive(pid):
+    """The listener's Claude Code process still runs: the pid is alive and is still the same process."""
+    if not _alive(pid):
+        return False
+    want = _PARENT_START.get(pid)
+    return want is None or _proc_start(pid) == want
+
+
 def _sleep(seconds, parent):
     end = time.time() + seconds
     while time.time() < end:
-        if parent is not None and not _alive(parent):
+        if parent is not None and not _parent_alive(parent):
             return
         time.sleep(min(5, max(0.1, end - time.time())))
 

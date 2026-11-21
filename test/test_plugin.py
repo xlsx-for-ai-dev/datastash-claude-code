@@ -3665,6 +3665,45 @@ class Xli374(Base):
         self.park_sleeps(10 ** 6, then=lambda i: self.agent("Second") if i == 3 else None)
         self.assertEqual(self.listen(), (0, ""))
 
+    def test_a_reused_parent_pid_never_keeps_the_listener_alive(self):
+        """No time limit: when Claude Code is gone and its pid is handed to a new process, the listener stops."""
+        self.saved["_proc_start"] = ds._proc_start
+        real = ds._proc_start
+        n = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            n.append(1)
+            if len(n) == 2:
+                ds._proc_start = lambda pid: "someone-else" if pid == os.getpid() else real(pid)
+            if len(n) > 5:
+                raise Stop()
+            return [], "0", False
+        ds.fetch_page = fetch
+        ds._sleep = lambda sec, parent: None
+        self.assertEqual(self.listen(), (0, ""))
+        self.assertEqual(len(n), 2)
+
+    def test_the_fallback_heartbeat_names_no_project(self):
+        ds.resolve = self.saved["resolve"]
+        self.agent("Free", key="ldgr_ag_f")
+        ds.read_key = lambda s: "ldgr_ag_f"
+        ds.BEAT_SECONDS = 0.02
+        beats = []
+        ds.send_beat = lambda agent, key, project: beats.append(project)
+        t0 = time.time()
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            if time.time() - t0 > 0.3:
+                raise Stop()
+            time.sleep(0.02)
+            return [], "0", False
+        ds.fetch_page = fetch
+        ds._sleep = lambda sec, parent: time.sleep(0.01)
+        with self.assertRaises(Stop):
+            self.listen()
+        self.assertTrue(beats)
+        self.assertEqual(set(beats), {None})
+
     # 5. SessionEnd by session id
     def test_session_end_stops_this_sessions_listener_by_its_session_id(self):
         ds.resolve = lambda p, me=None: (None, [])  # the folder resolves to nothing now (a parked fallback, say)

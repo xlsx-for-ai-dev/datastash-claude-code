@@ -363,14 +363,16 @@ list, asks first and idle agents last, from any session: "status", "status of al
     found the same key working again). It never asks datastash for a key or a pickup code: issuing a key stops the
     agent's live key, which may be another computer's working key. The fix is the person's own step.
   - Notices: one line per cause (key refused, key file missing, no agent on this computer, a folder that is not linked
-    while several agents have no folder), told once at the next session start or by the listener's next wake, removed
+    while several agents have no folder), told once at the next session start or by a parked listener's one wake, removed
     when fixed. Each ends with the sentence the person says to Claude to fix it. Kept in `state/notices.json`.
   - One-agent fallback: in a folder no agent is linked to, the session listens for the one agent on this computer with
     no folder of its own; with several such agents it never guesses. It re-checks every loop and lets go when that
     agent gets a folder elsewhere. The fallback never marks the session as an agent (it can still become main).
-  - A listening heartbeat (`POST /api/v1/agent/heartbeat`, state running, the folder name as project) about every 10
+  - A listening heartbeat (`POST /api/v1/agent/heartbeat`, state running, the folder name as project; none for the
+    one-agent fallback, whose open folder is not the agent's) about every 10
     minutes, in its own thread; none while parked; a 404 waits an hour. Its errors never stop the listener.
-  - It has no time limit (the hook timeout is 2,000,000 s). It stops when its Claude Code process goes away or at
+  - It has no time limit (the hook timeout is 2,000,000 s). It stops when its Claude Code process goes away (the pid
+    and its start time, so a reused pid never keeps it alive) or at
     SessionEnd (found by its session id in the lock files); the next turn or session start brings it back.
   - It only ever holds one HTTPS request at a time and uses no CPU between answers.
 - `claude -p` ends background hooks when the run ends, so headless runs get the session-start count but no listener.
