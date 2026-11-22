@@ -64,9 +64,19 @@ class SkillText(unittest.TestCase):
         part2 = body.split("# Part 2:", 1)[1]
         self.assertIn("Messages are delayed, never dropped", part2)
         self.assertIn("It never asks for a key", part2)
-        for sentence in ("Get datastash agent <name> a new key on this computer.", "Set this folder up as a datastash agent.",
-                         "Link this folder to datastash agent <name>."):
+        for sentence in ("Get datastash agent <name> a new key on this computer.", "Sign this computer in to datastash.",
+                         "Link this folder to datastash agent <name>.", "Make my datastash agent workbook."):
             self.assertIn(f'"{sentence}"', part2)
+
+    def test_the_agent_never_registers_itself_or_gets_its_first_key(self):
+        """XLI-375 P1: the plugin registers this computer's agents and the person allows them on /agents; the skill never
+        tells the AI to register itself or to get its own first key."""
+        _, body = parts()
+        part2 = body.split("# Part 2:", 1)[1]
+        self.assertIn("You never register yourself and never get your own first key.", part2)
+        self.assertIn("https://getdatastash.com/agents", part2)
+        self.assertNotIn("datastash auto-name", part2)
+        self.assertNotIn("Set this folder up as a datastash agent.", body)
 
 
 if __name__ == "__main__":

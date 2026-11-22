@@ -37,7 +37,12 @@ for k in ("DATASTASH_AGENT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR"):
 loader = importlib.machinery.SourceFileLoader("datastash_status", BIN)
 spec = importlib.util.spec_from_loader("datastash_status", loader)
 ds = importlib.util.module_from_spec(spec)
+# Cross-file isolation (P2 add): test_plugin.py, when it runs in the same process, turns the listener's status refresh off
+# for its own plugin copy; this copy keeps the plugin's default (60 s), and every other file's setting stays as it was.
+_refresh = os.environ.pop("DATASTASH_STATUS_REFRESH_SECONDS", None)
 loader.exec_module(ds)
+if _refresh is not None:
+    os.environ["DATASTASH_STATUS_REFRESH_SECONDS"] = _refresh
 
 WB = "11111111-2222-3333-4444-555555555555"
 ALL_CALLS = []  # every request any test made through the plugin (no answer route, ever: see NoAnswerRoute)
@@ -691,7 +696,7 @@ class Keeping(Base):
             ds._open_browser, ds.subprocess.Popen = saved
         self.assertEqual(rc, 0, err)
         self.assertIn("code: BCDF-GHJK", out)
-        self.assertIn("Type the code BCDF-GHJK there and press Approve", out)
+        self.assertIn("Type the code BCDF-GHJK there.", out)
         self.assertIn("datastash keep --on` again", out)
         self.assertEqual(ds.keep_state(), "yes")
 

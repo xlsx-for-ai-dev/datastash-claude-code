@@ -40,16 +40,15 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
    (Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
    `/plugin install datastash@datastash`.)
 2. **Restart Claude Code.**
-3. **Sign in once, from the link the plugin shows.** At the start of the first session, the plugin itself (no AI step)
-   starts the sign-in and shows you two lines:
+3. **Sign in once, from the line the plugin shows.** At the start of the first session, the plugin itself (no AI step)
+   starts the sign-in and shows you one line:
 
    ```
-   datastash isn't signed in on this computer. To sign in, open https://getdatastash.com/device (on any device), enter code BCDF-GHJK and press Approve.
-   The code works for 10 more minutes.
+   To add this computer to your datastash, open https://getdatastash.com/agents and type the code BCDF-GHJK (it works for 10 more minutes).
    ```
 
-   Open the page on any device (it works on a remote computer too: no localhost redirect), sign in with Google, type the
-   code and press **Approve**. A background helper finishes the login. If this computer has a desktop browser, the page
+   Open the page on any device (it works on a remote computer too: no localhost redirect; Google sign-in only when that
+   browser never signed in to datastash) and type the code. A background helper finishes the login. If this computer has a desktop browser, the page
    also opens there (at most once a day). Not approved yet? The next session start, and your first datastash use in a
    session, show the same link and code again while it is good; a new code is made only after the old one ends.
 4. **Connect in the session you're in.** After you approve, that session shows "datastash is signed in. Type /mcp
@@ -112,27 +111,25 @@ About `datastash login`:
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
 
-## Agents name themselves
+## Agents set up by the plugin, allowed by you (plugin 0.5.0)
 
-Nobody names an agent. A Claude Code session that is not the person's main and not linked yet registers itself on its
-first datastash use, with no question and no step for the person. The skill makes it:
+Nobody names an agent, and no AI registers itself. Once this computer is signed in, the plugin itself (never the AI):
 
-1. take its name from the project folder (`datastash auto-name`); when another agent already has that name it adds
-   `-2`, `-3`. A folder that is already linked reuses its agent, and the person's main session never registers;
-2. register that name (`ledger_agent_register`) on the `datastash` connector, signed in once per machine;
-3. get a one-time pickup code (`ledger_agent_key`) and run `printf '%s\n' '<code>' | datastash fetch "<name>" -`,
-   which reads the code from stdin (so it stays out of the process list), trades it for the agent key over HTTPS
-   and writes it to a mode-600 file without printing it. If another agent's name maps to the same file name, fetch
-   refuses unless `--force` is given. The code is bound to this machine: before the connector call, the plugin's hook
-   makes a random verifier, keeps it in `~/.config/datastash/pending/` (mode 600, never shown to the AI) and puts only
-   its hash in the call (`code_challenge`, replacing any the AI sent); the pickup sends the verifier, so a code that
-   leaks from the chat is useless elsewhere. A key asked for through this computer's datastash login has that login's
-   reach; any other new key starts with its agent workbook only, until you allow more on `/confirm`;
-4. use the account's agent workbook (if there is none, it says so in one line: making one is a paid workbook with the
-   usual approve-and-pay step);
-5. run `datastash link "<name>" --workbook <id> --agent-id <id>`, which links the current folder to the agent.
+1. finds the folders Claude Code was used in during the last 30 days, from Claude Code's own transcript folders (never
+   the home folder, `/` or "datastash main"; nothing a prompt, a hook's input or an environment value says changes the
+   list);
+2. registers one agent per folder over the REST door on this computer's login (named after the folder, `-2`, `-3` when
+   taken), and keeps each `agent_id` in `~/.config/datastash/enroll.json` (mode 600) with no key yet. A retry reuses
+   it, never a second agent;
+3. opens `https://getdatastash.com/agents`, where every waiting agent is listed (name and server) and **Allow all**
+   allows them at once. A later new folder's agent shows up there too.
 
-Any other name: ask the session for it ("register as Researcher"); the same steps run with that name.
+A session whose folder's agent waits says so once ("waits for your OK"), and its listener asks datastash about every
+10 seconds. Once datastash says the agent is allowed, the listener makes the agent's ONE first-key ask
+(`only_if_no_key`: datastash refuses an agent that already has a key before anything is issued, so no working key
+anywhere ever stops), picks the key up with a secret held in memory only, saves it (mode 600, never shown), links the
+folder, says hello and listens. An agent that already has a key elsewhere, or an account with no agent workbook yet,
+gets one notice with the sentence that fixes it.
 From then on, sessions in that folder start with a count of new messages and the listener runs.
 
 ## datastash main: the person's own session
@@ -400,7 +397,7 @@ Common causes:
   If it can't, run from a copy with `claude --plugin-dir <copy>/plugins/datastash`.
 - **The connector isn't signed in**: this computer has no datastash login yet (or it was signed out). The next session
   start shows the sign-in link and code; or ask Claude to run `datastash login`, which shows the same code. Open
-  `https://getdatastash.com/device` on any device, type the code, press **Approve**, then type `/mcp reconnect all`.
+  `https://getdatastash.com/agents` on any device, type the code, then type `/mcp reconnect all`.
   `/mcp` shows the plugin's datastash connector as failed (HTTP 401) while signed out, with no Authenticate option;
   that is expected.
 - **New datastash tools not showing**: current versions of datastash tell Claude Code when its tools change; on an older

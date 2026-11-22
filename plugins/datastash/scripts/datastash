@@ -1358,7 +1358,23 @@ def only_agent():
     """The one-agent fallback: the one agent on this computer with no folder of its own; None with none or with several
     (datastash never guesses between agents)."""
     u = unlinked_agents()
-    return u[0] if len(u) == 1 else None
+    return u[0] if len(u) == 1 and not _unreadable_agent_configs() else None
+
+
+def _unreadable_agent_configs():
+    """EPM LOW (P2 add): agent config files that can't be read as an agent (broken JSON, no name or workbook). Each may be
+    an agent with no folder, so the one-agent fallback never guesses while there is one."""
+    try:
+        names = os.listdir(CONF)
+    except OSError:
+        return 0
+    n = 0
+    for f in names:
+        if re.fullmatch(r"agent-([a-z0-9\-]+)\.json", f):
+            c = read_json(os.path.join(CONF, f), None)
+            if not (c and c.get("name") and c.get("workbook_id")):
+                n += 1
+    return n
 
 
 def _fallback_allowed(project_dir, me):
@@ -1410,7 +1426,7 @@ def _read_notices():
 
 
 def notice_cause(kind, s=None, folder=None):
-    if kind in ("dead", "missing"):
+    if kind in ("dead", "missing", "waiting", "haskey", "keyfailed"):
         return f"{kind}:{s}"
     if kind == "unlinked":
         return "unlinked:" + hashlib.sha256(os.path.realpath(folder or "").encode()).hexdigest()[:16]
@@ -1432,7 +1448,25 @@ def notice_text(kind, agent=None, names=None):
                 "this agent's key on any other computer.)")
     if kind == "noagent":
         return (f"{NOTICE}: this computer has no datastash agent yet, so no session here gets messages. "
-                + _fix("Set this folder up as a datastash agent."))
+                + _fix("Sign this computer in to datastash."))
+    # XLI-375: person sentences (the person reads them; the AI only relays them as they are)
+    if kind == "waiting":
+        return (f'{NOTICE}: agent "{disp(agent["name"])}" waits for your OK. Open {AGENTS_URL} and press Allow; it '
+                "starts by itself once you do. Its messages wait in its inbox (delayed, never dropped).")
+    if kind == "noworkbook":
+        return (f'{NOTICE}: agent "{disp(agent["name"])}" is allowed, but your datastash has no agent workbook yet, so '
+                "it can't start. It starts by itself once there is one. "
+                + _fix("Make my datastash agent workbook."))
+    if kind == "haskey":
+        name = disp(agent["name"])
+        return (f'{NOTICE}: agent "{name}" is allowed, but it already has a key on another computer, so this computer '
+                "did not get one (a new one would stop that one). "
+                + _fix(f"Get datastash agent {name} a new key on this computer.") + " (A new key here stops this "
+                "agent's key on any other computer.)")
+    if kind == "keyfailed":
+        name = disp(agent["name"])
+        return (f'{NOTICE}: agent "{name}" is allowed, but this computer could not pick up its key. '
+                + _fix(f"Get datastash agent {name} a new key on this computer."))
     shown = sorted(disp(n) for n in names or [])
     return (f"{NOTICE}: this folder is not linked to a datastash agent, and {len(shown)} agents on this computer have no "
             "folder, so this session gets no messages (datastash never guesses which one). To fix it, the person says "
@@ -1445,11 +1479,15 @@ def raise_notice(cause, text):
         with _NoticeLock():
             n = _read_notices()
             if cause in n:
-                return
+                return True
             n[cause] = {"text": text, "shown": False, "at": int(time.time())}
             write_private(NOTICES_FILE, json.dumps(n))
+            return True
     except OSError:
-        pass
+        return False
+
+
+AGENT_WAITING = "agent_waiting_for_person"
 
 
 def take_notices(causes):
@@ -1572,6 +1610,507 @@ def start_beat(agent, project, live, stop=None):
     return stop
 
 
+# ------------------------------------------------------------------ XLI-375 P1: agents set up by the plugin, approved by the person
+# Owner 11-22: "list the agents all at once for the user to approve and they should approve any new agents"; "All agents
+# at once at install." After this computer's one datastash login, the plugin (never the model) finds the folders Claude
+# Code was used in during the last 30 days, registers one agent per folder over the REST door on that login and keeps
+# each agent_id here, with no key. The person allows them on https://getdatastash.com/agents (the install opens it). A
+# session's listener waits for its folder's agent (one notice) and asks the approval route about every 10 s. Once the
+# server says the agent is approved, the listener asks for its ONE first key with only_if_no_key (the server refuses an
+# agent that holds a key before anything is issued, so no live key ever stops), picks it up with a verifier held in
+# memory only, saves it (mode 600), links the folder and listens.
+# What the model can reach decides nothing here: which folders come only from Claude Code's own transcript folders; no
+# prompt, stdin, argument or environment value names a folder, an agent, an approval or a key; the approval and the key
+# come only from datastash's answers. Running these commands by hand does exactly what the hooks do, no more.
+AGENTS_URL = ORIGIN + "/agents"
+AGENT_REGISTER_PATH = "/api/v1/agent/register"
+AGENT_KEY_PATH = "/api/v1/agent/key"
+AGENT_APPROVAL_PATH = "/api/v1/agent/approval"
+AGENT_HELLO_PATH = "/api/v1/agent/hello"  # XLI-375 S2; until it is live a 404 is fine (logged only)
+ENROLL_FILE = os.path.join(CONF, "enroll.json")  # folder -> {name, agent_id, proof, at, key_call?, state?} (mode 600)
+RECENT_DAYS = 30
+APPROVAL_POLL_SECONDS = float(os.environ.get("DATASTASH_APPROVAL_POLL_SECONDS", "10"))
+NO_WORKBOOK_RECHECK_SECONDS = 600  # an allowed agent whose account has no agent workbook yet looks again this often
+PROOF_RE = r"[A-Za-z0-9_\-]{43,128}"
+AGENT_ID_RE = r"[A-Za-z0-9\-]{1,64}"
+
+
+def proof_path(s):
+    return os.path.join(CONF, f"agent-{s}.proof")
+
+
+def linkable(here):
+    """A folder an agent may be set up for and linked to: never the home folder, "/", the person's "datastash main" (or
+    inside it), or the datastash folder itself."""
+    if not here:
+        return False
+    rp = os.path.realpath(here)
+    if rp in ("/", os.path.realpath(HOME)) or main_root(rp) is not None:
+        return False
+    return not _within(rp, os.path.realpath(CONF))
+
+
+def _transcript_cwd(path):
+    """The cwd Claude Code recorded in a transcript (its first lines), or None."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256 * 1024)
+    except OSError:
+        return None
+    for line in head.decode("utf-8", "replace").splitlines()[:200]:
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(v, dict) and isinstance(v.get("cwd"), str) and v["cwd"].startswith("/"):
+            return v["cwd"]
+    return None
+
+
+def recent_folders(now=None):
+    """The folders Claude Code was used in during the last RECENT_DAYS days on this computer, newest first, read from its
+    own transcript folders (<CLAUDE_DIR>/projects/<folder>/<session>.jsonl): existing folders of this user only, never
+    the home folder, "/" or "datastash main" (linkable)."""
+    now = time.time() if now is None else now
+    root = os.path.join(CLAUDE_DIR, "projects")
+    found = {}
+    try:
+        dirs = os.listdir(root)
+    except OSError:
+        return []
+    for d in dirs:
+        pd = os.path.join(root, d)
+        try:
+            files = [os.path.join(pd, n) for n in os.listdir(pd) if n.endswith(".jsonl")]
+        except OSError:
+            continue
+        recent = []
+        for f in files:
+            try:
+                st = os.lstat(f)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and now - st.st_mtime <= RECENT_DAYS * 86400:
+                recent.append((st.st_mtime, f))
+        for mtime, f in sorted(recent, reverse=True):
+            cwd = _transcript_cwd(f)
+            if cwd is None:
+                continue
+            rp = os.path.realpath(cwd)
+            try:
+                st = os.stat(rp)
+            except OSError:
+                break
+            if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and linkable(rp):
+                found[rp] = max(found.get(rp, 0), mtime)
+            break
+    return [p for p, _ in sorted(found.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _enrolled():
+    e = read_json(ENROLL_FILE, {})
+    return {k: v for k, v in e.items() if isinstance(k, str) and k.startswith("/") and isinstance(v, dict)
+            and isinstance(v.get("name"), str) and isinstance(v.get("agent_id"), str)
+            and re.fullmatch(AGENT_ID_RE, v["agent_id"]) and isinstance(v.get("proof"), str)
+            and re.fullmatch(PROOF_RE, v["proof"])}
+
+
+def _set_enrolled(folder, rec):
+    """Record (rec) or forget (None) the agent registered for folder. Callers hold the enroll lock or the agent's mint
+    lock; the file is always re-read first, so two writers never drop each other's folders."""
+    with _EnrollFileLock():
+        e = _enrolled()
+        if rec is None:
+            if folder not in e:
+                return
+            e.pop(folder)
+        else:
+            e[folder] = rec
+        ensure_dirs()
+        write_private(ENROLL_FILE, json.dumps(e, indent=2))
+
+
+def _update_enrolled(folder, **fields):
+    with _EnrollFileLock():
+        e = _enrolled()
+        if folder not in e:
+            return None
+        e[folder].update(fields)
+        write_private(ENROLL_FILE, json.dumps(e, indent=2))
+        return e[folder]
+
+
+class _EnrollFileLock:
+    """enroll.json's write lock (none where there is no file locking)."""
+
+    def __enter__(self):
+        ensure_dirs()
+        self.fd = None
+        if fcntl is not None:
+            self.fd = os.open(os.path.join(STATE, "enroll.file.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+
+
+def waiting_record(project_dir, me=None):
+    """(folder, rec) of the agent this folder waits for (the closest registered folder holding project_dir), or None:
+    never in the person's main session or "datastash main", never once the folder has an agent here."""
+    if not project_dir or is_main_session(me) or main_root(project_dir) is not None:
+        return None
+    if session_for(project_dir, me=me) is not None:
+        return None
+    here = os.path.realpath(project_dir)
+    best = None
+    for folder, rec in _enrolled().items():
+        if rec.get("state") == "off":
+            continue
+        if _within(here, folder) and (best is None or len(folder) > len(best[0])):
+            best = (folder, rec)
+    return best
+
+
+def _covered(folder):
+    """True when folder (or a folder holding it) already has an agent here, or one registered and kept in enroll.json."""
+    rp = os.path.realpath(folder)
+    linked = [p for a in all_agents() for p in (a.get("projects") or []) if isinstance(p, str)]
+    return any(_within(rp, os.path.realpath(p)) for p in linked + list(_enrolled()))
+
+
+def _folder_has_agent(folder):
+    rp = os.path.realpath(folder)
+    return any(os.path.realpath(p) == rp for a in all_agents() for p in (a.get("projects") or []) if isinstance(p, str))
+
+
+def _free_name(folder, taken=None):
+    """The name for folder's new agent: the folder's name, -2, -3 ... past any agent on this computer (or a name
+    datastash refused as taken)."""
+    mine = {a["slug"] for a in all_agents()} | {slug(r["name"]) for r in _enrolled().values()}
+    name = _next_name(taken) if taken else _folder_name(folder)
+    for _ in range(1000):
+        if name.strip().lower() not in RESERVED_NAMES and slug(name) not in mine:
+            return name
+        name = _next_name(name)
+    return None
+
+
+def _register(tok, folder, rec=None):
+    """Register folder's agent on the login (rec: the one registered earlier, reused by name and agent_id, never a
+    second agent). Returns (rec, answer). Raises ApiError / network errors."""
+    if rec is not None:
+        ans = api_json("POST", AGENT_REGISTER_PATH, tok, body={"name": rec["name"], "agent_id": rec["agent_id"],
+                                                                "agent_proof": rec["proof"]}, timeout=30)
+        return rec, (ans if isinstance(ans, dict) else {})
+    proof = secrets.token_urlsafe(32)
+    name = _free_name(folder)
+    for _ in range(20):
+        if name is None:
+            break
+        try:
+            ans = api_json("POST", AGENT_REGISTER_PATH, tok, body={"name": name, "agent_proof": proof}, timeout=30)
+        except ApiError as e:
+            if _body_code(e) == "agent_name_taken":
+                name = _free_name(folder, taken=name)
+                continue
+            raise
+        ans = ans if isinstance(ans, dict) else {}
+        agent_id = ans.get("agent_id")
+        if not isinstance(agent_id, str) or not re.fullmatch(AGENT_ID_RE, agent_id):
+            return None, ans
+        srv = ans.get("name").strip() if isinstance(ans.get("name"), str) else ""
+        if srv and slug(srv) == slug(name):
+            name = srv
+        rec = {"name": name, "agent_id": agent_id, "proof": proof, "at": int(time.time())}
+        _set_enrolled(folder, rec)
+        return rec, ans
+    return None, {}
+
+
+def _body_code(e):
+    return (e.body.get("code") or e.body.get("error") or "") if isinstance(e, ApiError) else ""
+
+
+def enroll(open_page=False):
+    """Register one agent for every recent folder that has none here yet (one at a time per computer, under the enroll
+    lock), then give each allowed agent its first key (advance). open_page: the install's end, so the person's browser
+    opens /agents once when anything new is waiting. Returns the number of agents newly registered. Never prints."""
+    if not signed_in():
+        return 0
+    lock = _try_lock(os.path.join(STATE, "enroll.lock"), wait=5)
+    if lock is None and fcntl is not None:
+        return 0  # another enroll runs now; it covers these folders
+    made = 0
+    try:
+        tok = login_token()
+        if not tok:
+            return 0  # a login outage: nothing registered, nothing lost; the next session start or listener tries again
+        # Outer folders first: a folder inside one that has (or now gets) an agent already belongs to that agent.
+        for folder in sorted(recent_folders(), key=lambda f: (len(f), f)):
+            if _covered(folder):
+                continue  # one agent per folder
+            try:
+                rec, _ans = _register(tok, folder)
+            except ApiError as e:
+                log("enroll", f"enroll: register refused (HTTP {e.status} {re.sub(r'[^A-Za-z0-9_]', '', _body_code(e))[:40]})")
+                if e.status in (401, 429) or e.status >= 500:
+                    break
+                continue
+            except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
+                log("enroll", f"enroll: datastash not reached ({type(e).__name__}); tries again later")
+                break
+            if rec is not None:
+                made += 1
+        for folder in list(_enrolled()):
+            try:
+                advance(folder, tok)
+            except Exception as e:  # noqa: BLE001 (one agent's trouble never stops the others)
+                log("enroll", f"enroll: {type(e).__name__}")
+    finally:
+        _unlock(lock)
+    if made and open_page:
+        _open_browser(AGENTS_URL)
+    return made
+
+
+def _mint_lock(s):
+    """The agent's first-key lock (non-blocking): one key ask per agent at a time on this computer."""
+    ensure_dirs()
+    fd = os.open(os.path.join(STATE, f"agent-{s}.mint.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    if fcntl is None:
+        return fd
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def _approval(tok, rec):
+    """The approval route's answer for rec's agent: "approved" | "waiting_for_person" | "switched_off" | "not_found"."""
+    try:
+        ans = api_json("GET", AGENT_APPROVAL_PATH + "?agent_id=" + urllib.parse.quote(rec["agent_id"]), tok, timeout=20)
+    except ApiError as e:
+        if e.status == 404:
+            return "not_found"
+        raise
+    st = ans.get("approval") if isinstance(ans, dict) else None
+    return st if st in ("approved", "waiting_for_person", "switched_off") else "waiting_for_person"
+
+
+def advance(folder, tok=None):
+    """One step for folder's waiting agent. Returns "ready" (its key is saved and the folder linked), "waiting",
+    "no_workbook", "off" (the person said no), "gone" (datastash has no such agent: forgotten here, so the next
+    enroll registers anew), "has_key", "failed" or "retry" (datastash not reached; nothing changed)."""
+    rec = _enrolled().get(folder)
+    if rec is None:
+        return "ready" if _folder_has_agent(folder) else "gone"
+    if rec.get("state") == "off":
+        return "off"
+    s = slug(rec["name"])
+    if read_key(s) and _folder_has_agent(folder):
+        _set_enrolled(folder, None)
+        return "ready"
+    if rec.get("key_call"):
+        return rec.get("state") or "failed"  # its one key ask was answered: never a second one
+    tok = tok or login_token()
+    if not tok:
+        return "retry"
+    try:
+        st = _approval(tok, rec)
+    except ApiError as e:
+        if e.status == 401:
+            return "retry"  # the login's token (outage, or signed out): wait
+        log(s, f"approval: HTTP {e.status}")
+        return "retry"
+    except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return "retry"
+    if st == "waiting_for_person":
+        return "waiting"
+    if st == "switched_off":
+        _update_enrolled(folder, state="off")
+        clear_notices([notice_cause("waiting", s)])
+        return "off"
+    if st == "not_found":
+        _set_enrolled(folder, None)
+        clear_notices([notice_cause("waiting", s)])
+        return "gone"
+    if rec.get("no_workbook_at") and time.time() - rec["no_workbook_at"] < NO_WORKBOOK_RECHECK_SECONDS:
+        return "no_workbook"
+    lock = _mint_lock(s)
+    if lock is None:
+        return "waiting"  # another process here is giving it its key right now
+    try:
+        return _first_key(folder, s, tok)
+    finally:
+        _unlock(lock)
+
+
+def _first_key(folder, s, tok):
+    """The ONE key ask, only after datastash said the agent is approved: only_if_no_key (refused, before anything is
+    issued, when the agent holds a key: no live key ever stops). The verifier lives in this function only."""
+    rec = _enrolled().get(folder)  # re-read under the mint lock
+    if rec is None or rec.get("key_call"):
+        return "ready" if rec is None and _folder_has_agent(folder) else "failed"
+    try:
+        _rec, ans = _register(tok, folder, rec)  # the same agent again: its agent workbooks, now that it may see them
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return "retry"
+    wbs = [t.get("workbook_id") for t in (ans.get("notes_tabs") or []) if isinstance(t, dict)
+           and isinstance(t.get("workbook_id"), str) and re.fullmatch(AGENT_ID_RE, t["workbook_id"])]
+    if not wbs:
+        _update_enrolled(folder, no_workbook_at=int(time.time()))
+        raise_notice(notice_cause("noworkbook"), notice_text("noworkbook", agent={"name": rec["name"]}))
+        return "no_workbook"
+    clear_notices([notice_cause("noworkbook")])
+    v = secrets.token_urlsafe(48)
+    try:
+        ans = api_json("POST", AGENT_KEY_PATH, tok, body={"name": rec["name"], "agent_id": rec["agent_id"],
+                                                           "code_challenge": challenge_of(v), "agent_proof": rec["proof"],
+                                                           "only_if_no_key": True}, timeout=30)
+    except ApiError as e:
+        c = _body_code(e)
+        if e.status == 401 or e.status == 429 or e.status >= 500 or c == AGENT_WAITING:
+            return "retry"  # nothing was issued: asked again on the next step
+        state = "has_key" if c == "has_key" else "failed"
+        _update_enrolled(folder, key_call=int(time.time()), state=state)
+        cause = notice_cause("haskey" if state == "has_key" else "keyfailed", s)
+        raise_notice(cause, notice_text("haskey" if state == "has_key" else "keyfailed", agent={"name": rec["name"]}))
+        log(s, f"first key: refused (HTTP {e.status} {re.sub(r'[^A-Za-z0-9_]', '', c)[:40]}); never asked again")
+        return state
+    except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return "retry"  # no answer: a code may have been issued, but no key is live; only_if_no_key keeps a retry safe
+    _update_enrolled(folder, key_call=int(time.time()), state="failed")  # answered: from here on, never a second ask
+    code = ans.get("pickup_code") if isinstance(ans, dict) else None
+    key = None
+    try:
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_\-]{6,200}", code):
+            key = _pickup(code, v)
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        key = None
+    code = v = None
+    if key is None:
+        raise_notice(notice_cause("keyfailed", s), notice_text("keyfailed", agent={"name": rec["name"]}))
+        log(s, "first key: no key picked up; never asked again")
+        return "failed"
+    others = sorted({a.get("workbook_id") for a in all_agents() if not is_person(a)} & set(wbs))
+    try:
+        save_agent(rec["name"], rec["agent_id"], key, others[0] if others else wbs[0], folder, proof=rec["proof"])
+    except OSError as e:
+        log(s, f"first key: not saved ({type(e).__name__})")
+        raise_notice(notice_cause("keyfailed", s), notice_text("keyfailed", agent={"name": rec["name"]}))
+        return "failed"
+    finally:
+        key = None
+    _set_enrolled(folder, None)
+    clear_notices([notice_cause("waiting", s), notice_cause("haskey", s), notice_cause("keyfailed", s)])
+    log(s, "first key: saved; folder linked")
+    return "ready"
+
+
+def _pickup(code, verifier):
+    """Trade a bound pickup code (with its in-memory verifier) for its key: the key text, or None. Never printed."""
+    status, _ctype, text = http("POST", PICKUP_PATH, form=pickup_form(code, verifier), timeout=30)
+    key = text.strip()
+    return key if status == 200 and re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key) else None
+
+
+def save_agent(name, agent_id, key, workbook_id, here, proof=None):
+    """Save a new agent's key (mode 600; never printed), its proof and its config, and link here (linkable folders
+    only). Returns the saved config (with slug)."""
+    ensure_dirs()
+    s = slug(name)
+    write_private(key_path(s), key + "\n")
+    if proof:
+        write_private(proof_path(s), proof + "\n")
+    c = read_json(conf_path(s), {})
+    c["name"] = name
+    if agent_id:
+        c["agent_id"] = agent_id
+    c["workbook_id"] = workbook_id
+    if linkable(here):
+        rp = os.path.realpath(here)
+        c["projects"] = [p for p in (c.get("projects") or []) if p != rp] + [rp]
+    write_private(conf_path(s), json.dumps(c, indent=2))
+    if os.path.exists(state_path(s)):
+        try:
+            set_flag(dict(c, slug=s), "key_refused", None)
+        except (OSError, ValueError):
+            pass
+    clear_notices(notice_causes({"slug": s}) + ["noagent", notice_cause("unlinked", folder=here)])
+    return dict(c, slug=s)
+
+
+def send_hello(agent, key):
+    """XLI-375: the agent says hello once its key works (S2's route; a 404 until then is logged only)."""
+    try:
+        api_json("POST", AGENT_HELLO_PATH, key, body={"workbook_id": agent["workbook_id"]}, timeout=20)
+        log(agent["slug"], "hello: sent")
+    except ApiError as e:
+        log(agent["slug"], f"hello: HTTP {e.status}")
+    except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
+        log(agent["slug"], f"hello: not sent ({type(e).__name__})")
+
+
+def _listen_waiting(folder, rec, session_id, project, me):
+    """The listener of a session whose folder's agent waits for the person's OK: it holds that agent's listener lock,
+    tells the waiting notice once (one wake), then asks the approval route about every APPROVAL_POLL_SECONDS. Once the
+    agent's key is saved it listens as that agent in this same process."""
+    s = slug(rec["name"])
+    lock = _take_listener_lock(s, session_id)
+    if lock is None:
+        return 0
+    try:
+        parent = _session_pid()
+        if parent is not None:
+            _PARENT_START[parent] = _proc_start(parent)
+        raise_notice(notice_cause("waiting", s), notice_text("waiting", agent={"name": rec["name"]}))
+        told = take_notices([notice_cause("waiting", s)])
+        if told:
+            log(s, "listen: waiting for the person's OK; tells the session once")
+            print(" ".join(told), file=sys.stderr)
+            sys.stderr.flush()
+            return 2  # the Stop hook after that turn starts the listener again, which then waits quietly
+        log(s, f"listen: waiting for the person's OK; asks every {APPROVAL_POLL_SECONDS:g}s")
+        while True:
+            if parent is not None and not _parent_alive(parent):
+                return 0
+            if me is not None and is_main_session(me):
+                return 0
+            st = advance(folder)
+            if st == "ready":
+                break
+            if st in ("off", "gone", "has_key", "failed"):
+                told = take_notices([notice_cause("haskey", s), notice_cause("keyfailed", s)])
+                if told:
+                    print(" ".join(told), file=sys.stderr)
+                    sys.stderr.flush()
+                    return 2
+                return 0
+            if st == "no_workbook":
+                told = take_notices([notice_cause("noworkbook")])
+                if told:
+                    print(" ".join(told), file=sys.stderr)
+                    sys.stderr.flush()
+                    return 2
+            _sleep(APPROVAL_POLL_SECONDS * random.uniform(0.9, 1.1), parent)
+        agent = listen_target(project, me=me)
+        if agent is None or agent.get("slug") != s:
+            return 0
+        mark_agent_use(me, "listen")
+        key = read_key(s)
+        if key:
+            send_hello(agent, key)
+        mine = lambda: _still_mine(s, project, me)  # noqa: E731
+        return _listen_loop(agent, s, session_id, None, me, mine=mine, project=project)
+    finally:
+        os.close(lock)
+
+
 # ------------------------------------------------------------------ hooks
 
 def cmd_check(_args):
@@ -1614,10 +2153,16 @@ def cmd_check(_args):
         if fb is not None:
             agent = dict(fb, via="only-agent")
     if agent is None:
-        if main_root(project) is None:
-            warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. On its first datastash use it registers '
-                           'itself, named after this folder (datastash-agent skill, "Self-registration"); never when the '
-                           'person types "datastash main".']
+        if main_root(project) is None and not is_main_session(me):
+            w = waiting_record(project, me)
+            if w is not None:
+                # XLI-375: the person's one notice that this folder's agent waits for their OK (told once)
+                s_w = slug(w[1]["name"])
+                raise_notice(notice_cause("waiting", s_w), notice_text("waiting", agent={"name": w[1]["name"]}))
+                warn = warn + take_notices([notice_cause("waiting", s_w)])
+            warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. The datastash plugin sets this '
+                           "folder's agent up by itself once this computer is signed in, and the person allows it on "
+                           f"{AGENTS_URL}; never register an agent or get a key yourself."]
         emit(" ".join(warn + _no_agent_notices(project, me)) + tail)
         return 0
     pre = "".join(w + " " for w in warn)
@@ -1635,8 +2180,8 @@ def cmd_check(_args):
             raise_notice(notice_cause("missing", s), notice_text("missing", agent))
             told = take_notices([notice_cause("missing", s)])
         ctx = told[0] if told else (f'{NOTE}: agent "{name}": its key file is missing or unusable ({key_path(s)}), so it '
-                                    "gets no messages until it has one. The datastash-agent skill covers getting a new "
-                                    "pickup code.")
+                                    "gets no messages until it has one. The person was told once how to fix it; never "
+                                    "get a key or a pickup code yourself.")
     else:
         # The network part runs in a helper thread and the hook waits at most CHECK_WAIT_SECONDS for it, so a stalled
         # DNS lookup or connection can never hold the session start up (the answer is then "counts unknown").
@@ -1666,11 +2211,14 @@ def _no_agent_notices(project, me):
     if not _fallback_allowed(project, me):
         return []
     if not all_agents():
+        if signed_in() or _enrolled() or _pending_live():
+            return []  # XLI-375: the plugin sets the agents up by itself (or the sign-in line is out): nothing to fix
         cause, text = "noagent", notice_text("noagent")
     else:
         clear_notices(["noagent"])
         u = unlinked_agents()
         if len(u) < 2:
+            clear_notices([notice_cause("unlinked", folder=project)])  # P2 add: its cause is gone, however it went
             return []
         cause, text = notice_cause("unlinked", folder=project), notice_text("unlinked", names=[a["name"] for a in u])
     raise_notice(cause, text)
@@ -1708,7 +2256,8 @@ def _check_counts(agent, key, name, out):
                 raise_notice(notice_cause("dead", s), notice_text("dead", agent))
                 told = take_notices([notice_cause("dead", s)])
             ctx = told[0] if told else (f'{NOTE}: agent "{name}": its key was refused (switched off, or a newer key was '
-                                        "issued). The datastash-agent skill covers this.")
+                                        "issued). The person was told once how to fix it; never get a key or a pickup "
+                                        "code yourself.")
         else:
             ctx = f'{NOTE}: agent "{name}": inbox check failed (HTTP {e.status}); counts unknown.'
         log(s, f"check: HTTP {e.status} {_code(e)}")
@@ -1766,7 +2315,9 @@ def _take_listener_lock(s, session_id):
         os.close(fd)
         return None
     os.ftruncate(fd, 0)
-    os.write(fd, json.dumps({"pid": os.getpid(), "session_id": session_id, "since": int(time.time())}).encode())
+    # P2 add (EPM LOW): the holder's start time too, so a reused pid is never taken for it
+    os.write(fd, json.dumps({"pid": os.getpid(), "start": _proc_start(os.getpid()), "session_id": session_id,
+                             "since": int(time.time())}).encode())
     return fd
 
 
@@ -1781,6 +2332,19 @@ def cmd_listen(_args, printer=None, forced=None):
     me = this_session(inp) if printer is None else this_session()
     project = project_of(inp)
     agent = forced if forced is not None else listen_target(project, me=me)
+    if (agent is None or agent.get("via")) and printer is None and forced is None and signed_in() \
+            and main_root(project) is None and not is_main_session(me):
+        # XLI-375: this folder has no agent here yet. The plugin registers one for each recent folder (Claude Code's own
+        # transcript folders decide which; nothing from this hook's input does), then this listener waits for the
+        # person's OK of this folder's agent.
+        try:
+            enroll()
+        except Exception as e:  # noqa: BLE001
+            log("enroll", f"enroll: {type(e).__name__}")
+        w = waiting_record(project, me)
+        if w is not None:
+            return _listen_waiting(w[0], w[1], str(inp.get("session_id") or ""), project, me)
+        agent = listen_target(project, me=me)
     if agent is None:
         return 0  # nothing to listen for here; the session start says why, once (notices)
     if not is_person(agent) and not agent.get("via"):
@@ -1997,7 +2561,12 @@ def _parent_alive(pid):
     if not _alive(pid):
         return False
     want = _PARENT_START.get(pid)
-    return want is None or _proc_start(pid) == want
+    if want is None:
+        # P2 add (EPM LOW): the start time was unreadable when the listener started: take the first one readable now, so
+        # from then on a reused pid never keeps the listener alive. Never readable: the pid alone decides.
+        _PARENT_START[pid] = _proc_start(pid)
+        return True
+    return _proc_start(pid) == want
 
 
 def _sleep(seconds, parent):
@@ -2043,6 +2612,8 @@ def stop_session_listeners(sid):
         info = read_json(os.path.join(STATE, n), {})
         pid = info.get("pid")
         if (isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and info.get("session_id") == sid
+                and _lock_held(os.path.join(STATE, n))
+                and (info.get("start") is None or _proc_start(pid) == info.get("start"))
                 and _is_listener(pid)):
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -2050,6 +2621,26 @@ def stop_session_listeners(sid):
             except OSError:
                 pass
     return stopped
+
+
+def _lock_held(path):
+    """P2 add (EPM LOW, pid reuse): True when some process holds this listener lock now (a lock nobody holds names a
+    listener that ended, whose pid may be another process by now). Where there are no file locks, True (the other
+    checks decide)."""
+    if fcntl is None:
+        return True
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
 
 
 def _is_listener(pid):
@@ -2127,7 +2718,8 @@ def cmd_fetch(args):
         status, _ctype, text = http("POST", PICKUP_PATH, form=pickup_form(code, verifier), timeout=30)
     except ApiError as e:
         die(f"pickup refused (HTTP {e.status}): the code is unknown, used or expired, or was asked for on another machine "
-            "or another name. Ask for a new one (ledger_agent_key) in this session.")
+            "or another name. Never ask for a new one yourself (it stops this agent's key on any other computer); tell "
+            "the person in one plain line. " + _fix(f"Get datastash agent {disp(name)} a new key on this computer."))
     except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
         die(f"could not reach datastash ({type(e).__name__}); the code may not have been used, try again")
     key = text.strip()
@@ -2536,7 +3128,8 @@ def _pending_code():
     if not (isinstance(code, str) and re.fullmatch(USER_CODE_RE, code) and isinstance(url, str) and url.startswith(ORIGIN + "/")
             and re.fullmatch(r"[\x21-\x7e]{1,200}", url)):
         return None
-    return {"user_code": code, "url": url, "until": p["until"], "opened": p.get("opened") is True}
+    # XLI-375: the person types the code on /agents (its code box), not the older /device page.
+    return {"user_code": code, "url": AGENTS_URL, "until": p["until"], "opened": p.get("opened") is True}
 
 
 def _start_blocked(hook):
@@ -2637,7 +3230,7 @@ def _start_code(hook=False, timeout=30):
         _drop(_start_state_file())
         if not _spawn_poller():
             return None, "could not start the background helper that finishes the login"
-        opened = _hook_browser(url) if hook else _open_browser(url)
+        opened = _hook_browser(AGENTS_URL) if hook else _open_browser(AGENTS_URL)  # XLI-375: the /agents code box
         # For the hook that waits on this file (L2: the code is saved before anyone is shown it). Only while the file
         # still holds this code: the poller drops a used code under the start lock, which this process holds here, so
         # the check and the write can't be split by it (EPM N2: never re-create the file for a code already used).
@@ -2649,7 +3242,7 @@ def _start_code(hook=False, timeout=30):
                                                               "opened": True}))
             except OSError:
                 pass
-        return {"user_code": code, "url": url, "until": until, "new": True, "opened": opened}, None
+        return {"user_code": code, "url": AGENTS_URL, "until": until, "new": True, "opened": opened}, None
     finally:
         _unlock(lock)
 
@@ -2690,16 +3283,18 @@ def device_sign_in(hook=False, timeout=30):
 
 
 def person_sign_in_text(info, legacy=False):
-    """The two lines the person sees (Claude Code shows a hook's systemMessage to the person, not to the AI's task)."""
+    """The line the person sees (Claude Code shows a hook's systemMessage to the person, not to the AI's task)."""
     mins = max(1, int((info["until"] - time.time() + 59) // 60))
     tail = f"The code works for {mins} more minute{'s' if mins != 1 else ''}."
     if info.get("opened"):
         tail = "A datastash page opened in your browser. " + tail
     if legacy:
-        return (f"datastash has a new sign-in for this computer. Open {info['url']} (on any device), enter code "
-                f"{info['user_code']} and press Approve. Your current connector sign-in keeps working in the meantime.\n{tail}")
-    return (f"datastash isn't signed in on this computer. To sign in, open {info['url']} (on any device), enter code "
-            f"{info['user_code']} and press Approve.\n{tail}")
+        return (f"datastash has a new sign-in for this computer. Open {info['url']} and type the code "
+                f"{info['user_code']}. Your current connector sign-in keeps working in the meantime.\n{tail}")
+    # XLI-375 plan item 1: one line. The browser's datastash session (or one Google sign-in) carries the rest.
+    return (f"To add this computer to your datastash, open {info['url']} and type the code {info['user_code']}"
+            f" (it works for {mins} more minute{'s' if mins != 1 else ''}"
+            + ("; the page is open in your browser" if info.get("opened") else "") + ").")
 
 
 def _late_sign_in_note():
@@ -4108,8 +4703,8 @@ def cmd_login(args):
     mins = max(1, int((info["until"] - time.time() + 59) // 60))
     print(f"code: {code}" + ("" if info["new"] else " (the code already shown to the person; no new sign-in started)"))
     print(f"page: {url}" + (" (opened in the person's browser)" if info["opened"] else " (the person opens it, on any device)"))
-    where = "A datastash page opened in your browser. Type" if info["opened"] else f"Open {url} on any device and type"
-    print(f'tell the person, in plain words: "{where} the code {code} there and press Approve." The code works for '
+    where = "A datastash page opened in your browser. Type" if info["opened"] else f"Open {url} and type"
+    print(f'tell the person, in plain words: "{where} the code {code} there." The code works for '
           f'{mins} more minute{"s" if mins != 1 else ""}. When the person says it is done, run datastash login --check.')
     return 0
 
@@ -4213,6 +4808,14 @@ def _login_poll_loop(p, interval, deadline):
             _drop(LOGIN_PENDING_FILE)
     finally:
         _unlock(lock)
+    if signed_in():
+        # XLI-375 plan item 1 / owner "All agents at once at install": the install ends by registering an agent for each
+        # folder used here in the last 30 days (all waiting for the person's OK) and opening /agents with them listed.
+        try:
+            # The /agents tab the plugin opened for the code refreshes itself; else the page opens now.
+            enroll(open_page=not p.get("opened"))
+        except Exception:  # noqa: BLE001 (the login is saved; the next session start or listener tries again)
+            pass
     return 0
 
 
