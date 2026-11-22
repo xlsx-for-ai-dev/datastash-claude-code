@@ -4164,7 +4164,9 @@ class Xli375(Base):
 
         def fetch(agent, key, cursor, wait, timeout=None):
             polls.append((agent["slug"], key))
-            raise Stop()
+            if len(polls) > 1:
+                raise Stop()
+            return [], "0", False  # the first key works (P2: then the hello goes, as on every listener start)
         ds.fetch_page = fetch
         with self.assertRaises(Stop):
             self.listen(inp)  # told already: waits quietly, then listens
@@ -4172,7 +4174,10 @@ class Xli375(Base):
         # one look by each listener start's enroll, then one per ~10 s wait until the Allow
         self.assertEqual(len(self.server.paths(ds.AGENT_APPROVAL_PATH)), 2 + 4)
         self.assertEqual(len(self.key_calls()), 1)
-        self.assertEqual(polls, [("alpha", "ldgr_ag_firstkey")])
+        self.assertEqual(polls, [("alpha", "ldgr_ag_firstkey")] * 2)
+        end = time.time() + 5
+        while time.time() < end and not self.server.paths(ds.AGENT_HELLO_PATH):
+            time.sleep(0.02)
         self.assertEqual(len(self.server.paths(ds.AGENT_HELLO_PATH)), 1)
         self.assertEqual(ds._read_notices(), {})  # the waiting notice is gone with its cause
 
