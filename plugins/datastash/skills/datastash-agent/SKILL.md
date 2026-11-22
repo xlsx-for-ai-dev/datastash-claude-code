@@ -111,6 +111,10 @@ The person turns it on by typing "Keep my agents' status and what I tell them to
 - A note says this agent has no saved status yet when the person asks for status: do the same in that turn (save yours, then `datastash status --all`).
 - While keeping is off, a note asks you to answer a status question the ordinary way and end with the one line to turn it on: do exactly that, once, and never suggest it otherwise.
 
+## Lookups datastash keeps ready
+
+The plugin counts your repeated lookups to outside tools (gh PRs and CI runs, Linear, Jira, Sentry) on this computer, in plain code: only the command's shape, never its output or arguments. When the person says yes to its offer in the status, a note tells you to run `datastash lookups steps <service>`: follow the steps it prints (the plugin hands the hook secret in itself; never run a fetch or set_secret line, never put a secret in a chat). After that, a line "datastash has this: ..." on a lookup tells you where the answer is kept: read that row instead of asking the tool again.
+
 ## REST door (with your key)
 
 `datastash api METHOD PATH [JSON]` sends one call as you, with the key read from its file. The JSON answer is printed between the two marker lines described above. Paths:

@@ -25,6 +25,9 @@ Subcommands (run `datastash help`):
                             the keep phrase (checked by the plugin, never taken from the AI): sign in if needed, next steps
   api METHOD PATH [JSON]    one call to the datastash REST door (/api/v1/agent/...) as the linked agent; the answer
                             is printed between two marker lines as untrusted data
+  lookups [steps SERVICE]   today's repeated outside lookups on this computer (shapes and counts only) and what
+                            datastash keeps; steps github|linear|jira: that feed's setup steps, after the person's
+                            "do N" on the status offer
   off NAME                  stop using NAME on this machine (key file moved to ~/.config/datastash/off/)
   watch                     print one line each time new messages arrive (for a Monitor loop)
   doctor                    check this machine's setup (hooks firing, Claude Code settings files, plugin enabled, key
@@ -4303,6 +4306,14 @@ def cmd_agent_tool(_args):
             hs["additionalContext"] = (hs.get("additionalContext", "") + " " + ai).strip()
         if person:
             out["systemMessage"] = person
+    try:
+        hint = lookup_hook(inp)  # XLI-308: count a repeated outside lookup; a hint once datastash keeps it
+    except Exception:
+        hint = None
+    if hint:
+        out = out or {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
+        hs = out["hookSpecificOutput"]
+        hs["additionalContext"] = (hs.get("additionalContext", "") + " " + hint).strip()
     if out is not None:
         print(json.dumps(out), flush=True)
     return _agent_tool(inp)
@@ -5199,6 +5210,8 @@ def read_status_cache(workbook_id):
     if not isinstance(c, dict) or not isinstance(c.get("agents"), list) or not _num_ok(c.get("fetched_at")):
         return None
     c["agents"] = [x for x in (norm_status_row(r) for r in c["agents"]) if x]
+    if not _changed_ok(c.get("changed")):
+        c.pop("changed", None)
     if not _num_ok(c.get("failed_at")):
         c["failed_at"] = None
     return c
@@ -5221,7 +5234,7 @@ def _merge_rows(old, new):
 _KEEP_MORNING = object()  # an agent key's read has no morning lines: the copy keeps the person's last ones
 
 
-def save_status_cache(workbook_id, rows, fetched_at, merge=True, morning=_KEEP_MORNING):
+def save_status_cache(workbook_id, rows, fetched_at, merge=True, morning=_KEEP_MORNING, changed=_KEEP_MORNING):
     ensure_dirs()
     with StateLock(f"status-{_wb_tag(workbook_id)}"):
         old = read_status_cache(workbook_id)
@@ -5232,6 +5245,13 @@ def save_status_cache(workbook_id, rows, fetched_at, merge=True, morning=_KEEP_M
             morning = (old or {}).get("morning")
         if _morning_ok(morning):
             c["morning"] = {"day": morning["day"], "lines": list(morning["lines"])}
+        if changed is _KEEP_MORNING:
+            changed = (old or {}).get("changed")  # an agent key's read has no changed block: keep the person's last
+        elif _changed_ok(changed):
+            changed = {"head": changed["head"], "lines": list(changed["lines"]),
+                       "at": changed["at"] if _num_ok(changed.get("at")) else fetched_at}
+        if _changed_ok(changed):
+            c["changed"] = changed
         write_private(status_cache_path(workbook_id), json.dumps(c))
     return c
 
@@ -5323,11 +5343,13 @@ def fetch_status(sess, timeout=10, asked=False):
     wb = sess["workbook_id"]
     rows, cursor, restarted, seq = [], None, False, None
     morning = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
+    changed = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
     try:
         for _ in range(STATUS_MAX_PAGES):
             body = _status_page(path, key, wb, cursor, timeout, asked)
             if cursor is None and path == PERSON_STATUS_PATH:
                 morning = body.get("morning")
+                changed = body.get("changed")  # XLI-306: "Changed in the last hour", the person's first page only
             if cursor is not None and body.get("note") and not restarted:
                 # the server could not read our cursor and served page 1 again: start the walk over, once
                 restarted, rows, cursor = True, [], None
@@ -5354,7 +5376,7 @@ def fetch_status(sess, timeout=10, asked=False):
     note_door(True)
     # Addendum 6 N2: a `keep` value in this reply is ignored. Until the site has a person-only action that sets it (never
     # an agent key, the sync tool or anything an agent can call), only the person's typed words here turn keeping on.
-    return save_status_cache(wb, rows, time.time(), morning=morning)
+    return save_status_cache(wb, rows, time.time(), morning=morning, changed=changed)
 
 
 # --- consent (PM ruling H2): the person's one yes, per project folder
@@ -5952,11 +5974,15 @@ def render_status_all(here, me, install=False, live_timeout=10, only=None, for_p
                 return []
             if only is None and not install:
                 out += take_morning(c)  # XLI-359: the first status of the person's day starts with these
+            changed = changed_lines(c, now)
+            offer = lookup_offer_line(numbers) if not install and only is None else None
             if for_person:
                 out.append(f"{STATUS_HEAD} {_freshness(c, now, note)}")
                 if install:
                     out.append(INSTALL_HEAD)
-                out += [STATUS_WORDS_LINE] + (lines or ["(no agent has written a status yet)"])
+                out += [STATUS_WORDS_LINE] + (lines or ["(no agent has written a status yet)"]) + changed
+                if offer:
+                    out.append(offer)
                 if install:
                     out += list(INSTALL_TAIL) + [INSTALL_QUESTION]
                 elif numbers:
@@ -5965,8 +5991,12 @@ def render_status_all(here, me, install=False, live_timeout=10, only=None, for_p
                 if install:
                     out.append(INSTALL_HEAD)
                 out += _framed_block(lines or ["(no agent has written a status yet)"])
+                if changed:
+                    out += _framed_block(changed, what="Changed in the last hour, from the services' events")
                 if install:
                     out += list(INSTALL_TAIL) + [INSTALL_QUESTION]
+                if offer:
+                    out.append(offer)
                 out.append(_freshness(c, now, note))
         else:
             out.append(f"{STATUS_HEAD}: {note}." if for_person else f"{STATUS_NOTE}: {note}.")
@@ -6557,6 +6587,8 @@ def cmd_status_verify(args):
     try:
         if rec.get("kind") == "keep":
             record_keep_all(True, "typed")
+        elif rec.get("kind") == "lookup":
+            lookup_setup(rec.get("data") or {}, sid)  # XLI-308: only on the person's own typed "do K"
     except OSError:
         return 0
     return 0
@@ -6701,6 +6733,8 @@ def status_prompt_context(inp):
     view = read_view(sid)
     if kind == "do":
         target = (view or {}).get("numbers", {}).get(str(arg))
+        if isinstance(target, dict) and target.get("lookup"):
+            return lookup_do(inp, arg, target)  # XLI-308
         if not isinstance(target, dict) or not target.get("ask"):
             return None  # not an ask of the list this session just showed: an ordinary prompt
         return {"show": DO_LATER.format(n=arg, agent=_clean(target.get("agent"), 64), text=_clean(target.get("text"), 300))}
@@ -6832,6 +6866,397 @@ def cmd_keep(args):
     return 0
 
 
+# --- XLI-308: repeated outside lookups, kept ready. Plain code, zero tokens: the PostToolUse Bash hook counts each
+# agent's lookups to outside tools (only a normalized command shape such as "gh pr view": never the output, the
+# arguments, an environment value or anything that could hold a secret). Past LOOKUP_OFFER_AFTER of one service in a
+# day, status shows one numbered ask, once. The person's typed "do K" (proved by the checker; nothing the AI types sets
+# anything up) sets up that service's feed with the agent's own key (ledger_feeds_setup, XLI-306) and the plugin itself
+# picks up or hands in the hook secret with this machine's verifier, so the AI never holds a code. A tool datastash does
+# not keep is recorded as declined for now. From then on the hook adds one line to that lookup: "datastash has this".
+
+LOOKUPS_PATH = os.path.join(CONF, "lookups.json")  # today's counts: {"day", "counts": {agent: {shape: n}}} (shapes only)
+LOOKUP_OFFERS_PATH = os.path.join(CONF, "lookup-offers.json")  # per service: offered | set_up | needs_secret | failed | declined-for-now
+LOOKUP_OFFER_AFTER = 10  # a service asked more than this many times in a day is offered (a trigger, not a cap)
+LOOKUP_STEPS_WAIT = VERIFY_WAIT + 30  # `datastash lookups steps` waits this long for the checker's setup
+CHANGED_MAX_AGE = 3600  # "Changed in the last hour" from an older read is never shown as current
+MCP_PATH = "/mcp"
+HOOK_PICKUP_PATH = "/api/v1/agent/hooks/pickup"
+FEED_SERVICES = ("github", "linear", "jira")  # the services ledger_feeds_setup keeps (XLI-306)
+LOOKUP_TOOLS = {"gh": "github", "linear": "linear", "jira": "jira", "sentry-cli": "sentry"}
+LOOKUP_LABEL = {"github": "GitHub", "linear": "Linear", "jira": "Jira", "sentry": "Sentry"}
+LOOKUP_TOPIC = {"github": "where PRs stand", "linear": "where Linear cards stand", "jira": "where Jira issues stand",
+                "sentry": "about Sentry errors"}
+FEED_TAB = {"github": ("PRs and CI", "owner/repo #123"), "linear": ("Cards", "XLI-12"), "jira": ("Issues", "PROJ-7")}
+_GH_LOOKUPS = {"pr": ("view", "list", "checks", "status"), "run": ("list", "view", "watch")}
+_SEG_RE = re.compile(r"&&|\|\||[;|&\n()`]")
+_WORD_RE = re.compile(r"[a-z][a-z\-]{0,30}")
+HOOK_ID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+LOOKUP_DO_NOTE = ("{note}: the person typed \"do {n}\": yes to datastash keeping {topic} ready. The plugin checks it was "
+                  "typed by them, then sets up the {label} feed with the agent key of \"{who}\". Run `datastash lookups "
+                  "steps {svc}` now (it waits for that setup) and follow the steps it prints; tell the person, in plain "
+                  "words, anything they must do once. Never run a fetch or set_secret line: the plugin hands secrets in "
+                  "itself.")
+
+
+def lookup_shape(cmd):
+    """(service, shape) for a shell command that looks something up in an outside tool, else None. The shape is the
+    tool and its subcommand only ("gh pr view", "gh api pulls", "linear issue"): no argument is ever kept."""
+    if not isinstance(cmd, str) or len(cmd) > 100000:
+        return None
+    for seg in _SEG_RE.split(cmd):
+        try:
+            words = shlex.split(seg)
+        except ValueError:
+            continue
+        while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0], re.S):
+            words.pop(0)  # VAR=value prefixes (a token, say) are skipped, never kept
+        if len(words) < 2:
+            continue
+        tool = os.path.basename(words[0])
+        service = LOOKUP_TOOLS.get(tool)
+        if service is None:
+            continue
+        if tool == "gh":
+            if words[1] in _GH_LOOKUPS and len(words) > 2 and words[2] in _GH_LOOKUPS[words[1]]:
+                return service, f"gh {words[1]} {words[2]}"
+            if words[1] == "api":
+                paths = [w for w in words[2:] if not w.startswith("-")]
+                for part in ("pulls", "actions"):
+                    if any(re.search(rf"(^|/){part}(/|\?|$)", w) for w in paths):
+                        return service, f"gh api {part}"
+            continue
+        if _WORD_RE.fullmatch(words[1]):
+            return service, f"{tool} {words[1]}"
+    return None
+
+
+def _today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def read_lookups():
+    rec = read_json(LOOKUPS_PATH, {})
+    if not isinstance(rec, dict) or rec.get("day") != _today() or not isinstance(rec.get("counts"), dict):
+        return {"day": _today(), "counts": {}}
+    return rec
+
+
+def count_lookup(who, shape):
+    ensure_dirs()
+    with StateLock("lookups"):
+        rec = read_lookups()
+        per = rec["counts"].get(who)
+        if not isinstance(per, dict):
+            per = rec["counts"][who] = {}
+        n = per.get(shape)
+        per[shape] = (n if isinstance(n, int) and not isinstance(n, bool) else 0) + 1
+        write_private(LOOKUPS_PATH, json.dumps(rec))
+
+
+def lookup_totals():
+    """{service: (today's count over all agents, the agent that asked most)}."""
+    tot, by = {}, {}
+    for who, per in read_lookups()["counts"].items():
+        if not isinstance(per, dict):
+            continue
+        for shape, n in per.items():
+            svc = LOOKUP_TOOLS.get(str(shape).split(" ", 1)[0])
+            if svc is None or not isinstance(n, int) or isinstance(n, bool):
+                continue
+            tot[svc] = tot.get(svc, 0) + n
+            by.setdefault(svc, {})[who] = by.get(svc, {}).get(who, 0) + n
+    return {s: (n, max(sorted(by[s]), key=lambda w: by[s][w])) for s, n in tot.items()}
+
+
+def read_offers():
+    rec = read_json(LOOKUP_OFFERS_PATH, {})
+    return {k: v for k, v in rec.items() if isinstance(v, dict)} if isinstance(rec, dict) else {}
+
+
+def set_offer(service, **fields):
+    ensure_dirs()
+    with StateLock("lookup-offers"):
+        rec = read_offers()
+        cur = dict(rec.get(service) or {})
+        cur.update(fields, at=int(time.time()))
+        rec[service] = cur
+        write_private(LOOKUP_OFFERS_PATH, json.dumps(rec))
+
+
+def _hook_secret_path(hook_id):
+    return os.path.join(CONF, f"hook-{hook_id}.secret")  # where the server's steps say it is (~/.config/datastash)
+
+
+def _lookup_code_path(service):
+    return os.path.join(PENDING, f"hook-{service}.code")  # a bound code waiting for the person's secret (mode 600)
+
+
+def _steps_path(service):
+    return os.path.join(STATE, f"lookup-steps-{service}.json")
+
+
+def lookup_offer_line(numbers):
+    """The one numbered lookup ask for the status (and its number in `numbers`), or None. A Linear feed waiting for the
+    person's signing secret asks for it while the secret file is there; otherwise the busiest service past the trigger
+    that was never offered (or whose setup failed) is offered, once."""
+    try:
+        offers = read_offers()
+        k = max([int(x) for x in numbers if str(x).isdigit()] or [0]) + 1
+        for svc in FEED_SERVICES:
+            o = offers.get(svc) or {}
+            hid = o.get("hook_id")
+            if o.get("state") == "needs_secret" and isinstance(hid, str) and re.fullmatch(HOOK_ID_RE, hid) \
+                    and os.path.exists(_hook_secret_path(hid)):
+                numbers[str(k)] = {"lookup": svc, "agent": o.get("agent")}
+                return (f"The {LOOKUP_LABEL[svc]} signing secret is saved in {_tilde(_hook_secret_path(hid))}. Want "
+                        f"datastash to hand it in now? (do {k})")
+        best = sorted(((n, svc, who) for svc, (n, who) in lookup_totals().items()
+                       if n > LOOKUP_OFFER_AFTER and (offers.get(svc) or {}).get("state") in (None, "failed")),
+                      key=lambda x: (-x[0], x[1]))
+        if not best:
+            return None
+        n, svc, who = best[0]
+        set_offer(svc, state="offered", agent=who, count=n)
+        numbers[str(k)] = {"lookup": svc, "agent": who}
+        return f"Your agents asked {LOOKUP_TOPIC[svc]} {n} times today. Want datastash to keep that ready? (do {k})"
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def lookup_hint(service):
+    """The one line the hook adds to a lookup datastash keeps, else None."""
+    o = read_offers().get(service) or {}
+    if service not in FEED_SERVICES or o.get("state") != "set_up":
+        return None
+    return _hint_text(service, o)
+
+
+def _hint_text(service, o):
+    tab = _clean(o.get("tab"), 64) or FEED_TAB[service][0]
+    ex = _clean(o.get("example_key"), 120) or FEED_TAB[service][1]
+    q = urllib.parse.urlencode({"workbook_id": _wb_tag(o.get("workbook_id")), "tab": tab, "key": ex},
+                               quote_via=urllib.parse.quote)
+    label = LOOKUP_LABEL[service]
+    return (f'datastash has this: read the row of tab "{tab}" by its key (like "{ex}") instead of asking {label}: '
+            f'datastash api GET "/api/v1/agent/rows/key?{q}" (or ledger_rows_get); {label}\'s own events keep it fresh.')
+
+
+def lookup_hook(inp):
+    """PostToolUse, Bash: count the lookup for this folder's agent; the hint when datastash keeps it. Never in the
+    person's main session or the "datastash main" folder."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PostToolUse" or inp.get("tool_name") != "Bash":
+        return None
+    ti = inp.get("tool_input")
+    got = lookup_shape(ti.get("command") if isinstance(ti, dict) else None)
+    if got is None:
+        return None
+    sid = _sid(inp)
+    if sid and os.path.exists(_main_path(sid)):
+        return None
+    here = project_of(inp)
+    if main_root(os.path.realpath(here)) is not None:
+        return None
+    try:
+        agent = agent_for(here)
+    except Exception:
+        agent = None
+    who = agent["slug"] if agent else "folder:" + hashlib.sha256(os.path.realpath(here).encode()).hexdigest()[:12]
+    service, shape = got
+    count_lookup(who, shape)
+    return lookup_hint(service)
+
+
+def lookup_do(inp, n, target):
+    """The prompt hook's answer to "do K" on a lookup ask. A tool datastash does not keep: declined for now, shown at
+    once (it only does less). A feed: handed to the checker, which acts only on the person's own typed prompt."""
+    svc, who = target.get("lookup"), target.get("agent")
+    if svc not in LOOKUP_LABEL:
+        return None
+    label = LOOKUP_LABEL[svc]
+    if svc not in FEED_SERVICES:
+        try:
+            set_offer(svc, state="declined-for-now", agent=who)
+        except OSError:
+            return {"show": "The datastash config folder is not writable. Nothing changed."}
+        return {"show": f"datastash doesn't keep {label} ready yet, so nothing changed: your agents keep asking {label} "
+                        "directly. This offer is saved as declined for now."}
+    shape = hook_shape(inp)
+    if shape is None or not start_check(shape, "lookup", inp.get("prompt"), {"service": svc, "agent": who}):
+        return None
+    return LOOKUP_DO_NOTE.format(note=STATUS_NOTE, n=n, topic=LOOKUP_TOPIC[svc], label=label, svc=svc,
+                                 who=_clean(who, 64))
+
+
+def mcp_tool(key, name, args, timeout=60):
+    """One tools/call on datastash's MCP door with this key: (is_error, the tool's JSON answer)."""
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}
+    _st, _ct, text = http("POST", MCP_PATH, key=key, body=body, timeout=timeout, accept="application/json, text/event-stream")
+    if text.lstrip().startswith(("event:", "data:")):
+        text = "\n".join(x[5:].strip() for x in text.splitlines() if x.startswith("data:"))
+    msg = json.loads(text)
+    res = msg.get("result") if isinstance(msg, dict) else None
+    if not isinstance(res, dict):
+        raise ValueError("no result")
+    blocks = [c.get("text") for c in res.get("content") or [] if isinstance(c, dict) and c.get("type") == "text"]
+    try:
+        out = json.loads(blocks[0]) if blocks else {}
+    except ValueError:
+        out = {"message": blocks[0]}
+    return bool(res.get("isError")), out if isinstance(out, dict) else {}
+
+
+def _github_repos(agent):
+    """owner/name of each of the agent's folders whose git origin is on GitHub (read locally)."""
+    out = []
+    for f in agent.get("projects") or []:
+        m = re.search(r"github\.com[:/]([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+?)(?:\.git)?/?$", _git(str(f), "remote", "get-url", "origin"))
+        if m and m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def _lookup_failed(svc, sid, why):
+    set_offer(svc, state="failed")
+    add_outcome(sid, f"The {LOOKUP_LABEL[svc]} feed was not set up: {_clean(why, 300)} It is offered again in the status.")
+
+
+def _pickup_secret(code, verifier, secret=None):
+    form = pickup_form(code, verifier)
+    if secret is not None:
+        form["secret"] = secret
+    _st, _ct, text = http("POST", HOOK_PICKUP_PATH, form=form, accept="text/plain")
+    return text.strip()
+
+
+def lookup_setup(data, sid):
+    """The checker, after the person's own typed "do K": set up the feed with the agent's key, or hand in the Linear
+    secret the person saved. Never prints or logs a code or a secret."""
+    svc, who = data.get("service"), data.get("agent")
+    if svc not in FEED_SERVICES:
+        return
+    label = LOOKUP_LABEL[svc]
+    net = (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError)
+    o = read_offers().get(svc) or {}
+    if o.get("state") == "needs_secret":
+        code = read_json(_lookup_code_path(svc), {}).get("code")
+        hid = o.get("hook_id")
+        try:
+            with open(_hook_secret_path(hid)) as f:
+                secret = f.read(4096).strip()
+        except (OSError, TypeError):
+            secret = ""
+        if not isinstance(code, str) or not secret:
+            add_outcome(sid, f"The {label} signing secret is not saved yet: nothing was sent.")
+            return
+        try:
+            _pickup_secret(code, read_verifier(f"hook-{svc}"), secret)
+        except net as e:
+            _lookup_failed(svc, sid, f"datastash did not take the secret ({type(e).__name__}).")
+            return
+        _drop(_lookup_code_path(svc))
+        set_offer(svc, state="set_up")
+        add_outcome(sid, f"The {label} feed is ready: your agents read it from datastash now.")
+        return
+    agent = next((a for a in all_agents() if a["slug"] == who), None) if isinstance(who, str) else None
+    key = read_key(agent["slug"]) if agent else None
+    if agent is None or key is None:
+        _lookup_failed(svc, sid, "no agent with a key on this computer asked those lookups.")
+        return
+    args = {"workbook_id": agent["workbook_id"], "services": [svc], "code_challenge": new_challenge(f"hook-{svc}")}
+    if svc == "github":
+        args["repos"] = _github_repos(agent)
+    try:
+        is_err, body = mcp_tool(key, "ledger_feeds_setup", args)
+    except net as e:
+        _lookup_failed(svc, sid, f"datastash could not be reached ({type(e).__name__}).")
+        return
+    feed = next((f for f in body.get("feeds") or [] if isinstance(f, dict) and f.get("service") == svc), None) \
+        if not is_err else None
+    hid = (feed or {}).get("hook_id")
+    if feed is None or feed.get("ok") is not True or not isinstance(hid, str) or not re.fullmatch(HOOK_ID_RE, hid):
+        _lookup_failed(svc, sid, str((feed or body).get("message") or "datastash refused it."))
+        return
+    steps = {k: feed[k] for k in ("tab", "key_column", "example_key", "url", "reused", "signature_header", "steps",
+                                  "register", "if_no_admin") if k in feed}
+    steps["steps"] = [re.sub(r",? then you run set_secret once\.?", ".", str(x)) for x in steps.get("steps") or []]
+    rec = dict(agent=who, workbook_id=agent["workbook_id"], hook_id=hid, tab=feed.get("tab"),
+               example_key=feed.get("example_key"))
+    code = feed.get("pickup_code")
+    state = "set_up"
+    if isinstance(code, str) and feed.get("bound") is True:
+        if svc == "linear":
+            os.makedirs(PENDING, mode=0o700, exist_ok=True)
+            write_private(_lookup_code_path(svc), json.dumps({"code": code}))
+            state = "needs_secret"
+            steps["plugin"] = (f"Linear makes its own signing secret: the person saves it to {_tilde(_hook_secret_path(hid))} "
+                               "(chmod 600) on this machine, then says status and answers the Linear line there (do N): "
+                               "the plugin hands the secret in. Never paste the secret into a chat; never run set_secret "
+                               "yourself.")
+        else:
+            try:
+                secret = _pickup_secret(code, read_verifier(f"hook-{svc}"))
+            except net as e:
+                _lookup_failed(svc, sid, f"the hook's secret could not be picked up ({type(e).__name__}).")
+                return
+            if not re.fullmatch(r"[A-Za-z0-9_\-]{16,512}", secret):
+                _lookup_failed(svc, sid, "the hook's secret came back in an unexpected shape.")
+                return
+            write_private(_hook_secret_path(hid), secret + "\n")
+            steps["plugin"] = f"The plugin saved the signing secret to {_tilde(_hook_secret_path(hid))}."
+    steps["read"] = _hint_text(svc, rec)
+    write_private(_steps_path(svc), json.dumps({"service": svc, "state": state, "at": time.time(), "steps": steps}))
+    set_offer(svc, state=state, **rec)
+    add_outcome(sid, f"datastash set up the {label} feed in tab \"{_clean(feed.get('tab'), 64)}\"; "
+                     + ("save Linear's signing secret as its steps say, then answer the Linear line in the status."
+                        if state == "needs_secret" else "the agent finishes the one-time setup steps."))
+
+
+def _changed_ok(ch):
+    return (isinstance(ch, dict) and isinstance(ch.get("head"), str) and isinstance(ch.get("lines"), list)
+            and bool(ch["lines"]) and all(isinstance(x, str) for x in ch["lines"]))
+
+
+def changed_lines(c, now):
+    """XLI-306: the server's "Changed in the last hour" lines (from the services' events), head first; [] when there
+    are none or the read that brought them is over an hour old."""
+    ch = c.get("changed") if isinstance(c, dict) else None
+    if not _changed_ok(ch) or not _num_ok(ch.get("at")) or now - ch["at"] > CHANGED_MAX_AGE:
+        return []
+    lines = [x for x in (_clean(v, 300) for v in ch["lines"]) if x]
+    return [_clean(ch["head"], 80) or "Changed in the last hour"] + lines if lines else []
+
+
+def cmd_lookups(args):
+    """datastash lookups: today's repeated outside lookups on this computer (shapes and counts only) and what datastash
+    keeps. datastash lookups steps SERVICE: the setup steps of that feed (after the person's "do K"), as data."""
+    if args[:1] == ["steps"] and len(args) == 2 and args[1] in FEED_SERVICES:
+        svc = args[1]
+        deadline = time.time() + LOOKUP_STEPS_WAIT
+        while True:
+            rec = read_json(_steps_path(svc), None)
+            state = (read_offers().get(svc) or {}).get("state")
+            if (isinstance(rec, dict) and rec.get("state") == state) or state in ("failed", None) or time.time() > deadline:
+                break
+            time.sleep(0.5)
+        if not isinstance(rec, dict) or rec.get("state") != state:
+            print(f"No {LOOKUP_LABEL[svc]} feed was set up on this computer"
+                  + (" (the setup failed; the status offers it again)." if state == "failed" else
+                     " yet. It is set up only after the person types \"do N\" on the status offer."))
+            return 1
+        print("\n".join(_framed_block([json.dumps(rec.get("steps") or {}, indent=1)],
+                                       what=f"Setup steps of the {LOOKUP_LABEL[svc]} feed, from datastash")))
+        return 0
+    if args:
+        die("usage: datastash lookups [steps github|linear|jira]")
+    offers = read_offers()
+    tot = lookup_totals()
+    for svc in LOOKUP_LABEL:
+        n = tot.get(svc, (0, None))[0]
+        state = (offers.get(svc) or {}).get("state") or ("not offered yet" if n <= LOOKUP_OFFER_AFTER else "to offer")
+        print(f"{LOOKUP_LABEL[svc]}: asked {n} times today; {state}")
+    return 0
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     args = sys.argv[2:]
@@ -6841,7 +7266,7 @@ def main():
              "read": cmd_read, "filter": cmd_filter, "agent-tool": cmd_agent_tool, "doctor": cmd_doctor,
              "login": cmd_login, "logout": cmd_logout, "token": cmd_token, "unfilter": lambda a: cmd_filter(a, hidden=False),
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
-             "status-verify": cmd_status_verify, "keep": cmd_keep}
+             "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

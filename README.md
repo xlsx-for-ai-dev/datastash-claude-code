@@ -111,6 +111,22 @@ About `datastash login`:
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
 
+## Lookups kept ready (plugin 0.6.0)
+
+Agents repeat slow lookups: where a PR stands, how CI went, the state of a card. The plugin counts them on this computer
+in plain code (no tokens): `gh pr view|list|checks|status`, `gh run`, `gh api` on pulls or actions, `linear`, `jira` and
+`sentry-cli`, per agent and per day, by command shape only (never the output, the arguments or anything that could hold
+a secret; `~/.config/datastash/lookups.json`). When one service passes 10 in a day, your status shows one numbered ask,
+once: "Your agents asked where PRs stand N times today. Want datastash to keep that ready? (do K)".
+
+- **do K** (typed by you; the plugin checks it): for GitHub, Linear or Jira the plugin sets up that feed in the agent's
+  workbook with the agent's own key (`ledger_feeds_setup`) and picks up the hook's signing secret itself; the agent then
+  follows the one-time steps (`datastash lookups steps <service>`). Linear makes its own secret: save it where the steps
+  say, then answer the Linear line in your next status. Any other tool is saved as declined for now.
+- From then on the agent's lookup gets one line: "datastash has this: ..." with where the row is.
+- Your status also shows **Changed in the last hour** from those feeds.
+- `datastash lookups` prints today's counts and what datastash keeps.
+
 ## Agents set up by the plugin, allowed by you (plugin 0.5.0)
 
 Nobody names an agent, and no AI registers itself. Once this computer is signed in, the plugin itself (never the AI):
