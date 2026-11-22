@@ -2074,6 +2074,8 @@ class SignInHint(Base):
         ds.imported_connector_hint = self.saved["imported_connector_hint"]
         os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a terminal Claude Code session (where the hooks offer the sign-in)
         self.addCleanup(os.environ.pop, "CLAUDE_CODE_ENTRYPOINT", None)
+        ds.set_clean(commands=False)  # XLI-386: these count the sign-in lines only, not the clean sessions nudge
+        self.addCleanup(ds.set_clean, commands=True)
         for k in ("STATE", "HEARTBEAT", "CONF", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE"):
             self.saved.setdefault(k, getattr(ds, k))
         root = tempfile.mkdtemp(dir=TMP)

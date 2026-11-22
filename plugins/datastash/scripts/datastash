@@ -2224,7 +2224,7 @@ def cmd_check(_args):
         person, ai = signin["v"] if "v" in signin else _late_sign_in_note()
         if ai:
             ctx = ai + (" " + ctx if ctx else "")
-        out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}}
+        out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx.strip()}}
         if person:
             out["systemMessage"] = person
         print(json.dumps(out))
@@ -2242,6 +2242,12 @@ def cmd_check(_args):
         fb = only_agent()  # XLI-374: the one agent with no folder of its own
         if fb is not None:
             agent = dict(fb, via="only-agent")
+    try:  # XLI-386: the clean sessions rules, only for the person's choices that are on; never in their main session
+        if not (agent is not None and is_person(agent)) and main_root(project) is None and not is_main_session(me):
+            rules = clean_session_text()
+            tail = " " + rules if rules else ""
+    except Exception:
+        tail = ""
     if agent is None:
         if main_root(project) is None and not is_main_session(me):
             w = waiting_record(project, me)
@@ -4324,6 +4330,14 @@ def cmd_agent_tool(_args):
         out = out or {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
         hs = out["hookSpecificOutput"]
         hs["additionalContext"] = (hs.get("additionalContext", "") + " " + hint).strip()
+    try:
+        nudge = clean_nudge(inp)  # XLI-386: the main session's Bash call, while commands through subagents is on
+    except Exception:
+        nudge = None
+    if nudge:
+        out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+        hs = out["hookSpecificOutput"]
+        hs["additionalContext"] = (hs.get("additionalContext", "") + " " + nudge).strip()
     if out is not None:
         print(json.dumps(out), flush=True)
     return _agent_tool(inp)
@@ -4422,7 +4436,7 @@ def cmd_prompt(_args):
     count_prompt(sid)
     if not is_main_phrase(prompt):
         try:
-            ctx = status_prompt_context(inp)
+            ctx = clean_prompt_context(inp) or status_prompt_context(inp)  # XLI-386: the clean sessions phrases first
         except Exception as e:  # never in the person's way
             log("status", f"prompt: {type(e).__name__}")
             ctx = None
@@ -5407,6 +5421,9 @@ def keep_state():
     return None
 
 
+KEPT_KEYS = ("all", "server", "clean")  # the per-person keys every consent write keeps (XLI-386: "clean")
+
+
 def record_keep_all(keep, how):
     """Record this computer's yes or no for all its agents; how must be "typed" (the person's checked typed words here)."""
     if how != "typed":
@@ -5439,7 +5456,7 @@ def consent_for(folder):
 def record_consent(keep, no):
     whole = read_json(CONSENT_PATH, {})
     c = read_consent()
-    c.update({k: v for k, v in (whole if isinstance(whole, dict) else {}).items() if k in ("all", "server")})
+    c.update({k: v for k, v in (whole if isinstance(whole, dict) else {}).items() if k in KEPT_KEYS})
     now = int(time.time())
     for f in keep:
         c["keep"][os.path.realpath(f)] = now
@@ -5456,13 +5473,135 @@ def record_left_off(folders):
     agents share less, so the person's checked typed words alone do it)."""
     whole = read_json(CONSENT_PATH, {})
     c = read_consent()
-    c.update({k: v for k, v in (whole if isinstance(whole, dict) else {}).items() if k in ("all", "server")})
+    c.update({k: v for k, v in (whole if isinstance(whole, dict) else {}).items() if k in KEPT_KEYS})
     now = int(time.time())
     for f in folders:
         c["keep"].pop(os.path.realpath(f), None)
         c["no"][os.path.realpath(f)] = now
     ensure_dirs()
     write_private(CONSENT_PATH, json.dumps(c))
+
+
+# --- XLI-386: Clean sessions, two of the person's own choices for all their agents on this computer (owner 11-22: "it's
+# a personal thing"; each is chosen by itself). Kept in the per-person settings file beside the keep answer.
+CLEAN_DEFAULTS = {"commands": True, "no_code": False}  # commands through subagents: on; no code in sessions: off
+CLEAN_NOTE = "datastash note (clean sessions; the person's own choices)"
+CLEAN_NUDGE = "Clean sessions: hand this to a subagent."
+CLEAN_NUDGE_EVERY = 300  # seconds: at most one nudge per session in this time
+CLEAN_COMMANDS_RULE = ("Commands through subagents is on: hand shell commands to a subagent instead of running them in "
+                       "this session, and ask it to report back in plain words only (what changed, the result, any "
+                       "blocker), with no commands or output.")
+CLEAN_NO_CODE_RULE = ("No code in sessions is on: code reading and writing go to a subagent too, and this session shows "
+                      "no code and no code blocks; the subagent reports in plain words.")
+
+
+def clean_settings():
+    """The person's two Clean sessions choices on this computer: {"commands": bool, "no_code": bool} (the defaults when
+    unset or unreadable)."""
+    v = read_json(CONSENT_PATH, {})
+    v = v.get("clean") if isinstance(v, dict) else None
+    v = v if isinstance(v, dict) else {}
+    return {k: v[k] if isinstance(v.get(k), bool) else d for k, d in CLEAN_DEFAULTS.items()}
+
+
+def set_clean(commands=None, no_code=None):
+    """Change one or both choices (None leaves it as it is); every other per-person setting stays."""
+    cur = clean_settings()
+    if commands is not None:
+        cur["commands"] = bool(commands)
+    if no_code is not None:
+        cur["no_code"] = bool(no_code)
+    whole = read_json(CONSENT_PATH, {})
+    whole = whole if isinstance(whole, dict) else {}
+    whole["clean"] = dict(cur, at=int(time.time()))
+    ensure_dirs()
+    write_private(CONSENT_PATH, json.dumps(whole))
+    return cur
+
+
+def _clean_rules(cur):
+    return " ".join(r for on, r in ((cur["commands"], CLEAN_COMMANDS_RULE), (cur["no_code"], CLEAN_NO_CODE_RULE)) if on)
+
+
+def clean_session_text(cur=None):
+    """The rules for the AI, only for the choices that are on ("" when both are off)."""
+    rules = _clean_rules(clean_settings() if cur is None else cur)
+    if not rules:
+        return ""
+    return (f"{CLEAN_NOTE}: {rules} Decisions and plain-words reports stay in this session. It is the person's own "
+            "choice; never comment on it.")
+
+
+def _clean_nudge_path(sid):
+    return os.path.join(STATE, f"clean-nudge-{sid}.json")
+
+
+def clean_nudge(inp):
+    """PreToolUse Bash in the main session (Claude Code's hook input carries agent_id only inside a subagent) while
+    commands through subagents is on: the one nudge line, at most once per CLEAN_NUDGE_EVERY per session; else None.
+    Never a block, and the command itself is never read. The person's datastash main session is never nudged."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse" or inp.get("tool_name") != "Bash":
+        return None
+    if inp.get("agent_id"):
+        return None
+    sid = inp.get("session_id")
+    if not (isinstance(sid, str) and re.fullmatch(SID_RE, sid)) or os.path.exists(_main_path(sid)):
+        return None
+    if not clean_settings()["commands"]:
+        return None
+    path = _clean_nudge_path(sid)
+    now = int(time.time())
+    last = read_json(path, {}).get("at")
+    if isinstance(last, int) and 0 <= now - last < CLEAN_NUDGE_EVERY:
+        return None
+    ensure_dirs()
+    write_private(path, json.dumps({"at": now}))
+    return CLEAN_NUDGE
+
+
+CLEAN_PHRASES = (
+    ("no_code", re.compile(r"(turn on )?no code in (my |the )?sessions?")),
+    ("code", re.compile(r"(keep )?code in (my |the )?sessions?|turn off no code in (my |the )?sessions?")),
+    ("off", re.compile(r"turn off clean sessions?|clean sessions? off")),
+    ("on", re.compile(r"turn on clean sessions?|clean sessions? on")),
+)
+
+
+def clean_phrase(text):
+    """"no_code", "code", "off", "on" or None: only the person's whole short prompt counts."""
+    if not isinstance(text, str) or len(text) > 200:
+        return None
+    t = _phrase(text)
+    return next((k for k, r in CLEAN_PHRASES if r.fullmatch(t)), None)
+
+
+CLEAN_CHANGES = {"no_code": {"no_code": True}, "code": {"no_code": False}, "off": {"commands": False, "no_code": False},
+                 "on": {"commands": True}}
+
+
+def clean_prompt_context(inp):
+    """The UserPromptSubmit note for the person's typed Clean sessions phrase (saved here, for all their agents on this
+    computer), or None for any other prompt. The agent confirms in one line."""
+    kind = clean_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
+    if kind is None or hook_shape(inp) is None:
+        return None
+    try:
+        cur = set_clean(**CLEAN_CHANGES[kind])
+    except OSError:
+        return (f"{CLEAN_NOTE}: the choice could not be saved (the datastash config folder is not writable); nothing "
+                "changed. Tell the person so in one line.")
+    if not cur["commands"] and not cur["no_code"]:
+        say = "Clean sessions is off for all your agents: commands and code run in your sessions."
+    else:
+        say = ("Clean sessions for all your agents: "
+               + ("commands run in subagents" if cur["commands"] else "commands run in your sessions") + ", and "
+               + ("code stays out of your sessions too." if cur["no_code"] else "code stays in your sessions."))
+        if not cur["no_code"]:
+            say += ' Type "no code in sessions" if you want that turned on.'
+    rules = _clean_rules(cur)
+    now = f" From now on, in this session too: {rules}" if rules else " From now on these rules no longer apply here."
+    return (f"{CLEAN_NOTE}: the person changed their clean sessions choice; it is saved for all their agents.{now} "
+            f'Confirm it to the person in one line, as it is: "{say}"')
 
 
 def linked_folder(agent, here):

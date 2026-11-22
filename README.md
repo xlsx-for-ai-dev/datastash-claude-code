@@ -111,6 +111,21 @@ About `datastash login`:
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
 
+## Clean sessions (plugin 0.8.0)
+
+Two choices of your own, each on or off by itself, for all your agents on this computer (kept in
+`~/.config/datastash/status-consent.json` beside your keep answer):
+
+- **Commands through subagents** (on from the start): the main agent hands shell commands to a subagent, which reports
+  back in plain words, so your session stays readable and its context stays small.
+- **No code in sessions** (off from the start): code reading, writing and code blocks stay in subagents too.
+
+The session start gives the agent the rules only for what is on. While commands through subagents is on, a Bash call by
+the main session (Claude Code's hook input carries `agent_id` only inside a subagent) gets one line, "Clean sessions: hand
+this to a subagent.", at most once every 5 minutes per session. It is a nudge, never a block, and the command itself is
+never read. Type "no code in sessions", "turn off clean sessions", "turn on clean sessions" or "code in sessions"; the
+plugin saves it and the agent confirms in one line.
+
 ## Project map (plugin 0.7.0)
 
 Agents spend many commands searching code. For each folder linked to an agent that is a git project, the listener keeps

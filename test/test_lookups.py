@@ -255,6 +255,7 @@ class DoK(LookupBase):
         self.assertIn(urllib.parse.quote("PRs and CI"), hint)
         self.assertIn(WB, hint)
         self.assertIsNone(self.hook(ds.cmd_agent_tool, bash("linear issue view X-1", cwd=self.folder)))  # not kept
+        ds.set_clean(commands=False)  # XLI-386: the clean sessions nudge is its own line on PreToolUse
         self.assertIsNone(self.hook(ds.cmd_agent_tool, bash("gh pr view 12", event="PreToolUse", cwd=self.folder)))
 
     def test_forged_or_headless_do_k_sends_nothing(self):
