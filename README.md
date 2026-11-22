@@ -146,12 +146,16 @@ MCP tool names and migrations, each with file:line. It maps again only when the 
 - Never mapped: `.env*`, `*.key`, `*.pem` and similar key files, anything with "secret" in its path, anything
   `.gitignore` names, dependencies and build output (`node_modules`, `vendor`, `dist`, `build`, ...) and files over
   about 1 MB. Nothing of a file is kept but its one-line purpose and the names found in it; only committed files are read.
+- Every git call the plugin makes is one of `rev-parse`, `log`, `remote`, `ls-tree`, `ls-files` and `cat-file`, with
+  the settings that could run a command or hook blanked (`core.fsmonitor`, `core.hooksPath`,
+  `core.alternateRefsCommand`, `core.sshCommand`, `credential.helper`, `diff.external`, `core.pager`) and
+  `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, so a repo's own config runs nothing while it is mapped.
 - The session's `datastash` command is `scripts/cli/datastash`, which runs the same helper with its compiled code cached.
 
 ## Lookups kept ready (plugin 0.6.0)
 
 Agents repeat slow lookups: where a PR stands, how CI went, the state of a card. The plugin counts them on this computer
-in plain code (no tokens): `gh pr view|list|checks|status`, `gh run`, `gh api` on pulls or actions, `linear`, `jira` and
+in plain code (no tokens): `gh pr view|list|checks|status`, `gh run`, `gh api` reads on pulls or actions (a write, with `-X`/`--method` other than GET or a `-f`/`-F`/`--field`/`--raw-field`/`--input` body, is not counted), `linear`, `jira` and
 `sentry-cli`, per agent and per day, by command shape only (never the output, the arguments or anything that could hold
 a secret; `~/.config/datastash/lookups.json`). When one service passes 10 in a day, your status shows one numbered ask,
 once: "Your agents asked where PRs stand N times today. Want datastash to keep that ready? (do K)".
@@ -349,9 +353,23 @@ list, asks first and idle agents last, from any session: "status", "status of al
 - **First status per session.** When keeping is on and a session's agent has no saved status yet, the first status ask
   there has the agent save its own status in that turn, then show the list. After that the plugin answers itself.
 - **After install.** The first "status of all my agents" after keeping is on lists the connected agents and asks "Did we
-  miss any of your agents, or is there one you don't want on datastash?". Naming a folder: it joins when first opened.
-  "leave <name> off" stops keeping that agent's folders (saved at once; it only makes agents share less). "keep <name> private":
-  private mode is coming.
+  miss any of your agents, or is there one you don't want on datastash?". "add <folder or project name>": a folder of
+  yours on this computer joins now (checked as your own typed prompt; you allow its agent on the agents page); a name
+  not found here gets "start Claude Code once in that folder; it joins then". "leave <name> off" (or "keep <name> off
+  datastash", or "datastash off" for this folder) turns that folder OFF (below; saved at once, since it only makes
+  agents share less). "keep <name> private": private mode is coming. After an answer the updated list is shown once.
+- **OFF folders.** A folder that is off makes no datastash call: no sign-in or inbox count at session start, no
+  listener, hello, heartbeat, status, seed, project-map share or lookup counting, and no agent is registered for it.
+  Claude Code runs the connector's `headersHelper` in the plugin's own folder with no project folder, so the helper
+  can't tell which folder a session is in; instead the PreToolUse hook refuses every datastash connector call in an off
+  folder (the whole server, not a list of tools). Its agent switches itself off on datastash with its own key, and its
+  key and config move to `~/.config/datastash/off/` (nothing is deleted). If datastash refuses the switch-off: "Couldn't
+  switch it off on datastash; it is off on this computer." An agent still waiting for your OK: "It is off on this
+  computer. On the agents page, press Don't allow next to it." "put <name> back on datastash" turns it back on, only as
+  your own typed prompt. A 0.9.x "leave <name> off" reads as off.
+- **What OFF and private stop.** OFF (and, later, private) stop a careless agent: one that would otherwise share by
+  mistake. They do not stop a hostile program running as the same user on this computer, which can read the same
+  files the plugin reads.
 - **Writing.** `datastash status-set -` (JSON on stdin) saves it on this machine at once and, while keeping is on for
   the project, sends it in the background (`POST /api/v1/agent/status` with `project`; the caller's own row, replaced
   whole), retrying quietly; an unsent write is sent again by the listener once datastash answers. `--project` only for
@@ -497,8 +515,9 @@ An agent can send datastash a capability request, an error report or anything el
 
 ## Switching off an agent
 
-- On this machine: `datastash off "<name>"` moves its key and config to `~/.config/datastash/off/` and stops its
-  listener. Uninstalling or disabling the plugin stops the hooks.
+- On this machine: `datastash off "<name>"` turns its folders OFF (see above), switches it off on datastash with its
+  own key where datastash allows it, moves its key and config to `~/.config/datastash/off/` and stops its listener.
+  Uninstalling or disabling the plugin stops the hooks.
 - Everywhere: switch it off in datastash (`ledger_agent_switch_off`, from the person's connection or an agent above
   it). Its key and every key under it stop on the next call. A lost or leaked key: ask for a new pickup code
   (`ledger_agent_key`); the old key stops at once.

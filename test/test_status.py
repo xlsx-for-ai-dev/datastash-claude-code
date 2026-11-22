@@ -1184,20 +1184,18 @@ class InstallQuestion(Base):
         n = len(self.spawned)
         text = self.prompt("leave web-app off")
         self.assertEqual(self.last_hook["decision"], "block")
-        self.assertIn('"web-app" is left off datastash', text)
+        self.assertIn('"web-app" is off datastash on this computer', text)  # XLI-328: full OFF
         self.assertFalse(ds.consent_for(self.folder))
         self.assertEqual(self.spawned[n:], [])
-        self.assertEqual(self.calls, [])
-        # the refresher, the sender and the Stop reminder all read consent_for: off now
-        rc, out, err = self.run_cmd(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Working."}))
-        self.assertEqual(rc, 0, err)
-        self.assertIn("kept on this machine only", out)
+        self.assertEqual([c for c in self.calls if c[1] != ds.MCP_PATH], [])  # only the agent's own switch-off
+        # the refresher, the sender and the Stop reminder all read consent_for: off now (and no agent works there)
+        self.run_cmd(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Working."}))
         self.assertEqual([a for a in self.spawned if "status-send" in a], [])
         self.assertIsNone(self.prompt("leave nobody-here off"))
 
     def test_leave_off_says_ok_only_when_saved(self):
         saved = ds.record_left_off
-        def fail(_folders):
+        def fail(_folders, *_a):
             raise OSError("read-only")
         ds.record_left_off = fail
         try:

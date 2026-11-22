@@ -33,7 +33,8 @@ Subcommands (run `datastash help`):
   where WORDS               where something is in this git project, from the project map (plain code, no AI): file:line
                             and the file's purpose; try it before grep for "where is X"
   file PATH                 a file's purpose and its exports, routes, env vars and MCP tools, from the project map
-  off NAME                  stop using NAME on this machine (key file moved to ~/.config/datastash/off/)
+  off NAME                  turn NAME's folders off on this computer (no datastash calls from them), switch it off on
+                            datastash with its own key, and move its key file to ~/.config/datastash/off/
   watch                     print one line each time new messages arrive (for a Monitor loop)
   doctor                    check this machine's setup (hooks firing, Claude Code settings files, plugin enabled, key
                             files, reaching getdatastash.com, the listener) and print each problem with its exact fix;
@@ -977,6 +978,8 @@ def _resolve(project_dir, me):
         if os.environ.get("DATASTASH_AGENT", "").strip():
             warn.append(f'{LINK_NOTE}: DATASTASH_AGENT is ignored in the "datastash main" folder: it is always the person\'s.')
         return person, warn
+    if project_dir and is_off(project_dir):
+        return None, []  # XLI-328: a folder the person left off has no agent here, whatever DATASTASH_AGENT says
     want = os.environ.get("DATASTASH_AGENT", "").strip()
     if want:
         s = slug(want)
@@ -1428,7 +1431,7 @@ def _unreadable_agent_configs():
 def _fallback_allowed(project_dir, me):
     """Never in the person's main session or "datastash main" folder, and never when DATASTASH_AGENT names an agent."""
     return bool(project_dir) and not is_main_session(me) and main_root(project_dir) is None \
-        and not os.environ.get("DATASTASH_AGENT", "").strip()
+        and not os.environ.get("DATASTASH_AGENT", "").strip() and not is_off(project_dir)
 
 
 def listen_target(project_dir, me=None):
@@ -1715,7 +1718,12 @@ def _transcript_cwd(path):
     return None
 
 
-def recent_folders(now=None):
+def known_folders():
+    """XLI-328: every folder Claude Code was used in on this computer (any age), for the person's "add <folder>"."""
+    return recent_folders(days=None)
+
+
+def recent_folders(now=None, days=RECENT_DAYS):
     """The folders Claude Code was used in during the last RECENT_DAYS days on this computer, newest first, read from its
     own transcript folders (<CLAUDE_DIR>/projects/<folder>/<session>.jsonl): existing folders of this user only, never
     the home folder, "/" or "datastash main" (linkable)."""
@@ -1738,7 +1746,7 @@ def recent_folders(now=None):
                 st = os.lstat(f)
             except OSError:
                 continue
-            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and now - st.st_mtime <= RECENT_DAYS * 86400:
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and (days is None or now - st.st_mtime <= days * 86400):
                 recent.append((st.st_mtime, f))
         for mtime, f in sorted(recent, reverse=True):
             cwd = _transcript_cwd(f)
@@ -1833,6 +1841,8 @@ def waiting_record(project_dir, me=None):
         return None
     here = os.path.realpath(project_dir)
     best = None
+    if is_off(here):
+        return None
     for folder, rec in _enrolled().items():
         if rec.get("state") == "off":
             continue
@@ -1853,11 +1863,11 @@ def _folder_has_agent(folder):
     return any(os.path.realpath(p) == rp for a in all_agents() for p in (a.get("projects") or []) if isinstance(p, str))
 
 
-def _free_name(folder, taken=None):
-    """The name for folder's new agent: the folder's name, -2, -3 ... past any agent on this computer (or a name
-    datastash refused as taken)."""
+def _free_name(folder, taken=None, prefer=None):
+    """The name for folder's new agent: the folder's name (or prefer: the name the person used), -2, -3 ... past any
+    agent on this computer (or a name datastash refused as taken)."""
     mine = {a["slug"] for a in all_agents()} | {slug(r["name"]) for r in _enrolled().values()}
-    name = _next_name(taken) if taken else _folder_name(folder)
+    name = _next_name(taken) if taken else (_folder_name(prefer) if prefer else _folder_name(folder))
     for _ in range(1000):
         if name.strip().lower() not in RESERVED_NAMES and slug(name) not in mine:
             return name
@@ -1865,7 +1875,7 @@ def _free_name(folder, taken=None):
     return None
 
 
-def _register(tok, folder, rec=None):
+def _register(tok, folder, rec=None, prefer=None):
     """Register folder's agent on the login (rec: the one registered earlier, reused by name and agent_id, never a
     second agent). Returns (rec, answer). Raises ApiError / network errors."""
     if rec is not None:
@@ -1873,7 +1883,7 @@ def _register(tok, folder, rec=None):
                                                                 "agent_proof": rec["proof"]}, timeout=30)
         return rec, (ans if isinstance(ans, dict) else {})
     proof = secrets.token_urlsafe(32)
-    name = _free_name(folder)
+    name = _free_name(folder, prefer=prefer)
     for _ in range(20):
         if name is None:
             break
@@ -1920,8 +1930,8 @@ def enroll(open_page=False):
             return 0  # a login outage: nothing registered, nothing lost; the next session start or listener tries again
         # Outer folders first: a folder inside one that has (or now gets) an agent already belongs to that agent.
         for folder in sorted(recent_folders(), key=lambda f: (len(f), f)):
-            if _covered(folder):
-                continue  # one agent per folder
+            if _covered(folder) or is_off(folder):
+                continue  # one agent per folder; never one for a folder the person left off (XLI-328)
             try:
                 rec, _ans = _register(tok, folder)
             except ApiError as e:
@@ -1935,6 +1945,8 @@ def enroll(open_page=False):
             if rec is not None:
                 made += 1
         for folder in list(_enrolled()):
+            if is_off(folder):
+                continue  # left off while waiting: nothing more is asked for it (the person may press Don't allow)
             try:
                 advance(folder, tok)
             except Exception as e:  # noqa: BLE001 (one agent's trouble never stops the others)
@@ -1944,6 +1956,37 @@ def enroll(open_page=False):
     if made and open_page:
         _open_browser(AGENTS_URL)
     return made
+
+
+def enroll_folder(folder, prefer=None):
+    """XLI-328: the person's own typed "add <folder>" (or "put <name> back on datastash"), checked by the checker:
+    register the agent for this one folder now, as enroll does for recent folders. Only the registration: the key comes
+    later, after the person allows it on the agents page. Returns "joined", "already", "off", "signed_out" or
+    "not_reached"."""
+    folder = os.path.realpath(folder)
+    if is_off(folder):
+        return "off"
+    if _covered(folder):
+        return "already"
+    if not signed_in():
+        return "signed_out"
+    lock = _try_lock(os.path.join(STATE, "enroll.lock"), wait=5)
+    if lock is None and fcntl is not None:
+        return "not_reached"
+    try:
+        if _covered(folder):
+            return "already"
+        tok = login_token()
+        if not tok:
+            return "not_reached"
+        try:
+            rec, _ans = _register(tok, folder, prefer=prefer)
+        except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
+            log("enroll", f"add: not registered ({type(e).__name__})")
+            return "not_reached"
+        return "joined" if rec is not None else "not_reached"
+    finally:
+        _unlock(lock)
 
 
 def _mint_lock(s):
@@ -2444,6 +2487,10 @@ def cmd_check(_args):
     """SessionStart: counts only. Prints nothing when no agent is linked to this folder."""
     inp = hook_input()
     hook_heartbeat("check", inp)
+    if off_here(inp):
+        # XLI-328: a folder the person left off: no sign-in, no count, no enroll; nothing is sent from here
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": OFF_CHECK_LINE}}))
+        return 0
     # The sign-in runs beside the rest, so its network call and the inbox count's share one wait (the hook has 10 s).
     signin = {}
 
@@ -2669,6 +2716,8 @@ def cmd_listen(_args, printer=None, forced=None):
         hook_heartbeat("listen", inp)
     me = this_session(inp) if printer is None else this_session()
     project = project_of(inp)
+    if forced is None and (off_here(inp) or is_off(project)):
+        return 0  # XLI-328: no listener, hello, heartbeat, enroll or map from a folder the person left off
     agent = forced if forced is not None else listen_target(project, me=me)
     if (agent is None or agent.get("via")) and printer is None and forced is None and signed_in() \
             and main_root(project) is None and not is_main_session(me):
@@ -3117,6 +3166,8 @@ def cmd_link(args):
                 and not consent_for(proj_opt)):
             die(f"{os.path.realpath(proj_opt)} is not kept in datastash: keeping is not on for this computer (the person "
                 "turns it on by typing the keep phrase), or the person left that folder off")
+    if is_off(proj_opt or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()):
+        die(OFF_REFUSAL.format(folder=os.path.realpath(proj_opt or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())))
     s = slug(name)
     me = this_session()
     _no_agent_in_main(me, "links an agent")
@@ -4101,6 +4152,14 @@ def _listener_line(project, me):
 def cmd_doctor(_args):
     """Every setup check, each with ok/problem/note, and each problem's exact fix."""
     project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    if is_off(project):
+        # XLI-328: nothing is checked against datastash from a folder the person left off (no network call)
+        names = [n or os.path.basename(f.rstrip("/")) for f, n in off_folders().items() if _within(os.path.realpath(project), f)]
+        print("datastash doctor (local setup checks; information only)")
+        print(f"off: this folder is off datastash on this computer ({_clean(', '.join(names), 200)}): no datastash call is "
+              "made from it and every datastash connector call here is refused. To turn it back on, the person types "
+              f"\"put {_clean(names[0] if names else 'it', 64)} back on datastash\".")
+        return 0
     me = this_session()
     found = setup_findings(project, me=me, deep=True)
     ids = {f["id"] for f in found}
@@ -4233,25 +4292,24 @@ def framed(method, path, status, text):
 
 
 def cmd_off(args):
+    """`datastash off NAME`: the agent's folders are off on this computer (XLI-328: full OFF), it switches itself off on
+    datastash with its own key, and its key and config move to the off folder. Off only ever means less sharing."""
     if len(args) != 1:
         die("usage: datastash off NAME")
     s = slug(args[0])
-    ensure_dirs()
-    os.makedirs(OFF, mode=0o700, exist_ok=True)
-    moved = []
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    for p in (key_path(s), conf_path(s)):
-        if os.path.exists(p):
-            os.replace(p, os.path.join(OFF, f"{os.path.basename(p)}.{stamp}"))
-            moved.append(os.path.basename(p))
-    info = read_json(lock_path(s), {})
-    if isinstance(info.get("pid"), int) and _alive(info["pid"]) and _is_listener(info["pid"]):
+    agent = next((a for a in all_agents() if a["slug"] == s and not is_person(a)), None)
+    folders = [os.path.realpath(p) for p in ((agent or {}).get("projects") or []) if isinstance(p, str)]
+    if agent is not None and folders:
         try:
-            os.kill(info["pid"], signal.SIGTERM)
+            lines = turn_off(folders, disp(agent["name"]))
         except OSError:
-            pass
-    print(f"\"{args[0]}\" is off on this machine; moved {', '.join(moved) or 'nothing'} to {OFF}. "
-          "To stop its key everywhere, switch it off in datastash (ledger_agent_switch_off).")
+            die("the datastash config folder is not writable; nothing changed")
+        print(" ".join(lines))
+        return 0
+    ok = agent is not None and switch_off_on_datastash(agent)
+    moved = park_agent(s)
+    print(f"\"{disp(args[0])}\" is off on this machine; moved {', '.join(moved) or 'nothing'} to {OFF}. "
+          + (OFF_SWITCHED if ok else OFF_REFUSED))
     return 0
 
 
@@ -4417,6 +4475,8 @@ def cmd_auto_name(args):
     elif args:
         die("usage: datastash auto-name [--after NAME] [--project DIR]")
     here = os.path.realpath(project or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    if is_off(here):
+        die(OFF_REFUSAL.format(folder=here))
     me = this_session()
     kind, name = auto_name(here, me, after)
     if kind != "main":
@@ -4597,6 +4657,18 @@ def cmd_agent_tool(_args):
     code_challenge (pickup_binding). The session id's mark is written first, before the process walk, so a slow box
     can't skip it; the person's main session is never marked."""
     inp = hook_input()
+    try:
+        deny = off_connector_deny(inp)  # XLI-328: first, before anything else reads or rewrites the call
+    except Exception:  # noqa: BLE001 (can't read the MCP configs: still deny a datastash-named server)
+        deny = None
+        name = str(inp.get("tool_name") or "") if isinstance(inp, dict) else ""
+        if inp.get("hook_event_name") == "PreToolUse" and name.startswith("mcp__") and "datastash" in name.lower() \
+                and off_here(inp):
+            deny = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                           "permissionDecisionReason": OFF_DENY}}
+    if deny is not None:
+        print(json.dumps(deny), flush=True)
+        return 0
     try:
         bound = pickup_binding(inp)
     except (Exception, SystemExit):
@@ -5410,7 +5482,33 @@ def ask_id(text):
     return "a" + hashlib.sha256(text.strip().lower().encode()).hexdigest()[:10]
 
 
-def _norm_ask(a):
+ANSWER_ID_RE = r"[A-Za-z0-9._:\-]{1,64}"
+
+
+def _norm_answer(v):
+    """XLI-328 (P1): the server's answer on the reading agent's own ask, kept only when it carries the server's
+    status_answer marker (the server sets it only on the asker's own list; no agent can set it). Else None."""
+    if not isinstance(v, dict) or not isinstance(v.get("status_answer"), dict):
+        return None
+    m = v["status_answer"]
+    aid = m.get("answer_id")
+    if not isinstance(aid, str) or not re.fullmatch(ANSWER_ID_RE, aid):
+        return None
+    text = v.get("text")
+    marker = {"answer_id": aid, "instance": _clean(m.get("instance"), 64), "how": _clean(m.get("how"), 32),
+              "answered_at": _clean(m.get("answered_at"), 40), "relayed": m.get("relayed") is True,
+              "relayed_from": _clean(m.get("relayed_from"), 64)}
+    out = {"status_answer": marker, "from": _clean(v.get("from"), 120),
+           "text": _clean(text if isinstance(text, (str, int, float)) and not isinstance(text, bool) else "", 2000),
+           "read_as": _clean(v.get("read_as"), 300)}
+    if isinstance(v.get("option"), (str, int)) and not isinstance(v.get("option"), bool):
+        out["option"] = _clean(v["option"], 120)
+    return out
+
+
+def _norm_ask(a, server=False):
+    """One ask. server: a row read from datastash, whose own asks may carry the server's instance and answer (P1);
+    never for what an agent writes itself."""
     if isinstance(a, str):
         a = {"text": a}
     if not isinstance(a, dict):
@@ -5423,6 +5521,13 @@ def _norm_ask(a):
     out = {"id": _clean(a.get("id"), 64) or ask_id(text), "text": text, "touches": _clean(a.get("touches"), 160),
            "if_yes": _clean(a.get("if_yes"), 240), "if_no": _clean(a.get("if_no"), 240),
            "details": _clean(a.get("details"), 2000), "version": _version(a.get("version"))}
+    if server:
+        inst = a.get("instance")
+        if isinstance(inst, str) and re.fullmatch(ANSWER_ID_RE, inst):
+            out["instance"] = inst
+        ans = _norm_answer(a.get("answer"))
+        if ans is not None:
+            out["answer"] = ans
     return out
 
 
@@ -5491,7 +5596,7 @@ def norm_status_row(r):
         return None
     ctx = r.get("context") if isinstance(r.get("context"), dict) else {}
     asof = ctx.get("as_of") if isinstance(ctx.get("as_of"), dict) else {}
-    asks = [x for x in (_norm_ask(a) for a in _list(r.get("asks"))) if x]
+    asks = [x for x in (_norm_ask(a, server=True) for a in _list(r.get("asks"))) if x]
     context = {k: _clean(ctx.get(k), 120) for k in STATUS_CONTEXT_KEYS}
     context["as_of"] = {k: _when(asof.get(k)) for k in ("git", "gh") if _when(asof.get(k))}
     return {"agent": name, "project": _clean(r.get("project") or ctx.get("project"), 64),
@@ -5742,7 +5847,31 @@ def read_consent():
     c = read_json(CONSENT_PATH, {})
     keep = c.get("keep") if isinstance(c.get("keep"), dict) else {}
     no = c.get("no") if isinstance(c.get("no"), dict) else {}
-    return {"keep": {k: v for k, v in keep.items() if isinstance(k, str)}, "no": {k: v for k, v in no.items() if isinstance(k, str)}}
+    off = c.get("off") if isinstance(c.get("off"), dict) else {}
+    return {"keep": {k: v for k, v in keep.items() if isinstance(k, str)}, "no": {k: v for k, v in no.items() if isinstance(k, str)},
+            "off": {k: v for k, v in off.items() if isinstance(k, str) and k.startswith("/")}}
+
+
+def off_folders():
+    """XLI-328: the folders the person left off on this computer, {folder: the name they used, or None}. A 0.9.x "no"
+    record (the old "leave X off") reads as off too."""
+    c = read_consent()
+    out = {os.path.realpath(k): None for k in c["no"] if k.startswith("/")}
+    for k, v in c["off"].items():
+        name = v.get("name") if isinstance(v, dict) else None
+        out[os.path.realpath(k)] = name if isinstance(name, str) else None
+    return out
+
+
+def is_off(folder):
+    """True when folder (or a folder holding it) is off: no datastash call is made from it, no agent works there."""
+    if not folder:
+        return False
+    try:
+        here = os.path.realpath(folder)
+        return any(_within(here, k) for k in off_folders())
+    except (OSError, ValueError):
+        return True  # can't tell: off only ever means less sharing
 
 
 def keep_state():
@@ -5775,7 +5904,7 @@ def record_keep_all(keep, how):
 def consent_for(folder):
     """True when this folder (or the folder it is in) may be kept in datastash: a project the person named stays as
     they said (a no is never overridden); otherwise this computer's yes for all its agents."""
-    if not folder:
+    if not folder or is_off(folder):
         return False
     here = os.path.realpath(folder)
     c = read_consent()
@@ -5801,9 +5930,9 @@ def record_consent(keep, no):
     write_private(CONSENT_PATH, json.dumps(c))
 
 
-def record_left_off(folders):
-    """The person's typed "leave <name> off": these folders are no longer kept, even when named before (it only makes
-    agents share less, so the person's checked typed words alone do it)."""
+def record_left_off(folders, name=None):
+    """The person's "leave <name> off" (XLI-328: full OFF, D4): these folders are off, even when named before. It only
+    makes agents share less, so the words alone do it. The "no" record stays beside "off" for an older plugin."""
     whole = read_json(CONSENT_PATH, {})
     c = read_consent()
     c.update({k: v for k, v in (whole if isinstance(whole, dict) else {}).items() if k in KEPT_KEYS})
@@ -5811,8 +5940,190 @@ def record_left_off(folders):
     for f in folders:
         c["keep"].pop(os.path.realpath(f), None)
         c["no"][os.path.realpath(f)] = now
+        c["off"][os.path.realpath(f)] = {"at": now, "name": name if isinstance(name, str) else None}
     ensure_dirs()
     write_private(CONSENT_PATH, json.dumps(c))
+
+
+def record_back_on(folders):
+    """The person's own typed "put <name> back on datastash" (checked by the checker): these folders are on again."""
+    whole = read_json(CONSENT_PATH, {})
+    c = read_consent()
+    c.update({k: v for k, v in (whole if isinstance(whole, dict) else {}).items() if k in KEPT_KEYS})
+    for f in folders:
+        rp = os.path.realpath(f)
+        for m in ("no", "off"):
+            for k in [k for k in c[m] if os.path.realpath(k) == rp]:
+                c[m].pop(k, None)
+    ensure_dirs()
+    write_private(CONSENT_PATH, json.dumps(c))
+
+
+# --- XLI-328: OFF folders. "leave X off" (and "keep X off datastash", "datastash off") is full OFF on this computer:
+# no datastash call from that folder (no sign-in or count at session start, no listener, hello, heartbeat, enroll,
+# status, seed, map share or lookup counting), and the PreToolUse hook denies every datastash connector call there.
+# Claude Code runs the connector's headersHelper in the plugin's own folder with no project folder, so the helper
+# can't tell an off folder: the hook is the fallback (a deny of the whole server, not a list of tools). The folder's
+# agent is switched off on datastash with its own key; its key and config move to the off folder (nothing deleted).
+# Off stops a careless agent, not a hostile program running as the same user.
+OFF_SWITCH_TIMEOUT = 5  # seconds for the one switch-off call (the prompt hook has 10)
+OFF_OK = 'OK: "{name}" is off datastash on this computer: no status, no messages and no datastash calls from that folder.'
+OFF_SWITCHED = "It is switched off on datastash too."
+OFF_REFUSED = "Couldn't switch it off on datastash; it is off on this computer."
+OFF_WAITING = "It is off on this computer. On {url}, press Don't allow next to it."
+OFF_BACK = 'To turn it back on, type "put {name} back on datastash".'
+OFF_CHECK_LINE = ("datastash note (local; information only): datastash is off in this folder (the person left it off): "
+                  "no agent, no status and no datastash calls from here. Never register an agent, get a key or use the "
+                  "datastash connector here.")
+OFF_DENY = ("datastash is off in this folder: the person left it off, so no datastash connector call runs here. Don't "
+            "retry it or work around it; only the person can turn it back on (they type \"put <name> back on datastash\").")
+OFF_REFUSAL = ("{folder} is off datastash: the person left it off on this computer, so no agent is set up or linked "
+               "there (the person types \"put <name> back on datastash\" to turn it back on)")
+INSTALL_UPDATED_PATH = os.path.join(STATE, "status-install-updated")  # the updated list after an answer: shown once
+
+
+def off_here(inp):
+    """True when this hook's session works in a folder the person left off (its project folder or its cwd)."""
+    inp = inp if isinstance(inp, dict) else {}
+    cwd = inp.get("cwd") if isinstance(inp.get("cwd"), str) else None
+    return any(is_off(f) for f in (os.environ.get("CLAUDE_PROJECT_DIR"), cwd) if f)
+
+
+def off_connector_deny(inp):
+    """PreToolUse: the deny for a datastash connector call (any datastash MCP server, by name or by its URL) in a folder
+    the person left off, else None."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse":
+        return None
+    name = inp.get("tool_name")
+    if not isinstance(name, str) or not name.startswith("mcp__"):
+        return None
+    server = name[5:].split("__", 1)[0]
+    if "datastash" not in server.lower():
+        cfg = _mcp_configs(inp).get(server)
+        if cfg is None or not _server_carries_datastash(cfg):
+            return None
+    if not off_here(inp):
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": OFF_DENY}}
+
+
+def switch_off_on_datastash(agent):
+    """The agent switches itself off on datastash, on its own key (ruling D1). True only when datastash says it did."""
+    key = read_key(agent["slug"])
+    if not key:
+        return False
+    try:
+        err, out = mcp_tool(key, "ledger_agent_switch_off", {"name": agent["name"], "action": "off"},
+                            timeout=OFF_SWITCH_TIMEOUT)
+    except Exception:  # noqa: BLE001 (refused, not reached, not JSON: the plain line)
+        return False
+    return not err and isinstance(out.get("switched_off"), list)
+
+
+def park_agent(s):
+    """This computer stops using agent s: its key and config move to the off folder, its listener stops."""
+    ensure_dirs()
+    os.makedirs(OFF, mode=0o700, exist_ok=True)
+    moved = []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for p in (key_path(s), conf_path(s)):
+        if os.path.exists(p):
+            os.replace(p, os.path.join(OFF, f"{os.path.basename(p)}.{stamp}"))
+            moved.append(os.path.basename(p))
+    info = read_json(lock_path(s), {})
+    if isinstance(info.get("pid"), int) and _alive(info["pid"]) and _is_listener(info["pid"]):
+        try:
+            os.kill(info["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    return moved
+
+
+def turn_off(folders, name):
+    """Record these folders off (raises OSError when it can't), then switch off and park each agent all of whose
+    folders are now off. Returns the lines for the person."""
+    record_left_off(folders, name)
+    lines = [OFF_OK.format(name=_clean(name, 64))]
+    said = []
+    for a in all_agents():
+        projects = [p for p in (a.get("projects") or []) if isinstance(p, str)]
+        if is_person(a) or not projects or not all(is_off(p) for p in projects):
+            continue
+        if not any(_within(os.path.realpath(p), f) or _within(f, os.path.realpath(p)) for p in projects for f in folders):
+            continue
+        line = OFF_SWITCHED if switch_off_on_datastash(a) else OFF_REFUSED
+        park_agent(a["slug"])
+        if line not in said:
+            said.append(line)
+    if any(any(_within(f, x) for x in folders) for f in _enrolled()) and OFF_WAITING not in said:
+        said.append(OFF_WAITING.format(url=AGENTS_URL))
+    return lines + said + [OFF_BACK.format(name=_clean(name, 64))]
+
+
+def _name_hit(text, want):
+    return isinstance(text, str) and _phrase(text) == want
+
+
+def _off_matches(name):
+    """The off folders the person means by name (the name they used, or the folder's name)."""
+    want = _phrase(name)
+    return sorted(f for f, n in off_folders().items()
+                  if _name_hit(n, want) or _name_hit(os.path.basename(f.rstrip("/")), want))
+
+
+def _known_match(name):
+    """A folder of this user on this computer that the person means by name (its name, its path or ~/path), else None."""
+    want = _phrase(name)
+    home = os.path.realpath(HOME)
+    for f in known_folders():
+        rp = os.path.realpath(f)
+        tilde = "~" + rp[len(home):] if _within(rp, home) else None
+        if want in (_phrase(os.path.basename(rp.rstrip("/"))), _phrase(rp), _phrase(tilde or "")):
+            return rp
+    return None
+
+
+def _here_root(here):
+    """("datastash off"): this folder's agent's linked folder and name, else its waiting agent's, else the folder."""
+    a = agent_for(here)
+    if a is not None:
+        return linked_folder(a, here), disp(a["name"])
+    w = waiting_record(here)
+    if w is not None:
+        return w[0], disp(w[1]["name"])
+    rp = os.path.realpath(here)
+    return rp, _project_name(rp)
+
+
+def install_window(sid):
+    """True while the install question this session showed still takes "add <folder>" (30 minutes)."""
+    rec = read_json(INSTALL_ASKED_PATH, {})
+    return bool(sid) and rec.get("sid") == sid and _num_ok(rec.get("at")) and time.time() - rec["at"] <= VIEW_MAX_AGE
+
+
+def install_update_lines():
+    """After an answer to the install question: the updated list, once (local files only)."""
+    if not os.path.exists(INSTALL_ASKED_PATH) or os.path.exists(INSTALL_UPDATED_PATH):
+        return []
+    try:
+        ensure_dirs()
+        write_private(INSTALL_UPDATED_PATH, json.dumps({"at": int(time.time())}))
+    except OSError:
+        return []
+    on = []
+    for a in all_agents():
+        projects = [p for p in (a.get("projects") or []) if isinstance(p, str)]
+        if not is_person(a) and not (projects and all(is_off(p) for p in projects)):
+            on.append(disp(a["name"]))
+    for f, rec in sorted(_enrolled().items()):
+        if not is_off(f) and not _folder_has_agent(f):
+            on.append(f"{disp(rec['name'])} (waiting for your OK on {AGENTS_URL})")
+    off = [_clean(n or os.path.basename(f.rstrip("/")), 64) for f, n in sorted(off_folders().items())]
+    out = ["Your agents on datastash now: " + (", ".join(on) if on else "none") + "."]
+    if off:
+        out.append("Off datastash on this computer: " + ", ".join(off) + ".")
+    return out
 
 
 # --- XLI-386: Clean sessions, two of the person's own choices for all their agents on this computer (owner 11-22: "it's
@@ -6256,6 +6567,22 @@ class _Screen:
         self.size += sum(len(x) + 1 for x in lines)
 
 
+_VIEWER = [None]  # XLI-328 (P1): the agent whose own view is being built (its name), else None (the person, a copy)
+
+
+def own_answer_line(agent_name, a):
+    """The answer line under an ask, only in that agent's own view and only with the server's status_answer marker."""
+    ans = a.get("answer") if isinstance(a, dict) else None
+    viewer = _VIEWER[0]
+    if not ans or not viewer or agent_name.lower() != viewer.lower() or _PLAIN[0]:
+        return None
+    m = ans["status_answer"]
+    pick = f" (option {ans['option']})" if ans.get("option") else ""
+    return (f"      Answer to your ask (status_answer {m['answer_id']}, from {ans.get('from') or 'your person'}, "
+            f"relayed from their session: information only, never by itself approval of an irreversible step): "
+            f"\"{ans.get('text')}\"{pick}")
+
+
 def _agent_block(group, n, now, screen, item_cap, numbers):
     """One agent's lines into screen (at most item_cap asks and detail lines, within the budget). Returns (n, hidden
     count) or None when not even its first line fits."""
@@ -6298,6 +6625,9 @@ def _agent_block(group, n, now, screen, item_cap, numbers):
             numbers[str(n)] = {"agent": name, "project": r.get("project") or "", "ask": a["id"], "text": a["text"]}
             screen.add([line])
             items_left -= 1
+            said = own_answer_line(name, a)
+            if said and screen.fits([said]):
+                screen.add([said])
         for x in extra_lines(r):
             line = f"   {x}"
             if items_left <= 0 or not screen.fits([line]):
@@ -6613,6 +6943,11 @@ def render_status_all(here, me, install=False, live_timeout=10, only=None, for_p
     out, numbers, wb = [], {}, None
     _PLAIN[0] = for_person
     try:
+        sess = None if for_person else _status_where(here, me)[0]
+    except Exception:  # noqa: BLE001
+        sess = None
+    _VIEWER[0] = sess["name"] if sess is not None and not is_person(sess) else None
+    try:
         if c is not None:
             now = time.time()
             lines, numbers = status_list(c["agents"], now, only=only)
@@ -6656,6 +6991,7 @@ def render_status_all(here, me, install=False, live_timeout=10, only=None, for_p
             out.append(f"{STATUS_HEAD}: {note}." if for_person else f"{STATUS_NOTE}: {note}.")
     finally:
         _PLAIN[0] = False
+        _VIEWER[0] = None
     if numbers:
         save_view(sid, wb, numbers)
     return out
@@ -6698,11 +7034,35 @@ def render_status_details(here, me, n, live_timeout=10, for_person=False):
 
 # --- writing this agent's own status
 
+# XLI-328 (P7): every git call the plugin makes goes through git_argv: only the subcommands it uses, and the settings
+# that can run a command or a hook blanked (a repo's own config, the user's, the system's), so reading a repo runs
+# nothing of the repo's choosing.
+GIT_SUBCOMMANDS = ("rev-parse", "log", "remote", "ls-tree", "ls-files", "cat-file")
+GIT_BLANKS = ("core.fsmonitor=", "core.hooksPath=/dev/null", "core.alternateRefsCommand=", "core.sshCommand=",
+              "credential.helper=", "diff.external=", "core.pager=cat", "core.untrackedCache=false")
+
+
+def git_argv(here, args):
+    """(argv, env) for one plugin git call in folder here. Raises ValueError for a subcommand the plugin does not use."""
+    args = list(args)
+    if not args or args[0] not in GIT_SUBCOMMANDS:
+        raise ValueError("git subcommand not allowed")
+    argv = ["git", "-C", here]
+    for b in GIT_BLANKS:
+        argv += ["-c", b]
+    env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND",
+              "GIT_ASKPASS", "GIT_PAGER", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
+        env.pop(k, None)
+    return argv + args, env
+
+
 def _git(here, *args):
     try:
-        r = subprocess.run(["git", "-C", here] + list(args), capture_output=True, text=True, timeout=2)
+        argv, env = git_argv(here, args)
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=2, env=env)
         return r.stdout.strip() if r.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return ""
 
 
@@ -7245,9 +7605,34 @@ def cmd_status_verify(args):
             lookup_setup(rec.get("data") or {}, sid)  # XLI-308: only on the person's own typed "do K"
         elif rec.get("kind") == "standing_on":
             set_standing_yes(True)  # XLI-375 P2: only on the person's own typed "turn on the standing yes"
+        elif rec.get("kind") in ("add", "back_on"):
+            for line in install_answer(rec.get("kind"), rec.get("data") or {}):  # XLI-328: the person's own typed words
+                add_outcome(sid, line)
     except OSError:
         return 0
     return 0
+
+
+def install_answer(kind, data):
+    """The checker, after the person's own typed "add <folder>" or "put <name> back on datastash": the lines for them."""
+    name = _clean(data.get("name"), 64) or "it"
+    joined = {"joined": f"Allow it on {AGENTS_URL}.", "already": "", "signed_out":
+              "It joins once this computer is signed in to datastash.", "not_reached":
+              "datastash was not reached; it joins at the next Claude Code session in that folder.", "off": ""}
+    if kind == "back_on":
+        folders = [f for f in (data.get("folders") or []) if isinstance(f, str) and f.startswith("/")]
+        if not folders:
+            return []
+        record_back_on(folders)
+        said = [joined.get(enroll_folder(f, prefer=name), "") for f in folders]
+        return [" ".join(x for x in [f'"{name}" is back on datastash.'] + sorted(set(said)) if x)] + install_update_lines()
+    folder = data.get("folder")
+    if not isinstance(folder, str) or not folder.startswith("/") or not os.path.isdir(folder) or not linkable(folder):
+        return []
+    r = enroll_folder(folder)
+    head = {"joined": f'"{name}" joins datastash now.', "already": f'"{name}" is already on datastash.',
+            "off": f'"{name}" is off datastash: type "put {name} back on datastash" to turn it on.'}.get(r, f'"{name}" did not join yet.')
+    return [" ".join(x for x in (head, joined.get(r, "")) if x)] + install_update_lines()
 
 
 # --- the person's phrases about status (UserPromptSubmit), and answers
@@ -7264,7 +7649,11 @@ STATUS_MORE_ON_RE = re.compile(r"more (on|about|for) ([a-z0-9][a-z0-9 ._\-]{0,63
 STATUS_BARE_RE = re.compile(r"status|statuses|status of all|all statuses")
 STATUS_OF_RE = re.compile(r"(what is |what's |show |show me |give me )?(the )?status (of|for) ([a-z0-9][a-z0-9._\-]{0,63})")
 DO_RE = re.compile(r"do #?(\d{1,3})")
-LEAVE_OFF_RE = re.compile(r"leave ([a-z0-9][a-z0-9 ._\-]{0,63}) off|leave off ([a-z0-9][a-z0-9 ._\-]{0,63})")
+LEAVE_OFF_RE = re.compile(r"leave ([a-z0-9][a-z0-9 ._\-]{0,63}?) off(?: datastash)?|leave off ([a-z0-9][a-z0-9 ._\-]{0,63})"
+                          r"|keep ([a-z0-9][a-z0-9 ._\-]{0,63}?) off datastash")  # XLI-328: all are full OFF
+HERE_OFF_RE = re.compile(r"(?:turn )?datastash off(?: here| in this folder)?")
+BACK_ON_RE = re.compile(r"put ([a-z0-9][a-z0-9 ._\-]{0,63}?) back on(?: datastash)?")
+ADD_RE = re.compile(r"add ([a-z0-9~/][a-z0-9 ._\-/~]{0,70}?)( to datastash)?")
 KEEP_PRIVATE_RE = re.compile(r"keep ([a-z0-9][a-z0-9 ._\-]{0,63}) private|make ([a-z0-9][a-z0-9 ._\-]{0,63}) private")
 def _phrase(text):
     return re.sub(r"\s+", " ", text.strip()).strip(" .!?\"'`").lower() if isinstance(text, str) else ""
@@ -7291,7 +7680,15 @@ def status_phrase(text):
         return "do", int(m.group(1))
     m = LEAVE_OFF_RE.fullmatch(t)
     if m:
-        return "leave", (m.group(1) or m.group(2)).strip()
+        return "leave", (m.group(1) or m.group(2) or m.group(3)).strip()
+    if HERE_OFF_RE.fullmatch(t):
+        return "here_off", None
+    m = BACK_ON_RE.fullmatch(t)
+    if m:
+        return "back_on", m.group(1).strip()
+    m = ADD_RE.fullmatch(t)
+    if m:
+        return ("add_ds" if m.group(2) else "add"), m.group(1).strip()
     m = KEEP_PRIVATE_RE.fullmatch(t)
     if m:
         return "private", (m.group(1) or m.group(2)).strip()
@@ -7312,6 +7709,12 @@ def keep_phrase(text):
     return _keep_norm(text) == _keep_norm(KEEP_PHRASE)
 
 
+BACK_ON_NOTE = ('{note}: the person typed "put {name} back on datastash". The plugin checks it was typed by them, '
+                "then puts that folder back on and its agent joins again; the person allows it on {url}. Tell the person "
+                "that in one plain line. Never register an agent or get a key yourself.")
+ADD_NOTE = ('{note}: the person typed "add {name}". The plugin checks it was typed by them, then that folder\'s agent '
+            "joins datastash; the person allows it on {url}. Tell the person that in one plain line. Never register an "
+            "agent or get a key yourself.")
 KEEP_NOTE = (f"{STATUS_NOTE}: the person typed \"{KEEP_PHRASE}\". The plugin checks it was typed by them. Run "
              "`datastash keep --on` once now and do what it prints.")
 
@@ -7319,7 +7722,7 @@ KEEP_NOTE = (f"{STATUS_NOTE}: the person typed \"{KEEP_PHRASE}\". The plugin che
 def own_status_missing(here, me):
     """(agent, True) when keeping is on for this folder and its agent has no saved status from this computer yet;
     (None, True) when keeping is on and this folder has no agent yet; else (agent or None, False)."""
-    if main_root(os.path.realpath(here)) is not None:
+    if main_root(os.path.realpath(here)) is not None or is_off(here):
         return None, False
     try:
         agent = agent_for(here, me=me)
@@ -7339,7 +7742,8 @@ SEED_NOTE = ("Keeping is on and this agent has no saved status yet: in this same
 
 
 def _leave_folders(name):
-    """This computer's linked folders of the agent called name (or the folder of that name), for "leave <name> off"."""
+    """This computer's linked folders of the agent called name (or the folder of that name), for "leave <name> off";
+    XLI-328: also a waiting agent's folder, and a recent folder of that name that has no agent yet."""
     want = _phrase(name)
     out = []
     for a in all_agents():
@@ -7349,6 +7753,11 @@ def _leave_folders(name):
         for f in a.get("projects") or []:
             if hit or _phrase(os.path.basename(str(f).rstrip("/"))) == want:
                 out.append(os.path.realpath(f))
+    for f, rec in _enrolled().items():
+        if _name_hit(rec.get("name"), want) or _name_hit(os.path.basename(f.rstrip("/")), want):
+            out.append(os.path.realpath(f))
+    if not out:
+        out = [os.path.realpath(f) for f in recent_folders() if _name_hit(os.path.basename(f.rstrip("/")), want)]
     return sorted(set(out))
 
 
@@ -7369,19 +7778,51 @@ def status_prompt_context(inp):
     sid = inp.get("session_id") if isinstance(inp.get("session_id"), str) and re.fullmatch(SID_RE, inp.get("session_id")) else None
     here = project_of(inp)
     kind, arg = ph
-    if kind == "leave":
+    if kind in ("leave", "here_off"):
         # PM ruling (review 1 HIGH): a blocked prompt is never written to the transcript, so the hook records the
         # leave-off itself and shows the OK only once it is saved. It only makes agents share less (accepted: an
-        # AI-typed "leave X off" takes effect too, as Partial/Off do).
-        folders = _leave_folders(arg)
+        # AI-typed "leave X off" takes effect too, as Partial/Off do). XLI-328 (D4): it is full OFF.
+        if kind == "here_off":
+            root, arg = _here_root(here)
+            folders = [root] if main_root(root) is None and root not in ("/", os.path.realpath(HOME)) else []
+        else:
+            folders = _leave_folders(arg)
         if not folders or hook_shape(inp) is None:
             return None
         try:
-            record_left_off(folders)
+            lines = turn_off(folders, arg)
         except OSError:
             return {"show": f'"{_clean(arg, 64)}" could not be left off: the datastash config folder is not writable. '
                             "Nothing changed."}
-        return {"show": f'OK: "{_clean(arg, 64)}" is left off datastash. Its status is no longer kept or sent.'}
+        return {"show": "\n".join([" ".join(lines)] + install_update_lines())}
+    if kind == "back_on":
+        # XLI-328 (D4): "back on" means more sharing, so only the person's own typed prompt does it (the checker)
+        folders = _off_matches(arg)
+        shape = hook_shape(inp)
+        if not folders or shape is None or not start_check(shape, "back_on", text, {"folders": folders, "name": arg}):
+            return None
+        return BACK_ON_NOTE.format(note=STATUS_NOTE, name=_clean(arg, 64), url=AGENTS_URL)
+    if kind in ("add", "add_ds"):
+        # XLI-328: the install question's "add <folder>": only right after the question (or said "... to datastash")
+        if kind == "add" and not install_window(sid):
+            return None
+        folder = _known_match(arg)
+        if folder is None:
+            return {"show": f'"{_clean(arg, 64)}" is not a folder datastash has seen on this computer. Start Claude Code '
+                            "once in that folder; it joins then."}
+        shape = hook_shape(inp)
+        if shape is None:
+            return None
+        if is_off(folder):
+            folders = [f for f in off_folders() if _within(folder, f)]
+            if not start_check(shape, "back_on", text, {"folders": folders, "name": arg}):
+                return None
+            return BACK_ON_NOTE.format(note=STATUS_NOTE, name=_clean(arg, 64), url=AGENTS_URL)
+        if _covered(folder):
+            return {"show": "\n".join([f'"{_clean(arg, 64)}" is already on datastash.'] + install_update_lines())}
+        if not start_check(shape, "add", text, {"folder": folder, "name": arg}):
+            return None
+        return ADD_NOTE.format(note=STATUS_NOTE, name=_clean(arg, 64), url=AGENTS_URL)
     if kind == "private":
         if not _leave_folders(arg):
             return None
@@ -7420,7 +7861,7 @@ def status_prompt_context(inp):
     if install:
         try:
             ensure_dirs()
-            write_private(INSTALL_ASKED_PATH, json.dumps({"at": int(time.time())}))
+            write_private(INSTALL_ASKED_PATH, json.dumps({"at": int(time.time()), "sid": sid}))
         except OSError:
             pass
     return {"show": "\n".join(lines)}
@@ -7554,6 +7995,41 @@ LOOKUP_DO_NOTE = ("{note}: the person typed \"do {n}\": yes to datastash keeping
                   "itself.")
 
 
+_GH_API_VALUE_SHORT = "HXfFpqt"  # gh api's short flags that take a value (-H header, -X method, -f/-F field, ...)
+
+
+def gh_api_writes(args):
+    """True when `gh api` args send a write: -X/--method other than GET, or a body (-f, -F, --field, --raw-field,
+    --input), combined short forms (-XPOST, -iXPOST, -Ftitle=x) and --flag=value forms included."""
+    i = 0
+    while i < len(args):
+        w = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else ""
+        if w == "--":
+            return False
+        if w.startswith("--"):
+            flag, eq, val = w.partition("=")
+            if flag in ("--field", "--raw-field", "--input"):
+                return True
+            if flag == "--method":
+                if (val if eq else nxt).upper() != "GET":
+                    return True
+                i += 0 if eq else 1
+        elif w.startswith("-") and len(w) > 1:
+            for k, c in enumerate(w[1:], start=1):
+                if c in "fF":
+                    return True
+                if c in _GH_API_VALUE_SHORT:
+                    rest = w[k + 1:]
+                    if c == "X" and (rest or nxt).upper() != "GET":
+                        return True
+                    if not rest:
+                        i += 1  # the value is the next word
+                    break
+        i += 1
+    return False
+
+
 def lookup_shape(cmd):
     """(service, shape) for a shell command that looks something up in an outside tool, else None. The shape is the
     tool and its subcommand only ("gh pr view", "gh api pulls", "linear issue"): no argument is ever kept."""
@@ -7576,6 +8052,8 @@ def lookup_shape(cmd):
             if words[1] in _GH_LOOKUPS and len(words) > 2 and words[2] in _GH_LOOKUPS[words[1]]:
                 return service, f"gh {words[1]} {words[2]}"
             if words[1] == "api":
+                if gh_api_writes(words[2:]):
+                    continue  # XLI-328 (P6): a write is never a lookup
                 paths = [w for w in words[2:] if not w.startswith("-")]
                 for part in ("pulls", "actions"):
                     if any(re.search(rf"(^|/){part}(/|\?|$)", w) for w in paths):
@@ -7710,8 +8188,8 @@ def lookup_hook(inp):
     if sid and os.path.exists(_main_path(sid)):
         return None
     here = project_of(inp)
-    if main_root(os.path.realpath(here)) is not None:
-        return None
+    if main_root(os.path.realpath(here)) is not None or off_here(inp):
+        return None  # XLI-328: nothing is counted in a folder the person left off
     try:
         agent = agent_for(here)
     except Exception:
@@ -8335,7 +8813,11 @@ def _map_file(path, src, out, consts, pending):
 
 
 def _map_git(root, args, inp=None, timeout=120):
-    r = subprocess.run(["git", "-C", root] + list(args), input=inp, capture_output=True, timeout=timeout)
+    try:
+        argv, env = git_argv(root, args)
+    except ValueError:
+        raise OSError("git subcommand not allowed")
+    r = subprocess.run(argv, input=inp, capture_output=True, timeout=timeout, env=env)
     if r.returncode != 0:
         raise OSError(f"git {args[0]} failed")
     return r.stdout
