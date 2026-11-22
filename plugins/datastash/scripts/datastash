@@ -23,8 +23,10 @@ Subcommands (run `datastash help`):
                             --project only for another folder of this folder's own agent
   keep [--on]               keeping agents' status in datastash: this computer's answer; --on after the person typed
                             the keep phrase (checked by the plugin, never taken from the AI): sign in if needed, next steps
-  api METHOD PATH [JSON]    one call to the datastash REST door (/api/v1/agent/...) as the linked agent; the answer
-                            is printed between two marker lines as untrusted data
+  api METHOD PATH [JSON | - | @FILE]
+                            one call to the datastash REST door (/api/v1/agent/...) as the linked agent; the body
+                            inline, from stdin (-) or from a file (@FILE): a big body always from stdin or a file.
+                            The answer is printed between two marker lines as untrusted data
   lookups [steps SERVICE]   today's repeated outside lookups on this computer (shapes and counts only) and what
                             datastash keeps; steps github|linear|jira: that feed's setup steps, after the person's
                             "do N" on the status offer
@@ -2449,14 +2451,14 @@ def cmd_check(_args):
         try:
             signin["v"] = session_sign_in(inp)
         except Exception:
-            signin["v"] = _late_sign_in_note()
+            signin["v"] = _late_sign_in_note(inp)
     t_signin = threading.Thread(target=_signin, daemon=True)
     t_signin.start()
     t0 = time.time()
 
     def emit(ctx):
         t_signin.join(max(0.0, t0 + HOOK_START_SECONDS + 0.5 - time.time()))
-        person, ai = signin["v"] if "v" in signin else _late_sign_in_note()
+        person, ai = signin["v"] if "v" in signin else _late_sign_in_note(inp)
         if ai:
             ctx = ai + (" " + ctx if ctx else "")
         out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx.strip()}}
@@ -3658,10 +3660,26 @@ def person_sign_in_text(info, legacy=False):
             + ("; the page is open in your browser" if info.get("opened") else "") + ").")
 
 
-def _late_sign_in_note():
-    """The session start's sign-in work ran late or broke: the fallback line for the AI only where it is true (a
-    device-mode, terminal session with no login on file); otherwise nothing. Cheap file checks only."""
+def keyed_agent_here(project, me=None):
+    """XLI-385 item 4: True when this folder's agent has its own agent key on file that datastash has not refused. Such
+    an agent works without this computer's login, so no hook tells it (or the person) that the computer is not signed
+    in. Cheap file checks only; never reads the network, never prints a key."""
     try:
+        agent = agent_for(project, me=me) if project else None
+        if agent is None or read_key(agent["slug"]) is None:
+            return False
+        return load_state(agent).get("key_refused") is None
+    except (Exception, SystemExit):  # noqa: BLE001
+        return False
+
+
+def _late_sign_in_note(inp=None):
+    """The session start's sign-in work ran late or broke: the fallback line for the AI only where it is true (a
+    device-mode, terminal session with no login on file, and no working agent key here); otherwise nothing. Cheap file
+    checks only."""
+    try:
+        if inp is not None and keyed_agent_here(project_of(inp), me=this_session(inp)):
+            return None, None
         if (hooks_offer_sign_in() and not _login_recorded()
                 and signin_state().get("mode") == SIGNIN_DEVICE):
             return None, AI_FALLBACK_NOTE
@@ -3678,6 +3696,8 @@ def session_sign_in(inp):
         return None, None
     if login_present():
         return None, None
+    if keyed_agent_here(project_of(inp), me=this_session(inp)):
+        return None, None  # XLI-385 item 4: this folder's agent works on its own key; no "not signed in" line
     legacy = effective_signin() == SIGNIN_LEGACY
     sid = _sid(inp)
     if sid is not None:
@@ -3998,7 +4018,7 @@ def setup_findings(project, me=None, deep=False):
                                 "(hooks) have not run in this session (the plugin was likely installed, enabled or "
                                 "updated after the session started).",
                                 "the person restarts Claude Code or types /reload-plugins.", wake=True))
-    if not signed_in():
+    if not signed_in() and not keyed_agent_here(project, me=me):  # XLI-385 item 4: an agent on its own key needs no login
         out.append(_finding("not_signed_in", "this computer is not signed in to datastash, so the datastash connector "
                             "can't connect.", "run datastash login, then tell the person, in plain words, what it says to do (it shows "
                             "the code the plugin already showed the person, when one is still waiting)."))
@@ -4126,21 +4146,38 @@ def cmd_doctor(_args):
     return 0
 
 
+API_USAGE = ("usage: datastash api METHOD /api/v1/agent/... [JSON_BODY | - | @FILE] (- reads the body from stdin, "
+             "@FILE from a file: use one of them for a big body, never a long argument)")
+
+
+def api_body(arg):
+    """XLI-385 item 5: the JSON body of datastash api: given inline, from stdin ("-") or from a file ("@FILE"). A big
+    write never rides on the command line (Linux holds one argument to about 128 KB)."""
+    if arg == "-":
+        raw = sys.stdin.read()
+    elif arg.startswith("@"):
+        try:
+            with open(os.path.expanduser(arg[1:]), "r", encoding="utf-8") as f:
+                raw = f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            die(f"could not read the body file {arg[1:]!r} ({type(e).__name__})")
+    else:
+        raw = arg
+    try:
+        return json.loads(raw)
+    except ValueError:
+        die("JSON_BODY is not valid JSON")
+
+
 def cmd_api(args):
     if len(args) < 2:
-        die("usage: datastash api METHOD /api/v1/agent/... [JSON_BODY]")
+        die(API_USAGE)
     method, path = args[0].upper(), args[1]
     if method not in ("GET", "POST"):
         die("METHOD is GET or POST")
     if not path_ok(path):
         die(f"PATH must start with {API_PREFIX} (no \"..\" segments, no fragment)")
-    body = None
-    if len(args) > 2:
-        raw = sys.stdin.read() if args[2] == "-" else args[2]
-        try:
-            body = json.loads(raw)
-        except ValueError:
-            die("JSON_BODY is not valid JSON")
+    body = api_body(args[2]) if len(args) > 2 else None
     here = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     me = this_session()
     if main_root(here) is not None:
@@ -5548,8 +5585,13 @@ def save_status_cache(workbook_id, rows, fetched_at, merge=True, morning=_KEEP_M
         c = {"workbook_id": workbook_id, "fetched_at": fetched_at, "agents": rows, "failed_at": None}
         if morning is _KEEP_MORNING:
             morning = (old or {}).get("morning")
+            asked = (old or {}).get("morning_asked")
+        else:
+            asked = _today()  # XLI-375 MEDIUM: the person's read: the server's answer for today (lines or none) is here
         if _morning_ok(morning):
             c["morning"] = {"day": morning["day"], "lines": list(morning["lines"])}
+        if _day_ok(asked):
+            c["morning_asked"] = asked
         if changed is _KEEP_MORNING:
             changed = (old or {}).get("changed")  # an agent key's read has no changed block: keep the person's last
         elif _changed_ok(changed):
@@ -5586,6 +5628,8 @@ def put_own_row(workbook_id, row):
         c = {"workbook_id": workbook_id, "fetched_at": old["fetched_at"], "agents": rows, "failed_at": old.get("failed_at")}
         if _morning_ok(old.get("morning")):
             c["morning"] = old["morning"]
+        if _day_ok(old.get("morning_asked")):
+            c["morning_asked"] = old["morning_asked"]
         if isinstance(old.get("listening"), dict):
             c["listening"] = old["listening"]
         write_private(status_cache_path(workbook_id), json.dumps(c))
@@ -6523,6 +6567,14 @@ def not_listening_morning(c):
 MORNING_PATH = os.path.join(CONF, "morning.json")
 
 
+def _today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def _day_ok(d):
+    return isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) is not None
+
+
 def _morning_ok(m):
     return (isinstance(m, dict) and isinstance(m.get("day"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", m["day"]) is not None
             and isinstance(m.get("lines"), list) and bool(m["lines"]) and all(isinstance(x, str) for x in m["lines"]))
@@ -6530,10 +6582,14 @@ def _morning_ok(m):
 
 def take_morning(c):
     """The server's morning lines, once per local day: only when they are for today here and this machine has not shown
-    them today. Taking them marks the day shown. [] otherwise (and on a day with no lines: nothing saved yesterday)."""
+    them today. Taking them marks the day shown. [] otherwise (and on a day with no lines: nothing saved yesterday).
+    XLI-375 review MEDIUM: the day is marked shown only once the server has answered for today (a person read today,
+    with lines or none); until then nothing is taken, so the day's lines are never lost to an earlier status."""
     m = c.get("morning") if isinstance(c, dict) else None
-    today = time.strftime("%Y-%m-%d", time.localtime())
+    today = _today()
     server = list(m["lines"]) if _morning_ok(m) and m["day"] == today else []
+    if not server and (c.get("morning_asked") if isinstance(c, dict) else None) != today:
+        return []  # the server's answer for today has not arrived: wait for it, mark nothing
     extra = not_listening_morning(c)  # XLI-375 P2: after the server's lines, even on a day it sent none
     if not server and not extra:
         return []

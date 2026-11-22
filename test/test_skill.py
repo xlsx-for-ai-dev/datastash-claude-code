@@ -79,5 +79,19 @@ class SkillText(unittest.TestCase):
         self.assertNotIn("Set this folder up as a datastash agent.", body)
 
 
+    def test_xli385_big_writes_go_through_a_file_or_stdin(self):
+        """XLI-385 item 5: never big JSON on the command line (Linux holds one argument to about 128 KB); datastash api
+        takes the body from stdin (-) or a file (@file); many long rows go in batches or as CSV through ledger_import."""
+        _, body = parts()
+        part2 = body.split("# Part 2:", 1)[1]
+        self.assertIn("datastash api METHOD PATH [JSON | - | @FILE]", part2)
+        for needle in ("128 KB", "@FILE", "stdin", "ledger_rows_upsert", "ledger_import"):
+            self.assertIn(needle, part2, needle)
+        with open(os.path.join(HERE, "..", "README.md")) as f:
+            readme = f.read()
+        for needle in ("128 KB", "@FILE", "stdin", "ledger_import"):
+            self.assertIn(needle, readme, needle)
+
+
 if __name__ == "__main__":
     unittest.main()

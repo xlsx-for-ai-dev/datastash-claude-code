@@ -108,6 +108,11 @@ About `datastash login`:
 - Once per account, after your first datastash use in Claude Code, datastash itself adds one line to its answer:
   "Want datastash in the Claude app and on claude.ai too?" with the connector address. The plugin passes it on as is.
 
+Big writes: never put big JSON on the command line (Linux holds each argument to about 128 KB). `datastash api` takes
+the body from stdin (`datastash api POST PATH -`) or from a file (`datastash api POST PATH @FILE`). For many long rows,
+save them from a file in batches with the connector's `ledger_rows_upsert` (up to 5,000 rows a call), or as CSV through
+`ledger_upload_link` and `ledger_import`.
+
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
 

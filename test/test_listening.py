@@ -122,6 +122,32 @@ class Listening(Base):
         self.assertEqual(out[0], "Not listening: Web (Desk), Api (Laptop). The fix for each is below.")
         self.assertTrue(ds.render_status_all(self.folder, ds.this_session(), for_person=True)[0].startswith(ds.STATUS_HEAD))
 
+    def test_xli375_medium_the_day_is_not_marked_shown_before_the_servers_lines_arrive(self):
+        """XLI-375 review MEDIUM (fixed on XLI-385): the first status of the day, read from a copy the server has not
+        answered today (an agent key's read, or yesterday's copy), must not mark the morning shown: the server's lines for
+        today come later and are shown then, followed by the not-listening line."""
+        ds.save_status_cache(WB, [], time.time(), merge=False, listening=ds.norm_listening(self.extra))  # no person read today
+        first = ds.render_status_all(self.folder, ds.this_session(), for_person=True)
+        self.assertTrue(first[0].startswith(ds.STATUS_HEAD), first[0])  # no morning lines yet
+        self.assertIn("Not listening: Web (Desk): its datastash hooks are off.", "\n".join(first))  # the details still show
+        self.assertFalse(os.path.exists(ds.MORNING_PATH))  # the day is not marked shown
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        self.morning = {"day": today, "lines": ["Yesterday datastash saved you 2.0 hours across all your agents."]}
+        self.person_fetch()  # the server's lines arrive
+        out = ds.render_status_all(self.folder, ds.this_session(), for_person=True)
+        self.assertEqual(out[0], self.morning["lines"][0])
+        self.assertEqual(out[1], "Not listening: Web (Desk), Api (Laptop). The fix for each is below.")
+        self.assertTrue(ds.render_status_all(self.folder, ds.this_session(), for_person=True)[0].startswith(ds.STATUS_HEAD))
+
+    def test_xli375_medium_yesterdays_answer_is_not_todays(self):
+        """A copy whose person read was on an earlier day holds no answer for today: nothing is marked shown."""
+        self.person_fetch()
+        c = ds.read_status_cache(WB)
+        c["morning_asked"] = "2001-01-01"
+        ds.write_private(ds.status_cache_path(WB), json.dumps(c))
+        self.assertTrue(ds.render_status_all(self.folder, ds.this_session(), for_person=True)[0].startswith(ds.STATUS_HEAD))
+        self.assertFalse(os.path.exists(ds.MORNING_PATH))
+
     def test_the_waiting_line_is_not_said_twice_when_the_morning_just_said_it(self):
         today = time.strftime("%Y-%m-%d", time.localtime())
         self.morning = {"day": today, "lines": ["New agents waiting for your OK:", "Builder (Laptop)", ds.AGENTS_URL]}

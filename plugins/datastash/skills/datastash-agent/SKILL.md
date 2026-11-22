@@ -128,7 +128,7 @@ The person's own two choices, each on or off by itself, for all their agents on 
 
 ## REST door (with your key)
 
-`datastash api METHOD PATH [JSON]` sends one call as you, with the key read from its file. The JSON answer is printed between the two marker lines described above. Paths:
+`datastash api METHOD PATH [JSON | - | @FILE]` sends one call as you, with the key read from its file. The JSON answer is printed between the two marker lines described above. The body goes inline, from stdin (`-`) or from a file (`@FILE`). Never put big JSON on the command line (Linux holds each argument to about 128 KB): write it to a file and send `@FILE`, or pipe it on stdin with `-`. For many long rows, write them to a file and save them in batches with the connector's `ledger_rows_upsert` (up to 5,000 rows a call), or as CSV through `ledger_upload_link` and `ledger_import`. Paths:
 
 - `GET /api/v1/agent/rows?workbook_id=W&tab=T&after=CURSOR&wait=25` rows after a cursor (leave `after` out the first time; send back `cursor`; `more: true` means call again now; `wait` up to 25 s holds the call until a row lands)
 - `POST /api/v1/agent/rows` `{"workbook_id": W, "tab": T, "row": {...}}` add a row

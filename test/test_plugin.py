@@ -2061,6 +2061,70 @@ class SetupDoctor(Base):
         self.assertIn("belongs to another user", out.getvalue())
 
 
+class ApiBody(Base):
+    """XLI-385 item 5: datastash api takes its JSON body inline, from stdin (-) or from a file (@file), so a big write
+    never has to ride on the command line (Linux holds one argument to about 128 KB)."""
+
+    def call(self, args, stdin=None):
+        sent = []
+
+        def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
+            sent.append(body)
+            return 200, "application/json", "{}"
+        ds.http = fake_http
+        proj = tempfile.mkdtemp(dir=TMP)
+        old_dir, old_in = os.environ.get("CLAUDE_PROJECT_DIR"), sys.stdin
+        os.environ["CLAUDE_PROJECT_DIR"] = proj
+        if stdin is not None:
+            sys.stdin = io.StringIO(stdin)
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                try:
+                    code = ds.cmd_api(args)
+                except SystemExit as e:
+                    code = e.code
+        finally:
+            sys.stdin = old_in
+            if old_dir is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = old_dir
+        return code, sent, err.getvalue()
+
+    def test_inline_stdin_and_file_bodies_send_the_same_json(self):
+        body = {"workbook_id": "wb1", "tab": "Notes", "rows": [{"k": str(i), "text": "x" * 2000} for i in range(100)]}
+        raw = json.dumps(body)
+        self.assertGreater(len(raw), 128 * 1024)  # over one Linux argument's limit: the reason for - and @file
+        f = os.path.join(TMP, f"body-{time.time()}.json")
+        with open(f, "w", encoding="utf-8") as out:
+            out.write(raw)
+        for arg, stdin, want in ((json.dumps({"a": 1}), None, {"a": 1}), ("-", raw, body), ("@" + f, None, body)):
+            code, sent, err = self.call(["POST", "/api/v1/agent/rows", arg], stdin)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sent, [want])
+
+    def test_a_missing_or_bad_file_is_refused_and_nothing_is_sent(self):
+        code, sent, err = self.call(["POST", "/api/v1/agent/rows", "@" + os.path.join(TMP, "no-such-file.json")])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(sent, [])
+        self.assertIn("could not read", err)
+        bad = os.path.join(TMP, f"bad-{time.time()}.json")
+        with open(bad, "w") as out:
+            out.write("{not json")
+        code, sent, err = self.call(["POST", "/api/v1/agent/rows", "@" + bad])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(sent, [])
+        self.assertIn("not valid JSON", err)
+
+    def test_usage_names_stdin_and_file(self):
+        code, _sent, err = self.call(["POST"])
+        self.assertNotEqual(code, 0)
+        self.assertIn("-", err)
+        self.assertIn("@FILE", err)
+        with open(BIN) as f:
+            self.assertIn("api METHOD PATH [JSON | - | @FILE]", f.read())  # the command's own help
+
+
 class SignInHint(Base):
     """XLI-278: this computer's datastash login. Not signed in: the session start (once per session), doctor and the
     first-use check tell the AI to run datastash login; never a token in any line. The imported claude.ai connector line
@@ -2285,9 +2349,21 @@ class SignInHint(Base):
             ds.cmd_check([])
         got = json.loads(out.getvalue())
         ctx = got["hookSpecificOutput"]["additionalContext"]
+        # XLI-385 item 4: this folder's agent has a working agent key, so no "not signed in" line (person or AI).
+        self.assertNotIn("not signed in", ctx)
+        self.assertNotIn("systemMessage", got)
+        self.assertIn("1 new message in its inbox", ctx)
+        # Its key refused: the sign-in line comes back, and the count is still kept.
+        ds.set_flag(dict(AGENT), "key_refused", int(time.time()))
+        self.addCleanup(ds.set_flag, dict(AGENT), "key_refused", None)
+        ds.hook_input = lambda: {"session_id": "sess-E2"}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            ds.cmd_check([])
+        got = json.loads(out.getvalue())
+        ctx = got["hookSpecificOutput"]["additionalContext"]
         self.assertTrue(ctx.startswith(ds.AI_SHOWN_NOTE))
         self.assertIn("type the code BCDF-GHJK", got["systemMessage"])
-        self.assertIn("1 new message in its inbox", ctx)
 
     def test_doctor_and_first_use_check(self):
         ds.http = lambda *a, **k: (200, "text/html", "")
@@ -2306,6 +2382,39 @@ class SignInHint(Base):
             ds.cmd_doctor([])
         self.assertIn("ok: sign-in: this computer is signed in to datastash", out.getvalue())
         self.assertNotIn("dsrt_", out.getvalue())
+
+    def keyed(self, refused=False):
+        """XLI-385 item 4: this folder's agent has its own agent key on file (refused: datastash refused that key)."""
+        ds.resolve = lambda p, me=None: (dict(AGENT), [])
+        ds.read_key = lambda s: "ldgr_ag_" + "k" * 40 if s == AGENT["slug"] else None
+        if refused:
+            ds.set_flag(dict(AGENT), "key_refused", int(time.time()))
+        self.addCleanup(ds.set_flag, dict(AGENT), "key_refused", None)
+
+    def test_xli385_an_agent_with_a_working_key_gets_no_sign_in_note(self):
+        """XLI-385 item 4: not signed in, but this folder's agent has a working agent key: no "not signed in" line at
+        session start (person or AI), no sign-in started, none at the first-use check or after the turn."""
+        self.keyed()
+        ds.hook_input = lambda: {"session_id": "sess-K"}
+        self.assertEqual(ds.session_sign_in({"session_id": "sess-K", "cwd": self.proj}), (None, None))
+        self.assertEqual(ds._late_sign_in_note({"session_id": "sess-K", "cwd": self.proj}), (None, None))
+        self.assertEqual(self.starts, [])
+        self.assertFalse(os.path.exists(ds._signed_out_mark("sess-K")))  # so no follow-up line in a later hook either
+        self.assertNotIn("not_signed_in", {f["id"] for f in ds.setup_findings(self.proj)})
+        err = io.StringIO()
+        ds.auto_setup_check(self.proj, stream=err)
+        self.assertNotIn("not signed in", err.getvalue())
+
+    def test_xli385_a_refused_or_missing_agent_key_still_gets_the_sign_in(self):
+        """XLI-385 item 4: a refused key (or none) is not a working key: the sign-in line is shown as before."""
+        self.keyed(refused=True)
+        person, ai = ds.session_sign_in({"session_id": "sess-R", "cwd": self.proj})
+        self.assertIn("type the code BCDF-GHJK", person or "")
+        self.assertEqual(ai, ds.AI_SHOWN_NOTE)
+        self.assertIn("not_signed_in", {f["id"] for f in ds.setup_findings(self.proj)})
+        ds.read_key = lambda s: None
+        person, _ai = ds.session_sign_in({"session_id": "sess-M", "cwd": self.proj})
+        self.assertIn("type the code BCDF-GHJK", person or "")
 
     def test_put_on_path_writes_the_scripts_folder_once(self):
         env = os.path.join(TMP, f"env-{time.time()}")
