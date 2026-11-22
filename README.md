@@ -148,8 +148,10 @@ MCP tool names and migrations, each with file:line. It maps again only when the 
   about 1 MB. Nothing of a file is kept but its one-line purpose and the names found in it; only committed files are read.
 - Every git call the plugin makes is one of `rev-parse`, `log`, `remote`, `ls-tree`, `ls-files` and `cat-file`, with
   the settings that could run a command or hook blanked (`core.fsmonitor`, `core.hooksPath`,
-  `core.alternateRefsCommand`, `core.sshCommand`, `credential.helper`, `diff.external`, `core.pager`) and
-  `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, so a repo's own config runs nothing while it is mapped.
+  `core.alternateRefsCommand`, `core.sshCommand`, `credential.helper`, `diff.external`, `core.pager`, `pager.log`,
+  `pager.show`, and `log.showSignature`, which would run `gpg.program`), `log` run with `--no-ext-diff --no-textconv`
+  (so no diff driver a repo's `.gitattributes` names), and `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`. A repo's
+  own config runs none of these while it is mapped.
 - The session's `datastash` command is `scripts/cli/datastash`, which runs the same helper with its compiled code cached.
 
 ## Lookups kept ready (plugin 0.6.0)
@@ -354,15 +356,16 @@ list, asks first and idle agents last, from any session: "status", "status of al
   there has the agent save its own status in that turn, then show the list. After that the plugin answers itself.
 - **After install.** The first "status of all my agents" after keeping is on lists the connected agents and asks "Did we
   miss any of your agents, or is there one you don't want on datastash?". "add <folder or project name>": a folder of
-  yours on this computer joins now (checked as your own typed prompt; you allow its agent on the agents page); a name
-  not found here gets "start Claude Code once in that folder; it joins then". "leave <name> off" (or "keep <name> off
+  yours on this computer joins now (checked as your own typed prompt; you allow its agent on the agents page). Only a folder datastash has seen counts; any other "add ..." (say "add
+  dark mode to the settings page") is an ordinary prompt and goes through untouched. "leave <name> off" (or "keep <name> off
   datastash", or "datastash off" for this folder) turns that folder OFF (below; saved at once, since it only makes
   agents share less). "keep <name> private": private mode is coming. After an answer the updated list is shown once.
 - **OFF folders.** A folder that is off makes no datastash call: no sign-in or inbox count at session start, no
   listener, hello, heartbeat, status, seed, project-map share or lookup counting, and no agent is registered for it.
   Claude Code runs the connector's `headersHelper` in the plugin's own folder with no project folder, so the helper
   can't tell which folder a session is in; instead the PreToolUse hook refuses every datastash connector call in an off
-  folder (the whole server, not a list of tools). Its agent switches itself off on datastash with its own key, and its
+  folder (the whole server, not a list of tools), and any `ledger_` tool on any server (a claude.ai connector the person
+  renamed). Its agent switches itself off on datastash with its own key, and its
   key and config move to `~/.config/datastash/off/` (nothing is deleted). If datastash refuses the switch-off: "Couldn't
   switch it off on datastash; it is off on this computer." An agent still waiting for your OK: "It is off on this
   computer. On the agents page, press Don't allow next to it." "put <name> back on datastash" turns it back on, only as

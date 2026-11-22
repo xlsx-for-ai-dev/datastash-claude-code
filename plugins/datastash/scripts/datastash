@@ -5990,20 +5990,21 @@ def off_here(inp):
 
 
 def off_connector_deny(inp):
-    """PreToolUse: the deny for a datastash connector call (any datastash MCP server, by name or by its URL) in a folder
+    """PreToolUse: the deny for a datastash connector call (any datastash MCP server, by name or by its URL, or any ledger_ tool) in a folder
     the person left off, else None."""
     if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse":
         return None
     name = inp.get("tool_name")
     if not isinstance(name, str) or not name.startswith("mcp__"):
         return None
-    server = name[5:].split("__", 1)[0]
-    if "datastash" not in server.lower():
+    server, _, tool = name[5:].partition("__")
+    if not off_here(inp):
+        return None
+    if "datastash" not in server.lower() and not tool.startswith("ledger_"):
+        # a ledger_ tool is datastash's own, on any server: a claude.ai connector the person renamed is in no local config
         cfg = _mcp_configs(inp).get(server)
         if cfg is None or not _server_carries_datastash(cfg):
             return None
-    if not off_here(inp):
-        return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": OFF_DENY}}
 
@@ -7039,7 +7040,12 @@ def render_status_details(here, me, n, live_timeout=10, for_person=False):
 # nothing of the repo's choosing.
 GIT_SUBCOMMANDS = ("rev-parse", "log", "remote", "ls-tree", "ls-files", "cat-file")
 GIT_BLANKS = ("core.fsmonitor=", "core.hooksPath=/dev/null", "core.alternateRefsCommand=", "core.sshCommand=",
-              "credential.helper=", "diff.external=", "core.pager=cat", "core.untrackedCache=false")
+              "credential.helper=", "diff.external=", "core.pager=cat", "core.untrackedCache=false",
+              "log.showSignature=false", "pager.log=false", "pager.show=false")
+# log.showSignature runs gpg.program (or gpg.ssh.program / gpg.x509.program); pager.<cmd> overrides core.pager. A
+# repo's .gitattributes can name a diff driver (diff.<x>.command / .textconv) that no -c can blank by name, so a log
+# call also gets --no-ext-diff --no-textconv.
+GIT_LOG_FLAGS = ("--no-ext-diff", "--no-textconv")
 
 
 def git_argv(here, args):
@@ -7054,6 +7060,8 @@ def git_argv(here, args):
     for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND",
               "GIT_ASKPASS", "GIT_PAGER", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
         env.pop(k, None)
+    if args[0] == "log":
+        args[1:1] = list(GIT_LOG_FLAGS)
     return argv + args, env
 
 
@@ -7808,8 +7816,7 @@ def status_prompt_context(inp):
             return None
         folder = _known_match(arg)
         if folder is None:
-            return {"show": f'"{_clean(arg, 64)}" is not a folder datastash has seen on this computer. Start Claude Code '
-                            "once in that folder; it joins then."}
+            return None  # not a folder datastash has seen: an ordinary prompt ("add dark mode ..."), never blocked
         shape = hook_shape(inp)
         if shape is None:
             return None

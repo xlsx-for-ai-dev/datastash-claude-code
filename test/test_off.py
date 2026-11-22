@@ -239,6 +239,18 @@ class NoCallsWhenOff(OffBase):
         out = self.tool("Read", tool_input={"file_path": "/etc/hostname"})
         self.assertNotEqual(((out or {}).get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
 
+    def test_a_renamed_claude_ai_connector_is_denied_in_an_off_folder(self):
+        self.prompt("leave web-app off")
+        for name in ("mcp__claude_ai_Ledger__ledger_rows_get", "mcp__claude_ai_My_sheets__ledger_inbox_send"):
+            hs = (self.tool(name) or {}).get("hookSpecificOutput") or {}
+            self.assertEqual(hs.get("permissionDecision"), "deny", name)
+        hs = (self.tool("mcp__claude_ai_Other__rows_get") or {}).get("hookSpecificOutput") or {}
+        self.assertNotEqual(hs.get("permissionDecision"), "deny")
+
+    def test_a_ledger_tool_in_an_on_folder_is_not_denied(self):
+        hs = (self.tool("mcp__claude_ai_Ledger__ledger_rows_get") or {}).get("hookSpecificOutput") or {}
+        self.assertNotEqual(hs.get("permissionDecision"), "deny")
+
     def test_a_folder_that_is_on_is_not_denied(self):
         out = self.tool("mcp__plugin_datastash_datastash__ledger_rows_get")
         self.assertNotEqual(((out or {}).get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
@@ -308,12 +320,20 @@ class InstallAnswers(OffBase):
                      "cwd": self.folder, "prompt_id": str(uuid.uuid4()), "transcript_path": self.transcript("sess1")})
         self.assertEqual(self.registered, [])
 
-    def test_add_a_name_not_found_here(self):
+    def test_add_a_name_not_found_here_passes_through(self):
         self.shown_install()
         ds.known_folders = lambda: []
-        text = self.prompt("add mobile-app")
-        self.assertEqual(self.last_hook["decision"], "block")
-        self.assertIn("Start Claude Code once in that folder; it joins then.", text)
+        self.assertIsNone(self.prompt("add mobile-app"))
+        self.assertNotEqual((self.last_hook or {}).get("decision"), "block")
+        self.assertEqual(self.registered, [])
+
+    def test_an_ordinary_add_prompt_right_after_the_question_is_untouched(self):
+        self.shown_install()
+        ds.known_folders = lambda: [self.other_folder("billing-api"), self.other_folder("settings")]
+        for p in ("add dark mode to the settings page", "add tests", "add error handling.",
+                  "add dark mode to datastash"):
+            self.assertIsNone(self.prompt(p), p)
+            self.assertNotEqual((self.last_hook or {}).get("decision"), "block", p)
         self.assertEqual(self.registered, [])
 
     def test_add_outside_the_install_answer_is_an_ordinary_prompt(self):
@@ -436,13 +456,41 @@ class GitBlanks(Base):
         subprocess.run(["git", "-C", root, "status", "--porcelain"], capture_output=True)
         self.assertTrue(os.path.exists(pwn))
 
+    def test_a_repo_set_to_show_signatures_runs_no_gpg_program(self):
+        root, pwn = self.make_repo()
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1")
+        run = lambda *a, **k: subprocess.run(["git", "-C", root] + list(a), check=True, capture_output=True, env=env, **k)
+        head = run("cat-file", "commit", "HEAD").stdout.decode()
+        hdr, body = head.split("\n\n", 1)
+        sig = "gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQEz\n -----END PGP SIGNATURE-----"
+        obj = f"{hdr}\n{sig}\n\n{body}"
+        sha = run("hash-object", "-t", "commit", "-w", "--stdin", input=obj.encode()).stdout.decode().strip()
+        run("update-ref", "HEAD", sha)
+        hook = os.path.join(root, "..", os.path.basename(root) + "-hook.sh")
+        run("config", "log.showSignature", "true")
+        for k in ("gpg.program", "gpg.ssh.program", "gpg.x509.program"):
+            run("config", k, hook)
+        self.assertEqual(ds.git_context(root)["last_commit"], "one")
+        self.assertEqual(ds._git(root, "rev-parse", "HEAD"), sha)
+        self.assertFalse(os.path.exists(pwn))
+        # the same repo without the blanks does run it (so the test proves something)
+        subprocess.run(["git", "-C", root, "log", "-1", "--format=%s"], capture_output=True, env=env)
+        self.assertTrue(os.path.exists(pwn))
+
+    def test_a_log_call_takes_no_diff_driver(self):
+        argv, _env = ds.git_argv("/x", ["log", "-1", "--format=%s"])
+        i = argv.index("log")
+        self.assertEqual(argv[i:], ["log", "--no-ext-diff", "--no-textconv", "-1", "--format=%s"])
+        self.assertIn("log.showSignature=false", argv)
+
     def test_every_git_call_goes_through_the_one_helper(self):
         with open(BIN) as f:
             src = f.read()
         self.assertEqual(src.count('["git"'), 1, "a git call outside git_argv")
         argv, env = ds.git_argv("/x", ["rev-parse", "HEAD"])
         for blank in ("core.fsmonitor=", "core.hooksPath=/dev/null", "core.alternateRefsCommand=", "core.sshCommand=",
-                      "credential.helper=", "diff.external=", "core.pager=cat"):
+                      "credential.helper=", "diff.external=", "core.pager=cat", "log.showSignature=false",
+                      "pager.log=false", "pager.show=false"):
             self.assertIn(blank, argv)
         self.assertEqual((env["GIT_CONFIG_NOSYSTEM"], env["GIT_TERMINAL_PROMPT"]), ("1", "0"))
         with self.assertRaises(ValueError):
