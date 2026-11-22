@@ -247,6 +247,43 @@ class Build(MapBase):
         for p in ("src/env.ts", "src/keys.ts", "src/builder.ts", "lib/environment.py"):
             self.assertFalse(ds.map_skip(p), p)
 
+    def test_a_one_megabyte_line_with_no_period_maps_in_under_a_second(self):
+        line = "envenv" + "word " * 199_000  # about 1 MB, one line, no sentence end
+        for rel in ("notes.txt", "long.md", "src/long.ts", "app/long.py"):
+            with open(os.path.join(self.folder, rel), "w") as f:
+                f.write(("# " if rel.endswith((".md", ".py")) else "// " if rel.endswith(".ts") else "") + line + "\n"
+                        + ("export function after() {}\n" if rel.endswith(".ts") else ""))
+        git(self.folder, "add", "-A")
+        git(self.folder, "commit", "-q", "-m", "long lines")
+        head = git(self.folder, "rev-parse", "HEAD")
+        for rel in ("notes.txt", "src/long.ts"):
+            t = time.time()
+            with open(os.path.join(self.folder, rel)) as f:
+                ds._map_file(rel, f.read(), [], {}, [])
+            self.assertLess(time.time() - t, 1, rel)
+        t = time.time()
+        self.assertLessEqual(len(ds._map_sentence(line)), 200)
+        self.assertLess(time.time() - t, 1)
+        t = time.time()
+        m = ds.map_build(self.folder, head)
+        self.assertLess(time.time() - t, 5)
+        self.assertEqual(by(m["entries"], "export", "after")[0][:2], ["src/long.ts", 2])  # line numbers kept
+        self.assertTrue(all(len(e[4]) <= 200 for e in m["entries"]))
+
+    def test_contents_are_read_in_small_batches_with_the_same_map(self):
+        whole = ds.map_build(self.folder, self.head)["entries"]
+        calls, real = [], ds._map_git
+        ds._map_git = lambda root, args, inp=None, timeout=120: calls.append(args[0]) or real(root, args, inp, timeout)
+        old = ds.MAP_BATCH_FILES
+        ds.MAP_BATCH_FILES = 3
+        try:
+            small = ds.map_build(self.folder, self.head)["entries"]
+        finally:
+            ds.MAP_BATCH_FILES, ds._map_git = old, real
+        self.assertGreater(calls.count("cat-file"), 3)
+        self.assertEqual(small, whole)
+        self.assertEqual([len(b) for b in ds._map_batches([("a", "x", 5_000_000)] * 3)], [1, 1, 1])
+
     def test_a_secret_looking_word_in_a_purpose_is_cut(self):
         m = ds.map_build(self.folder, self.head)
         purpose = by(m["entries"], "file", path="src/token.ts")[0][4]
@@ -396,7 +433,22 @@ class Where(MapBase):
         self.assertIn("src/mcp.ts:2", r.stdout)
         self.assertLess(took, 3)
 
-    def test_where_with_no_copy_builds_one_here(self):
+    def test_where_with_no_copy_never_waits_and_maps_in_the_background(self):
+        real = ds.map_build
+        ds.map_build = lambda root, sha: self.fail("where mapped in the foreground")
+        try:
+            t = time.time()
+            rc, out, _ = self.run_cmd(ds.cmd_where, ["Order"])
+            self.assertLess(time.time() - t, 1)
+            self.assertEqual(rc, 1)
+            self.assertIn("being built now", out)
+            rc, out, _ = self.run_cmd(ds.cmd_file, ["app/main.py"])
+            self.assertIn("being built now", out)
+        finally:
+            ds.map_build = real
+        self.assertEqual(self.spawned[0][-1], "map-refresh")
+        self.assertEqual(self.run_cmd(ds.cmd_map_refresh, [])[0], 0)  # what the spawned helper runs
+        self.assertEqual(self.mcp_calls, [])  # it never sends the map
         rc, out, _ = self.run_cmd(ds.cmd_where, ["Order"])
         self.assertEqual(rc, 0)
         self.assertIn("app/main.py:14", out)
