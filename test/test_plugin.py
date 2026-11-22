@@ -3775,6 +3775,8 @@ class Server:
         self.has_key = has_key
         self.workbooks = list(workbooks)
         self.agents = {}  # name -> agent_id
+        self.made = 0
+        self.unauthorized = set()  # agent ids the approval route answers 401 for (their login is cut, e.g. a re-login)
         self.down = False
         self.codes = {}
 
@@ -3785,7 +3787,10 @@ class Server:
         base = path.split("?")[0]
         if base == ds.AGENT_REGISTER_PATH:
             name = body["name"]
-            aid = self.agents.setdefault(name, "aaaaaaaa-0000-0000-0000-%012d" % (len(self.agents) + 1))
+            if name not in self.agents:
+                self.made += 1
+                self.agents[name] = "aaaaaaaa-0000-0000-0000-%012d" % self.made
+            aid = self.agents[name]
             if body.get("agent_id") not in (None, aid):
                 raise ds.ApiError(409, {"code": "agent_mismatch"})
             ans = {"agent_id": aid, "name": name}
@@ -3796,6 +3801,8 @@ class Server:
             return 200, "application/json", json.dumps(ans)
         if base == ds.AGENT_APPROVAL_PATH:
             aid = urllib.parse.parse_qs(path.split("?", 1)[1])["agent_id"][0]
+            if aid in self.unauthorized:
+                raise ds.ApiError(401, {"code": "unauthorized"})
             if aid not in self.agents.values():
                 raise ds.ApiError(404, {"code": "agent_not_found"})
             return 200, "application/json", json.dumps({"agent_id": aid, "approval": self.approval})
@@ -3840,10 +3847,16 @@ class Xli375(Base):
         self.projects = os.path.join(ds.CLAUDE_DIR, "projects")
         self._aside()
         self.addCleanup(self._aside)
+        self.sign_in()
+
+    def sign_in(self):
+        """A login recorded on this computer (its own login id, as each device sign-in gets)."""
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": int(time.time()), "login_id": ds._new_login_id()}))
+        return ds._login_id()
 
     def _aside(self):
         for n in os.listdir(TMP):
-            if re.fullmatch(r"(agent-.+\.(json|key|proof))|enroll\.json", n):
+            if re.fullmatch(r"(agent-.+\.(json|key|proof))|enroll\.json|login\.json", n):
                 os.replace(os.path.join(TMP, n), os.path.join(TMP, f"old375-{n}-{time.time()}"))
         if os.path.isdir(os.path.join(ds.CLAUDE_DIR, "projects")):
             os.replace(os.path.join(ds.CLAUDE_DIR, "projects"), os.path.join(ROOT, f"old-projects-{time.time()}"))
@@ -4016,6 +4029,89 @@ class Xli375(Base):
         ds.enroll()  # beta is registered anew; alpha stays off (the person said no)
         self.assertIn(b, ds._enrolled())
         self.assertEqual(ds._enrolled()[a]["state"], "off")
+
+    # enroll.json belongs to the login that registered it (review 1 HIGH)
+    def relogin(self):
+        """Signed out and in again: datastash cut the old login's agents (cutGrantFootholds), so its approval route
+        answers 401 for them; the old names are free again."""
+        self.server.unauthorized |= set(self.server.agents.values())
+        self.server.agents = {}
+        self.cut_at = len(self.server.calls)
+        return self.sign_in()
+
+    def approval_401s(self):
+        """Approval asks sent after the cut for an agent datastash answers 401 for."""
+        return [c for c in self.server.calls[self.cut_at:] if c[1].split("?")[0] == ds.AGENT_APPROVAL_PATH
+                and urllib.parse.parse_qs(c[1].split("?", 1)[1])["agent_id"][0] in self.server.unauthorized]
+
+    def test_each_record_keeps_its_login_and_a_relogin_registers_again_with_no_401s(self):
+        a = self.used(os.path.join(self.root, "alpha"))
+        lid = ds._login_id()
+        self.assertEqual(ds.enroll(), 1)
+        old = ds._enrolled()[a]
+        self.assertEqual(old["login"], lid)
+        self.relogin()
+        self.assertNotEqual(ds._login_id(), lid)
+        self.assertEqual(ds._enrolled(), {})  # the old login's record is not this login's
+        self.assertEqual(ds.enroll(), 1)  # the folder registers again, on the new login
+        new = ds._enrolled()[a]
+        self.assertNotEqual(new["agent_id"], old["agent_id"])
+        self.assertEqual(new["login"], ds._login_id())
+        self.assertNotIn(old["agent_id"], open(ds.ENROLL_FILE).read())  # dropped from the file on that write
+        # the listener's polls: never a 401 for the old agent, never a second registration
+        for _ in range(5):
+            self.assertEqual(ds.advance(a), "waiting")
+            ds.enroll()
+        self.assertEqual(self.approval_401s(), [])
+        self.assertEqual(len(self.server.paths(ds.AGENT_REGISTER_PATH)), 2)
+
+    def test_a_401_on_a_live_login_forgets_the_record_once_and_the_folder_registers_again(self):
+        a = self.used(os.path.join(self.root, "alpha"))
+        forced = []
+        ds.login_token = lambda force=False: forced.append(force) or "dsat_" + "t" * 30
+        ds.enroll()
+        old = ds._enrolled()[a]["agent_id"]
+        self.server.unauthorized.add(old)
+        self.server.agents = {}  # this agent is not the login's any more at datastash
+        self.cut_at = len(self.server.calls)
+        self.assertEqual(ds.advance(a), "gone")  # a fresh token is refused too: gone, not "retry" forever
+        self.assertIn(True, forced)
+        self.assertNotIn(a, ds._enrolled())
+        self.assertEqual(len(self.approval_401s()), 2)  # the first ask, and one on the refreshed token
+        self.assertEqual(ds.advance(a), "gone")  # nothing left to ask about
+        self.assertEqual(ds.enroll(), 1)
+        for _ in range(3):
+            self.assertEqual(ds.advance(a), "waiting")
+        self.assertEqual(len(self.approval_401s()), 2)  # no endless 401s
+        self.assertEqual(self.key_calls(), [])
+
+    def test_a_401_from_a_stale_token_alone_just_retries_on_the_fresh_one(self):
+        a = self.used(os.path.join(self.root, "alpha"))
+        ds.enroll()
+        stale = "dsat_" + "s" * 30
+        real = self.server.__call__
+        def srv(method, path, key=None, **kw):
+            if key == stale:
+                raise ds.ApiError(401, {"code": "unauthorized"})
+            return real(method, path, key=key, **kw)
+        ds.http = srv
+        ds.login_token = lambda force=False: "dsat_" + "t" * 30 if force else stale
+        self.assertEqual(ds.advance(a), "waiting")
+        self.assertIn(a, ds._enrolled())
+
+    def test_logout_forgets_every_waiting_agent(self):
+        a = self.used(os.path.join(self.root, "alpha"))
+        ds.enroll()
+        ds.raise_notice(ds.notice_cause("waiting", "alpha"), "waiting (test)")
+        self.saved.setdefault("_keychain_del", ds._keychain_del)
+        ds._keychain_del = lambda: None
+        ds._forget_login()
+        self.assertFalse(os.path.exists(ds.ENROLL_FILE))
+        self.assertEqual(ds._enrolled(), {})
+        self.assertEqual(ds.take_notices([ds.notice_cause("waiting", "alpha")]), [])
+        self.sign_in()
+        self.assertEqual(ds.enroll(), 1)
+        self.assertIn(a, ds._enrolled())
 
     def test_the_only_key_ask_in_the_plugin_is_the_first_key(self):
         """Nothing anywhere else asks for a key: AGENT_KEY_PATH is used by _first_key alone, with only_if_no_key."""

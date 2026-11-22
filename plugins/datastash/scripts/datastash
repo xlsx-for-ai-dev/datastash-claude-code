@@ -448,9 +448,44 @@ def _save_login(refresh, access, expires_in):
     else:
         write_private(LOGIN_REFRESH_FILE, refresh + "\n")
         store = "file"
-    write_private(LOGIN_FILE, json.dumps({"store": store, "at": int(time.time())}))
+    # A new login (a new grant at datastash): its own id, so agents registered on an earlier login are dropped here.
+    write_private(LOGIN_FILE, json.dumps({"store": store, "at": int(time.time()), "login_id": _new_login_id()}))
     _save_access(access, expires_in)
     return store
+
+
+LOGIN_ID_RE = r"[A-Za-z0-9_\-]{16,64}"
+
+
+def _new_login_id():
+    return secrets.token_urlsafe(16)
+
+
+def _login_id():
+    """This computer's current login's id (made here at each sign-in; the grant's stand-in, never a secret), or None when
+    not signed in. A login recorded before the id existed gets one now, once (under a lock, so all processes agree)."""
+    rec = read_json(LOGIN_FILE, {})
+    if rec.get("store") not in ("keychain", "file"):
+        return None
+    lid = rec.get("login_id")
+    if isinstance(lid, str) and re.fullmatch(LOGIN_ID_RE, lid):
+        return lid
+    lock = None
+    try:
+        ensure_dirs()
+        lock = _try_lock(os.path.join(STATE, "login-id.lock"), wait=2)
+        rec = read_json(LOGIN_FILE, {})
+        if rec.get("store") not in ("keychain", "file"):
+            return None
+        lid = rec.get("login_id")
+        if not (isinstance(lid, str) and re.fullmatch(LOGIN_ID_RE, lid)):
+            rec["login_id"] = lid = _new_login_id()
+            write_private(LOGIN_FILE, json.dumps(rec))
+        return lid
+    except OSError:
+        return None
+    finally:
+        _unlock(lock)
 
 
 def _save_access(access, expires_in):
@@ -463,6 +498,7 @@ def _save_access(access, expires_in):
 
 def _forget_login():
     _keychain_del()
+    _forget_enrolled()  # agents registered on this login wait for it no more
     for p in (LOGIN_REFRESH_FILE, LOGIN_ACCESS_FILE, LOGIN_FILE, LOGIN_PENDING_FILE):
         _drop(p)
 
@@ -489,7 +525,9 @@ def _store_refresh(refresh):
     try:
         write_private(LOGIN_REFRESH_FILE, refresh + "\n")
         if where != "file":
-            write_private(LOGIN_FILE, json.dumps({"store": "file", "at": int(time.time())}))
+            rec = read_json(LOGIN_FILE, {})
+            keep = {"login_id": rec["login_id"]} if isinstance(rec.get("login_id"), str) else {}
+            write_private(LOGIN_FILE, json.dumps({"store": "file", "at": int(time.time()), **keep}))
         return True
     except OSError:
         return False
@@ -1627,7 +1665,7 @@ AGENT_REGISTER_PATH = "/api/v1/agent/register"
 AGENT_KEY_PATH = "/api/v1/agent/key"
 AGENT_APPROVAL_PATH = "/api/v1/agent/approval"
 AGENT_HELLO_PATH = "/api/v1/agent/hello"  # XLI-375 S2; until it is live a 404 is fine (logged only)
-ENROLL_FILE = os.path.join(CONF, "enroll.json")  # folder -> {name, agent_id, proof, at, key_call?, state?} (mode 600)
+ENROLL_FILE = os.path.join(CONF, "enroll.json")  # folder -> {name, agent_id, proof, login, at, key_call?, state?} (mode 600)
 RECENT_DAYS = 30
 APPROVAL_POLL_SECONDS = float(os.environ.get("DATASTASH_APPROVAL_POLL_SECONDS", "10"))
 NO_WORKBOOK_RECHECK_SECONDS = 600  # an allowed agent whose account has no agent workbook yet looks again this often
@@ -1708,11 +1746,30 @@ def recent_folders(now=None):
 
 
 def _enrolled():
+    """The agents registered here on the CURRENT login and still waiting. A record from another login (signed out and in,
+    a revoked or expired grant) is not this login's: datastash switched it off with that login, so it is left out (and
+    dropped on the next write), and its folder registers again."""
+    lid = _login_id()
+    if lid is None:
+        return {}
     e = read_json(ENROLL_FILE, {})
     return {k: v for k, v in e.items() if isinstance(k, str) and k.startswith("/") and isinstance(v, dict)
             and isinstance(v.get("name"), str) and isinstance(v.get("agent_id"), str)
             and re.fullmatch(AGENT_ID_RE, v["agent_id"]) and isinstance(v.get("proof"), str)
-            and re.fullmatch(PROOF_RE, v["proof"])}
+            and re.fullmatch(PROOF_RE, v["proof"]) and v.get("login") == lid}
+
+
+def _forget_enrolled():
+    """Logout: forget every registered-and-waiting agent here (and its waiting notice)."""
+    e = read_json(ENROLL_FILE, {})
+    causes = [notice_cause("waiting", slug(v["name"])) for v in e.values() if isinstance(v, dict) and isinstance(v.get("name"), str)]
+    try:
+        with _EnrollFileLock():
+            _drop(ENROLL_FILE)
+    except OSError:
+        _drop(ENROLL_FILE)
+    if causes:
+        clear_notices(causes)
 
 
 def _set_enrolled(folder, rec):
@@ -1824,7 +1881,10 @@ def _register(tok, folder, rec=None):
         srv = ans.get("name").strip() if isinstance(ans.get("name"), str) else ""
         if srv and slug(srv) == slug(name):
             name = srv
-        rec = {"name": name, "agent_id": agent_id, "proof": proof, "at": int(time.time())}
+        lid = _login_id()
+        if lid is None:
+            return None, ans  # signed out meanwhile: nothing kept for a login that is gone
+        rec = {"name": name, "agent_id": agent_id, "proof": proof, "login": lid, "at": int(time.time())}
         _set_enrolled(folder, rec)
         return rec, ans
     return None, {}
@@ -1902,6 +1962,20 @@ def _approval(tok, rec):
     return st if st in ("approved", "waiting_for_person", "switched_off") else "waiting_for_person"
 
 
+def _approval_on_fresh_token(rec):
+    """After a 401: the approval answer on a freshly refreshed token, "unauthorized" when that live token is refused
+    too, or None (no live login: not reached, or signed out)."""
+    tok = login_token(force=True)
+    if not tok:
+        return None
+    try:
+        return _approval(tok, rec)
+    except ApiError as e:
+        return "unauthorized" if e.status == 401 else None
+    except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return None
+
+
 def advance(folder, tok=None):
     """One step for folder's waiting agent. Returns "ready" (its key is saved and the folder linked), "waiting",
     "no_workbook", "off" (the person said no), "gone" (datastash has no such agent: forgotten here, so the next
@@ -1923,10 +1997,19 @@ def advance(folder, tok=None):
     try:
         st = _approval(tok, rec)
     except ApiError as e:
-        if e.status == 401:
-            return "retry"  # the login's token (outage, or signed out): wait
-        log(s, f"approval: HTTP {e.status}")
-        return "retry"
+        if e.status != 401:
+            log(s, f"approval: HTTP {e.status}")
+            return "retry"
+        st = _approval_on_fresh_token(rec)
+        if st is None:
+            return "retry"  # the login itself is out (an outage, or signed out: then its records go with it)
+        if st == "unauthorized":
+            # A live login (a fresh token just worked to refresh) that datastash still turns away for this agent: the
+            # agent is not this login's any more. Forget it, so the folder registers again; never a 401 every poll.
+            _set_enrolled(folder, None)
+            clear_notices([notice_cause("waiting", s)])
+            log(s, "approval: refused on a live login; forgotten, registers again")
+            return "gone"
     except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
         return "retry"
     if st == "waiting_for_person":
