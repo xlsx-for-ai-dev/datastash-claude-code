@@ -959,6 +959,20 @@ class Morning(Base):
                          "Yesterday datastash saved you 0.5 hours [2J across all your agents.")
 
 
+class AskedRead(Base):
+    """XLI-359: only a read someone asked for says asked=1; the background refresh never does."""
+    def test_on_demand_read_says_asked_and_the_refresh_does_not(self):
+        ds.save_status_cache(WB, [ds.norm_status_row(EXAMPLE[0])], time.time() - 600, merge=False)
+        ds.render_status_all(self.folder, ds.this_session())  # stale copy: one live read, asked for
+        gets = [c[1] for c in self.calls if c[0] == "GET"]
+        self.assertEqual(len(gets), 1)
+        self.assertIn("asked=1", gets[0])
+        self.calls.clear()
+        ds.fetch_status({"slug": "web-app", "workbook_id": WB})  # what the refresher calls
+        ds.fetch_status({"slug": ds.PERSON_SLUG, "workbook_id": WB})
+        self.assertTrue(all("asked=" not in c[1] for c in self.calls if c[0] == "GET"))
+
+
 class Refresh(Base):
     def run_refresher(self, seconds=0.3):
         wake, stop = threading.Event(), threading.Event()

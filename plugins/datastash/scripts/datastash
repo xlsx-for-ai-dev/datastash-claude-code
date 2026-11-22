@@ -4610,8 +4610,10 @@ def _utc_offset_minutes():
         return None
 
 
-def _status_page(path, key, wb, cursor, timeout):
+def _status_page(path, key, wb, cursor, timeout, asked=False):
     q = {"workbook_id": wb}
+    if asked:
+        q["asked"] = "1"  # XLI-359: someone asked for this read (the background refresh never says so)
     if cursor is not None:
         q["cursor"] = cursor
     elif path == PERSON_STATUS_PATH and _utc_offset_minutes() is not None:
@@ -4626,7 +4628,7 @@ def _status_page(path, key, wb, cursor, timeout):
     return body
 
 
-def fetch_status(sess, timeout=10):
+def fetch_status(sess, timeout=10, asked=False):
     """Every agent's status in sess's agent workbook (XLI-332: a page at a time, following next_cursor to the end);
     saves the local copy only after a whole walk and returns it. A failure partway keeps the old copy and marks it."""
     key, path = _status_cred(sess)
@@ -4637,13 +4639,13 @@ def fetch_status(sess, timeout=10):
     morning = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
     try:
         for _ in range(STATUS_MAX_PAGES):
-            body = _status_page(path, key, wb, cursor, timeout)
+            body = _status_page(path, key, wb, cursor, timeout, asked)
             if cursor is None and path == PERSON_STATUS_PATH:
                 morning = body.get("morning")
             if cursor is not None and body.get("note") and not restarted:
                 # the server could not read our cursor and served page 1 again: start the walk over, once
                 restarted, rows, cursor = True, [], None
-                body = _status_page(path, key, wb, None, timeout)
+                body = _status_page(path, key, wb, None, timeout, asked)
             elif cursor is not None and body.get("note"):
                 raise ApiError(200, {"error": "cursor_restart"})
             if seq is None and _num_ok(body.get("seq")):
@@ -5190,7 +5192,7 @@ def load_status(here, me, max_age=STATUS_FRESH_SECONDS, live_timeout=10, live=Tr
         return c, ("agent status isn't available on datastash yet; showing the copy on this machine" if c is not None else
                    "agent status isn't available on datastash yet")
     try:
-        return fetch_status(sess, timeout=live_timeout), None
+        return fetch_status(sess, timeout=live_timeout, asked=True), None
     except ApiError as e:
         url = approval_url(e.body)
         why = (f"datastash needs the person's OK for this computer first: {url}" if url else
