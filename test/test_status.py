@@ -887,6 +887,78 @@ class Paging(Base):
         self.assertIsNone(ds.read_status_cache(WB))
 
 
+class Morning(Base):
+    """XLI-359: the person's first status of the day starts with the server's morning lines (hours saved yesterday, then
+    new agents waiting for the OK); once per local day; none when the server sent none; an agent key's read keeps them."""
+    LINES = ["Yesterday datastash saved you 1.2 hours across all your agents.", "New agents waiting for your OK:",
+             "Builder (Laptop)", "https://x.example/agents"]
+
+    def setUp(self):
+        super().setUp()
+        if os.path.exists(ds.MORNING_PATH):
+            os.replace(ds.MORNING_PATH, os.path.join(TMP, f"old-morning-{time.time()}"))
+        self.today = time.strftime("%Y-%m-%d", time.localtime())
+        self.morning = {"day": self.today, "lines": list(self.LINES), "show": "x"}
+        base = ds.http
+
+        def http(method, path, key=None, body=None, form=None, timeout=40):
+            st, ct, text = base(method, path, key, body, form, timeout)
+            if method == "GET" and path.startswith(ds.PERSON_STATUS_PATH + "?") and self.morning is not None:
+                b = json.loads(text)
+                b["morning"] = self.morning
+                text = json.dumps(b)
+            return st, ct, text
+        ds.http = http
+
+    def person_fetch(self):
+        return ds.fetch_status({"slug": ds.PERSON_SLUG, "workbook_id": WB})
+
+    def test_person_read_sends_the_offset_and_the_first_status_of_the_day_starts_with_the_lines_once(self):
+        self.person_fetch()
+        get = [c for c in self.calls if c[0] == "GET"][0][1]
+        q = dict(urllib.parse.parse_qsl(get.split("?", 1)[1]))
+        self.assertEqual(int(q["utc_offset"]), int(time.localtime().tm_gmtoff // 60))
+        out = ds.render_status_all(self.folder, ds.this_session(), for_person=True)
+        self.assertEqual(out[:4], self.LINES)
+        self.assertTrue(out[4].startswith(ds.STATUS_HEAD))
+        again = ds.render_status_all(self.folder, ds.this_session(), for_person=True)
+        self.assertTrue(again[0].startswith(ds.STATUS_HEAD))
+        self.assertNotIn(self.LINES[0], "\n".join(again))
+        self.assertNotIn(self.LINES[0], "\n".join(ds.render_status_all(self.folder, ds.this_session())))
+
+    def test_the_ai_facing_status_also_starts_with_them_before_the_framed_block(self):
+        self.person_fetch()
+        out = ds.render_status_all(self.folder, ds.this_session())
+        self.assertEqual(out[:4], self.LINES)
+        self.assertTrue(out[4].startswith("<<datastash-data "))
+
+    def test_no_lines_on_a_day_the_server_sent_none_or_for_another_day(self):
+        self.morning = None
+        self.person_fetch()
+        self.assertTrue(ds.render_status_all(self.folder, ds.this_session(), for_person=True)[0].startswith(ds.STATUS_HEAD))
+        self.morning = {"day": "2001-01-01", "lines": list(self.LINES)}
+        self.person_fetch()
+        self.assertTrue(ds.render_status_all(self.folder, ds.this_session(), for_person=True)[0].startswith(ds.STATUS_HEAD))
+        self.assertFalse(os.path.exists(ds.MORNING_PATH))
+
+    def test_an_agent_key_read_keeps_the_persons_lines_and_never_asks_with_an_offset(self):
+        self.person_fetch()
+        self.calls.clear()
+        ds.fetch_status({"slug": "web-app", "workbook_id": WB})
+        self.assertNotIn("utc_offset", [c for c in self.calls if c[0] == "GET"][0][1])
+        self.assertEqual(ds.render_status_all(self.folder, ds.this_session(), for_person=True)[:4], self.LINES)
+
+    def test_bad_lines_from_the_server_are_ignored_and_control_characters_dropped(self):
+        for bad in ({"day": self.today, "lines": "text"}, {"day": "today", "lines": ["x"]}, {"day": self.today, "lines": [1]}, []):
+            self.morning = bad
+            self.person_fetch()
+            self.assertTrue(ds.render_status_all(self.folder, ds.this_session(), for_person=True)[0].startswith(ds.STATUS_HEAD))
+        self.morning = {"day": self.today, "lines": ["Yesterday datastash saved you 0.5 hours\x1b[2J across all your agents."]}
+        self.person_fetch()
+        self.assertEqual(ds.render_status_all(self.folder, ds.this_session(), for_person=True)[0],
+                         "Yesterday datastash saved you 0.5 hours [2J across all your agents.")
+
+
 class Refresh(Base):
     def run_refresher(self, seconds=0.3):
         wake, stop = threading.Event(), threading.Event()

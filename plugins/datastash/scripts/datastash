@@ -4532,13 +4532,20 @@ def _merge_rows(old, new):
     return out
 
 
-def save_status_cache(workbook_id, rows, fetched_at, merge=True):
+_KEEP_MORNING = object()  # an agent key's read has no morning lines: the copy keeps the person's last ones
+
+
+def save_status_cache(workbook_id, rows, fetched_at, merge=True, morning=_KEEP_MORNING):
     ensure_dirs()
     with StateLock(f"status-{_wb_tag(workbook_id)}"):
         old = read_status_cache(workbook_id)
         if merge and old:
             rows = _merge_rows(old["agents"], rows)
         c = {"workbook_id": workbook_id, "fetched_at": fetched_at, "agents": rows, "failed_at": None}
+        if morning is _KEEP_MORNING:
+            morning = (old or {}).get("morning")
+        if _morning_ok(morning):
+            c["morning"] = {"day": morning["day"], "lines": list(morning["lines"])}
         write_private(status_cache_path(workbook_id), json.dumps(c))
     return c
 
@@ -4561,8 +4568,10 @@ def put_own_row(workbook_id, row):
     with StateLock(f"status-{_wb_tag(workbook_id)}"):
         old = read_status_cache(workbook_id) or {"agents": [], "fetched_at": 0, "failed_at": None}
         rows = [r for r in old["agents"] if _row_key(r) != _row_key(row)] + [row]
-        write_private(status_cache_path(workbook_id), json.dumps(
-            {"workbook_id": workbook_id, "fetched_at": old["fetched_at"], "agents": rows, "failed_at": old.get("failed_at")}))
+        c = {"workbook_id": workbook_id, "fetched_at": old["fetched_at"], "agents": rows, "failed_at": old.get("failed_at")}
+        if _morning_ok(old.get("morning")):
+            c["morning"] = old["morning"]
+        write_private(status_cache_path(workbook_id), json.dumps(c))
 
 
 # --- the status door (404 until the server builder lands it)
@@ -4593,10 +4602,20 @@ def _status_cred(sess):
 STATUS_MAX_PAGES = 10000  # a guard against a server that never stops answering next_cursor (not a data limit)
 
 
+def _utc_offset_minutes():
+    """This machine's offset from UTC now, in minutes east (XLI-359: the person's day for the morning line)."""
+    try:
+        return int(time.localtime().tm_gmtoff // 60)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def _status_page(path, key, wb, cursor, timeout):
     q = {"workbook_id": wb}
     if cursor is not None:
         q["cursor"] = cursor
+    elif path == PERSON_STATUS_PATH and _utc_offset_minutes() is not None:
+        q["utc_offset"] = str(_utc_offset_minutes())  # XLI-359: the first page carries the morning lines in this day
     _status, _ctype, text = http("GET", path + "?" + urllib.parse.urlencode(q), key=key, timeout=timeout)
     try:
         body = json.loads(text)
@@ -4615,9 +4634,12 @@ def fetch_status(sess, timeout=10):
         raise ApiError(401, {"error": "no_key"})
     wb = sess["workbook_id"]
     rows, cursor, restarted, seq = [], None, False, None
+    morning = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
     try:
         for _ in range(STATUS_MAX_PAGES):
             body = _status_page(path, key, wb, cursor, timeout)
+            if cursor is None and path == PERSON_STATUS_PATH:
+                morning = body.get("morning")
             if cursor is not None and body.get("note") and not restarted:
                 # the server could not read our cursor and served page 1 again: start the walk over, once
                 restarted, rows, cursor = True, [], None
@@ -4644,7 +4666,7 @@ def fetch_status(sess, timeout=10):
     note_door(True)
     # Addendum 6 N2: a `keep` value in this reply is ignored. Until the site has a person-only action that sets it (never
     # an agent key, the sync tool or anything an agent can call), only the person's typed words here turn keeping on.
-    return save_status_cache(wb, rows, time.time())
+    return save_status_cache(wb, rows, time.time(), morning=morning)
 
 
 # --- consent (PM ruling H2): the person's one yes, per project folder
@@ -5197,6 +5219,34 @@ def _freshness(c, now, note):
     return f"({fresh}{'; ' + note if note else ''})"
 
 
+# --- XLI-359: the morning lines (hours saved yesterday, then new agents waiting for the person's OK), from the server
+
+MORNING_PATH = os.path.join(CONF, "morning.json")
+
+
+def _morning_ok(m):
+    return (isinstance(m, dict) and isinstance(m.get("day"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", m["day"]) is not None
+            and isinstance(m.get("lines"), list) and bool(m["lines"]) and all(isinstance(x, str) for x in m["lines"]))
+
+
+def take_morning(c):
+    """The server's morning lines, once per local day: only when they are for today here and this machine has not shown
+    them today. Taking them marks the day shown. [] otherwise (and on a day with no lines: nothing saved yesterday)."""
+    m = c.get("morning") if isinstance(c, dict) else None
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    if not _morning_ok(m) or m["day"] != today:
+        return []
+    try:
+        ensure_dirs()
+        with StateLock("morning"):
+            if read_json(MORNING_PATH, {}).get("shown") == today:
+                return []
+            write_private(MORNING_PATH, json.dumps({"shown": today}))
+    except OSError:
+        return []
+    return [x for x in (_clean(v, 600) for v in m["lines"]) if x]
+
+
 def render_status_all(here, me, install=False, live_timeout=10, only=None, for_person=False):
     """The numbered list with how fresh the copy is; saves this session's view (the numbering for "full context of N").
     For the AI: framed as agent-written data. for_person (XLI-337): the text the plugin shows the person itself, from
@@ -5212,6 +5262,8 @@ def render_status_all(here, me, install=False, live_timeout=10, only=None, for_p
             wb = c["workbook_id"]
             if only is not None and not lines:
                 return []
+            if only is None and not install:
+                out += take_morning(c)  # XLI-359: the first status of the person's day starts with these
             if for_person:
                 out.append(f"{STATUS_HEAD} {_freshness(c, now, note)}")
                 if install:
