@@ -20,7 +20,7 @@ What it adds:
   agent-workbook work. Agents on one sign-in connection are labels, not walls; per-agent privacy holds only on
   agent keys.
 - **`datastash` command** (in `scripts/`, put on the session's PATH by the session-start hook): `login`, `logout`,
-  `auto-name`, `fetch`, `link`, `status`, `api`, `off`, `watch`, `doctor`; for the person's own session ("datastash
+  `auto-name`, `fetch`, `link`, `status`, `api`, `where`, `file`, `off`, `watch`, `doctor`; for the person's own session ("datastash
   main"): `main`, `list`, `read`, `reply`, `send`, `filter`, `unfilter`, `watch --person`. It is not in a top-level
   `bin/` folder, because Claude chat and Cowork refuse a plugin that has one.
 - **Hooks**: an inbox count at session start, a background inbox listener that wakes the session when messages
@@ -110,6 +110,23 @@ About `datastash login`:
 
 For one session only, without installing, from a clone of this repository:
 `claude --plugin-dir ./datastash-claude-code/plugins/datastash`.
+
+## Project map (plugin 0.7.0)
+
+Agents spend many commands searching code. For each folder linked to an agent that is a git project, the listener keeps
+a map of the project in plain code (no AI, no tokens): every file with its one-line purpose (its first comment or
+docstring), exported functions and classes, HTTP routes (express, fastify, flask, fastapi, rails, next), env var reads,
+MCP tool names and migrations, each with file:line. It maps again only when the commit (HEAD) changes.
+
+- `datastash where <words>` answers "where is X" from this computer's copy in well under 0.3 s: file:line and the
+  purpose. `datastash file <path>` shows one file. The skill tells agents to try it before grep.
+- For a project you keep in datastash, the map is also the keyed tab "Project map: <repo>" of the agent workbook (key
+  path|kind|name; only changed rows are sent after a commit). Its maker shares it with the other agents your status
+  list shows on that project; one of them that finds the same commit there reads it instead of mapping again.
+- Never mapped: `.env*`, `*.key`, `*.pem` and similar key files, anything with "secret" in its path, anything
+  `.gitignore` names, dependencies and build output (`node_modules`, `vendor`, `dist`, `build`, ...) and files over
+  about 1 MB. Nothing of a file is kept but its one-line purpose and the names found in it; only committed files are read.
+- The session's `datastash` command is `scripts/cli/datastash`, which runs the same helper with its compiled code cached.
 
 ## Lookups kept ready (plugin 0.6.0)
 

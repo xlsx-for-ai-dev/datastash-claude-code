@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""The `datastash` command on the session's PATH (XLI-307): runs ../datastash with its compiled code kept in
+__pycache__, so a command starts without compiling the whole helper again (the hooks run ../datastash itself)."""
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "datastash")
+_loader = importlib.machinery.SourceFileLoader("datastash_cli", _SRC)
+_spec = importlib.util.spec_from_file_location("datastash_cli", _SRC, loader=_loader)
+_mod = importlib.util.module_from_spec(_spec)
+sys.modules["datastash_cli"] = _mod
+_loader.exec_module(_mod)
+try:
+    sys.exit(_mod.main())
+except KeyboardInterrupt:
+    sys.exit(130)
