@@ -81,8 +81,9 @@ This computer's datastash login (XLI-278; the person approves it once in their b
   token --header            for the datastash connector's headersHelper only: prints {"Authorization": "Bearer ..."} (a
                             15-minute token only when run by Claude Code as the connector's helper, never to a terminal
                             or a tool call, which the hooks also deny); when there is none, the fixed placeholder
-                            "signed-out" in the device sign-in mode on a terminal Claude Code (so Claude Code offers no
-                            OAuth sign-in), else {} (the connector's own sign-in keeps working). Always exits 0.
+                            "signed-out" only when this computer has a datastash login on record (device sign-in mode,
+                            terminal Claude Code), else {}, a fresh computer included, so Claude Code's /mcp
+                            Authenticate sign-in for the connector shows and keeps working. Always exits 0.
 Hook entry points (run by Claude Code, not by hand): check, listen, end, prompt, agent-tool, status-check; map-refresh
 (started by where and file).
 
@@ -3649,15 +3650,20 @@ def device_host():
     return os.environ.get("CLAUDE_CODE_ENTRYPOINT") in DEVICE_HOSTS
 
 
+HOOK_SIGN_IN = False  # XLI-390 P1: the hooks never start a datastash login
+
+
 def placeholder_applies():
     """The connector's helper sends the placeholder when signed out: only in the device mode, only with file locking
-    (the login can refresh), only on a host where the person sees the device sign-in."""
+    (the login can refresh), only on a host where the person sees the device sign-in, and (XLI-390: identity rides on
+    the connector's own OAuth sign-in) only while some datastash sign-in other than the connector's exists to send
+    the person to: the hooks start one (HOOK_SIGN_IN), or this computer has a datastash login on record (a 0.9.x
+    login, kept as before). A fresh computer with neither gets no header, so Claude Code's /mcp Authenticate shows."""
     if fcntl is None or not device_host():
         return False
+    if not (HOOK_SIGN_IN or _login_recorded()):
+        return False
     return effective_signin() == SIGNIN_DEVICE
-
-
-HOOK_SIGN_IN = False  # XLI-390 P1: the hooks never start a datastash login
 
 
 def hooks_offer_sign_in():
@@ -3699,7 +3705,7 @@ def signin_doctor_line():
     mode = rec.get("mode")
     since = time.strftime("%Y-%m-%d", time.localtime(rec.get("changed_at") or rec["first_run_at"]))
     host = os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "unknown"
-    door = "placeholder (device sign-in only)" if placeholder_applies() else "no header while signed out (the host's own sign-in stays)"
+    door = "placeholder (a datastash login is on record)" if placeholder_applies() else "no header while signed out (the host's own sign-in stays)"
     line = f"sign-in mode: {mode} since {since} ({rec.get('changed_by') or rec.get('why')})"
     if mode == SIGNIN_LEGACY:
         left = max(0, int((_legacy_deadline(rec) - time.time() + 86399) // 86400))
@@ -5827,9 +5833,9 @@ def connector_helper_call():
 def cmd_token(args):
     """The datastash connector's headersHelper. Always exits 0. Prints the login's 15-minute token when there is one;
     otherwise (not signed in, sign-in waiting, refresh failed, keychain unreadable, anything else): in the device mode
-    on a host that shows the device sign-in, the fixed placeholder "Bearer signed-out" (datastash answers 401 and
-    Claude Code, since the helper supplied Authorization, offers no OAuth sign-in, so the device sign-in is the only
-    door); in every other case {} as in 0.1.x, so a stored OAuth sign-in keeps working and the host's own door stays.
+    on a host that shows the device sign-in, with a datastash login on record (placeholder_applies), the fixed
+    placeholder "Bearer signed-out" (datastash answers 401 and Claude Code, since the helper supplied Authorization,
+    offers no OAuth sign-in); in every other case, a fresh computer included, {} as in 0.1.x, so a stored OAuth sign-in keeps working and the host's own door stays.
     Never a token on a terminal or to a tool call (connector_helper_call), never logs, never the refresh token."""
     if args != ["--header"]:
         die("usage: datastash token --header   (for the datastash connector only)")

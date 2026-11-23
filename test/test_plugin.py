@@ -2696,13 +2696,14 @@ class Login(Base):
                 self.assertNotIn("{}", out)
 
     def test_token_header_as_a_real_process_in_a_signed_out_home(self):
-        """The helper as Claude Code runs it (a pipe, a fresh config folder): exit 0 and the placeholder header."""
+        """The helper as Claude Code runs it (a pipe, a fresh config folder, the shipped HOOK_SIGN_IN False): exit 0
+        and no header, so Claude Code's /mcp Authenticate shows for the connector (release 1.0.2 review HIGH)."""
         home = harness.tmpdir(self, dir=TMP)
         env = dict(os.environ, DATASTASH_CONFIG_DIR=os.path.join(home, "conf"), HOME=home, CLAUDE_CODE_ENTRYPOINT="cli",
                    CLAUDE_CONFIG_DIR=os.path.join(home, ".claude"))
         r = subprocess.run([sys.executable, "-I", BIN, "token", "--header"], capture_output=True, text=True, env=env, timeout=20)
         self.assertEqual(r.returncode, 0)
-        self.assertEqual(json.loads(r.stdout), {"Authorization": "Bearer signed-out"})
+        self.assertEqual(json.loads(r.stdout), {})
         self.assertEqual(r.stderr, "")
 
     def test_token_header_never_fails_the_connector(self):
@@ -3104,7 +3105,7 @@ class Transition(Base):
         self.assertEqual((r.returncode, r.stdout.strip(), r.stderr), (0, "{}", ""))  # no header: the stored sign-in is used
         self.new_computer()
         r = self.run_bin("token", "--header")
-        self.assertEqual(json.loads(r.stdout), {"Authorization": "Bearer signed-out"})  # fresh: one door
+        self.assertEqual(json.loads(r.stdout), {})  # fresh, no hook sign-in and no login: /mcp Authenticate is the door
 
     def test_a_token_is_sent_in_every_mode_and_host(self):
         self.new_computer(updated=True)
@@ -3207,7 +3208,11 @@ class Transition(Base):
             self.run_bin(*args)
             self.assertEqual(self.mode(), ds.SIGNIN_DEVICE, args)
         r = self.run_bin("token", "--header")
+        self.assertEqual(json.loads(r.stdout), {})  # no login on record: the connector's own sign-in, in the device mode too
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": 1}))  # a datastash login on record
+        r = self.run_bin("token", "--header")
         self.assertEqual(json.loads(r.stdout), {"Authorization": "Bearer signed-out"})
+        self.assertEqual(self.mode(), ds.SIGNIN_DEVICE)
         with open(BIN) as f:  # nothing but the first decision ever writes the legacy mode
             src = f.read()
         self.assertEqual(src.count("mode=SIGNIN_LEGACY"), 1)  # the one first-decision case in _decide_signin
@@ -3264,7 +3269,10 @@ class Transition(Base):
         self.new_computer()
         r = self.run_bin("doctor")
         self.assertIn("note: sign-in mode: device since ", r.stdout)
-        self.assertIn("when signed out: placeholder (device sign-in only)", r.stdout)
+        self.assertIn("when signed out: no header while signed out", r.stdout)  # fresh: no login on record
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": 1}))
+        r = self.run_bin("doctor")
+        self.assertIn("when signed out: placeholder (a datastash login is on record)", r.stdout)
 
     # M1: no file locking: the old behaviour for good
     def test_without_file_locking_the_old_behaviour_stays_for_good(self):

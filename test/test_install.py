@@ -22,6 +22,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import time
 import unittest
@@ -30,7 +31,7 @@ from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_status import ds  # noqa: E402  (the same harness and plugin copy)
+from test_status import BIN, ds  # noqa: E402  (the same harness and plugin copy)
 import harness  # noqa: E402
 
 WB = "11111111-2222-3333-4444-555555555555"
@@ -751,6 +752,105 @@ class HomeFolderInstall(Base):
         v, _ = self.slash("/datastash:install")
         self.assertIn(ds.NO_CONNECTOR_LINE, v["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("Settings, Connectors", v["hookSpecificOutput"]["additionalContext"])
+
+
+class FreshHome(Base):
+    """Release 1.0.2 review HIGH: on a fresh macOS/Linux computer (empty HOME, no datastash login) the connector's
+    helper sent "Bearer signed-out", which hid Claude Code's /mcp Authenticate, and no hook starts a sign-in, so a new
+    person could never sign in. Now (XLI-390: identity rides on the connector's own OAuth sign-in) the helper sends no
+    header there; an earlier 0.9.x datastash login still gets its token (and the placeholder only while it fails)."""
+
+    def helper(self, home, entry="cli"):
+        """`token --header` exactly as Claude Code runs the connector's headersHelper, in a clean environment."""
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "CLAUDE_CODE_ENTRYPOINT": entry,
+               "CLAUDE_CODE_MCP_SERVER_URL": ds.CONNECTOR_URL, "CLAUDE_CONFIG_DIR": os.path.join(home, ".claude"),
+               "DATASTASH_CONFIG_DIR": os.path.join(home, ".config", "datastash"),  # the default under HOME, named for the harness
+               "DATASTASH_NO_NETWORK": "1"}
+        r = subprocess.run([sys.executable, "-I", BIN, "token", "--header"], capture_output=True, text=True, env=env,
+                           timeout=20, cwd=home)
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        return json.loads(r.stdout)
+
+    def test_an_empty_home_sends_no_placeholder_so_mcp_authenticate_shows(self):
+        home = harness.tmpdir(self, prefix="empty-home-", dir=harness.ROOT)
+        self.assertEqual(os.listdir(home), [])
+        self.assertEqual(self.helper(home), {})  # no Authorization: Claude Code offers its own OAuth sign-in
+        self.assertEqual(self.helper(home), {})  # and on every later run (the device mode is recorded by then)
+        with open(os.path.join(home, ".config", "datastash", "signin-mode.json")) as f:
+            self.assertEqual(json.load(f)["mode"], ds.SIGNIN_DEVICE)
+
+    def test_an_old_0_9_login_still_gets_its_token_and_the_placeholder_while_it_fails(self):
+        home = harness.tmpdir(self, prefix="old-login-home-", dir=harness.ROOT)
+        conf = os.path.join(home, ".config", "datastash")
+        os.makedirs(conf, mode=0o700)
+        ds.write_private(os.path.join(conf, "login.json"), json.dumps({"store": "file", "at": 1}))
+        ds.write_private(os.path.join(conf, "login.refresh"), "dsrt_" + "r" * 43 + "\n")
+        tok = "dsat_" + "a" * 43
+        ds.write_private(os.path.join(conf, "login.access.json"), json.dumps({"token": tok, "exp": int(time.time()) + 900}))
+        self.assertEqual(self.helper(home), {"Authorization": "Bearer " + tok})  # as before
+        ds.write_private(os.path.join(conf, "login.access.json"), json.dumps({"token": tok, "exp": 0}))
+        os.replace(os.path.join(conf, "login.refresh"), os.path.join(home, "moved-refresh"))  # refresh can't run here
+        self.assertEqual(self.helper(home), {"Authorization": "Bearer signed-out"})  # as before: a login on record
+
+    def test_after_authenticate_install_makes_the_key_note_and_list(self):
+        """The fresh-HOME path end to end: no hook sign-in at session start, the helper's {} (so /mcp Authenticate
+        signs the plugin's own connector in), then /datastash:install through that connector: key, note, list."""
+        self.assertFalse(ds.hooks_offer_sign_in())
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"
+        os.environ["CLAUDE_CODE_MCP_SERVER_URL"] = ds.CONNECTOR_URL
+        self.addCleanup(os.environ.pop, "CLAUDE_CODE_ENTRYPOINT", None)
+        self.addCleanup(os.environ.pop, "CLAUDE_CODE_MCP_SERVER_URL", None)
+        self.assertEqual(os.listdir(ds.CONF) if os.path.isdir(ds.CONF) else [], [])  # nothing datastash on this computer
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(ds.cmd_token(["--header"]), 0)
+        self.assertEqual(json.loads(buf.getvalue()), {})
+        self.assertEqual(ds.signin_state()["mode"], ds.SIGNIN_DEVICE)
+        start = self.hook(ds.cmd_check, {"session_id": "s1", "hook_event_name": "SessionStart", "cwd": self.folder}) or {}
+        self.assertNotIn("getdatastash.com/agents", json.dumps(start))  # no device code: the /mcp door is the one way in
+        self.assertFalse([c for c in self.calls if c[1] == ds.DEVICE_START_PATH])
+        v, pid = self.slash("/datastash:install")
+        ai = v["hookSpecificOutput"]["additionalContext"]
+        self.assertIn('ledger_agent_register with name "web-app"', ai)
+        self.assertIn(ds.NO_CONNECTOR_LINE, ai)  # the one fallback line, if the connector is still not there
+        self.assertNotIn("datastash login", ai)
+        for k in ("systemMessage",):
+            self.assertNotIn(k, v or {})
+        self.tool("PostToolUse", "ledger_agent_register", {"name": "web-app"},
+                  {"agent_id": OWN, "notes_tabs": [{"workbook_id": WB}]})
+        bound = self.tool("PreToolUse", "ledger_agent_key", {"name": "web-app", "agent_id": OWN, "only_if_no_key": True})
+        challenge = bound["hookSpecificOutput"]["updatedInput"]["code_challenge"]
+        self.answers[ds.COLLECT_PATH] = (200, {"agent_id": OWN, "name": "web-app", "workbook_id": WB, "key": KEY,
+                                               "answer_key": ANSWER})
+        out = self.tool("PostToolUse", "ledger_agent_key", {"name": "web-app"},
+                        {"collect": "ready", "mint_id": MINT, "name": "web-app"})
+        self.assertEqual(out["systemMessage"], ds.MINT_LINE.format(name="web-app"))
+        sent = [c for c in self.calls if c[1] == ds.COLLECT_PATH][0][3]
+        self.assertEqual(ds.challenge_of(sent["verifier"]), challenge)
+        self.assertEqual(stat.S_IMODE(os.stat(ds.key_path("web-app")).st_mode), 0o600)  # the key, mode 600
+        self.assertNotIn(KEY, json.dumps(out) + json.dumps(bound))
+        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        note = self.tool("PreToolUse", "ledger_agents_note", {"kind": "install"})["hookSpecificOutput"]
+        self.assertNotEqual(note.get("permissionDecision"), "deny", note)
+        got = note["updatedInput"]
+        self.assertEqual((got["kind"], got["list_id"], got["targets"]), ("install", LIST_ID, sorted([ALPHA, BETA])))
+        self.assertTrue(proof_ok(got["typed_proof"], "install", [ALPHA, BETA], pid, "/datastash:install"))
+        done = self.tool("PostToolUse", "ledger_agents_note", got, {"run_id": RUN, "kind": "install", "targets": 2,
+                                                                     "status_path": "/api/v1/agent/uninstall/" + RUN})
+        self.assertEqual(done["systemMessage"].split("\n")[:4], [ds.ON_HEAD, "- web-app (public)", "- alpha (private)",
+                                                                  "- beta (public)"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ds.cmd_token(["--header"])
+        self.assertEqual(json.loads(buf.getvalue()), {})  # still no placeholder: the OAuth sign-in keeps working
+
+    def tool(self, event, name, tool_input=None, answer=None, sid="s1"):
+        """The plugin's own connector (signed in by /mcp Authenticate), not a claude.ai one."""
+        inp = {"session_id": sid, "hook_event_name": event, "tool_name": OWN_TOOL + name, "tool_input": tool_input or {},
+               "cwd": self.folder}
+        if answer is not None:
+            inp["tool_response"] = [{"type": "text", "text": json.dumps(answer)}]
+        return self.hook(ds.cmd_agent_tool, inp)
 
 
 class Commands(unittest.TestCase):

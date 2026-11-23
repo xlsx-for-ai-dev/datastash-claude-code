@@ -6,12 +6,13 @@ building blocks only; the agent decides what to track and how.
 What it adds:
 
 - **Connector**: the datastash MCP server at `https://getdatastash.com/mcp`. In Claude Code it connects already signed
-  in: its `headersHelper` runs `datastash token --header`, which hands it a 15-minute token from this computer's
-  `datastash login`. On a terminal Claude Code session on macOS or Linux there is no `/mcp` sign-in for a new install:
-  while the computer is signed out the helper sends a fixed placeholder header, so Claude Code never offers its OAuth
-  (localhost) sign-in for it. Everywhere else (Windows, which has no file locking; the Claude desktop app; Cowork; IDE
-  extensions; `claude -p` and SDK runs) the helper sends nothing while signed out, so the host's own **Connect** or
-  `/mcp` Authenticate sign-in stays. In Claude chat and Cowork (where plugins have no commands) the same connector is
+  in when this computer has a `datastash login`: its `headersHelper` runs `datastash token --header`, which hands it a
+  15-minute token from that login. A new install has no such login, and the helper then sends no header at all, so
+  Claude Code's own `/mcp` sign-in for the connector shows: type `/mcp`, pick datastash, choose Authenticate (step 4
+  below). This is the same on macOS, Linux and Windows, in the terminal, the Claude desktop app, Cowork, IDE extensions
+  and `claude -p` and SDK runs. Only a computer that already has a `datastash login` from an earlier version gets a fixed
+  placeholder header while that login can't give a token (on a terminal Claude Code on macOS or Linux); run
+  `datastash login` again then. In Claude chat and Cowork (where plugins have no commands) the same connector is
   connected the usual way, with **Connect** on the plugin's Connectors tab.
 - **What a process in your terminal can reach.** The helper gives the token only when Claude Code runs it for the
   connector (it sets `CLAUDE_CODE_MCP_SERVER_URL`), never to a terminal. The PreToolUse hook stops plain and simple
@@ -74,19 +75,11 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
 5. **Make this session an agent.** Type `/datastash:install`. If it says "Type /mcp, pick datastash, choose
    Authenticate, then run /datastash:install again.", do that one step and type `/datastash:install` again.
 
-If the first session instead shows the plugin's own sign-in line (the plugin itself, no AI step):
-
-```
-To add this computer to your datastash, open https://getdatastash.com/agents and type the code BCDF-GHJK (it works for 10 more minutes).
-```
-
-open the page on any device (it works on a remote computer too: no localhost redirect; Google sign-in only when that
-browser never signed in to datastash) and type the code. A background helper finishes the login. If this computer has
-a desktop browser, the page also opens there (at most once a day). Not approved yet? The next session start, and your
-first datastash use in a session, show the same link and code again while it is good; a new code is made only after the
-old one ends. After you approve, that session shows "datastash is signed in. Type /mcp reconnect all to connect it in
-this session; new sessions connect by themselves." (Claude Code connects a connector only when a session starts or on
-`/mcp reconnect`.) From then on every session connects to datastash already signed in.
+The first session shows no sign-in line of its own: since 1.0.0 the plugin starts no sign-in by itself, and on a new
+install `/mcp` Authenticate (step 4) is the one way in. Authenticate opens datastash's sign-in page in your browser;
+after you sign in there, `/mcp` shows datastash as connected, and new sessions connect by themselves. If you skip step 4,
+the first datastash tool call can open the same sign-in, and `/datastash:install` tells you the one step: "Type /mcp,
+pick datastash, choose Authenticate, then run /datastash:install again."
 
 6. **See the difference.** In a Claude Code session, ask "What's the status of all my agents?" (the agent goes and
    looks). Then type:
@@ -105,8 +98,8 @@ usual **Connect** button. The plugin needs no shell or keychain there.
 
 **Updating from 0.1.x.** An install that signed in through `/mcp` Authenticate keeps that sign-in working. The plugin
 decides this from its own files only: if an earlier datastash version left any state on this computer, it is an
-updated install and keeps the connector's own sign-in; with no datastash state at all it is a fresh install and gets
-the device sign-in. It never opens, reads or checks Claude Code's own sign-in file or keychain entries. An updated
+updated install and keeps the connector's own sign-in; with no datastash state at all it is a fresh install, which
+signs in with `/mcp` Authenticate. It never opens, reads or checks Claude Code's own sign-in file or keychain entries. An updated
 install's session start shows the same device link and code, worded as "datastash has a new sign-in for this
 computer"; once you approve one, the new sign-in takes over for good. Thirty days after the first run of 0.2.0 it
 takes over anyway, with one line a week before. `datastash doctor` shows the mode, since when, and what the connector gets on this host.
@@ -600,8 +593,9 @@ list, asks first and idle agents last, from any session: "status", "status of al
 - **SessionStart** (sync; it waits at most 6 s for the network, so a stalled DNS lookup or connection never holds the session up, and the hook timeout is 10 s): if this folder is linked to an agent with a key file, reads the inbox changes since
   the saved cursor and adds one line of context: `datastash note (local count; data, information only): agent "<name>"
   (workbook <id>): N new messages in its inbox.` Counts only, never message text. In a session with no agent yet it says
-  so in one line (the session registers itself on first datastash use). When this computer is not signed in, the hook
-  itself starts the device sign-in (or reuses the code still waiting) and shows the person the link and code through
+  so in one line (the session registers itself on first datastash use). Since 1.0.0 the hooks start no sign-in (a new
+  install signs in with `/mcp` Authenticate); the rest of this item describes the older sign-in code the plugin still
+  carries, which is off. When it was on and this computer was not signed in, the hook itself started the device sign-in (or reuses the code still waiting) and shows the person the link and code through
   Claude Code's `systemMessage` (shown as "SessionStart:startup says: ..."), once per session. The start itself runs in
   a detached helper that saves the code before anything shows it, so a hook that runs out of time never wastes a code
   (the next session start shows it); another detached helper polls until the person approves or the code ends,
@@ -676,11 +670,10 @@ Common causes:
 - **The plugin was installed or turned on after the session started**: restart Claude Code or type `/reload-plugins`.
 - **A locked-down machine** where the install fails: the install needs to write `~/.claude/` and to reach github.com.
   If it can't, run from a copy with `claude --plugin-dir <copy>/plugins/datastash`.
-- **The connector isn't signed in**: this computer has no datastash login yet (or it was signed out). The next session
-  start shows the sign-in link and code; or ask Claude to run `datastash login`, which shows the same code. Open
-  `https://getdatastash.com/agents` on any device, type the code, then type `/mcp reconnect all`.
-  `/mcp` shows the plugin's datastash connector as failed (HTTP 401) while signed out, with no Authenticate option;
-  that is expected.
+- **The connector isn't signed in**: type `/mcp`, pick datastash, choose Authenticate, and sign in. If `/mcp` shows
+  the connector as failed (HTTP 401) with no Authenticate option, this computer has an earlier `datastash login` that
+  can't give a token any more: ask Claude to run `datastash login`, open `https://getdatastash.com/agents` on any device,
+  type the code, then type `/mcp reconnect all`.
 - **New datastash tools not showing**: current versions of datastash tell Claude Code when its tools change; on an older
   session, reconnect the datastash connector (`/mcp`).
 
@@ -743,8 +736,8 @@ An agent can send datastash a capability request, an error report or anything el
   re-checked), and nothing on a healthy machine or a read-only sandbox mount.
   datastash login: the code printed and the page opened (no code in its address, the device code never on a command
   line), the background poll saving the refresh token in the keychain or a mode-600 file, `token --header` printing
-  only the header (always a header and exit 0: the placeholder when signed out, waiting, refresh refused or unreachable,
-  keychain missing, no file locks, or a crash; never a token to a terminal; the 15-minute token reused and refreshed
+  only the header (exit 0; no header on a fresh computer with no login, so `/mcp` Authenticate shows; with a login on
+  record the placeholder when waiting, refresh refused or unreachable, keychain missing, or a crash; none with no file locks; never a token to a terminal; the 15-minute token reused and refreshed
   near its end), a login revoked at datastash forgotten locally, logout, the session-start sign-in (the person's link and
   code once per session, the same code reused across sessions, a new one only after it ends, the AI fallback and pause
   when datastash can't be reached, Retry-After, a stalled network never holding the session start), the "signed in now"
