@@ -110,6 +110,9 @@ About `datastash login`:
   computer (`agent-<name>.proof`), and the plugin adds it to that agent's own datastash connector calls, never to a call
   made as another agent, never to `ledger_agent_register` or `ledger_agent_key`, and never to a server that is not
   `https://getdatastash.com`. The AI never chooses it, and a Bash or file tool call naming the proof files is refused.
+  The proof is never shown to the model and never printed by datastash. But Claude Code keeps each hook's output, the
+  proof included, in the session transcript on this computer, as same-user data. The proof follows the folder's agent:
+  two sessions in the same folder share it.
 - If the login is used from a network (or country) you haven't allowed it from, it drops back to its agent workbook until
   you allow that network with one more click on `/confirm`, which names it.
 - Your account page lists every signed-in computer (name, last used, country, network) with **Sign out**, which stops it
@@ -324,7 +327,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | File | Holds |
 |---|---|
 | `agent-<name>.key` | the agent key. Read only by the `datastash` command and the hooks; sent only to `https://getdatastash.com` in an `Authorization` header; never printed, logged or passed on a command line |
-| `agent-<name>.proof` | the agent's proof (plugin 0.9.8): added by the hook only to that agent's own datastash connector calls; never printed, logged or given to a tool call |
+| `agent-<name>.proof` | the agent's proof (plugin 0.9.8): added by the hook only to that agent's own datastash connector calls; never shown to the model, printed or logged by datastash, never given to a tool call (Claude Code's session transcript on this computer keeps hook output, the proof included); shared by two sessions in one folder |
 | `agent-<name>.json` | agent name, agent_id, agent workbook id, linked folders |
 | `state/agent-<name>.json` | the inbox cursor, the ids of messages still "new", and the last wake time (no message text) |
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
