@@ -2780,6 +2780,8 @@ def cmd_check(_args):
         ctx, ids = out["ctx"], out.get("ids")
     ctx = pre + ctx + tail
     emit(ctx)
+    if key is not None and out.get("chat_told") is not None and out.get("sid"):
+        chat_told(s, out["sid"], out["chat_told"])  # XLI-391: told only after the session start printed it
     if ids:
         try:  # told first, then marked: a crash in between re-counts, never loses. Counts as a wake (pacing).
             announce_ids(agent, ids, time.time())
@@ -2836,7 +2838,8 @@ def _check_counts(agent, key, name, out):
             left = CHECK_WAIT_SECONDS - (time.time() - out.get("t0", time.time())) - 0.5
             note = chatstash_note(agent, key, out.get("sid"), timeout=max(1.0, min(5.0, left)))
             if note:
-                ctx += " " + note
+                ctx += " " + note[0]
+                out["chat_told"] = note[1]  # recorded by the hook only once this line is printed
     except ApiError as e:
         if e.status == 401 or (e.body.get("error") or e.body.get("code")) == "agent_switched_off":
             set_flag(agent, "key_refused", int(time.time()))
@@ -3060,10 +3063,12 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
                 if note:
                     log(s, "listen: chatstash setting changed; tells the session")
                     if printer is not None:
-                        printer(note)
+                        printer(note[0])
+                        chat_told(s, session_id, note[1])
                         continue
-                    print(note, file=sys.stderr)
+                    print(note[0], file=sys.stderr)
                     sys.stderr.flush()
+                    chat_told(s, session_id, note[1])
                     return 2
             wait = 0 if catching_up else WAIT_SECONDS
             if pending_since is not None and not catching_up:
@@ -4947,6 +4952,27 @@ def read_proof(s):
     return _read_key_file(proof_path(s), PROOF_RE, s)
 
 
+def _url_is_datastash_exact(url):
+    """True only for an https URL whose host is exactly getdatastash.com (no subdomain, no user info, the default port)."""
+    try:
+        u = urllib.parse.urlsplit(url.strip()) if isinstance(url, str) else None
+        port = u.port if u is not None else None
+    except ValueError:
+        return False
+    return (u is not None and u.scheme.lower() == "https" and (u.hostname or "") == DATASTASH_HOST
+            and u.username is None and u.password is None and port in (None, 443))
+
+
+def _trusted_connector(inp, name):
+    """XLI-391 review: a connector is datastash's for the chat_key, the _meta settings and install notes only when its
+    configured URL is https on getdatastash.com itself (the plugin's own connector, or one the person added by that
+    URL); never by a name containing "datastash", and never a server whose URL this computer can't see."""
+    if not isinstance(name, str) or not name.startswith("mcp__") or "__" not in name[5:]:
+        return False
+    cfg = _mcp_configs(inp).get(name[5:].split("__", 1)[0])
+    return isinstance(cfg, dict) and _url_is_datastash_exact(cfg.get("url"))
+
+
 def _proof_server(inp, name):
     """True only for a connector whose configured URL is on datastash's own host (the plugin's own connector, or one the
     person added by that URL); never a server known by name only."""
@@ -5128,6 +5154,15 @@ def cmd_agent_tool(_args):
                 hs["updatedMCPToolOutput"] = hidden
             if chat_ai:
                 hs["additionalContext"] = (hs.get("additionalContext", "") + " " + chat_ai).strip()
+    elif inp.get("hook_event_name") == "PostToolUseFailure":
+        try:  # XLI-391 review: a failed call's text that shows the held chat_key retires it
+            retired = chat_key_failed(inp)
+        except Exception:  # noqa: BLE001  never in the way
+            retired = None
+        if retired:
+            out = out or {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure"}}
+            hs = out["hookSpecificOutput"]
+            hs["additionalContext"] = (hs.get("additionalContext", "") + " " + retired).strip()
     if out is not None:
         print(json.dumps(out), flush=True)
     return _agent_tool(inp)
@@ -11519,12 +11554,13 @@ def result_notes(inp):
     """EPM MUST 3: install notes only from the dedicated `_meta.datastash_note` field of a datastash connector call's
     result: the hook's own tool_response when it carries `_meta`, or the result entry Claude Code writes to this
     session's transcript (its `mcpMeta._meta`, which only the MCP server sets; never the model's text, a row, a message
-    or a result's text). The entry's tool_use_id must be a datastash connector call of this session (not a side chain)."""
+    or a result's text). The entry's tool_use_id must be a call of this session (not a side chain), and the connector
+    must be datastash's by its configured URL (_trusted_connector), never by its name."""
     notes = []
     tr = inp.get("tool_response")
     meta = tr.get("_meta") if isinstance(tr, dict) else None
     name = str(inp.get("tool_name") or "")
-    if isinstance(meta, dict) and name.startswith("mcp__") and "datastash" in name.lower() and _note_ok(meta.get(NOTE_FIELD)):
+    if isinstance(meta, dict) and _note_ok(meta.get(NOTE_FIELD)) and _trusted_connector(inp, name):
         notes.append(meta[NOTE_FIELD])
     sid, tp = _sid(inp), inp.get("transcript_path")
     if not sid or not isinstance(tp, str) or not _transcript_ok(tp, sid):
@@ -11553,7 +11589,7 @@ def result_notes(inp):
         c = msg.get("content")
         ids = [x.get("tool_use_id") for x in c if isinstance(x, dict) and x.get("type") == "tool_result"] if isinstance(c, list) else []
         call = calls.get(ids[0], "") if len(ids) == 1 and isinstance(ids[0], str) else ""
-        if call.startswith("mcp__") and "datastash" in call.lower() and _note_ok(mm["_meta"].get(NOTE_FIELD)):
+        if _note_ok(mm["_meta"].get(NOTE_FIELD)) and _trusted_connector(inp, call):
             notes.append(mm["_meta"][NOTE_FIELD])
     return notes
 
@@ -11782,6 +11818,11 @@ CHATSTASH_EVERY = 60  # the listener reads the setting at most this often
 CHATSTASH_FIRST = 20  # and first this long after it starts (the session start has just said it)
 CHAT_KEY_RE = r"[A-Za-z0-9._:\-]{1,100}"  # the server's own chat_key shape
 CHAT_KEY_HIDDEN = "(this chat's key, held by the datastash plugin)"
+# A failed call's text can't be rewritten (Claude Code's PostToolUseFailure output takes additionalContext only), so a
+# held chat_key that shows up there is retired: the plugin reads a new one for the next chat_save and never sends the
+# shown one again.
+CHAT_KEY_RETIRED = ("datastash note (chatstash): that failed datastash call's text showed this chat's key. The plugin "
+                    "retired it and adds a new one to the next chat_save itself; never send, keep or repeat a chat_key.")
 CHAT_SAVE_RE = re.compile(r"mcp__(.+?)__chat_save")
 CHATS_KEEP = 50  # sessions remembered per agent
 _WHEN_RE = re.compile(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d)(?::\d\d(?:\.\d+)?)?(Z|[+-]00:?00)?")
@@ -11848,14 +11889,18 @@ def chatstash_fetch(agent, key, sid, timeout=10):
     body = api_json("GET", CHATSTASH_PATH + q, key, timeout=timeout)
     st = chatstash_setting(body)
     ck = body.get("chat_key") if isinstance(body, dict) else None
-    if st is not None and sid and isinstance(ck, str) and re.fullmatch(CHAT_KEY_RE, ck) and ck != held:
+    retired = _chat_sessions(agent["slug"]).get(sid, {}).get("retired") if sid else None
+    if st is not None and sid and isinstance(ck, str) and re.fullmatch(CHAT_KEY_RE, ck) and ck != held \
+            and ck not in (retired if isinstance(retired, list) else []):
         _chat_put(agent["slug"], sid, key=ck)
     return st
 
 
 def chatstash_note(agent, key, sid, only_changed=False, timeout=10):
-    """The note for this session: at session start always, from the listener only when the setting differs from what
-    this session was last told. Recorded as told before it is said. None when nothing is to be said or it can't be read."""
+    """(note, told) for this session: at session start always, from the listener only when the setting differs from
+    what this session was last told; None when nothing is to be said or it can't be read. Nothing is recorded here: the
+    caller records `told` with chat_told only after the note was shown (a note that never reached the session is said
+    again)."""
     if is_person(agent) or not sid:
         return None
     try:
@@ -11866,12 +11911,19 @@ def chatstash_note(agent, key, sid, only_changed=False, timeout=10):
         return None
     if only_changed and _chat_sessions(agent["slug"]).get(sid, {}).get("told") == _chat_sig(st):
         return None
-    _chat_put(agent["slug"], sid, told=_chat_sig(st))
-    return chatstash_line(st)
+    return chatstash_line(st), _chat_sig(st)
+
+
+def chat_told(s, sid, told):
+    """Records that this session was shown the chatstash note `told` (after it was shown). Never in the way."""
+    try:
+        _chat_put(s, sid, told=told)
+    except OSError:
+        pass
 
 
 def _datastash_call(inp, name):
-    return name.startswith("mcp__") and ("datastash" in name[5:].split("__", 1)[0].lower() or _proof_server(inp, name))
+    return _trusted_connector(inp, name)
 
 
 def chat_key_binding(inp, args):
@@ -11920,6 +11972,28 @@ def chat_key_hidden(inp):
     if held is None or held not in json.dumps(tr, ensure_ascii=False):
         return None
     return _swap(tr, held, CHAT_KEY_HIDDEN)
+
+
+def chat_key_failed(inp):
+    """PostToolUseFailure of a datastash connector call whose error text shows this session's held chat_key: that key is
+    retired (the next chat_save reads a new one) and the AI line, else None. The error text itself can't be replaced."""
+    name = str(inp.get("tool_name") or "")
+    sid = _sid(inp)
+    if inp.get("hook_event_name") != "PostToolUseFailure" or not sid or not _datastash_call(inp, name):
+        return None
+    own = _own_agent(inp)
+    held = held_chat_key(own["slug"], sid) if own else None
+    err = inp.get("error")
+    if held is None or held not in (err if isinstance(err, str) else json.dumps(err, ensure_ascii=False)):
+        return None
+    with StateLock(own["slug"]):
+        ses = _chat_sessions(own["slug"])
+        cur = ses.get(sid, {})
+        cur.pop("key", None)
+        cur["retired"] = (cur.get("retired") or [])[-4:] + [held]  # never taken back from a ?chat_key= answer
+        ses[sid] = cur
+        write_private(chatkey_path(own["slug"]), json.dumps({"sessions": dict(list(ses.items())[-CHATS_KEEP:])}))
+    return CHAT_KEY_RETIRED
 
 
 def chatstash_meta_note(inp):

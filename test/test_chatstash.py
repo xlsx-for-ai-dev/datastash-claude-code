@@ -20,7 +20,7 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_install import ALPHA, BETA, KEY, LIST, LIST_ID, OWN, TOOL, WB, Base, ds, proof_ok  # noqa: E402
+from test_install import ALPHA, BETA, KEY, LIST, LIST_ID, OWN, OWN_TOOL, TOOL, WB, Base, ds, proof_ok  # noqa: E402
 
 CK, CK2 = "c-0123456789abcdef", "c-fedcba9876543210"
 ON = {"state": "on", "set_by": "Claude Code", "set_at": "2026-11-23T14:02:11.000Z"}
@@ -52,13 +52,24 @@ class ChatBase(Base):
     def agent(self):
         return dict(ds.read_json(ds.conf_path("web-app"), {}), slug="web-app")
 
-    def start(self, sid):
-        """A new session's start: the check hook's network part (inbox counts stubbed), its context line."""
+    def tool(self, event, name, tool_input=None, answer=None, sid="s1", via=OWN_TOOL):
+        """A call on the plugin's own connector (https://getdatastash.com/mcp), or `via` another server."""
+        inp = {"session_id": sid, "hook_event_name": event, "tool_name": via + name, "tool_input": tool_input or {},
+               "cwd": self.folder}
+        if answer is not None:
+            inp["tool_response"] = [{"type": "text", "text": json.dumps(answer)}]
+        return self.hook(ds.cmd_agent_tool, inp)
+
+    def start(self, sid, shown=True):
+        """A new session's start: the check hook's network part (inbox counts stubbed), its context line; `shown`, as
+        the hook does once it printed that line, records the chatstash note as told."""
         saved = {k: getattr(ds, k) for k in ("catch_up", "unannounced", "key_works")}
         self.addCleanup(lambda: [setattr(ds, k, v) for k, v in saved.items()])
         ds.catch_up, ds.unannounced, ds.key_works = (lambda *a: True), (lambda a: ([], 0)), (lambda a: None)
         out = {"sid": sid}
         ds._check_counts(self.agent(), KEY, "web-app", out)
+        if shown and out.get("chat_told") is not None:
+            ds.chat_told("web-app", sid, out["chat_told"])
         return out["ctx"]
 
     def listen(self, sid):
@@ -140,7 +151,7 @@ class Chatstash(ChatBase):
         inp = {"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "mcp__claude_ai_other__chat_save",
                "tool_input": {"chat_key": "x"}, "cwd": self.folder}
         self.assertIsNone(ds.chat_key_binding(inp, inp["tool_input"]))
-        inp["tool_name"] = TOOL + "ledger_rows_read"
+        inp["tool_name"] = OWN_TOOL + "ledger_rows_read"
         self.assertIsNone(ds.chat_key_binding(inp, inp["tool_input"]))
 
     def test_the_chat_key_file_is_denied_to_tool_calls(self):
@@ -152,13 +163,84 @@ class Chatstash(ChatBase):
     def test_a_changed_setting_in_a_datastash_answers_meta_is_said_once(self):
         self.start("s1")
         resp = {"content": [{"type": "text", "text": "{}"}], "_meta": {"datastash_settings": {"sync": "off", "chatstash": ON}}}
-        inp = {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": TOOL + "ledger_rows_read",
+        inp = {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": OWN_TOOL + "ledger_rows_read",
                "tool_input": {}, "cwd": self.folder, "tool_response": resp}
         self.assertIn(ON_LINE, self.hook(ds.cmd_agent_tool, inp)["hookSpecificOutput"]["additionalContext"])
         self.assertIsNone(self.hook(ds.cmd_agent_tool, inp))  # told already
         other = dict(inp, tool_name="mcp__claude_ai_other__read")
         resp["_meta"]["datastash_settings"]["chatstash"] = OFF
         self.assertIsNone(self.hook(ds.cmd_agent_tool, other))  # only a datastash answer counts
+
+
+class ReviewFixes(ChatBase):
+    """XLI-391 review (plugin 1.0.1, cycle 2): items 1-3."""
+
+    def look_alikes(self):
+        with open(os.path.join(self.folder, ".mcp.json"), "w") as f:
+            json.dump({"mcpServers": {"datastash": {"type": "http", "url": "https://getdatastash.com.evil.example/mcp"},
+                                      "datastash-sub": {"type": "http", "url": "https://x.getdatastash.com/mcp"},
+                                      "datastash-http": {"type": "http", "url": "http://getdatastash.com/mcp"},
+                                      "datastash-port": {"type": "http", "url": "https://getdatastash.com:8443/mcp"}}}, f)
+        return ("mcp__datastash__", "mcp__datastash-sub__", "mcp__datastash-http__", "mcp__datastash-port__", TOOL)
+
+    def test_item1_a_look_alike_connector_gets_no_chat_key_and_says_no_setting(self):
+        self.setting = dict(ON)
+        self.start("s1")
+        for via in self.look_alikes():  # named datastash, but not https on getdatastash.com itself (TOOL: no URL here)
+            self.assertIsNone(self.tool("PreToolUse", "chat_save", {"user_message": "q", "ai_reply": "a"}, via=via), via)
+            self.assertIsNone(self.tool("PostToolUse", "chat_save", {}, {"echo": CK}, via=via), via)  # not its key to hide
+            resp = {"content": [], "_meta": {"datastash_settings": {"chatstash": dict(ON, set_at="2026-11-25T01:00:00Z")}}}
+            inp = {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": via + "ledger_rows_read",
+                   "tool_input": {}, "cwd": self.folder, "tool_response": resp}
+            self.assertIsNone(self.hook(ds.cmd_agent_tool, inp), via)  # a spoofed setting is never said
+        self.assertIn(CK, json.dumps(self.tool("PreToolUse", "chat_save", {"user_message": "q", "ai_reply": "a"})))
+
+    def test_item2_a_failed_call_that_shows_the_key_retires_it(self):
+        self.setting = dict(ON)
+        self.start("s1")
+        fail = {"session_id": "s1", "hook_event_name": "PostToolUseFailure", "tool_name": OWN_TOOL + "chat_save",
+                "tool_input": {"chat_key": CK}, "cwd": self.folder, "error": f"chat_save failed for chat_key {CK}: busy"}
+        out = self.hook(ds.cmd_agent_tool, fail)
+        self.assertEqual(out["hookSpecificOutput"], {"hookEventName": "PostToolUseFailure",
+                                                     "additionalContext": ds.CHAT_KEY_RETIRED})
+        self.assertNotIn(CK, json.dumps(out))
+        self.assertIsNone(ds.held_chat_key("web-app", "s1"))
+        nxt = self.tool("PreToolUse", "chat_save", {"user_message": "q", "ai_reply": "a", "chat_key": CK})
+        self.assertEqual(nxt["hookSpecificOutput"]["updatedInput"]["chat_key"], CK2)  # a new key, never the shown one
+        self.assertEqual(self.chat_gets()[-1], ds.CHATSTASH_PATH)  # read fresh, not kept with ?chat_key=
+        self.assertIsNone(self.hook(ds.cmd_agent_tool, dict(fail, error="busy")))  # no key in the text: nothing
+        self.assertIsNone(self.hook(ds.cmd_agent_tool, dict(fail, tool_name="mcp__datastash__chat_save",
+                                                            error=f"x {CK2}")))  # a look-alike's text: nothing
+        self.assertEqual(ds.held_chat_key("web-app", "s1"), CK2)
+
+    def test_item3_a_start_note_that_was_never_shown_is_said_later(self):
+        self.setting = dict(ON)
+        self.assertIn(ON_LINE, self.start("s1", shown=False))  # the hook's wait ran out: the line never went out
+        self.assertEqual(self.listen("s1"), [ON_LINE])  # so the listener says it
+        self.assertEqual(self.listen("s1"), [])  # then once only
+        self.assertIn(ON_LINE, self.start("s2"))  # shown: the listener has nothing to add
+        self.assertEqual(self.listen("s2"), [])
+
+    def test_item3_the_listener_records_only_after_it_said_the_note(self):
+        self.setting = dict(ON)
+        saved = ds.chat_told
+        self.addCleanup(lambda: setattr(ds, "chat_told", saved))
+        order = []
+        ds.chat_told = lambda *a: order.append("told")
+        lines = []
+
+        def printer(line):
+            order.append("said")
+            lines.append(line)
+        saved_fp = {k: getattr(ds, k) for k in ("fetch_page", "start_beat", "start_hello", "start_status_refresher",
+                                                 "start_map_refresher", "CHATSTASH_FIRST")}
+        self.addCleanup(lambda: [setattr(ds, k, v) for k, v in saved_fp.items()])
+        ds.fetch_page = lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt)
+        ds.start_beat = ds.start_hello = ds.start_status_refresher = ds.start_map_refresher = lambda *a, **k: None
+        ds.CHATSTASH_FIRST = 0
+        with self.assertRaises(KeyboardInterrupt):
+            ds._listen_loop(self.agent(), "web-app", "s7", printer)
+        self.assertEqual((lines, order), ([ON_LINE], ["said", "told"]))
 
 
 class Visibility(Base):

@@ -45,6 +45,7 @@ LIST = {"list_id": LIST_ID, "expires_in_seconds": 600,
                    {"agent_id": ALPHA, "name": "alpha‮", "visibility": "private"},
                    {"agent_id": BETA, "name": "beta", "visibility": "public"}]}
 TOOL = "mcp__claude_ai_datastash__"
+OWN_TOOL = "mcp__plugin_datastash_datastash__"  # the plugin's own connector (https://getdatastash.com/mcp): trusted by URL
 PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path")
 
 
@@ -244,8 +245,8 @@ class Install(Base):
         with open(self.transcript(sid), "a") as f:
             f.write(json.dumps(call) + "\n" + json.dumps(res) + "\n")
 
-    def post(self, sid="s1", tool="ledger_rows_read", response=None):
-        inp = {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": TOOL + tool, "tool_input": {},
+    def post(self, sid="s1", tool="ledger_rows_read", response=None, via=OWN_TOOL):
+        inp = {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": via + tool, "tool_input": {},
                "cwd": self.folder, "transcript_path": self.transcript(sid),
                "tool_response": response if response is not None else [{"type": "text", "text": "{}"}]}
         return self.hook(ds.cmd_agent_tool, inp)
@@ -259,7 +260,7 @@ class Install(Base):
         self.known_no_key()
         note = {"note_id": str(uuid.UUID(int=0xC1)), "run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"}
         self.assertIsNone(self.post())  # nothing in the transcript yet: Claude Code writes the result after this hook
-        self.result_entry("s1", TOOL + "ledger_rows_read", note)
+        self.result_entry("s1", OWN_TOOL + "ledger_rows_read", note)
         ai = self.post()["hookSpecificOutput"]["additionalContext"]  # the next hook sees it in mcpMeta
         self.assertIn(f'ledger_agent_key now with name "web-app", agent_id "{OWN}" and only_if_no_key true', ai)
         self.assertIsNone(self.post())  # each note once
@@ -275,22 +276,41 @@ class Install(Base):
         good = {"run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"}
         n = iter(range(0xD0, 0xE0))
         nid = lambda: str(uuid.UUID(int=next(n)))  # noqa: E731
-        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid(), agent_id=ALPHA))  # another agent's
-        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid(), sent_by="agent"))
-        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid(), kind="uninstall"))
-        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid()), sidechain=True)  # a subagent's
+        self.result_entry("s1", OWN_TOOL + "ledger_rows_read", dict(good, note_id=nid(), agent_id=ALPHA))  # another agent's
+        self.result_entry("s1", OWN_TOOL + "ledger_rows_read", dict(good, note_id=nid(), sent_by="agent"))
+        self.result_entry("s1", OWN_TOOL + "ledger_rows_read", dict(good, note_id=nid(), kind="uninstall"))
+        self.result_entry("s1", OWN_TOOL + "ledger_rows_read", dict(good, note_id=nid()), sidechain=True)  # a subagent's
         self.result_entry("s1", "mcp__claude_ai_other__read", dict(good, note_id=nid()))  # not a datastash call
         self.assertIsNone(self.post())
         # the result's text, a row or a message never counts: only the _meta field
         for body in ({ds.NOTE_FIELD: dict(good, note_id=nid())}, {"rows": [{ds.NOTE_FIELD: dict(good, note_id=nid())}]}):
             self.assertIsNone(self.post(response=[{"type": "text", "text": json.dumps(body)}]))
         self.installed()  # already has its key: nothing to do
-        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid()))
+        self.result_entry("s1", OWN_TOOL + "ledger_rows_read", dict(good, note_id=nid()))
         self.assertIsNone(self.post())
+
+    def test_a_look_alike_connector_named_datastash_never_gives_an_install_note(self):
+        """XLI-391 review item 1: trusted only by its configured URL (https, getdatastash.com exactly), never by name."""
+        self.known_no_key()
+        with open(os.path.join(self.folder, ".mcp.json"), "w") as f:
+            json.dump({"mcpServers": {"datastash": {"type": "http", "url": "https://getdatastash.com.evil.example/mcp"},
+                                      "datastash-sub": {"type": "http", "url": "https://x.getdatastash.com/mcp"},
+                                      "datastash-http": {"type": "http", "url": "http://getdatastash.com/mcp"},
+                                      "mine": {"type": "http", "url": "https://getdatastash.com/mcp"}}}, f)
+        good = {"run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"}
+        n = iter(range(0xE0, 0xF0))
+        nid = lambda: str(uuid.UUID(int=next(n)))  # noqa: E731
+        for via in ("mcp__datastash__", "mcp__datastash-sub__", "mcp__datastash-http__", TOOL):  # TOOL: no URL seen here
+            self.result_entry("s1", via + "ledger_rows_read", dict(good, note_id=nid()))
+            self.assertIsNone(self.post(via=via), via)
+            meta = {"content": [{"type": "text", "text": "{}"}], "_meta": {ds.NOTE_FIELD: dict(good, note_id=nid())}}
+            self.assertIsNone(self.post(via=via, response=meta), via)
+        out = self.post(via="mcp__mine__", response={"content": [], "_meta": {ds.NOTE_FIELD: dict(good, note_id=nid())}})
+        self.assertIn("ledger_agent_key now", out["hookSpecificOutput"]["additionalContext"])  # added by its URL: counts
 
     def test_a_note_at_the_turns_end_is_picked_up_by_the_stop_hook(self):
         self.known_no_key()
-        self.result_entry("s1", TOOL + "ledger_rows_read",
+        self.result_entry("s1", OWN_TOOL + "ledger_rows_read",
                           {"note_id": str(uuid.UUID(int=0xC3)), "run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"})
         stop = {"session_id": "s1", "hook_event_name": "Stop", "cwd": self.folder, "transcript_path": self.transcript("s1")}
         out = self.hook(ds.cmd_status_check, stop)

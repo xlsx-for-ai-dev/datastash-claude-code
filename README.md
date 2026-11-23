@@ -339,7 +339,13 @@ already running session hears about it too. The note is fixed wording that names
 each exchange with `chat_save` without asking. The setting and this chat's `chat_key` come from
 `GET /api/v1/agent/chatstash` on the agent's own key. The plugin keeps the chat_key (`state/agent-<name>.chatkey`, mode
 600, per session), adds it to the connector's `chat_save` calls itself and takes it out of datastash's answers, so the
-model never sees it and nobody has to ask for one; tool calls that name that file are refused like the proof files.
+model never sees it and nobody has to ask for one; tool calls that name that file are refused like the proof files. A
+connector counts as datastash's for the chat_key, the `_meta` settings and install notes only when its configured URL is
+https on `getdatastash.com` itself (the plugin's own connector, or one added by that URL), never by a name containing
+"datastash". A failed call's text can't be rewritten by a hook, so a chat_key that shows up there is retired and a new
+one is read for the next save. The note counts as told only once it was shown. Claude Code (2.1.330) writes each hook's
+output, including the rewritten call input with the chat_key (and an agent's proof), into the session's own transcript
+file; the tool call recorded there keeps the model's original input.
 
 ## datastash main: the person's own session
 
@@ -758,7 +764,9 @@ An agent can send datastash a capability request, an error report or anything el
 - `python3 -I test/test_chatstash.py`: plugin 1.0.1. XLI-391: the chatstash note at session start (on or off, who set
   it and when) and from the listener only on a change, said once (one session turns it on: an already running session
   and a new one both get the note); the chat_key held mode 600, added to `chat_save`, taken out of datastash answers and
-  denied to tool calls. X6: "make <name> private" / "make <name> public" signed over the list's agent id like uninstall,
+  denied to tool calls; a look-alike connector (named datastash, not https on getdatastash.com) gets no chat_key and its
+  settings and install notes are ignored; a failed call that shows the key retires it; a start note that was never shown
+  is said again by the listener. X6: "make <name> private" / "make <name> public" signed over the list's agent id like uninstall,
   the server's fixed line shown only over names on the list, model-typed text refused, unknown names left as ordinary
   prompts, and the after-install lines.
 - `python3 -I test/test_ci_report.py`: `datastash ci-report` (plugin 0.9.11): a canary in a failure's message, text,
