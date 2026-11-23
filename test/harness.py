@@ -2,13 +2,42 @@
 the plugin, it gives every test a throwaway HOME, datastash folder and Claude Code config folder (never the real
 ~/.claude, ~/.claude.json or ~/.config), and fails a test on any real network call or on a process started outside
 the throwaway folder, by it or by any process it starts."""
+import atexit
 import os
+import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 import unittest
 
 ROOT = os.path.realpath(tempfile.mkdtemp(prefix="ds-status-test-"))
+
+
+def remove_tree(path):
+    """Test code removing its own throwaway folder (read-only parts made writable first). Never a person's file."""
+    def again(func, p, _exc):
+        try:
+            os.chmod(os.path.dirname(p), stat.S_IRWXU)
+            if os.path.isdir(p) and not os.path.islink(p):
+                os.chmod(p, stat.S_IRWXU)
+            func(p)
+        except OSError:
+            pass
+    if os.path.lexists(path):
+        shutil.rmtree(path, onerror=again)
+
+
+def tmpdir(test, **kw):
+    """tempfile.mkdtemp for a test: the folder is removed when that test ends (addCleanup)."""
+    path = tempfile.mkdtemp(**kw)
+    test.addCleanup(remove_tree, path)
+    return path
+
+
+atexit.register(remove_tree, ROOT)  # the whole throwaway folder goes when the test process ends
+tempfile.tempdir = ROOT  # a stray mkdtemp() or temp file (and the plugin's own temp files) land under ROOT too
+os.environ["TMPDIR"] = ROOT
 CONF = os.path.join(ROOT, "conf")
 FAKE_HOME = os.path.join(ROOT, "home")
 os.makedirs(CONF, mode=0o700)

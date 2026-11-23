@@ -27,6 +27,7 @@ import urllib.parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_status import ds, BIN, TMP  # noqa: E402  (the same harness and plugin copy)
+import harness  # noqa: E402  (tmpdir: a test's own temp folders go when it ends)
 
 CANARY = "MSG_CANARY_7f3e"
 WB = "0b6a3f9e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
@@ -157,7 +158,7 @@ def junit(cases, name="suite"):
 class CiReport(unittest.TestCase):
     def setUp(self):
         self.fake = FakeDatastash()
-        self.dir = tempfile.mkdtemp(prefix="ci-report-", dir=TMP)
+        self.dir = harness.tmpdir(self, prefix="ci-report-", dir=TMP)
         self.sleeps = []
         for name, new in (("mcp_tool", self.fake.mcp_tool), ("api_json", self.fake.api_json)):
             old = getattr(ds, name)

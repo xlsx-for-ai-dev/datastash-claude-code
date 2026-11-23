@@ -14,7 +14,6 @@ import os
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -629,7 +628,7 @@ class MainFolderIdentity(Base):
         self.main = ds.make_main_dir()
         self.sub = os.path.join(self.main, "notes", "deep")
         os.makedirs(self.sub, exist_ok=True)
-        self.elsewhere = tempfile.mkdtemp(prefix="agent-proj-", dir=TMP)
+        self.elsewhere = harness.tmpdir(self, prefix="agent-proj-", dir=TMP)
         ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps(dict(PERSON, projects=[self.main])))
         self.env = {k: os.environ.get(k) for k in ("CLAUDE_PROJECT_DIR", "DATASTASH_AGENT")}
         self.confs = []
@@ -888,7 +887,7 @@ class MainBase(Base):
         self.login = "dsat_" + "t" * 43
         ds.login_token = lambda force=False: self.login
         ds.signed_in = lambda: self.login is not None
-        self.folder = tempfile.mkdtemp(prefix="agent-linked-", dir=TMP)
+        self.folder = harness.tmpdir(self, prefix="agent-linked-", dir=TMP)
         ds.write_private(ds.conf_path("builder"), json.dumps({"name": "Builder", "workbook_id": "wb-b", "projects": [self.folder]}))
         ds.write_private(ds.conf_path(ds.PERSON_SLUG), json.dumps({"workbook_id": WID, "projects": []}))
         self.env = {k: os.environ.get(k) for k in ("CLAUDE_PROJECT_DIR", "DATASTASH_AGENT", "CLAUDE_CODE_SESSION_ID")}
@@ -1190,7 +1189,7 @@ class MainAnySession(MainBase):
         calls = (lambda: ds.cmd_list([]), lambda: ds.cmd_read(["person"]), lambda: ds.cmd_filter(["Builder"]),
                  lambda: ds._person_post({"to": "Builder", "message": "x"}), lambda: ds.cmd_watch(["--person"]))
         # An agent session in the same folder, and an ordinary session elsewhere that never became main.
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         for sid, proc, folder in (("sess-B", (2002, "tB"), self.folder), ("sess-P", (2102, "tP"), plain)):
             self.be(sid, proc)
             os.environ["CLAUDE_PROJECT_DIR"] = folder
@@ -1279,7 +1278,7 @@ class CleanSessionOnly(MainBase):
     def setUp(self):
         super().setUp()
         self.saved.setdefault("CLAUDE_USER_CONFIG", ds.CLAUDE_USER_CONFIG)
-        ds.CLAUDE_USER_CONFIG = os.path.join(tempfile.mkdtemp(dir=TMP), ".claude.json")  # never the real one
+        ds.CLAUDE_USER_CONFIG = os.path.join(harness.tmpdir(self, dir=TMP), ".claude.json")  # never the real one
 
     def recorded(self, sid, proc):
         return any(os.path.exists(p) for p in ds._used_paths(self.be(sid, proc)))
@@ -1326,7 +1325,7 @@ class CleanSessionOnly(MainBase):
     def test_each_first_agent_action_records_the_session(self):
         self.put_main_key()
         ds.fetch_page = lambda *a, **k: ([], "c", False)
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         steps = []
 
         def check(sid):  # agent identity + agent key use at session start
@@ -1372,7 +1371,7 @@ class CleanSessionOnly(MainBase):
                 self.assert_never_main(sid, proc)
 
     def test_tools_that_carry_nothing_from_datastash_never_record(self):
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = plain
         ds.write_private(ds.CLAUDE_USER_CONFIG, json.dumps({"mcpServers": {"notes": {"type": "http", "url": "https://example.com/mcp"},
                                                                           "lookalike": {"url": "https://getdatastash.com.example.net/mcp"},
@@ -1393,7 +1392,7 @@ class CleanSessionOnly(MainBase):
         # Review 19ac442 HIGH, exactly: an unlinked session reads hostile inbox text over the claude.ai connector
         # (mcp__claude_ai_Datastash__...), then its AI replays the forged phrase with a main key on the machine.
         self.put_main_key()
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = plain
         self.be("sess-R", (7801, "tR"))
         self.tool_hook("sess-R", "mcp__claude_ai_Datastash__ledger_inbox_read", {"workbook_id": "w"})
@@ -1412,7 +1411,7 @@ class CleanSessionOnly(MainBase):
                 self.assert_never_main(sid, proc)
 
     def test_b_any_mcp_server_whose_url_is_getdatastash(self):
-        proj = tempfile.mkdtemp(prefix="proj-", dir=TMP)
+        proj = harness.tmpdir(self, prefix="proj-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = proj
         ds.write_private(ds.CLAUDE_USER_CONFIG, json.dumps({
             "mcpServers": {"ds": {"type": "http", "url": "https://getdatastash.com/mcp"}},
@@ -1453,7 +1452,7 @@ class CleanSessionOnly(MainBase):
                 self.assert_never_main(sid, proc)
 
     def test_default_deny_when_it_cannot_tell(self):
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = plain
         cases = [("unknown connector", {"tool_name": "mcp__claude_ai_Gmail__search", "tool_input": {}}),
                  ("no tool name", {"tool_input": {}}),
@@ -1477,7 +1476,7 @@ class CleanSessionOnly(MainBase):
             ds.tool_carries_datastash = orig
 
     def test_running_datastash_login_never_records_the_session_as_an_agent(self):
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = plain
         sid, proc = "sess-W", (8401, "tW")
         self.be(sid, proc)
@@ -1490,7 +1489,7 @@ class CleanSessionOnly(MainBase):
 
     def test_the_main_session_is_never_recorded(self):
         self.put_main_key()
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = plain
         self.be("sess-M", (8501, "tM"))
         self.prompt("sess-M")
@@ -1502,7 +1501,7 @@ class CleanSessionOnly(MainBase):
 
     def test_a_clean_session_becomes_main_with_the_key_on_the_machine(self):
         self.put_main_key()
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = plain
         self.be("sess-clean", (7501, "tClean"))
         self.assertIn("the person typed", self.prompt("sess-clean"))
@@ -1522,7 +1521,7 @@ class CleanSessionOnly(MainBase):
         """Owner 11-19: the first "datastash main" on a machine makes the key with one connector call. Exactly that call
         (the plugin's connector, ledger_person_watch, only {"action": "main"}), only in a clean session where the person
         typed the phrase, and only when its answer carries nothing but the code, leaves the session clean."""
-        plain = tempfile.mkdtemp(prefix="plain-", dir=TMP)
+        plain = harness.tmpdir(self, prefix="plain-", dir=TMP)
         os.environ["CLAUDE_PROJECT_DIR"] = plain
         sid, proc = "sess-S", (7601, "tS")
         self.be(sid, proc)
@@ -1578,7 +1577,7 @@ class CleanSessionOnly(MainBase):
         for n in os.listdir(TMP):
             if re.fullmatch(r"agent-.+\.(json|key|proof)", n):
                 os.replace(os.path.join(TMP, n), os.path.join(TMP, f"old-{n}-{time.time()}"))
-        proj = os.path.join(tempfile.mkdtemp(dir=TMP), "reports")
+        proj = os.path.join(harness.tmpdir(self, dir=TMP), "reports")
         os.makedirs(proj)
         os.environ["CLAUDE_PROJECT_DIR"] = proj
         self.be("sess-F1", (7801, "tF1"))
@@ -1638,10 +1637,10 @@ class SelfRegistration(MainBase):
 
     def test_first_use_is_named_from_the_folder(self):
         self.be("sess-R", (1201, "tR"))
-        proj = os.path.join(tempfile.mkdtemp(dir=TMP), "Q4 launch-plan")
+        proj = os.path.join(harness.tmpdir(self, dir=TMP), "Q4 launch-plan")
         os.makedirs(proj)
         self.assertEqual(self.name_in(proj), "name: Q4 launch-plan")
-        odd = os.path.join(tempfile.mkdtemp(dir=TMP), 'we"ird$name`')
+        odd = os.path.join(harness.tmpdir(self, dir=TMP), 'we"ird$name`')
         os.makedirs(odd)
         self.assertEqual(self.name_in(odd), "name: we-ird-name")
         # The session-start note says it is not an agent yet (one line, no command for the person).
@@ -1667,8 +1666,8 @@ class SelfRegistration(MainBase):
 
     def test_a_duplicate_name_gets_a_suffix(self):
         self.be("sess-S", (1301, "tS"))
-        other = os.path.join(tempfile.mkdtemp(dir=TMP), "app")
-        mine = os.path.join(tempfile.mkdtemp(dir=TMP), "app")
+        other = os.path.join(harness.tmpdir(self, dir=TMP), "app")
+        mine = os.path.join(harness.tmpdir(self, dir=TMP), "app")
         os.makedirs(other)
         os.makedirs(mine)
         ds.write_private(ds.conf_path("app"), json.dumps({"name": "app", "workbook_id": "wb", "projects": [other]}))
@@ -1678,7 +1677,7 @@ class SelfRegistration(MainBase):
             # datastash refused a name as taken (another connection has it): the next suffix.
             self.assertEqual(self.name_in(mine, after="app-3"), "name: app-4")
             # Reserved names are never used.
-            person_dir = os.path.join(tempfile.mkdtemp(dir=TMP), "person")
+            person_dir = os.path.join(harness.tmpdir(self, dir=TMP), "person")
             os.makedirs(person_dir)
             self.assertEqual(self.name_in(person_dir), "name: person-2")
         finally:
@@ -1705,7 +1704,7 @@ class SelfRegistration(MainBase):
         os.makedirs(sub, exist_ok=True)
         self.assertTrue(self.name_in(sub).startswith('linked: "Builder"'))
         # A folder whose own agent conf already names it: that name, no suffix.
-        proj = os.path.join(tempfile.mkdtemp(dir=TMP), "reports")
+        proj = os.path.join(harness.tmpdir(self, dir=TMP), "reports")
         os.makedirs(proj)
         ds.write_private(ds.conf_path("reports"), json.dumps({"name": "reports", "workbook_id": "wb", "projects": [os.path.realpath(proj)]}))
         try:
@@ -1731,7 +1730,7 @@ class PickupBinding(MainBase):
         super().setUp()
         self.saved.setdefault("CLAUDE_USER_CONFIG", ds.CLAUDE_USER_CONFIG)
         self.saved.setdefault("http", ds.http)
-        ds.CLAUDE_USER_CONFIG = os.path.join(tempfile.mkdtemp(dir=TMP), ".claude.json")
+        ds.CLAUDE_USER_CONFIG = os.path.join(harness.tmpdir(self, dir=TMP), ".claude.json")
 
     def test_the_hook_binds_each_code_asking_call_and_replaces_a_planted_challenge(self):
         sid = "sess-H7"
@@ -1801,7 +1800,7 @@ class SetupDoctor(Base):
         super().setUp()
         for k in ("CONF", "STATE", "HEARTBEAT", "CLAUDE_DIR", "_lstat", "http"):
             self.saved.setdefault(k, getattr(ds, k))
-        root = tempfile.mkdtemp(dir=TMP)
+        root = harness.tmpdir(self, dir=TMP)
         ds.CONF = os.path.join(root, "conf")
         ds.STATE = os.path.join(ds.CONF, "state")
         ds.HEARTBEAT = os.path.join(ds.STATE, "hooks-heartbeat.json")
@@ -1902,7 +1901,7 @@ class SetupDoctor(Base):
         self.assertEqual(self.auto().strip(), line)
 
     def test_sudo_fix_quotes_odd_paths(self):
-        ds.CLAUDE_DIR = os.path.join(tempfile.mkdtemp(dir=TMP), "my home", ".claude")
+        ds.CLAUDE_DIR = os.path.join(harness.tmpdir(self, dir=TMP), "my home", ".claude")
         os.makedirs(ds.CLAUDE_DIR)
         os.chmod(ds.CLAUDE_DIR, 0o700)
         path = os.path.join(ds.CLAUDE_DIR, "settings.json")
@@ -2082,7 +2081,7 @@ class ApiBody(Base):
             sent.append(body)
             return 200, "application/json", "{}"
         ds.http = fake_http
-        proj = tempfile.mkdtemp(dir=TMP)
+        proj = harness.tmpdir(self, dir=TMP)
         old_dir, old_in = os.environ.get("CLAUDE_PROJECT_DIR"), sys.stdin
         os.environ["CLAUDE_PROJECT_DIR"] = proj
         if stdin is not None:
@@ -2152,7 +2151,7 @@ class SignInHint(Base):
         self.addCleanup(ds.set_clean, commands=True)
         for k in ("STATE", "HEARTBEAT", "CONF", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE"):
             self.saved.setdefault(k, getattr(ds, k))
-        root = tempfile.mkdtemp(dir=TMP)
+        root = harness.tmpdir(self, dir=TMP)
         ds.CONF = os.path.join(root, "conf")
         ds.STATE = os.path.join(ds.CONF, "state")
         ds.HEARTBEAT = os.path.join(ds.STATE, "hooks-heartbeat.json")
@@ -2455,7 +2454,7 @@ class Login(Base):
                   "_keychain_set", "_keychain_get", "_keychain_del", "_open_browser", "LOGIN_LOCK_FILE", "fcntl",
                   "login_token"):
             self.saved.setdefault(k, getattr(ds, k))
-        root = tempfile.mkdtemp(dir=TMP)
+        root = harness.tmpdir(self, dir=TMP)
         ds.CONF = os.path.join(root, "conf")
         ds.STATE = os.path.join(ds.CONF, "state")
         for k, n in (("LOGIN_FILE", "login.json"), ("LOGIN_REFRESH_FILE", "login.refresh"), ("LOGIN_ACCESS_FILE", "login.access.json"), ("LOGIN_PENDING_FILE", "login.pending.json")):
@@ -2672,7 +2671,7 @@ class Login(Base):
         fake_http = ds.http
         for name, setup in states:
             with self.subTest(name):
-                root = tempfile.mkdtemp(dir=TMP)  # a fresh computer for each state
+                root = harness.tmpdir(self, dir=TMP)  # a fresh computer for each state
                 ds.CONF = os.path.join(root, "conf")
                 ds.STATE = os.path.join(ds.CONF, "state")
                 for k, n in (("LOGIN_FILE", "login.json"), ("LOGIN_REFRESH_FILE", "login.refresh"),
@@ -2698,7 +2697,7 @@ class Login(Base):
 
     def test_token_header_as_a_real_process_in_a_signed_out_home(self):
         """The helper as Claude Code runs it (a pipe, a fresh config folder): exit 0 and the placeholder header."""
-        home = tempfile.mkdtemp(dir=TMP)
+        home = harness.tmpdir(self, dir=TMP)
         env = dict(os.environ, DATASTASH_CONFIG_DIR=os.path.join(home, "conf"), HOME=home, CLAUDE_CODE_ENTRYPOINT="cli",
                    CLAUDE_CONFIG_DIR=os.path.join(home, ".claude"))
         r = subprocess.run([sys.executable, "-I", BIN, "token", "--header"], capture_output=True, text=True, env=env, timeout=20)
@@ -2849,7 +2848,7 @@ class Login(Base):
                 if works:
                     self.keychain.pop("ak")
                 else:
-                    os.replace(ds._answer_key_file(), os.path.join(tempfile.mkdtemp(), "lost"))
+                    os.replace(ds._answer_key_file(), os.path.join(harness.tmpdir(self), "lost"))
                 self.assertTrue(os.path.exists(ds._answer_meta_file()))  # the record still says it is kept
                 self.assertIsNone(ds.read_answer_key())
                 self.expire_access()
@@ -2966,7 +2965,7 @@ class Transition(Base):
         """A fresh plugin folder (updated: an earlier version left its files) and Claude Code config folder. The
         Claude Code folder always holds a planted sign-in file and an unrelated one: the plugin must never look at
         either, so they never change the decision."""
-        root = tempfile.mkdtemp(dir=TMP)
+        root = harness.tmpdir(self, dir=TMP)
         ds.CONF = os.path.join(root, "conf")
         ds.STATE = os.path.join(ds.CONF, "state")
         ds.HEARTBEAT = os.path.join(ds.STATE, "hooks-heartbeat.json")
@@ -4116,7 +4115,7 @@ class Xli375(Base):
         ds.read_key = self.saved["read_key"]
         self.server = Server()
         ds.http = self.server
-        self.root = os.path.realpath(tempfile.mkdtemp(prefix="p375-", dir=ROOT))
+        self.root = os.path.realpath(harness.tmpdir(self, prefix="p375-", dir=ROOT))
         self.projects = os.path.join(ds.CLAUDE_DIR, "projects")
         self._aside()
         self.addCleanup(self._aside)
@@ -4518,7 +4517,7 @@ class P2Adds(Base):
         self.assertFalse(ds._lock_held(p))
 
     def test_the_unlinked_notice_goes_once_its_cause_is_gone(self):
-        proj = os.path.realpath(tempfile.mkdtemp(dir=ROOT))
+        proj = os.path.realpath(harness.tmpdir(self, dir=ROOT))
         cause = ds.notice_cause("unlinked", folder=proj)
         ds.raise_notice(cause, "x")
         ds.all_agents = lambda: [{"name": "Solo", "slug": "solo", "workbook_id": "w"}]

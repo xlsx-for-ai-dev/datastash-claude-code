@@ -19,7 +19,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 import uuid
@@ -427,7 +426,7 @@ class GhApiWrites(unittest.TestCase):
 
 class GitBlanks(Base):
     def make_repo(self):
-        root = os.path.realpath(tempfile.mkdtemp(prefix="repo-", dir=TMP))
+        root = os.path.realpath(harness.tmpdir(self, prefix="repo-", dir=TMP))
         env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1")
         run = lambda *a: subprocess.run(["git", "-C", root] + list(a), check=True, capture_output=True, env=env)
         run("init", "-q")

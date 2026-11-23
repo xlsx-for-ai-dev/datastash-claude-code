@@ -18,13 +18,13 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_status import ds, TMP, Base as StatusBase  # noqa: E402  (the same harness and plugin copy)
+import harness  # noqa: E402  (tmpdir: a test's own temp folders go when it ends)
 import time  # noqa: E402
 import uuid  # noqa: E402
 
@@ -84,7 +84,7 @@ class NewestRelease(Base):
         self.assertIsNone(ds.newest_release(None))
 
     def test_real_git_ls_remote_on_a_local_repo_ignores_the_untagged_head(self):
-        repo = os.path.realpath(tempfile.mkdtemp(prefix="rel-repo-", dir=TMP))
+        repo = os.path.realpath(harness.tmpdir(self, prefix="rel-repo-", dir=TMP))
         git(repo, "init", "-q", "-b", "main")
         commits = []
         for i in range(3):
@@ -208,7 +208,7 @@ class InstalledFrom(Base):
 
 
     def test_the_catalog_is_read_from_the_plugins_folder_it_was_installed_in(self):
-        plugins = os.path.realpath(tempfile.mkdtemp(prefix="plugins-", dir=TMP))
+        plugins = os.path.realpath(harness.tmpdir(self, prefix="plugins-", dir=TMP))
         market = os.path.join(plugins, "elsewhere", "datastash-market")
         os.makedirs(os.path.join(market, ".claude-plugin"))
         with open(os.path.join(market, ".claude-plugin", "marketplace.json"), "w") as f:
@@ -237,7 +237,7 @@ class UpdatedLine(Base):
         self.patch("PLUGIN_VERSION", "1.0.0")
         ds.updated_line()
         ds.PLUGIN_VERSION = "1.0.1"
-        folder = tempfile.mkdtemp(prefix="upd-", dir=TMP)
+        folder = harness.tmpdir(self, prefix="upd-", dir=TMP)
         self.patch("hook_input", lambda: {"session_id": "sess-upd", "cwd": folder})
         self.patch("off_here", lambda inp: False)
         self.patch("session_sign_in", lambda inp: (None, None))
@@ -314,7 +314,7 @@ class OffSwitch(StatusBase):
 
     def prompt(self, text, sid="sess1"):
         return self.hook(ds.cmd_prompt, {"session_id": sid, "hook_event_name": "UserPromptSubmit", "prompt": text,
-                                         "cwd": tempfile.mkdtemp(prefix="su-", dir=TMP), "prompt_id": str(uuid.uuid4()),
+                                         "cwd": harness.tmpdir(self, prefix="su-", dir=TMP), "prompt_id": str(uuid.uuid4()),
                                          "transcript_path": self.transcript(sid)})
 
     @staticmethod
@@ -374,8 +374,8 @@ class ReleaseGate(Base):
 
     def setUp(self):
         super().setUp()
-        self.repo = os.path.realpath(tempfile.mkdtemp(prefix="gate-repo-", dir=TMP))
-        self.records = os.path.realpath(tempfile.mkdtemp(prefix="gate-rec-", dir=TMP))
+        self.repo = os.path.realpath(harness.tmpdir(self, prefix="gate-repo-", dir=TMP))
+        self.records = os.path.realpath(harness.tmpdir(self, prefix="gate-rec-", dir=TMP))
         git(self.repo, "init", "-q", "-b", "main")
         os.makedirs(os.path.join(self.repo, "plugins/datastash/.claude-plugin"))
         os.makedirs(os.path.join(self.repo, ".claude-plugin"))

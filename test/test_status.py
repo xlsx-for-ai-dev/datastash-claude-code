@@ -14,7 +14,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -123,7 +122,7 @@ class Base(unittest.TestCase):
         ds.login_token = lambda force=False: "dsat_person"
         ds._claude_chain = lambda: [[4242, "start-A"]]
         ds.spawn_detached = lambda argv, cwd: self.spawned.append(argv)
-        self.folder = os.path.realpath(tempfile.mkdtemp(prefix="proj-", dir=TMP))
+        self.folder = os.path.realpath(harness.tmpdir(self, prefix="proj-", dir=TMP))
         ds.write_private(ds.conf_path("web-app"), json.dumps({"name": "web-app", "workbook_id": WB, "projects": [self.folder]}))
         ds.write_private(ds.key_path("web-app"), "ldgr_ag_" + "x" * 40)
         ds.record_consent([self.folder], [])
@@ -504,13 +503,13 @@ class Write(Base):
         rc, _, err, _ = self.status_set({"details": "no doing"})
         self.assertNotEqual(rc, 0)
         self.assertIn('"doing" is needed', err)
-        os.environ["CLAUDE_PROJECT_DIR"] = tempfile.mkdtemp(dir=TMP)
+        os.environ["CLAUDE_PROJECT_DIR"] = harness.tmpdir(self, dir=TMP)
         rc, _, err, _ = self.status_set({"doing": "x"})
         self.assertIn("no agent is linked", err)
 
     def test_project_flag_only_for_this_folders_agent(self):
         """L2: --project writes only for the agent linked to the current folder."""
-        other = os.path.realpath(tempfile.mkdtemp(prefix="other-", dir=TMP))
+        other = os.path.realpath(harness.tmpdir(self, prefix="other-", dir=TMP))
         ds.write_private(ds.conf_path("billing"), json.dumps({"name": "billing", "workbook_id": WB, "projects": [other]}))
         ds.write_private(ds.key_path("billing"), "ldgr_ag_" + "y" * 40)
         ds.record_consent([other], [])
@@ -519,7 +518,7 @@ class Write(Base):
         self.assertIn("--project works only for this folder's own agent", err)
         self.assertEqual(started, [])
         self.assertIsNone(ds.read_json(ds._outbox_path("billing"), None))
-        second = os.path.realpath(tempfile.mkdtemp(prefix="second-", dir=TMP))  # web-app's own second folder: fine
+        second = os.path.realpath(harness.tmpdir(self, prefix="second-", dir=TMP))  # web-app's own second folder: fine
         ds.write_private(ds.conf_path("web-app"), json.dumps({"name": "web-app", "workbook_id": WB, "projects": [self.folder, second]}))
         ds.record_consent([second], [])
         rc, out, err, started = self.status_set({"doing": "The second folder."}, args=("-", "--project", second))
@@ -623,7 +622,7 @@ class StopHook(Base):
         self.assertIsNone(self.stop())
 
     def test_not_an_agent_session(self):
-        os.environ["CLAUDE_PROJECT_DIR"] = tempfile.mkdtemp(dir=TMP)
+        os.environ["CLAUDE_PROJECT_DIR"] = harness.tmpdir(self, dir=TMP)
         self.turn()
         self.tool()
         self.assertIsNone(self.hook(ds.cmd_status_check, {"session_id": "sess1", "cwd": os.environ["CLAUDE_PROJECT_DIR"]}))
@@ -636,7 +635,7 @@ class Keeping(Base):
     def setUp(self):
         super().setUp()
         ds.write_private(ds.CONSENT_PATH, json.dumps({"keep": {}, "no": {}}))  # not asked yet
-        self.other = os.path.realpath(tempfile.mkdtemp(prefix="api-", dir=TMP))
+        self.other = os.path.realpath(harness.tmpdir(self, prefix="api-", dir=TMP))
 
     def test_phrase_matches_forgivingly_and_only_whole(self):
         K = ds.keep_phrase
@@ -809,8 +808,8 @@ class LinkGate(Base):
     def test_link_another_folder_needs_keeping_on_and_not_left_off(self):
         """Review 1 LOW 3: the keep phrase covers all agents on this computer, so it is the yes for its folders; a
         folder the person left off, or keeping off, refuses (no pointer to a removed skill section)."""
-        other = os.path.realpath(tempfile.mkdtemp(prefix="other-", dir=TMP))
-        left = os.path.realpath(tempfile.mkdtemp(prefix="left-", dir=TMP))
+        other = os.path.realpath(harness.tmpdir(self, prefix="other-", dir=TMP))
+        left = os.path.realpath(harness.tmpdir(self, prefix="left-", dir=TMP))
         ds.record_left_off([left])
         rc, _, err = self.run_cmd(ds.cmd_link, ["web-app", "--workbook", WB, "--project", left])
         self.assertNotEqual(rc, 0)
@@ -823,7 +822,7 @@ class LinkGate(Base):
         c = ds.read_json(ds.CONSENT_PATH, {})
         c["all"] = {"keep": False, "at": 1}
         ds.write_private(ds.CONSENT_PATH, json.dumps(c))
-        third = os.path.realpath(tempfile.mkdtemp(prefix="third-", dir=TMP))
+        third = os.path.realpath(harness.tmpdir(self, prefix="third-", dir=TMP))
         rc, _, err = self.run_cmd(ds.cmd_auto_name, ["--project", third])
         self.assertNotEqual(rc, 0)
         self.assertIn("keeping is not on for this computer", err)

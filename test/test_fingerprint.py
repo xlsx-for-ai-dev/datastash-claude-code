@@ -15,12 +15,12 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_status import ds, BIN, TMP  # noqa: E402  (the same harness and plugin copy)
+import harness  # noqa: E402  (tmpdir: a test's own temp folders go when it ends)
 
 SECRET_TEXT = "FILE_TEXT_CANARY_4b1d"  # inside the files: must never be in the output
 
@@ -37,7 +37,7 @@ def sha256(path):
 
 class Fingerprint(unittest.TestCase):
     def setUp(self):
-        self.repo = os.path.realpath(tempfile.mkdtemp(prefix="fp-repo-", dir=TMP))
+        self.repo = os.path.realpath(harness.tmpdir(self, prefix="fp-repo-", dir=TMP))
         git(self.repo, "init", "-q", "-b", "main")
         git(self.repo, "remote", "add", "origin", "https://someone:ghp_TOKENCANARY@github.com/acme/widgets.git")
         for rel, text in (("src/a.ts", f"export const a = '{SECRET_TEXT}';\n"), ("src/b.ts", "b\n"), ("README.md", "r\n")):
@@ -85,7 +85,7 @@ class Fingerprint(unittest.TestCase):
     def test_untracked_and_outside_files_get_sha256(self):
         with open(os.path.join(self.repo, "new.txt"), "w") as f:
             f.write("new\n")
-        outside = os.path.join(os.path.realpath(tempfile.mkdtemp(prefix="fp-plain-", dir=TMP)), "notes.md")
+        outside = os.path.join(os.path.realpath(harness.tmpdir(self, prefix="fp-plain-", dir=TMP)), "notes.md")
         with open(outside, "w") as f:
             f.write("notes\n")
         got = self.items("--no-commit", "new.txt", outside)
@@ -190,7 +190,7 @@ class Fingerprint(unittest.TestCase):
         key = os.path.join(ds.CONF, "agent-fp-hardlink.key")
         code = os.path.join(ds.PENDING, "hook-fp-hardlink.code")
         state = os.path.join(ds.STATE, "fp-hardlink.json")
-        moved = os.path.realpath(tempfile.mkdtemp(prefix="fp-moved-", dir=TMP))  # outside the repo (no rm)
+        moved = os.path.realpath(harness.tmpdir(self, prefix="fp-moved-", dir=TMP))  # outside the repo (no rm)
         for i, path in enumerate((key, code, state)):
             with open(path, "w") as f:
                 f.write(f"not a real secret {SECRET_TEXT}\n")
@@ -218,7 +218,7 @@ class Fingerprint(unittest.TestCase):
 
     def test_a_file_outside_a_repo_is_sent_home_relative(self):
         home = os.path.realpath(os.path.expanduser("~"))
-        folder = os.path.realpath(tempfile.mkdtemp(prefix="fp-home-", dir=home))
+        folder = os.path.realpath(harness.tmpdir(self, prefix="fp-home-", dir=home))
         notes = os.path.join(folder, "sub", "notes.md")
         os.makedirs(os.path.dirname(notes))
         with open(notes, "w") as f:

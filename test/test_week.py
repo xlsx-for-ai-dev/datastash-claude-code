@@ -13,13 +13,13 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_status import ds, BIN  # noqa: E402  (the same harness and plugin copy)
+import harness  # noqa: E402  (tmpdir: a test's own temp folders go when it ends)
 
 SECRET = "ZEBRA-PLANTED-WORD"
 NOW = datetime.datetime(2026, 11, 23, 12, 0, 0, tzinfo=datetime.timezone.utc)
@@ -166,7 +166,7 @@ class Week(unittest.TestCase):
     def setUp(self):
         # A Claude Code folder of this test's own: the shared one under the throwaway HOME holds other test files'
         # sessions when the whole suite runs in one process.
-        self.claude = tempfile.mkdtemp(prefix="week-claude-", dir=ds.HOME)
+        self.claude = harness.tmpdir(self, prefix="week-claude-", dir=ds.HOME)
         self.saved = {k: getattr(ds, k) for k in ("CLAUDE_DIR", "http", "_week_now")}
         ds.CLAUDE_DIR = self.claude
         make_history(self.claude)

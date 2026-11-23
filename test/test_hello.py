@@ -16,7 +16,6 @@ import io
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -25,6 +24,7 @@ from contextlib import redirect_stdout, redirect_stderr
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_plugin import Base, Stop, ds, ROOT, TMP, AGENT  # noqa: E402  (the same harness, plugin copy and fixtures)
+import harness  # noqa: E402  (tmpdir: a test's own temp folders go when it ends)
 
 KEY = "ldgr_ag_" + "k" * 40
 
@@ -72,7 +72,7 @@ class HelloBase(Base):
             self.waits.append(seconds)
             return event.is_set()
         ds._hello_wait = wait
-        self.proj = os.path.realpath(tempfile.mkdtemp(prefix="p2hello-", dir=ROOT))
+        self.proj = os.path.realpath(harness.tmpdir(self, prefix="p2hello-", dir=ROOT))
         self.user_settings = os.path.join(self.proj, "user-settings.json")
         ds._settings_files = lambda project: [self.user_settings] + (
             [os.path.join(project, ".claude", "settings.json"), os.path.join(project, ".claude", "settings.local.json")]

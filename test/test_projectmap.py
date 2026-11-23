@@ -21,6 +21,7 @@ import urllib.parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from test_status import Base, ds, WB, BIN, row  # noqa: E402  (the same harness, plugin copy and fixtures)
+import harness  # noqa: E402  (tmpdir: a test's own temp folders go when it ends)
 
 BODY_MARKER = "BODY_ONLY_TEXT_7f3a"  # appears only inside function bodies and values: must never reach the map
 ENV_VALUE = "sk_live_ENVVALUE_should_never_leave"
@@ -381,8 +382,7 @@ class Refresh(MapBase):
         self.assertEqual(self.local()["sha"], self.head)
 
     def test_not_a_git_folder_does_nothing(self):
-        import tempfile
-        plain = os.path.realpath(tempfile.mkdtemp(prefix="plain-", dir=ds.CONF))
+        plain = os.path.realpath(harness.tmpdir(self, prefix="plain-", dir=ds.CONF))
         self.assertEqual(ds.map_refresh(self.agent, plain, "ldgr_ag_test"), "none")
 
     def test_the_listener_thread_maps_each_linked_folder_and_never_for_the_person(self):
@@ -455,8 +455,7 @@ class Where(MapBase):
         self.assertEqual(self.local()["sha"], self.head)
 
     def test_where_outside_a_git_folder(self):
-        import tempfile
-        plain = os.path.realpath(tempfile.mkdtemp(prefix="plain-", dir=ds.CONF))
+        plain = os.path.realpath(harness.tmpdir(self, prefix="plain-", dir=ds.CONF))
         os.environ["CLAUDE_PROJECT_DIR"] = plain
         cwd = os.getcwd()
         os.chdir(plain)

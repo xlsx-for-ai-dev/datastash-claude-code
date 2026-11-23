@@ -23,7 +23,6 @@ import json
 import os
 import stat
 import sys
-import tempfile
 import time
 import unittest
 import uuid
@@ -61,7 +60,7 @@ def real_entries(name):
 class Base(unittest.TestCase):
     def setUp(self):
         self.saved = {k: getattr(ds, k) for k in PATCHED}
-        root = os.path.realpath(tempfile.mkdtemp(prefix="install-", dir=harness.ROOT))
+        root = os.path.realpath(harness.tmpdir(self, prefix="install-", dir=harness.ROOT))
         ds.CONF, ds.MAIN_DIR = os.path.join(root, "datastash"), os.path.join(root, "datastash main")
         ds.STATE, ds.PENDING, ds.OFF = (os.path.join(ds.CONF, d) for d in ("state", "pending", "off"))
         self.env = os.environ.get("DATASTASH_CONFIG_DIR")
