@@ -10661,24 +10661,41 @@ def cmd_fingerprint(args):
 # class and a sha256 of the first message line with numbers and hex ids stripped. Failure messages, stack traces,
 # stdout and stderr are read only to take that hash and are never sent or printed.
 #
-# Flaky, order-independent (card A review): every report first records its outcome on the commit (its failure rows, and
-# one "Test runs" row: the hash of the tests it ran and the ids it failed), and only then reads the commit's failure rows
-# and Test runs rows. Writes to one workbook are serialized, so of two reports on one commit the later one always sees the
-# earlier: a pass sees the failure row; a failure sees a run of the same tests that did not fail it. When both run at
-# once both see it; the first to move the failure row's passes from 0 (save only if unchanged) adds flaky_commits once.
+# Flaky, order-independent (card A review, cycle 2): one rule on both sides: a test is flaky on a commit when one report
+# passed it and another (or the same, a retry) failed it. Every report first records its outcome on the commit (its
+# failure rows, and its "Test runs" rows: the hash of the tests it ran, the ids it failed and a short hash of each test it
+# passed), and only then reads the commit's failure rows and Test runs rows. Writes to one workbook are serialized, so of
+# two reports on one commit the later one always sees the earlier: a pass sees the failure row; a failure sees the pass
+# hash, whatever tests each job ran. When both run at once both see it; the first to move the failure row's passes from
+# 0 (save only if unchanged) adds flaky_commits once. A --local run (uncommitted edits) never writes or reads these.
 #
 # A reporting problem never fails the build: the command prints one line and exits 0. A brake (429) or busy answer is
-# waited out (Retry-After), up to DATASTASH_CI_WAIT_SECONDS in all; each page is sent with an idempotency key, so a retry
-# never counts twice.
+# waited out (Retry-After), up to DATASTASH_CI_WAIT_SECONDS in all (a bad value: the default); each page is sent with an
+# idempotency key, so a retry never counts twice. A server that does not answer is given CI_CALL_SECONDS a call and
+# CI_HANG_SECONDS in all.
 CI_USAGE = ("usage: datastash ci-report <junit.xml ...> --repo OWNER/NAME --sha SHA --branch BRANCH --run-url URL "
             "[--job NAME] [--default-branch main] [--workbook ID] [--local]  (agent key in DATASTASH_AGENT_KEY, "
             "workbook id in DATASTASH_WORKBOOK_ID or --workbook)")
 CI_TESTS, CI_FAILURES, CI_WEEKS, CI_RUNS = "Tests", "Test failures", "Test weeks", "Test runs"
 CI_PAGE = 1000  # rows per upsert or read (a transport detail, not a cap)
-CI_WAIT_SECONDS = float(os.environ.get("DATASTASH_CI_WAIT_SECONDS", "900"))
+
+
+def _ci_env_seconds(name, default):
+    """A positive number of seconds from the environment; anything else (empty, text, nan, 0 or less) is the default."""
+    try:
+        v = float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) and v > 0 else default
+
+
+CI_WAIT_SECONDS = _ci_env_seconds("DATASTASH_CI_WAIT_SECONDS", 900.0)
+CI_CALL_SECONDS = 60.0  # the longest one call may go unanswered
+CI_HANG_SECONDS = 180.0  # unanswered calls (timeouts, network errors) in all, before the report stops
 CI_RETRIES = 4  # tries for a network or server error that is not a brake
 CI_RETRY_SECONDS = float(os.environ.get("DATASTASH_CI_RETRY_SECONDS", "2"))
 CI_IDS_CHARS = 60_000  # failed ids listed on a Test runs row; past it the row says the list is not complete
+CI_PASS_HASH = 12  # hex characters of sha256(test id) listed per passed test, CI_IDS_CHARS per Test runs row
 CI_RUNS_KEEP_DAYS = 14  # Test runs rows are needed only while a commit's jobs report; older ones are removed
 CI_CAS_TRIES = 6
 CI_READ_CHUNK = 1 << 16
@@ -10836,12 +10853,18 @@ class CiClient:
 
     def __init__(self, key, workbook, deadline):
         self.key, self.wb, self.deadline = key, workbook, deadline
+        self.hang_left = CI_HANG_SECONDS
 
     def _call(self, what, fn):
+        """fn(timeout): one call, given at most CI_CALL_SECONDS, the time left before the deadline and the hang budget."""
         tries = 0
         while True:
+            timeout = min(CI_CALL_SECONDS, self.deadline - time.time(), self.hang_left)
+            if timeout <= 0:
+                raise CiProblem(f"{what}: datastash did not answer in time; this report was not finished")
+            began = time.time()
             try:
-                return fn()
+                return fn(max(0.1, timeout))
             except _CiWait as w:
                 wait = max(1.0, float(w.seconds or 5))
             except ApiError as e:
@@ -10855,6 +10878,9 @@ class CiClient:
                 else:
                     raise CiProblem(f"{what}: datastash answered HTTP {e.status} {ci_clean(e.body.get('code') or e.body.get('error'), 60)}".rstrip())
             except (OSError, ValueError, httpclient.HTTPException) as e:
+                self.hang_left -= time.time() - began
+                if self.hang_left <= 0:
+                    raise CiProblem(f"{what}: datastash did not answer in {int(CI_HANG_SECONDS)} s; this report was not finished")
                 if tries >= CI_RETRIES:
                     raise CiProblem(f"{what}: datastash can't be reached ({ci_clean(e, 120)})")
                 tries += 1
@@ -10865,8 +10891,8 @@ class CiClient:
 
     def tool(self, name, args, what, missing_ok=False):
         """One MCP tool call. A read of a tab that is not there yet (missing_ok) answers None; a write never does."""
-        def once():
-            is_err, body = mcp_tool(self.key, name, args, timeout=120)
+        def once(timeout):
+            is_err, body = mcp_tool(self.key, name, args, timeout=timeout)
             if is_err:
                 code = str(body.get("code") or body.get("error") or "")
                 ra = body.get("retry_after_seconds")
@@ -10915,15 +10941,15 @@ class CiClient:
         (the caller then adds flaky_commits once); False when passes was already set by another report."""
         q = urllib.parse.urlencode({"workbook_id": self.wb, "tab": CI_FAILURES, "key": key}, quote_via=urllib.parse.quote)
         for _ in range(CI_CAS_TRIES):
-            row = self._call("reading Test failures", lambda: api_json("GET", ROWS_PATH + "/key?" + q, self.key))
+            row = self._call("reading Test failures", lambda t: api_json("GET", ROWS_PATH + "/key?" + q, self.key, timeout=t))
             if _ci_num((row.get("cells") or {}).get("passes")) > 0:
                 return False
             body = {"workbook_id": self.wb, "tab": CI_FAILURES, "key": "key", "row": {"key": key, "passes": 1},
                     "if_version": row.get("row_version")}
 
-            def save():
+            def save(timeout):
                 try:
-                    api_json("POST", ROWS_PATH, self.key, body=body)
+                    api_json("POST", ROWS_PATH, self.key, body=body, timeout=timeout)
                     return True
                 except ApiError as e:
                     if e.status == 409:
@@ -10932,10 +10958,6 @@ class CiClient:
             if self._call("writing Test failures", save):
                 return True
         raise CiProblem("writing Test failures: the row kept changing; flaky not recorded this time")
-
-
-def _ci_true(v):
-    return v is True or (isinstance(v, str) and v.strip().lower() == "true") or (isinstance(v, (int, float)) and v == 1)
 
 
 def _ci_num(v):
@@ -10956,15 +10978,20 @@ def _ci_ids_text(ids):
     return "\n".join(out), True
 
 
-def ci_report(paths, repo, sha, branch, run_url, job, default_branch, key, wb, on_main=None, now=None):
-    """Send one CI report. Returns a summary dict; raises CiProblem with a plain reason."""
+def ci_pass_hash(t):
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()[:CI_PASS_HASH]
+
+
+def ci_report(paths, repo, sha, branch, run_url, job, default_branch, key, wb, on_main=None, now=None, local=False):
+    """Send one CI report. Returns a summary dict; raises CiProblem with a plain reason. local: a run on this computer
+    (maybe on uncommitted edits): never main's state and never the commit's flaky bookkeeping (Test failures, Test runs)."""
     now = time.time() if now is None else now
     tests = ci_parse(paths)
     if not tests:
         raise CiProblem("no test cases in " + ", ".join(os.path.basename(p) for p in paths))
     iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
     week, base_week = ci_iso_week(now), ci_iso_week(now - 28 * 86400)
-    on_main = (branch == default_branch) if on_main is None else on_main
+    on_main = False if local else ((branch == default_branch) if on_main is None else on_main)
     client = CiClient(key, wb, time.time() + CI_WAIT_SECONDS)
     tag = "ci-report-" + secrets.token_hex(8)
     failed = sorted(t for t, v in tests.items() if v["fails"])
@@ -10973,19 +11000,29 @@ def ci_report(paths, repo, sha, branch, run_url, job, default_branch, key, wb, o
     tkey = lambda t: f"{repo} / {t}"  # noqa: E731
     fkey = lambda t: f"{repo} / {sha} / {t}"  # noqa: E731
 
-    # 1. This report's outcome on the commit, before anything is read: its failure rows and its Test runs row.
-    client.upsert(CI_FAILURES, [{
-        "key": fkey(t), "repo": repo, "sha": sha, "test": t, "branch": branch, "run_url": run_url,
-        "error_class": tests[t]["error_class"], "error_hash": tests[t]["error_hash"], "fails": {"inc": tests[t]["fails"]},
-    } for t in failed], tag + "-f")
+    # 1. This report's outcome on the commit, before anything is read: its failure rows and its Test runs rows (the
+    # first holds the failed ids; each holds up to CI_IDS_CHARS of passed-test hashes). Never for a --local run.
     set_hash = hashlib.sha256("\n".join(executed).encode("utf-8")).hexdigest()
     ids, complete = _ci_ids_text(failed)
     run_key = f"{repo} / {sha} / {set_hash[:16]} / {hashlib.sha256(ids.encode('utf-8')).hexdigest()[:16]}"
-    client.upsert(CI_RUNS, [{
-        "key": run_key, "repo": repo, "sha": sha, "branch": branch, "job": job, "set_hash": set_hash,
-        "tests": len(executed), "failed_count": len(failed), "failed_ids": ids, "failed_listed": complete,
-        "reports": {"inc": 1}, "first_seen": {"min": iso}, "last_seen": {"max": iso},
-    }], tag + "-r")
+    if not local:
+        client.upsert(CI_FAILURES, [{
+            "key": fkey(t), "repo": repo, "sha": sha, "test": t, "branch": branch, "run_url": run_url,
+            "error_class": tests[t]["error_class"], "error_hash": tests[t]["error_hash"], "fails": {"inc": tests[t]["fails"]},
+        } for t in failed], tag + "-f")
+        per = CI_IDS_CHARS // (CI_PASS_HASH + 1)
+        hashes = sorted({ci_pass_hash(t) for t in passed})
+        parts = [hashes[i:i + per] for i in range(0, len(hashes), per)] or [[]]
+        runs = [{
+            "key": run_key, "repo": repo, "sha": sha, "branch": branch, "job": job, "set_hash": set_hash,
+            "tests": len(executed), "failed_count": len(failed), "failed_ids": ids, "failed_listed": complete,
+            "passed_hashes": "\n".join(parts[0]), "parts": len(parts),
+            "reports": {"inc": 1}, "first_seen": {"min": iso}, "last_seen": {"max": iso},
+        }]
+        runs += [{"key": f"{run_key} / {i}", "repo": repo, "sha": sha, "job": job, "set_hash": set_hash, "part": i,
+                  "passed_hashes": "\n".join(part), "first_seen": {"min": iso}, "last_seen": {"max": iso}}
+                 for i, part in enumerate(parts[1:], 1)]
+        client.upsert(CI_RUNS, runs, tag + "-r")
 
     # 2. Reads that must come before the Tests rows move: main's last outcome, and each file's week four weeks back.
     broke = set()
@@ -11027,16 +11064,23 @@ def ci_report(paths, repo, sha, branch, run_url, job, default_branch, key, wb, o
         wrows.append(r)
     client.upsert(CI_WEEKS, wrows, tag + "-w")
 
-    # 4. Flaky, order-independent: read the commit's failures and runs only now, after this report's own writes.
+    if local:
+        return {"tests": len(tests), "files": len(files), "failed": len(failed), "flaky": [], "new_flaky": [],
+                "broke": []}
+
+    # 4. Flaky, order-independent: read the commit's failures and runs only now, after this report's own writes. One
+    # rule whichever report comes first and whatever tests each ran: a recorded pass and a recorded failure.
     here = {"and": [{"eq": ["repo", repo]}, {"eq": ["sha", sha]}]}
     failed_here = {str(r.get("test")) for r in client.filter(CI_FAILURES, here) if _ci_num(r.get("fails")) > 0}
     flaky = {t for t in passed if t in failed_here}  # it failed in another job or run on this commit
     flaky |= {t for t in failed if tests[t]["passes"]}  # failed and passed in this report (a retry)
+    passed_there = set()
     for r in client.filter(CI_RUNS, here):
-        if r.get("key") == run_key or r.get("set_hash") != set_hash or not _ci_true(r.get("failed_listed")):
-            continue
-        theirs = set(str(r.get("failed_ids") or "").split("\n"))
-        flaky |= {t for t in failed if t not in theirs}  # the same tests ran there and this one did not fail
+        k = str(r.get("key") or "")
+        if k == run_key or k.startswith(run_key + " / "):
+            continue  # this report's own rows (or a report with the same outcome)
+        passed_there |= set(str(r.get("passed_hashes") or "").split("\n"))
+    flaky |= {t for t in failed if ci_pass_hash(t) in passed_there}  # it passed in another job or run on this commit
     new, more = [], []
     for t in sorted(flaky):
         if client.first_pass(fkey(t)):
@@ -11114,7 +11158,7 @@ def cmd_ci_report(args):
         if not re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key):
             raise CiProblem("set DATASTASH_AGENT_KEY (a CI secret) to the agent's key (ldgr_ag_...)")
         s = ci_report(o["paths"], o["repo"], o["sha"], o["branch"], o["run_url"], o["job"], o["default_branch"], key,
-                      o["wb"], on_main=False if o["local"] else None)
+                      o["wb"], local=o["local"])
         extra = (f", flaky on this commit: {len(s['flaky'])}" if s["flaky"] else "") + \
                 (f", main broke: {len(s['broke'])}" if s["broke"] else "")
         print(f"datastash ci-report: {s['tests']} tests from {s['files']} files sent for {o['repo']} "

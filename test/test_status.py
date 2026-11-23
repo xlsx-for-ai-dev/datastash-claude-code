@@ -1630,11 +1630,17 @@ class DetailsBound(Base):
 
 
 class ZzAnswerRoute(unittest.TestCase):
-    """Runs last (the loader sorts classes by name): XLI-310 item 2: every request any test made to an answer route was
-    the plugin's own typed answer (the login token as bearer, a typed proof in the body); never an undo; no answer
-    command for a tool call to run."""
+    """XLI-310 item 2: every request any test made to an answer route was the plugin's own typed answer (the login token
+    as bearer, a typed proof in the body); never an undo; no answer command for a tool call to run. Self-contained (in
+    any order): it runs the answering tests itself first, then checks every request recorded so far."""
     def test_only_typed_answers_went_to_the_answer_route(self):
-        self.assertTrue(ALL_CALLS)  # the run did make requests through the recorder
+        start = len(ALL_CALLS)
+        loader = unittest.TestLoader()
+        suite = unittest.TestSuite(loader.loadTestsFromTestCase(c) for c in (TypedAnswer, DoN, FastAnswer))
+        result = unittest.TestResult()
+        suite.run(result)
+        self.assertEqual((result.failures, result.errors), ([], []))
+        self.assertTrue([c for c in ALL_CALLS[start:] if "/answer" in c[1]])  # this run made answers through the recorder
         self.assertEqual([c for c in ALL_CALLS if "/undo" in c[1]], [])
         answers = [c for c in ALL_CALLS if "/answer" in c[1]]
         self.assertTrue(answers)

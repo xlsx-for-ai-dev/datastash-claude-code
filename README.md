@@ -201,8 +201,8 @@ those inputs, computed on this computer in plain code:
 go-junit-report, gradle) and sends per-test results into the agent workbook's tests tabs (set them up once with
 `ledger_feeds_setup {services: ["tests"]}`): **Tests** (one row per test: runs, fails, skips, times, last outcome, main's
 state), **Test failures** (one row per failing test and commit) and **Test weeks** (one row per test file and week). The
-engine computes flaky, fail_rate, slower, main_red and slowdown. The command also keeps a **Test runs** tab: one row per
-commit and set of tests run, with the ids that failed, kept 14 days.
+engine computes flaky, fail_rate, slower, main_red and slowdown. The command also keeps a **Test runs** tab: rows per
+commit and set of tests run, with the ids that failed and a short hash of each test that passed, kept 14 days.
 
 ```yaml
       - name: Tests
@@ -224,20 +224,25 @@ commit and set of tests run, with the ids that failed, kept 14 days.
 (`path/to/datastash` is `plugins/datastash/scripts/datastash` from this repo; it needs only `python3`. The values go
 through `env`, never pasted into the script, so a branch name can't inject a command.) Pytest:
 `pytest --junitxml=junit.xml`. `--default-branch` (default `main`) names the branch whose red tests set `main_broke_at`.
-`--local` reports a run on this computer, with the repo, commit and branch from git, and never touches main's state.
+`--local` reports a run on this computer, with the repo, commit and branch from git; it never touches main's state or
+the commit's flaky bookkeeping (no Test failures or Test runs rows), since the run may be on uncommitted edits.
 
 - **It never fails a build.** Every reporting problem (no key, a bad file, datastash unreachable, a refusal) prints one
-  line and exits 0. A brake (429) or busy answer is waited out (Retry-After), up to 15 minutes in all; each page of
-  1,000 rows carries an idempotency key, so a retry never counts twice.
+  line and exits 0. A brake (429) or busy answer is waited out (Retry-After), up to 15 minutes in all
+  (`DATASTASH_CI_WAIT_SECONDS`; a bad value means the default); a server that does not answer stops the step after 3
+  minutes of unanswered calls (1 minute a call). Each page of 1,000 rows carries an idempotency key, so a retry never
+  counts twice.
 - **What leaves CI.** Test ids and file paths as the runner names them, counts, times, the error class (the failure's
   `type`, as `AssertionError`) and a sha256 of the first message line with numbers and hex ids stripped (so one failure
   groups across runs). Never a failure message, stack trace, stdout or stderr. The XML is read with Python's own expat
   parser with no DTD: a DOCTYPE or entity declaration is refused, so no entity expansion or outside fetch.
-- **Flaky in any order.** Each report first records its outcome on the commit (its failure rows and its Test runs row),
-  then reads the commit's failures and runs. Writes to a workbook are one at a time, so of two reports on one commit the
-  later always sees the earlier: a pass sees the failure, a failure sees a run of the same tests that did not fail it.
-  Parallel matrix jobs, re-runs and a retry inside one run are all caught; shards that run different tests are never
-  called flaky. The first report to mark the failure row's `passes` (saved only if unchanged) adds `flaky_commits` once.
+- **Flaky in any order.** One rule: a test is flaky on a commit when one report passed it and another (or the same
+  one, a retry) failed it. Each report first records its outcome on the commit (its failure rows and its Test runs rows
+  with the passed-test hashes), then reads the commit's failures and runs. Writes to a workbook are one at a time, so of
+  two reports on one commit the later always sees the earlier: a pass sees the failure, a failure sees the pass, also
+  when the matrix legs ran different sets of tests. A test that ran in only one report (a shard) or was skipped elsewhere
+  is never called flaky. The first report to mark the failure row's `passes` (saved only if unchanged) adds
+  `flaky_commits` once.
 - The key is an agent key kept as a CI secret; it is never printed.
 
 ## Lookups kept ready (plugin 0.6.0)
@@ -699,9 +704,9 @@ An agent can send datastash a capability request, an error report or anything el
   server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
 - `python3 -I test/test_ci_report.py`: `datastash ci-report` (plugin 0.9.11): a canary in a failure's message, text,
   stdout and stderr never sent or printed, only allow-listed fields; a DOCTYPE, billion laughs and an outside entity
-  refused; rows folded; flaky in either order, at once (counted once), in a retry, and never for shards, skips or another
-  commit; main_broke_at; the week four weeks back; pages of 1,000 with idempotency keys; 429 and busy waited out; old
-  Test runs rows removed; exit 0 with one line for every problem.
+  refused; rows folded; flaky in either order (also across legs that ran different tests), at once (counted once), in a
+  retry, and never for shards, skips, another commit or a `--local` run; main_broke_at; the week four weeks back; pages of 1,000 with idempotency keys; 429 and busy waited out; old
+  Test runs rows removed; exit 0 with one line for every problem, a bad wait setting and a server that does not answer.
 - `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
   for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
   without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the

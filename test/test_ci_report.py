@@ -3,16 +3,19 @@
 - Privacy: a canary in a failure's message, its text, system-out and system-err never reaches datastash or the output;
   only ids, counts, times, the error class and the hash of the first message line (numbers and hex ids stripped) do.
 - The XML parser refuses a DOCTYPE, entity declarations (billion laughs) and external entities.
-- Flaky is order-independent (card A review): a pass and a failure of one test on one commit flag it whichever report
-  comes first, and when both read at once; flaky_commits is added exactly once. Different test sets (shards) are never
-  flaky; a failure then pass inside one report (a retry) is.
+- Flaky is order-independent (card A review, cycle 2): a pass and a failure of one test on one commit flag it whichever
+  report comes first, also when the legs ran different test sets, and when both read at once; flaky_commits is added
+  exactly once. A test run in one shard only is never flaky; a failure then pass inside one report (a retry) is. A
+  --local run never writes or reads the commit's flaky bookkeeping.
 - Pages of 1,000 rows with an idempotency key each; a 429 or busy answer is waited out and the page sent again.
 - main_broke_at on the default branch; base_avg_ms from four weeks back; old Test runs rows removed.
-- The command always exits 0 with one line, also for bad arguments, a missing key and no network.
+- The command always exits 0 with one line, also for bad arguments, a missing key, no network and a bad
+  DATASTASH_CI_WAIT_SECONDS; a server that does not answer is given a short total time, not the brake wait.
 No network, no key; a fake datastash in memory, under test/harness.py.
 Run: python3 -I test/test_ci_report.py"""
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -174,9 +177,9 @@ class CiReport(unittest.TestCase):
             f.write(text)
         return p
 
-    def report(self, cases, sha=SHA, branch="feature", job="test", now=None):
+    def report(self, cases, sha=SHA, branch="feature", job="test", now=None, local=False):
         return ds.ci_report([self.file(junit(cases))], "acme/widgets", sha, branch,
-                            "https://github.com/acme/widgets/actions/runs/1", job, "main", KEY, WB, now=now)
+                            "https://github.com/acme/widgets/actions/runs/1", job, "main", KEY, WB, now=now, local=local)
 
     def row(self, tab, key):
         return self.fake.tabs.get(tab, {}).get(key)
@@ -206,7 +209,7 @@ class CiReport(unittest.TestCase):
         allowed = {"key", "repo", "sha", "test", "file", "branch", "run_url", "error_class", "error_hash", "fails", "passes",
                    "runs", "skips", "ms_sum", "last_ms", "last_outcome", "last_sha", "first_seen", "last_seen", "week",
                    "base_avg_ms", "main_outcome", "main_sha", "main_broke_at", "flaky_commits", "job", "set_hash", "tests",
-                   "failed_count", "failed_ids", "failed_listed", "reports"}
+                   "failed_count", "failed_ids", "failed_listed", "reports", "passed_hashes", "parts", "part"}
         for name, args in self.fake.calls:
             for r in (args or {}).get("rows") or []:
                 self.assertLessEqual(set(r), allowed, name)
@@ -392,6 +395,67 @@ class CiReport(unittest.TestCase):
                 self.report(runs[i], job=f"j{i}")
             self.assert_flaky_once()
 
+    def test_flaky_legs_with_different_test_sets_either_order(self):
+        # Review cycle 2 item 1: a matrix leg that skips or lacks another test; pass first or failure first, one rule.
+        linux = [("t", "a", "pass", 1), ("t", "c", "pass", 1)]
+        mac = [("t", "a", "fail", 1), ("t", "b", "pass", 1)]
+        for order in ((linux, mac), (mac, linux)):
+            self.setUp()
+            for cases in order:
+                self.report(cases, job="leg")
+            self.assert_flaky_once()
+            self.assertIsNone(self.trow("t > b").get("flaky_commits"))
+            self.assertIsNone(self.trow("t > c").get("flaky_commits"))
+
+    def test_flaky_pass_hashes_over_several_runs_rows(self):
+        # A big leg's passes span several Test runs rows; a failure after it still finds each one.
+        old = ds.CI_IDS_CHARS
+        ds.CI_IDS_CHARS = (ds.CI_PASS_HASH + 1) * 2  # two hashes a row
+        self.addCleanup(setattr, ds, "CI_IDS_CHARS", old)
+        names = [f"n{i}" for i in range(5)]
+        self.report([("t", n, "pass", 1) for n in names] + [("t", "only", "pass", 1)], job="big")
+        self.assertEqual(len(self.fake.tabs["Test runs"]), 3)  # six passes, two hashes a row
+        self.report([("t", n, "fail", 1) for n in names], job="small")
+        for n in names:
+            self.assert_flaky_once(f"t > {n}")
+
+    def test_local_run_never_touches_flaky_bookkeeping(self):
+        # Review cycle 2 item 2: a local failure on uncommitted edits plus a CI pass on HEAD is not a flake.
+        s = self.report([("t", "a", "fail", 1), ("t", "b", "pass", 1)], local=True)
+        self.assertEqual((s["failed"], s["flaky"]), (1, []))
+        self.assertNotIn("Test failures", self.fake.tabs)
+        self.assertNotIn("Test runs", self.fake.tabs)
+        self.assertEqual(self.trow("t > a")["last_outcome"], "fail")  # the Tests row is still kept
+        self.report([("t", "a", "pass", 1), ("t", "b", "pass", 1)], job="ci")
+        self.report([("t", "a", "fail", 1), ("t", "a", "pass", 1)], local=True)  # a local retry: no flaky either
+        self.assertIsNone(self.trow("t > a").get("flaky_commits"))
+        self.assertIsNone(self.fail_row("t > a"))
+        self.report([("t", "b", "fail", 1)], branch="main", local=True)
+        self.assertNotIn("main_outcome", self.trow("t > b"))  # and never main's state
+        self.assertEqual(list(self.fake.tabs.get("Test failures", {})), [])  # the CI pass made none; local none either
+        self.assertEqual(len(self.fake.tabs["Test runs"]), 1)  # only the CI report's
+
+    def test_cli_local_flag_reaches_the_report(self):
+        got = {}
+        old = ds.ci_report
+        ds.ci_report = lambda *a, **k: got.update(k) or {"tests": 1, "files": 1, "failed": 0, "flaky": [], "broke": []}
+        self.addCleanup(setattr, ds, "ci_report", old)
+        env = {k: os.environ.get(k) for k in ("DATASTASH_AGENT_KEY", "DATASTASH_WORKBOOK_ID")}
+        os.environ["DATASTASH_AGENT_KEY"], os.environ["DATASTASH_WORKBOOK_ID"] = KEY, WB
+        try:
+            from io import StringIO
+            from contextlib import redirect_stdout
+            with redirect_stdout(StringIO()):
+                ds.cmd_ci_report([self.file(junit([("t", "a", "pass", 1)])), "--local", "--repo", "a/b", "--sha", SHA,
+                                  "--branch", "x"])
+        finally:
+            for k, v in env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertIs(got.get("local"), True)
+
     def test_shards_are_not_flaky(self):
         self.report([("t", "a", "pass", 1)], job="shard1")
         self.report([("t", "b", "fail", 1)], job="shard2")
@@ -421,9 +485,11 @@ class CiReport(unittest.TestCase):
 
     # --- the command never fails a build
 
-    def run_cli(self, *args, key=KEY, wb=WB):
+    def run_cli(self, *args, key=KEY, wb=WB, wait=None):
         env = dict(os.environ, DATASTASH_NO_NETWORK="1", DATASTASH_CI_RETRY_SECONDS="0", DATASTASH_AGENT_KEY=key,
                    DATASTASH_WORKBOOK_ID=wb)
+        if wait is not None:
+            env["DATASTASH_CI_WAIT_SECONDS"] = wait
         return subprocess.run([sys.executable, "-I", BIN, "ci-report"] + list(args), capture_output=True, text=True,
                               env=env, timeout=60)
 
@@ -446,6 +512,58 @@ class CiReport(unittest.TestCase):
             self.assertIn("not sent", lines[0])
             self.assertIn(want, lines[0])
             self.assertNotIn(KEY, lines[0])
+
+    def test_bad_wait_setting_falls_back_and_exits_zero(self):
+        # Review cycle 2 item 3: a bad DATASTASH_CI_WAIT_SECONDS no longer stops the script at import.
+        for bad in ("abc", "nan", "inf", "-5", "0", ""):
+            os.environ["DATASTASH_CI_WAIT_SECONDS"] = bad
+            try:
+                self.assertEqual(ds._ci_env_seconds("DATASTASH_CI_WAIT_SECONDS", 900.0), 900.0, bad)
+            finally:
+                os.environ.pop("DATASTASH_CI_WAIT_SECONDS", None)
+            p = self.file(junit([("t", "a", "pass", 1)]))
+            r = self.run_cli(p, "--repo", "acme/widgets", "--sha", SHA, "--branch", "b", "--run-url", "https://x.example/1",
+                             wait=bad)
+            self.assertEqual(r.returncode, 0, bad)
+            lines = (r.stdout + r.stderr).strip().splitlines()
+            self.assertEqual(len(lines), 1, (bad, lines))
+            self.assertIn("can't be reached", lines[0])
+        os.environ["DATASTASH_CI_WAIT_SECONDS"] = "12.5"
+        try:
+            self.assertEqual(ds._ci_env_seconds("DATASTASH_CI_WAIT_SECONDS", 900.0), 12.5)
+        finally:
+            os.environ.pop("DATASTASH_CI_WAIT_SECONDS", None)
+
+    def test_hung_server_stops_within_the_short_total(self):
+        # Review cycle 2 item 3: each call is given at most CI_CALL_SECONDS and unanswered calls CI_HANG_SECONDS in all,
+        # however long the brake wait (CI_WAIT_SECONDS) is.
+        for name, v in (("CI_CALL_SECONDS", 0.2), ("CI_HANG_SECONDS", 0.5), ("CI_RETRIES", 50)):
+            old = getattr(ds, name)
+            setattr(ds, name, v)
+            self.addCleanup(setattr, ds, name, old)
+        timeouts = []
+
+        def hung(key, name, args, timeout=60):
+            timeouts.append(timeout)
+            time.sleep(timeout)
+            raise socket.timeout("timed out")
+        ds.mcp_tool = hung
+        began = time.time()
+        with self.assertRaises(ds.CiProblem) as cm:
+            self.report([("t", "a", "fail", 1)])
+        self.assertLess(time.time() - began, 2)
+        self.assertIn("did not answer", str(cm.exception))
+        self.assertTrue(all(t <= 0.2 for t in timeouts), timeouts)
+        self.assertLessEqual(sum(timeouts), 0.5 + 0.1 + 1e-6)
+        self.assertGreaterEqual(len(timeouts), 3)
+
+    def test_calls_are_given_the_time_left_under_the_deadline(self):
+        seen = []
+        orig = self.fake.mcp_tool
+        ds.mcp_tool = lambda key, name, args, timeout=60: seen.append(timeout) or orig(key, name, args, timeout)
+        self.report([("t", "a", "pass", 1)])
+        self.assertTrue(seen)
+        self.assertTrue(all(0 < t <= ds.CI_CALL_SECONDS for t in seen), seen)
 
     def test_cli_internal_error_exits_zero(self):
         old = ds.ci_report
