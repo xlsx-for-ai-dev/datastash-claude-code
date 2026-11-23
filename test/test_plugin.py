@@ -2436,6 +2436,8 @@ class Login(Base):
         super().setUp()
         os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a terminal Claude Code session; a fresh computer: the device mode
         self.addCleanup(os.environ.pop, "CLAUDE_CODE_ENTRYPOINT", None)
+        os.environ["CLAUDE_CODE_MCP_SERVER_URL"] = ds.ORIGIN + "/mcp"  # XLI-310: as Claude Code runs the headersHelper
+        self.addCleanup(os.environ.pop, "CLAUDE_CODE_MCP_SERVER_URL", None)
         ds.signed_in = self.saved["signed_in"]
         ds._login_recorded = self.saved["_login_recorded"]
         for k in ("CONF", "STATE", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_PENDING_FILE", "http",
@@ -2820,7 +2822,9 @@ class Transition(Base):
         for k in ("CONF", "STATE", "HEARTBEAT", "LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE",
                   "LOGIN_PENDING_FILE", "LOGIN_LOCK_FILE", "_keychain_state", "HOOK_START_SECONDS"):
             self.saved.setdefault(k, getattr(ds, k))
-        self.env_saved = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT")}
+        self.env_saved = {k: os.environ.get(k) for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT",
+                                                          "CLAUDE_CODE_MCP_SERVER_URL")}
+        os.environ["CLAUDE_CODE_MCP_SERVER_URL"] = ds.ORIGIN + "/mcp"  # XLI-310: as Claude Code runs the headersHelper
         self.starts = []
         self.spawned = []
         ds._spawn_poller = lambda: self.spawned.append(1) or True
@@ -3000,6 +3004,54 @@ class Transition(Base):
         ds.write_private(ds.LOGIN_ACCESS_FILE, json.dumps({"token": "dsat_" + "a" * 43, "exp": int(time.time()) + 900}))
         for entry in ("cli", "claude-desktop", "local-agent", None):
             self.assertEqual(self.token_out(entry), {"Authorization": "Bearer " + "dsat_" + "a" * 43})
+
+    # XLI-310 (EPM M2 on a69057f): the token goes only to the connector's headersHelper, never to a tool call
+    def signed_in_computer(self):
+        self.new_computer()
+        ds.write_private(ds.LOGIN_FILE, json.dumps({"store": "file", "at": 1}))
+        ds.write_private(ds.LOGIN_ACCESS_FILE, json.dumps({"token": "dsat_" + "a" * 43, "exp": int(time.time()) + 900}))
+
+    def test_the_connector_helper_still_gets_the_token(self):
+        self.signed_in_computer()
+        self.assertEqual(self.token_out("cli"), {"Authorization": "Bearer " + "dsat_" + "a" * 43})
+        os.environ["CLAUDE_CODE_MCP_SERVER_URL"] = ds.ORIGIN + "/mcp/"  # a trailing slash is the same connector
+        self.assertEqual(self.token_out("cli"), {"Authorization": "Bearer " + "dsat_" + "a" * 43})
+        r = self.run_bin("token", "--header")  # a real process with a pipe, as Claude Code runs it
+        self.assertEqual((r.returncode, json.loads(r.stdout), r.stderr), (0, {"Authorization": "Bearer " + "dsat_" + "a" * 43}, ""))
+
+    def test_a_tool_call_piping_the_helper_gets_no_token(self):
+        """A Bash tool call has no CLAUDE_CODE_MCP_SERVER_URL (Claude Code sets it only for the headersHelper) and has
+        CLAUDECODE=1: the helper answers as it does on a terminal, with no token on stdout or stderr."""
+        self.signed_in_computer()
+        for url in (None, "", "https://evil.example/mcp", ds.ORIGIN, ds.ORIGIN + "/mcp?x=1", "http://getdatastash.com/mcp"):
+            with self.subTest(url=url):
+                if url is None:
+                    os.environ.pop("CLAUDE_CODE_MCP_SERVER_URL", None)
+                else:
+                    os.environ["CLAUDE_CODE_MCP_SERVER_URL"] = url
+                out = self.token_out("cli")
+                self.assertNotIn("dsat_", json.dumps(out))
+                self.assertEqual(out, {"Authorization": "Bearer signed-out"})
+                env_url = {} if url is None else {"CLAUDE_CODE_MCP_SERVER_URL": url}
+                saved = os.environ.pop("CLAUDE_CODE_MCP_SERVER_URL", None)
+                try:
+                    os.environ.update(env_url, CLAUDECODE="1")
+                    r = self.run_bin("token", "--header")
+                finally:
+                    os.environ.pop("CLAUDECODE", None)
+                    os.environ.pop("CLAUDE_CODE_MCP_SERVER_URL", None)
+                    if saved is not None:
+                        os.environ["CLAUDE_CODE_MCP_SERVER_URL"] = saved
+                self.assertEqual(r.returncode, 0)
+                self.assertNotIn("dsat_", r.stdout + r.stderr)
+                self.assertEqual(json.loads(r.stdout), {"Authorization": "Bearer signed-out"})
+                self.assertIn("only to the datastash connector", r.stderr)
+
+    def test_the_helpers_own_config_names_the_url_it_checks(self):
+        with open(os.path.join(HERE, "..", "plugins", "datastash", ".mcp.json")) as f:
+            cfg = json.load(f)["mcpServers"]["datastash"]
+        self.assertEqual(cfg["url"], ds.ORIGIN + "/mcp")
+        self.assertEqual(ds.CONNECTOR_URL, cfg["url"])
 
     # Problem 2: never remove a Connect button where the device sign-in can't run
     def test_hosts_that_cant_show_the_device_sign_in_keep_their_own_door(self):

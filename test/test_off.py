@@ -497,5 +497,63 @@ class GitBlanks(Base):
             ds.git_argv("/x", ["fetch"])
 
 
+class TokenHelperDeny(OffBase):
+    """XLI-310 (EPM M2 on a69057f): the login token goes only to the connector's headersHelper. A Bash tool call that runs
+    the token helper, or a tool call that reads the login's token files, is denied by the PreToolUse hook; the reason
+    never carries a token."""
+
+    TOKEN = "dsat_" + "z" * 43
+
+    def setUp(self):
+        super().setUp()
+        ds.write_private(ds.LOGIN_ACCESS_FILE, json.dumps({"token": self.TOKEN, "exp": int(time.time()) + 900}))
+
+    def denied(self, out):
+        hs = (out or {}).get("hookSpecificOutput", {})
+        return hs.get("permissionDecision") == "deny"
+
+    def test_a_bash_call_that_runs_the_token_helper_is_denied(self):
+        for cmd in ('python3 "$CLAUDE_PLUGIN_ROOT/scripts/datastash" token --header | cat',
+                    "datastash token --header",
+                    "datastash token --header > /tmp/t; cat /tmp/t",
+                    "python3 '/home/p/.claude/plugins/cache/datastash/scripts/datastash' 'token' '--header'",
+                    "CLAUDE_CODE_MCP_SERVER_URL=https://getdatastash.com/mcp datastash token --header",
+                    "exec datastash token --header",
+                    "cd /x && datastash token"):
+            with self.subTest(cmd=cmd):
+                out = self.tool("Bash", tool_input={"command": cmd})
+                self.assertTrue(self.denied(out), out)
+                text = json.dumps(out)
+                self.assertNotIn(self.TOKEN, text)
+                self.assertNotIn("dsat_", text)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], ds.TOKEN_DENY)
+
+    def test_a_tool_call_that_reads_the_login_token_files_is_denied(self):
+        for name, ti in (("Bash", {"command": f"cat {ds.LOGIN_ACCESS_FILE}"}),
+                         ("Bash", {"command": "cat ~/.config/datastash/login.refresh"}),
+                         ("Read", {"file_path": ds.LOGIN_ACCESS_FILE}),
+                         ("Grep", {"pattern": "dsat_", "path": os.path.join(ds.CONF, "login.access.json")})):
+            with self.subTest(name=name, ti=ti):
+                out = self.tool(name, tool_input=ti)
+                self.assertTrue(self.denied(out), out)
+                self.assertNotIn(self.TOKEN, json.dumps(out))
+
+    def test_other_datastash_commands_and_other_tools_are_not_denied(self):
+        for name, ti in (("Bash", {"command": "datastash status"}), ("Bash", {"command": "datastash login --check"}),
+                         ("Bash", {"command": "git log --oneline -3"}), ("Bash", {"command": "echo token"}),
+                         ("Read", {"file_path": "/x/README.md"})):
+            with self.subTest(name=name, ti=ti):
+                self.assertFalse(self.denied(self.tool(name, tool_input=ti)))
+
+    def test_only_before_the_call(self):
+        cmd = {"command": "datastash token --header"}
+        for event in ("PostToolUse", "PostToolUseFailure"):
+            self.assertFalse(self.denied(self.tool("Bash", event=event, tool_input=cmd)))
+
+    def test_the_call_still_marks_the_session_as_an_agent(self):
+        self.tool("Bash", tool_input={"command": "datastash token --header"}, sid="sess-tok")
+        self.assertTrue(os.path.exists(os.path.join(ds.STATE, "agent-used-sid-sess-tok")))
+
+
 if __name__ == "__main__":
     unittest.main()
