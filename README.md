@@ -170,6 +170,23 @@ once: "Your agents asked where PRs stand N times today. Want datastash to keep t
 - Your status also shows **Changed in the last hour** from those feeds.
 - `datastash lookups` prints today's counts and what datastash keeps.
 
+## Your own week in numbers (plugin 0.9.3)
+
+`datastash week` shows one line about the last 7 days on this computer, measured from its own Claude Code history in
+plain local code. Nothing is sent anywhere. The first time, it asks: "Want to see what last week cost your agents? I'll
+read this computer's Claude Code history; nothing leaves it." (`datastash week yes` or `datastash week no`; only that
+answer is kept, in `~/.config/datastash/week.json`). It reads timestamps, tool-call shapes and message gaps, never
+text, and keeps nothing but counts:
+
+- **waited on you**: in your own sessions (not subagents or `claude -p` runs), from the agent's last output to your next
+  typed prompt, when no tool was still running; gaps under 2 minutes are left out;
+- **messages between agents sat unread**: from when another agent's message was queued to the agent's first output
+  after it arrived (a subagent's hand-back is not counted);
+- **repeated lookups**: the same outside lookup (the shapes above) asked again within 10 minutes, by its measured time;
+  background calls are counted, not timed.
+
+Every number is measured; a number under a minute is shown as tiny, and nothing is rounded up.
+
 ## Agents set up by the plugin, allowed by you (plugin 0.5.0)
 
 Nobody names an agent, and no AI registers itself. Once this computer is signed in, the plugin itself (never the AI):

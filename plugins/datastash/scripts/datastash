@@ -30,6 +30,9 @@ Subcommands (run `datastash help`):
   lookups [steps SERVICE]   today's repeated outside lookups on this computer (shapes and counts only) and what
                             datastash keeps; steps github|linear|jira: that feed's setup steps, after the person's
                             "do N" on the status offer
+  week [yes|no]             your own week in numbers, measured from this computer's Claude Code history (plain local
+                            code, nothing sent): asks first; after the person's yes, one line: hours agents waited on
+                            the person, time messages between agents sat unread, minutes on repeated lookups
   where WORDS               where something is in this git project, from the project map (plain code, no AI): file:line
                             and the file's purpose; try it before grep for "where is X"
   file PATH                 a file's purpose and its exports, routes, env vars and MCP tools, from the project map
@@ -8398,6 +8401,295 @@ def cmd_lookups(args):
     return 0
 
 
+# --- XLI-325: your own week in numbers. Plain local code that never sends anything: after the person's yes, it reads
+# this computer's own Claude Code history (<CLAUDE_DIR>/projects/**/*.jsonl) for timestamps, tool-call shapes and
+# message gaps only, never text, and prints ONE line of measured numbers (the 11-22 measured method):
+#   - waiting on you: in a session with a person in it (entrypoint "cli"; never a subagent or a `claude -p` run), from
+#     the agent's last output to the person's next typed prompt, when no tool call was still open; waits under 2
+#     minutes are reaction time and are left out;
+#   - messages sat unread: a message from another agent (a peer message; a subagent's hand-back is not one), from when
+#     it was queued to the agent's first output after it was delivered;
+#   - repeated lookups: an outside lookup (the shapes `datastash lookups` counts) asked again, with the same command,
+#     within 10 minutes of the last ask by any session; its measured time (call to result, shared evenly over the
+#     command's parts). Background calls are counted, never timed.
+# Text is judged in memory only while a record is read (a message is matched to its queue entry by a hash) and is
+# dropped at once; only counts and seconds are kept. Nothing is written but the person's answer.
+WEEK_PATH = os.path.join(CONF, "week.json")  # the person's answer only: {"answer": "yes" | "no", "at": <time>}
+WEEK_ASK = "Want to see what last week cost your agents? I'll read this computer's Claude Code history; nothing leaves it."
+WEEK_DAYS = 7
+WEEK_MIN_WAIT = 120  # seconds: a shorter gap before the person types is reaction time, not waiting
+WEEK_REPEAT_WINDOW = 600  # seconds: a lookup asked again within this is a repeat
+
+
+def _week_now():
+    return time.time()
+
+
+def _week_ts(v):
+    import datetime
+    if not isinstance(v, str) or not v:
+        return None
+    try:
+        d = datetime.datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d.timestamp()
+
+
+def _week_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(c.get("text") or "" for c in content if isinstance(c, dict) and isinstance(c.get("text"), str))
+    return ""
+
+
+def _week_hash(text):
+    i = text.find("<agent-message")
+    return hashlib.sha256((text[i:] if i >= 0 else text).strip().encode("utf-8", "replace")).hexdigest()
+
+
+def _week_lookup_keys(cmd):
+    """(parts, [hash of each lookup part's words]) for one Bash command; the hashes live in memory only."""
+    if not isinstance(cmd, str):
+        return 0, []
+    parts, keys = 0, []
+    for seg in _SEG_RE.split(cmd):
+        if not seg.strip():
+            continue
+        parts += 1
+        if lookup_shape(seg) is None:
+            continue
+        try:
+            words = shlex.split(seg)
+        except ValueError:
+            continue
+        while words and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0], re.S):
+            words.pop(0)
+        keys.append(hashlib.sha256("\0".join(words).encode("utf-8", "replace")).hexdigest())
+    return parts, keys
+
+
+def _week_overlap(a, b, lo, hi):
+    return max(0.0, min(b, hi) - max(a, lo))
+
+
+def _week_files(root):
+    for d, dirs, names in os.walk(os.path.join(root, "projects")):
+        dirs.sort()
+        for n in sorted(names):
+            if n.endswith(".jsonl"):
+                yield os.path.join(d, n), (os.sep + "subagents" + os.sep) in (os.path.join(d, n))
+
+
+def _week_file(path, sub, lo, hi, out, lookups):
+    """Read one transcript line by line; add its waits and messages to out and its lookups to the list."""
+    person = None
+    last_out = None
+    last_input = None
+    pending = set()
+    calls = {}  # tool id -> (call time, share, [keys])
+    queued = {}  # message hash -> [queued times]
+    seen = {}  # message hash -> delivery time (one message written twice)
+    awaiting = []  # [queued time, delivered time] of messages the agent has not acted on yet
+    first = None
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            ts = _week_ts(d.get("timestamp"))
+            if ts is None or ts > hi:
+                continue
+            first = ts if first is None else min(first, ts)
+            typ = d.get("type")
+            side = sub or bool(d.get("isSidechain"))
+            if person is None and isinstance(d.get("entrypoint"), str):
+                person = d.get("entrypoint") == "cli"
+
+            def deliver(text, queued_at):
+                h = _week_hash(text)
+                if queued_at is None:
+                    q = queued.get(h)
+                    queued_at = q.pop(0) if q else ts
+                elif queued.get(h):
+                    queued[h].pop(0)
+                if h in seen and ts - seen[h] < 3600:
+                    return
+                seen[h] = ts
+                awaiting.append([min(queued_at, ts), ts])
+
+            if typ == "queue-operation":
+                c = d.get("content")
+                if not side and isinstance(c, str) and c.lstrip().startswith("<agent-message"):
+                    if d.get("operation") == "enqueue":
+                        queued.setdefault(_week_hash(c), []).append(ts)
+                    elif d.get("operation") == "remove" and d.get("reason") in ("absorbed_mid_turn", "delivered_to_agent"):
+                        deliver(c, None)
+                continue
+            if typ == "attachment":
+                a = d.get("attachment")
+                if not side and isinstance(a, dict) and a.get("type") == "queued_command":
+                    o = a.get("origin")
+                    if isinstance(o, dict) and o.get("kind") == "peer" and not o.get("handback"):
+                        deliver(_week_text(a.get("prompt")), _week_ts(a.get("timestamp")))
+                continue
+            msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+            content = msg.get("content")
+            if typ == "assistant":
+                if isinstance(content, list):
+                    for c in content:
+                        if not isinstance(c, dict) or c.get("type") != "tool_use":
+                            continue
+                        pending.add(c.get("id"))
+                        inp = c.get("input") if isinstance(c.get("input"), dict) else {}
+                        if c.get("name") == "Bash":
+                            parts, keys = _week_lookup_keys(inp.get("command"))
+                            if keys:
+                                bg = bool(inp.get("run_in_background"))
+                                ev = [ts, keys, None if bg else 1.0 / parts]
+                                lookups.append(ev)
+                                if not bg:
+                                    calls[c.get("id")] = ev
+                if not side:
+                    for q, dl in awaiting:
+                        if ts >= dl:
+                            out["messages"] += 1 if q >= lo else 0
+                            out["unread_s"] += _week_overlap(q, ts, lo, hi) if q >= lo else 0.0
+                    awaiting = [w for w in awaiting if ts < w[1]]
+                last_out = ts
+                continue
+            if typ != "user":
+                continue
+            if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_result":
+                        tid = c.get("tool_use_id")
+                        pending.discard(tid)
+                        ev = calls.pop(tid, None)
+                        if ev is not None and ev[2] is not None:
+                            ev.append(max(0.0, ts - ev[0]) * ev[2])
+                continue
+            origin = d.get("origin")
+            okind = origin.get("kind") if isinstance(origin, dict) else origin
+            if okind == "peer":
+                if not side and not origin.get("handback"):
+                    deliver(_week_text(content), None)
+                continue
+            if "origin" in d or "promptSource" in d:
+                is_typed = okind == "human"
+            else:  # older transcripts with no origin field
+                is_typed = (isinstance(content, str) and not d.get("isMeta") and not d.get("isCompactSummary")
+                            and not d.get("toolUseResult") and not content.lstrip().startswith("<"))
+            if is_typed and _week_text(content).lstrip().startswith("[Request interrupted"):
+                is_typed = False
+            if is_typed and person and not side and last_out is not None and not pending \
+                    and (last_input is None or last_out > last_input) and ts - last_out >= WEEK_MIN_WAIT \
+                    and ts > lo:
+                out["waits"] += 1
+                out["wait_s"] += _week_overlap(last_out, ts, lo, hi)
+            if is_typed:
+                last_input = ts
+    return first
+
+
+def week_numbers(root, now=None):
+    """The week's measured counts from the Claude Code history under root: numbers only, never text."""
+    hi = _week_now() if now is None else now
+    lo = hi - WEEK_DAYS * 86400
+    out = {"waits": 0, "wait_s": 0.0, "messages": 0, "unread_s": 0.0, "repeats": 0, "timed_repeats": 0,
+           "lookup_s": 0.0, "days": 0}
+    lookups = []
+    earliest = None
+    for path, sub in _week_files(root):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            continue
+        if st.st_mtime < lo:  # nothing in it is from this week; it shows the history goes back that far
+            earliest = st.st_mtime if earliest is None else min(earliest, st.st_mtime)
+            continue
+        first = _week_file(path, sub, lo, hi, out, lookups)
+        if first is not None:
+            earliest = first if earliest is None else min(earliest, first)
+    last = {}
+    for ev in sorted(lookups, key=lambda e: e[0]):
+        ts, keys = ev[0], ev[1]
+        for k in keys:
+            prev = last.get(k)
+            last[k] = ts
+            if prev is None or ts - prev > WEEK_REPEAT_WINDOW or ts < lo:
+                continue
+            out["repeats"] += 1
+            if ev[2] is not None and len(ev) > 3:
+                out["timed_repeats"] += 1
+                out["lookup_s"] += ev[3]
+    if earliest is not None and earliest < hi:
+        out["days"] = min(WEEK_DAYS, max(1, int(-(-(hi - max(earliest, lo)) // 86400))))
+    return out
+
+
+def _week_amount(seconds):
+    if seconds < 60:
+        return "under a minute (tiny)"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} min"
+    return f"{int(seconds / 360) / 10:.1f} h"  # one decimal, never rounded up
+
+
+def _week_count(n, one, many):
+    return f"{n} {one if n == 1 else many}"
+
+
+def week_line(n):
+    """The one line: measured numbers only, a tiny one called tiny, an empty one said plainly."""
+    days = n.get("days") or 0
+    if not days:
+        return f"No Claude Code history on this computer in the last {WEEK_DAYS} days: nothing to show yet."
+    span = f"last {days} day" + ("" if days == 1 else "s")
+    wait = (f"your agents waited on you {_week_amount(n['wait_s'])} ({_week_count(n['waits'], 'wait', 'waits')})"
+            if n["waits"] else "your agents never waited on you")
+    msgs = (f"messages between agents sat unread {_week_amount(n['unread_s'])} "
+            f"({_week_count(n['messages'], 'message', 'messages')})" if n["messages"] else "no messages between agents")
+    looks = (f"repeated lookups took {_week_amount(n['lookup_s'])} ({_week_count(n['repeats'], 'repeat', 'repeats')})"
+             if n["repeats"] else "no repeated lookups")
+    return (f"Your week in numbers (measured on this computer from its Claude Code history, {span}; nothing was sent): "
+            f"{wait}; {msgs}; {looks}.")
+
+
+def cmd_week(args):
+    """`datastash week [yes|no]`: asks first; after the person's yes, the one line of measured numbers."""
+    if args and args[0] in ("yes", "no"):
+        ensure_dirs()
+        write_private(WEEK_PATH, json.dumps({"answer": args[0], "at": int(time.time())}))
+        if args[0] == "no":
+            print("OK: datastash won't read this computer's Claude Code history. To change that: datastash week yes")
+            return 0
+    elif args:
+        print("Usage: datastash week [yes|no]")
+        return 1
+    answer = read_json(WEEK_PATH, {}).get("answer")
+    if answer == "no":
+        print("You said no, so this computer's Claude Code history is not read. To change that: datastash week yes")
+        return 0
+    if answer != "yes":
+        print(f"{WEEK_ASK} Ask the person; on their yes run: datastash week yes (on no: datastash week no)")
+        return 0
+    print(week_line(week_numbers(CLAUDE_DIR)))
+    return 0
+
+
 # --- XLI-307: the project map. Plain code, zero tokens: for each linked git folder the listener maps HEAD's files (each
 # with its one-line purpose: the first comment or docstring), exported functions and classes, HTTP routes (express,
 # fastify, flask, fastapi, rails, next), env var reads, MCP tool names and migrations, each with file:line. It maps again
@@ -9317,7 +9609,7 @@ def main():
              "read": cmd_read, "filter": cmd_filter, "agent-tool": cmd_agent_tool, "doctor": cmd_doctor,
              "login": cmd_login, "logout": cmd_logout, "token": cmd_token, "unfilter": lambda a: cmd_filter(a, hidden=False),
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
-             "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups,
+             "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh}
     if cmd not in table:
         print(__doc__)
