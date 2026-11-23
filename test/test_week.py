@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 
@@ -163,7 +164,9 @@ EXPECTED = ("Your week in numbers (measured on this computer from its Claude Cod
 
 class Week(unittest.TestCase):
     def setUp(self):
-        self.claude = os.path.join(ds.HOME, ".claude")
+        # A Claude Code folder of this test's own: the shared one under the throwaway HOME holds other test files'
+        # sessions when the whole suite runs in one process.
+        self.claude = tempfile.mkdtemp(prefix="week-claude-", dir=ds.HOME)
         self.saved = {k: getattr(ds, k) for k in ("CLAUDE_DIR", "http", "_week_now")}
         ds.CLAUDE_DIR = self.claude
         make_history(self.claude)

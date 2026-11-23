@@ -507,6 +507,14 @@ class TokenHelperDeny(OffBase):
     def setUp(self):
         super().setUp()
         ds.write_private(ds.LOGIN_ACCESS_FILE, json.dumps({"token": self.TOKEN, "exp": int(time.time()) + 900}))
+        self.addCleanup(self._drop_token)
+
+    def _drop_token(self):
+        # The datastash folder is shared by every test file in one run: leave no live login token behind.
+        try:
+            os.replace(ds.LOGIN_ACCESS_FILE, os.path.join(TMP, f"old-login.access-{uuid.uuid4().hex}.json"))
+        except OSError:
+            pass
 
     def denied(self, out):
         hs = (out or {}).get("hookSpecificOutput", {})

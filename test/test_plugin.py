@@ -355,7 +355,10 @@ class Pacing(Base):
             st = ds.load_state(agent)
             senders = {i: st["from"].get(i, "") for i in ids}
             announce(agent, ids, wake_time)
-            wakes.append((round(time.time() - inbox.t0, 2), lines[-1] if lines else "", list(ids)))
+            # The wake's own time (what the plugin paces from), not the time after the state write: on a busy machine
+            # that write's delay otherwise shows up as a short gap to the next wake.
+            at = wake_time if wake_time is not None else time.time()
+            wakes.append((round(at - inbox.t0, 2), lines[-1] if lines else "", list(ids)))
             inbox.handle([i for i in ids if handles(senders[i])])
         self.saved.setdefault("announce_ids", announce)
         ds.announce_ids = announced
