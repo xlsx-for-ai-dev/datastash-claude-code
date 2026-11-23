@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""release-gate: the only way a datastash plugin release is tagged, pinned and put on main (XLI-390 P2).
+
+Users update themselves to the newest vX.Y.Z tag, and only when main's marketplace catalog pins that tag's commit. So a
+tag and a pin must only ever name a commit that passed an independent review. A commit can't name its own sha, so a
+release is two reviewed commits:
+  1. the release commit R (plugin.json says X.Y.Z): reviewed, then  `release-gate tag`  tags it vX.Y.Z;
+  2. the pin commit P on top of R, made by  `release-gate pin vX.Y.Z`  (marketplace.json only): reviewed, then
+     `release-gate main`  checks P before the fast-forward of main.
+
+Review records are text files with lines like "opus review: PASS at <sha>" or "opus review (cycle 2): PASS at <sha>"
+(at least 7 hex characters of the commit). Give their folders with --records DIR (repeatable) or RELEASE_GATE_RECORDS
+(folders separated by ":"). A FAIL line for the same commit, anywhere, refuses it.
+
+  release-gate check  [--records DIR] [REV]  exit 0 when REV (default HEAD) has a recorded PASS
+  release-gate tag    [--records DIR] [--dry-run]
+                                             tag HEAD vX.Y.Z (X.Y.Z from plugin.json): refused unless the tree is
+                                             clean, HEAD has a PASS, the tag is new and X.Y.Z is above every v* tag
+  release-gate pin    [--records DIR] vX.Y.Z  point marketplace.json at that tag's commit (writes the file, no commit):
+                                             refused unless that commit has a PASS
+  release-gate main   [--records DIR]        before a fast-forward of main: refused unless HEAD has a PASS, its catalog
+                                             pins a v* tag's exact commit with a PASS, and that tag is the newest one
+Never pushes, never force-anything. Exit 0 on success, 1 when refused (with the reason), 2 on a usage error."""
+import json
+import os
+import re
+import subprocess
+import sys
+
+PLUGIN_JSON = "plugins/datastash/.claude-plugin/plugin.json"
+CATALOG = ".claude-plugin/marketplace.json"
+REPO_URL = "https://github.com/xlsx-for-ai-dev/datastash-claude-code.git"
+VERSION_RE = r"(\d{1,4})\.(\d{1,4})\.(\d{1,4})"
+LINE_RE = re.compile(r"^\s*opus review(?: \(cycle \d+\))?: (PASS|FAIL) at ([0-9a-f]{7,40})\b", re.M)
+
+
+class Refused(Exception):
+    pass
+
+
+def git(*args, check=True):
+    r = subprocess.run(["git"] + list(args), capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise Refused(f"git {' '.join(args)} failed: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def vt(v):
+    m = re.fullmatch(VERSION_RE, v or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def verdicts(dirs):
+    """[(verdict, sha prefix)] from every file in the record folders."""
+    if not dirs:
+        raise Refused("no review records: give --records DIR or RELEASE_GATE_RECORDS")
+    out = []
+    for d in dirs:
+        if not os.path.isdir(d):
+            raise Refused(f"no such records folder: {d}")
+        for root, _dirs, names in os.walk(d):
+            for n in sorted(names):
+                try:
+                    with open(os.path.join(root, n), encoding="utf-8", errors="replace") as f:
+                        out += LINE_RE.findall(f.read())
+                except OSError:
+                    pass
+    return out
+
+
+def require_pass(sha, dirs, what):
+    found = [v for v, pre in verdicts(dirs) if sha.startswith(pre)]
+    if "FAIL" in found:
+        raise Refused(f"{what} {sha[:12]} has a recorded FAIL")
+    if "PASS" not in found:
+        raise Refused(f"{what} {sha[:12]} has no recorded independent PASS")
+
+
+def release_tags():
+    """{version: commit} for every vX.Y.Z tag, peeled to its commit."""
+    tags = {}
+    for t in git("tag", "--list", "v*").split():
+        if vt(t[1:]):
+            tags[t[1:]] = git("rev-list", "-n", "1", t)
+    return tags
+
+
+def head_version():
+    with open(PLUGIN_JSON) as f:
+        v = json.load(f).get("version")
+    if not vt(v):
+        raise Refused(f"{PLUGIN_JSON} has no X.Y.Z version")
+    return v
+
+
+def cmd_check(dirs, rest):
+    rev = rest[0] if rest else "HEAD"
+    require_pass(git("rev-parse", rev + "^{commit}"), dirs, rev)
+    print(f"PASS recorded for {rev}")
+
+
+def cmd_tag(dirs, rest):
+    dry = "--dry-run" in rest
+    if git("status", "--porcelain"):
+        raise Refused("the working tree is not clean")
+    head = git("rev-parse", "HEAD")
+    require_pass(head, dirs, "HEAD")
+    v = head_version()
+    tags = release_tags()
+    if v in tags:
+        raise Refused(f"v{v} already exists")
+    if tags and vt(v) <= max(vt(t) for t in tags):
+        raise Refused(f"v{v} is not above the newest release v{max(tags, key=vt)}")
+    if dry:
+        print(f"would tag {head[:12]} v{v}")
+        return
+    git("tag", "-a", "v" + v, "-m", f"datastash plugin {v}", head)
+    print(f"tagged {head[:12]} v{v}")
+
+
+def cmd_pin(dirs, rest):
+    if len(rest) != 1 or not rest[0].startswith("v") or not vt(rest[0][1:]):
+        raise SystemExit("usage: release-gate pin vX.Y.Z")
+    v = rest[0][1:]
+    commit = release_tags().get(v)
+    if commit is None:
+        raise Refused(f"no tag v{v}")
+    require_pass(commit, dirs, f"v{v}")
+    with open(CATALOG) as f:
+        cat = json.load(f)
+    entry = next((p for p in cat.get("plugins", []) if p.get("name") == "datastash"), None)
+    if entry is None:
+        raise Refused("no datastash entry in the catalog")
+    entry["source"] = {"source": "git-subdir", "url": REPO_URL, "path": "plugins/datastash", "ref": "v" + v,
+                       "sha": commit}
+    with open(CATALOG, "w") as f:
+        f.write(json.dumps(cat, indent=2) + "\n")
+    print(f"pinned {CATALOG} to v{v} ({commit[:12]}); commit it, get it reviewed, then run release-gate main")
+
+
+def cmd_main(dirs, rest):
+    head = git("rev-parse", "HEAD")
+    require_pass(head, dirs, "HEAD")
+    cat = json.loads(git("show", "HEAD:" + CATALOG))
+    entry = next((p for p in cat.get("plugins", []) if p.get("name") == "datastash"), {})
+    src = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+    ref, sha = src.get("ref"), src.get("sha")
+    if src.get("source") != "git-subdir" or not isinstance(ref, str) or not re.fullmatch(r"[0-9a-f]{40}", str(sha)):
+        raise Refused("the catalog does not pin a tag and a full commit sha")
+    tags = release_tags()
+    if not ref.startswith("v") or tags.get(ref[1:]) != sha:
+        raise Refused(f"the catalog pins {ref} at {str(sha)[:12]}, which is not that tag's commit")
+    if vt(ref[1:]) != max(vt(t) for t in tags):
+        raise Refused(f"the catalog pins {ref}, not the newest release v{max(tags, key=vt)}")
+    require_pass(sha, dirs, ref)
+    print(f"ok: HEAD {head[:12]} pins {ref} ({sha[:12]}); fast-forward main to it (never force)")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0 if argv else 2
+    cmd, rest, dirs = argv[0], [], []
+    it = iter(argv[1:])
+    for a in it:
+        if a == "--records":
+            dirs.append(next(it, ""))
+        else:
+            rest.append(a)
+    if not dirs and os.environ.get("RELEASE_GATE_RECORDS"):
+        dirs = [d for d in os.environ["RELEASE_GATE_RECORDS"].split(":") if d]
+    table = {"check": cmd_check, "tag": cmd_tag, "pin": cmd_pin, "main": cmd_main}
+    if cmd not in table:
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        os.chdir(git("rev-parse", "--show-toplevel"))
+        table[cmd](dirs, rest)
+    except Refused as e:
+        print(f"release-gate: refused: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

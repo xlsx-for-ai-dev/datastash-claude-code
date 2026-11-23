@@ -116,6 +116,30 @@ except ImportError:
     fcntl = None
 
 ORIGIN = "https://getdatastash.com"
+# XLI-390 P2 (owner 11-23): every call names the real plugin version, in its own header and in the User-Agent, so datastash
+# can count who is on 1.0. Read from this copy's plugin.json; never sent when it can't be read.
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VERSION_RE = r"(\d{1,4})\.(\d{1,4})\.(\d{1,4})"
+
+
+def plugin_version(root=PLUGIN_ROOT):
+    """This copy's version from its plugin.json ("X.Y.Z"), or None."""
+    try:
+        with open(os.path.join(root, ".claude-plugin", "plugin.json")) as f:
+            v = json.load(f).get("version")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, str) and re.fullmatch(VERSION_RE, v) else None
+
+
+def version_tuple(v):
+    m = re.fullmatch(VERSION_RE, v) if isinstance(v, str) else None
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+PLUGIN_VERSION = plugin_version()
+VERSION_HEADER = "X-Datastash-Plugin-Version"
+USER_AGENT = "datastash-claude-code-plugin/" + (PLUGIN_VERSION or "unknown")
 API_PREFIX = "/api/v1/agent/"
 PICKUP_PATH = "/api/v1/agent/pickup"
 INBOX_PATH = "/api/v1/agent/inbox"
@@ -807,7 +831,9 @@ def http(method, path, key=None, body=None, form=None, timeout=40, accept="appli
     if not path.startswith("/"):
         path = "/" + path
     url = ORIGIN + path
-    headers = {"Accept": accept, "User-Agent": "datastash-claude-code-plugin/0.2"}
+    headers = {"Accept": accept, "User-Agent": USER_AGENT}
+    if PLUGIN_VERSION:
+        headers[VERSION_HEADER] = PLUGIN_VERSION
     data = None
     if form is not None:
         data = urllib.parse.urlencode(form).encode()
@@ -2628,9 +2654,16 @@ def cmd_check(_args):
     """SessionStart: counts only. Prints nothing when no agent is linked to this folder."""
     inp = hook_input()
     hook_heartbeat("check", inp)
+    try:  # XLI-390 P2: "datastash updated to vX", once, at the first start of a newer version
+        upd = updated_line()
+    except Exception:  # noqa: BLE001
+        upd = None
     if off_here(inp):
         # XLI-328: a folder the person left off: no sign-in, no count, no enroll; nothing is sent from here
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": OFF_CHECK_LINE}}))
+        out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": OFF_CHECK_LINE}}
+        if upd:
+            out["systemMessage"] = upd
+        print(json.dumps(out))
         return 0
     # The sign-in runs beside the rest, so its network call and the inbox count's share one wait (the hook has 10 s).
     signin = {}
@@ -2650,6 +2683,7 @@ def cmd_check(_args):
         if ai:
             ctx = ai + (" " + ctx if ctx else "")
         out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx.strip()}}
+        person = " ".join(x for x in (upd, person) if x)
         if person:
             out["systemMessage"] = person
         print(json.dumps(out))
@@ -10647,6 +10681,172 @@ def cmd_fingerprint(args):
     return 0
 
 
+# ------------------------------------------------------------------ self-update (XLI-390 P2, owner 11-23)
+# Claude Code's own marketplace auto-update is off for a third-party marketplace like ours, and only the person (/plugin,
+# Marketplaces) or an admin's managed settings can turn it on; marketplace.json has no field for it. So the plugin asks
+# Claude Code itself: at most once a day, in the background at session start, when the plugin repo has a release tag
+# (vX.Y.Z; never a branch head) newer than this copy, it runs `claude plugin marketplace update datastash`, checks that
+# the refreshed catalog pins exactly that tag's commit, and only then `claude plugin update datastash@datastash`. No file
+# of Claude Code's or of the plugin is written by hand; no person step. The new version loads at the next start, which
+# says UPDATED_LINE once. Failures are logged, never shown, never a block.
+RELEASE_REPO = "https://github.com/xlsx-for-ai-dev/datastash-claude-code.git"
+MARKETPLACE_NAME = "datastash"
+PLUGIN_ID = "datastash@datastash"
+SELF_UPDATE_EVERY = 24 * 3600
+SELF_UPDATE_FILE = os.path.join(STATE, "self-update.json")  # last check time and result (no secret)
+VERSION_SEEN_FILE = os.path.join(STATE, "version-seen.json")  # the version the last session start ran
+UPDATED_LINE = "datastash updated to v{version}"
+RELEASE_TAG_RE = re.compile(r"([0-9a-f]{40})\trefs/tags/v(\d{1,4}\.\d{1,4}\.\d{1,4})(\^\{\})?")
+CLAUDE_RUN_SECONDS = 300
+
+
+def newest_release(ls_remote):
+    """(version, commit) of the newest vX.Y.Z tag in `git ls-remote --tags` output, the commit peeled for an annotated
+    tag; None when there is none. Branch heads and any other ref never count."""
+    tags = {}
+    for line in (ls_remote or "").splitlines():
+        m = RELEASE_TAG_RE.fullmatch(line.strip())
+        if m:
+            sha, v, peeled = m.groups()
+            if peeled or v not in tags:
+                tags[v] = sha
+    if not tags:
+        return None
+    v = max(tags, key=version_tuple)
+    return v, tags[v]
+
+
+def catalog_pin(catalog):
+    """(ref, sha) the marketplace catalog's datastash entry is pinned to, or None (a relative path, a moving branch)."""
+    try:
+        entry = next(p for p in catalog["plugins"] if p.get("name") == "datastash")
+        src = entry["source"]
+        sha, ref = src.get("sha"), src.get("ref")
+    except (KeyError, TypeError, AttributeError, StopIteration):
+        return None
+    if src.get("source") not in ("git-subdir", "github", "url") or not re.fullmatch(r"[0-9a-f]{40}", str(sha)):
+        return None
+    return ref, sha
+
+
+def installed_from_marketplace(root=None):
+    """True for a copy Claude Code installed from the datastash marketplace (its cache folder); a --plugin-dir or local
+    development copy never updates itself."""
+    root = os.path.realpath(root or os.environ.get("CLAUDE_PLUGIN_ROOT") or PLUGIN_ROOT)
+    return root.split(os.sep)[-4:-1] == ["cache", MARKETPLACE_NAME, "datastash"]  # <plugins>/cache/<market>/<plugin>/<v>
+
+
+def marketplace_catalog(root=None):
+    """Claude Code's own copy of the datastash catalog (read only), or None. Its plugins folder is the one this copy was
+    installed in (<plugins>/cache/datastash/datastash/<version>)."""
+    root = os.path.realpath(root or os.environ.get("CLAUDE_PLUGIN_ROOT") or PLUGIN_ROOT)
+    plugins = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(root))))
+    known = read_json(os.path.join(plugins, "known_marketplaces.json"), {}).get(MARKETPLACE_NAME)
+    where = known.get("installLocation") if isinstance(known, dict) else None
+    where = where if isinstance(where, str) and where else os.path.join(plugins, "marketplaces", MARKETPLACE_NAME)
+    return read_json(os.path.join(where, ".claude-plugin", "marketplace.json"), None)
+
+
+def _ls_remote(repo=RELEASE_REPO):
+    """The release repo's tags (`git ls-remote --tags`), or None. Never prompts (no terminal, no askpass)."""
+    if os.environ.get("DATASTASH_NO_NETWORK") == "1" and "://" in repo:
+        return None
+    git = shutil.which("git")
+    if not git:
+        return None
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="", SSH_ASKPASS="")
+    try:
+        r = subprocess.run([git, "ls-remote", "--tags", repo], capture_output=True, text=True, timeout=60, env=env,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _run_claude(args):
+    """Claude Code's own plugin command; its exit code (127 when there is no `claude` on PATH)."""
+    claude = shutil.which("claude")
+    if not claude:
+        return 127
+    try:
+        return subprocess.run([claude] + args, capture_output=True, timeout=CLAUDE_RUN_SECONDS,
+                              stdin=subprocess.DEVNULL).returncode
+    except (OSError, subprocess.SubprocessError):
+        return 1
+
+
+def self_update(now=None):
+    """One self-update pass; returns what happened (one word, also recorded). At most once a day."""
+    now = time.time() if now is None else now
+    st = read_json(SELF_UPDATE_FILE, {})
+    last = st.get("checked_at")
+    if isinstance(last, (int, float)) and 0 <= now - last < SELF_UPDATE_EVERY:
+        return "recent"
+    if not installed_from_marketplace():
+        return "not-installed"
+
+    def done(result, **extra):
+        st.update(checked_at=now, result=result, **extra)
+        try:
+            ensure_dirs()
+            write_private(SELF_UPDATE_FILE, json.dumps(st))
+        except OSError:
+            pass
+        return result
+    done("checking")  # the day's check counts from its start, so a failing check is not retried at every start
+    cur = version_tuple(PLUGIN_VERSION)
+    if cur is None:
+        return done("no-version")
+    rel = newest_release(_ls_remote())
+    if rel is None:
+        return done("no-release")
+    version, commit = rel
+    if version_tuple(version) <= cur:
+        return done("current")
+    if _run_claude(["plugin", "marketplace", "update", MARKETPLACE_NAME]) != 0:
+        return done("marketplace-failed")
+    if catalog_pin(marketplace_catalog()) != ("v" + version, commit):
+        return done("pin-mismatch")  # the catalog does not name that reviewed tag's commit: leave it
+    if _run_claude(["plugin", "update", PLUGIN_ID]) != 0:
+        return done("update-failed")
+    return done("updated", updated_to=version)
+
+
+def updated_line():
+    """At session start: UPDATED_LINE once, when this copy is newer than the one the last session start ran."""
+    cur = PLUGIN_VERSION
+    if version_tuple(cur) is None:
+        return None
+    seen = read_json(VERSION_SEEN_FILE, {}).get("version")
+    if seen == cur:
+        return None
+    try:
+        ensure_dirs()
+        write_private(VERSION_SEEN_FILE, json.dumps({"version": cur}))
+    except OSError:
+        return None  # not recorded: say nothing rather than say it at every start
+    old = version_tuple(seen)
+    return UPDATED_LINE.format(version=cur) if old is not None and version_tuple(cur) > old else None
+
+
+def cmd_self_update(_args):
+    """SessionStart hook (async): one self_update pass under a lock; prints nothing, always exits 0."""
+    hook_input()
+    lock = None
+    try:
+        ensure_dirs()
+        lock = os.open(os.path.join(STATE, "self-update.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another session is checking: leave it to that one
+        self_update()  # its result is recorded in SELF_UPDATE_FILE
+    except Exception:  # noqa: BLE001  never a failed hook
+        pass
+    finally:
+        if lock is not None:
+            os.close(lock)
+    return 0
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     args = sys.argv[2:]
@@ -10658,7 +10858,7 @@ def main():
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
-             "fingerprint": cmd_fingerprint}
+             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

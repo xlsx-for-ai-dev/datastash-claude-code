@@ -41,6 +41,13 @@ What it adds:
 - **Hooks**: an inbox count at session start, a background inbox listener that wakes the session when messages
   arrive, and a prompt hook that sees the person type "datastash main".
 
+- **Updates itself** (1.0): at most once a day, in the background at session start, the plugin looks for a newer
+  release tag (`vX.Y.Z`; never a branch head) and, when Claude Code's refreshed copy of this marketplace pins exactly
+  that tag's commit, runs Claude Code's own `claude plugin update datastash@datastash`. The next session start says
+  "datastash updated to vX" once. Every call to datastash names the plugin's version (`X-Datastash-Plugin-Version`
+  and the User-Agent). Releases: `tools/release-gate` tags, pins and approves main only at commits with a recorded
+  independent review PASS.
+
 Requires `python3` (3.8 or later, standard library only) and Claude Code with plugin hooks.
 
 ## Install
