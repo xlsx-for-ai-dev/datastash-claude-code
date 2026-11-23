@@ -44,6 +44,11 @@ Subcommands (run `datastash help`):
                             as all its files, and the repo's HEAD commit; --url URL or --lookup KEY hash what you pipe in
                             on stdin (a page you read, an outside lookup's answer, under a stable key). Fingerprints
                             only, never file text; computed here, nothing sent
+  ci-report <junit.xml ...> --repo R --sha S --branch B --run-url U
+                            a CI step: per-test results into the agent workbook's tests tabs (ledger_feeds_setup
+                            "tests"), with flaky and main-broke bookkeeping. Agent key in DATASTASH_AGENT_KEY, workbook id
+                            in DATASTASH_WORKBOOK_ID. Only ids, counts, times, the error class and a hash of the first
+                            message line are sent, never message text. Always exits 0 (never fails a build)
   off NAME                  turn NAME's folders off on this computer (no datastash calls from them), switch it off on
                             datastash with its own key, and move its key file to ~/.config/datastash/off/
   watch                     print one line each time new messages arrive (for a Monitor loop)
@@ -11626,6 +11631,526 @@ def agent_removed(agent, key):
     return REMOVED_HERE_LINE
 
 
+# --- XLI-378 B: datastash ci-report, per-test results from CI into the "tests" preset (ledger_feeds_setup services
+# ["tests"]: Tests, Test failures, Test weeks), plus the "Test runs" tab this command keeps for flaky bookkeeping.
+#
+# Privacy (plan section 2): the JUnit XML is parsed here, in CI, with the standard library's expat parser and no DTD
+# (a DOCTYPE or an entity declaration is refused before it is read, so no entity expansion, billion laughs or external
+# fetch). Only allow-listed fields leave CI: test ids and file paths (as the runner names them), counts, times, the error
+# class and a sha256 of the first message line with numbers and hex ids stripped. Failure messages, stack traces,
+# stdout and stderr are read only to take that hash and are never sent or printed.
+#
+# Flaky, order-independent (card A review, cycle 2): one rule on both sides: a test is flaky on a commit when one report
+# passed it and another (or the same, a retry) failed it. Every report first records its outcome on the commit (its
+# failure rows, and its "Test runs" rows: the hash of the tests it ran, the ids it failed and a short hash of each test it
+# passed), and only then reads the commit's failure rows and Test runs rows. Writes to one workbook are serialized, so of
+# two reports on one commit the later one always sees the earlier: a pass sees the failure row; a failure sees the pass
+# hash, whatever tests each job ran. When both run at once both see it; the first to move the failure row's passes from
+# 0 (save only if unchanged) adds flaky_commits once. A --local run (uncommitted edits) never writes or reads these.
+#
+# A reporting problem never fails the build: the command prints one line and exits 0. A brake (429) or busy answer is
+# waited out (Retry-After), up to DATASTASH_CI_WAIT_SECONDS in all (a bad value: the default); each page is sent with an
+# idempotency key, so a retry never counts twice. A server that does not answer is given CI_CALL_SECONDS a call and
+# CI_HANG_SECONDS in all.
+CI_USAGE = ("usage: datastash ci-report <junit.xml ...> --repo OWNER/NAME --sha SHA --branch BRANCH --run-url URL "
+            "[--job NAME] [--default-branch main] [--workbook ID] [--local]  (agent key in DATASTASH_AGENT_KEY, "
+            "workbook id in DATASTASH_WORKBOOK_ID or --workbook)")
+CI_TESTS, CI_FAILURES, CI_WEEKS, CI_RUNS = "Tests", "Test failures", "Test weeks", "Test runs"
+CI_PAGE = 1000  # rows per upsert or read (a transport detail, not a cap)
+
+
+def _ci_env_seconds(name, default):
+    """A positive number of seconds from the environment; anything else (empty, text, nan, 0 or less) is the default."""
+    try:
+        v = float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) and v > 0 else default
+
+
+CI_WAIT_SECONDS = _ci_env_seconds("DATASTASH_CI_WAIT_SECONDS", 900.0)
+CI_CALL_SECONDS = 60.0  # the longest one call may go unanswered
+CI_HANG_SECONDS = 180.0  # unanswered calls (timeouts, network errors) in all, before the report stops
+CI_RETRIES = 4  # tries for a network or server error that is not a brake
+CI_RETRY_SECONDS = float(os.environ.get("DATASTASH_CI_RETRY_SECONDS", "2"))
+CI_IDS_CHARS = 60_000  # failed ids listed on a Test runs row; past it the row says the list is not complete
+CI_PASS_HASH = 12  # hex characters of sha256(test id) listed per passed test, CI_IDS_CHARS per Test runs row
+CI_RUNS_KEEP_DAYS = 14  # Test runs rows are needed only while a commit's jobs report; older ones are removed
+CI_CAS_TRIES = 6
+CI_READ_CHUNK = 1 << 16
+CI_REPO_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+")
+CI_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+CI_WB_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+CI_CLASS_RE = re.compile(r"[A-Za-z_$][\w$.]*")
+CI_HASH_STRIP = [re.compile(p) for p in (
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",  # uuids
+    r"0[xX][0-9a-fA-F]+",  # 0x... addresses
+    r"\b(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{6,}\b",  # hex ids (shas, object ids)
+    r"\d+",  # numbers
+)]
+
+
+class CiProblem(Exception):
+    """A reporting problem: its one plain line is printed and the command exits 0."""
+
+
+class _CiWait(Exception):
+    def __init__(self, seconds):
+        super().__init__("wait")
+        self.seconds = seconds
+
+
+def ci_clean(s, n=1000):
+    """Text as a field: control characters to spaces, trimmed, at most n characters."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(s or "")).strip()[:n]
+
+
+def ci_error_hash(first_line):
+    """sha256 of the first message line with uuids, hex ids and numbers stripped, so one failure groups across runs."""
+    t = first_line or ""
+    for rx in CI_HASH_STRIP:
+        t = rx.sub("#", t)
+    return hashlib.sha256(re.sub(r"\s+", " ", t).strip().encode("utf-8", "replace")).hexdigest()
+
+
+def ci_error_class(typ, tag):
+    """The error class from a failure's type attribute (AssertionError, pytest.fail.Exception), never more."""
+    m = CI_CLASS_RE.match((typ or "").strip())
+    v = m.group(0).rstrip(".")[:100] if m else ""
+    return v or ("Error" if tag == "error" else "Failure")
+
+
+def ci_test_id(file, classname, name):
+    parts = []
+    for p in (file, classname, name):
+        p = ci_clean(p, 400)
+        if p and p not in parts:
+            parts.append(p)
+    return " > ".join(parts)[:1000]
+
+
+def ci_parse(paths):
+    """{test id: {file, runs, passes, fails, skips, ms, error_class, error_hash}} from JUnit XML files, read in chunks
+    with expat and no DTD. Raises CiProblem with a plain reason."""
+    import xml.parsers.expat as expat
+    tests = {}
+    for path in paths:
+        stack, case, fail = [], None, None
+
+        def refuse(*_a):
+            raise CiProblem(f"{os.path.basename(path)}: a DOCTYPE or entity declaration is refused (JUnit needs none)")
+
+        def start(tag, attrs):
+            nonlocal case, fail
+            if tag == "testsuite":
+                stack.append(attrs.get("file") or "")
+            elif tag == "testcase":
+                cls = attrs.get("classname") or ""
+                f = attrs.get("file") or next((x for x in reversed(stack) if x), "") or cls
+                try:
+                    ms = max(0, int(round(float(attrs.get("time") or 0) * 1000)))
+                except (TypeError, ValueError, OverflowError):
+                    ms = 0
+                case = {"id": ci_test_id(attrs.get("file") or "", cls, attrs.get("name") or ""), "file": ci_clean(f, 400),
+                        "ms": ms if ms < 10 ** 12 else 0, "outcome": "pass"}
+            elif case is not None and tag in ("failure", "error"):
+                if case["outcome"] != "fail":
+                    case["outcome"] = "fail"
+                    case["class"] = ci_error_class(attrs.get("type"), tag)
+                    msg = (attrs.get("message") or "").strip()
+                    case["line"] = msg.splitlines()[0] if msg else None
+                    fail = [] if case["line"] is None else None  # no message attribute: the text's first line
+            elif case is not None and tag == "skipped" and case["outcome"] == "pass":
+                case["outcome"] = "skip"
+
+        def text(data):
+            if fail is not None and sum(len(x) for x in fail) < 4096:
+                fail.append(data)
+
+        def end(tag):
+            nonlocal case, fail
+            if tag == "testsuite" and stack:
+                stack.pop()
+            elif tag in ("failure", "error") and fail is not None and case is not None:
+                lines = [x.strip() for x in "".join(fail).splitlines() if x.strip()]
+                case["line"], fail = (lines[0] if lines else ""), None
+            elif tag == "testcase" and case is not None:
+                c, case = case, None
+                if not c["id"]:
+                    return
+                t = tests.setdefault(c["id"], {"file": c["file"] or "(none)", "runs": 0, "passes": 0, "fails": 0,
+                                               "skips": 0, "ms": 0})
+                t["runs"] += 1
+                if c["outcome"] != "skip":
+                    t["ms"] += c["ms"]
+                t[{"pass": "passes", "fail": "fails", "skip": "skips"}[c["outcome"]]] += 1
+                if c["outcome"] == "fail" and "error_class" not in t:
+                    t["error_class"], t["error_hash"] = c["class"], ci_error_hash(c.get("line") or "")
+
+        p = expat.ParserCreate()
+        p.StartDoctypeDeclHandler = refuse
+        p.EntityDeclHandler = refuse
+        p.UnparsedEntityDeclHandler = refuse
+        p.ExternalEntityRefHandler = refuse
+        p.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+        p.StartElementHandler, p.EndElementHandler, p.CharacterDataHandler = start, end, text
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    b = f.read(CI_READ_CHUNK)
+                    p.Parse(b, not b)
+                    if not b:
+                        break
+        except OSError as e:
+            raise CiProblem(f"{os.path.basename(path)}: can't be read ({e.strerror or e})")
+        except expat.ExpatError as e:
+            raise CiProblem(f"{os.path.basename(path)}: not JUnit XML ({expat.ErrorString(e.code)}, line {e.lineno})")
+    return tests
+
+
+def ci_iso_week(now):
+    """The ISO week of a unix time, as 2026-W48 (UTC)."""
+    import datetime
+    y, w, _d = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isocalendar()[:3]
+    return f"{y}-W{w:02d}"
+
+
+def ci_instant(v):
+    """A stored ISO time as a unix time, or None."""
+    import datetime
+    try:
+        return datetime.datetime.fromisoformat(str(v).strip().replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+class CiClient:
+    """The datastash calls of one report, on the agent key: batch upserts and reads on the MCP door, the one-row save
+    only if unchanged on REST. Brakes and busy answers are waited out (until the deadline); other errors raise CiProblem."""
+
+    sleep = staticmethod(time.sleep)  # its own name, so a test can watch this client's waits alone
+
+    def __init__(self, key, workbook, deadline):
+        self.key, self.wb, self.deadline = key, workbook, deadline
+        self.hang_left = CI_HANG_SECONDS
+
+    def _call(self, what, fn):
+        """fn(timeout): one call, given at most CI_CALL_SECONDS, the time left before the deadline and the hang budget."""
+        tries = 0
+        while True:
+            timeout = min(CI_CALL_SECONDS, self.deadline - time.time(), self.hang_left)
+            if timeout <= 0:
+                raise CiProblem(f"{what}: datastash did not answer in time; this report was not finished")
+            began = time.time()
+            try:
+                return fn(max(0.1, timeout))
+            except _CiWait as w:
+                wait = max(1.0, float(w.seconds or 5))
+            except ApiError as e:
+                if e.status == 429:
+                    wait = float(e.retry_after or 5)
+                elif e.status in (401, 403):
+                    raise CiProblem(f"{what}: the agent key was refused (HTTP {e.status}); check the CI secret")
+                elif e.status >= 500 and tries < CI_RETRIES:
+                    tries += 1
+                    wait = CI_RETRY_SECONDS * tries
+                else:
+                    raise CiProblem(f"{what}: datastash answered HTTP {e.status} {ci_clean(e.body.get('code') or e.body.get('error'), 60)}".rstrip())
+            except (OSError, ValueError, httpclient.HTTPException) as e:
+                self.hang_left -= time.time() - began
+                if self.hang_left <= 0:
+                    raise CiProblem(f"{what}: datastash did not answer in {int(CI_HANG_SECONDS)} s; this report was not finished")
+                if tries >= CI_RETRIES:
+                    raise CiProblem(f"{what}: datastash can't be reached ({ci_clean(e, 120)})")
+                tries += 1
+                wait = CI_RETRY_SECONDS * tries
+            if time.time() + wait > self.deadline:
+                raise CiProblem(f"{what}: still slowed down after {int(CI_WAIT_SECONDS)} s; this report was not finished")
+            self.sleep(wait)
+
+    def tool(self, name, args, what, missing_ok=False):
+        """One MCP tool call. A read of a tab that is not there yet (missing_ok) answers None; a write never does."""
+        def once(timeout):
+            is_err, body = mcp_tool(self.key, name, args, timeout=timeout)
+            if is_err:
+                code = str(body.get("code") or body.get("error") or "")
+                ra = body.get("retry_after_seconds")
+                if isinstance(ra, (int, float)) and ra > 0 or code in ("busy", "rate_limited", "agent_slowed_down"):
+                    raise _CiWait(ra if isinstance(ra, (int, float)) else 3)
+                if code == "not_found" and missing_ok:
+                    return None
+                raise CiProblem(f"{what}: {ci_clean(body.get('message') or code or 'refused', 200)}")
+            return body
+        return self._call(what, once)
+
+    def upsert(self, tab, rows, tag):
+        """rows in pages of CI_PAGE, each with its own idempotency key (a retry never counts twice)."""
+        for i in range(0, len(rows), CI_PAGE):
+            self.tool("ledger_rows_upsert", {"workbook_id": self.wb, "tab": tab, "rows": rows[i:i + CI_PAGE], "key": "key",
+                                             "idempotency_key": f"{tag}-{i // CI_PAGE}"}, f"writing {tab}")
+
+    def filter(self, tab, where, order=None, pages=None):
+        out, cursor, n = [], None, 0
+        while True:
+            args = {"workbook_id": self.wb, "tab": tab, "where": where, "limit": CI_PAGE}
+            if order:
+                args["order"] = order
+            if cursor:
+                args["cursor"] = cursor
+            body = self.tool("ledger_rows_filter", args, f"reading {tab}", missing_ok=True)
+            if body is None:
+                return out
+            out += [r for r in body.get("rows") or [] if isinstance(r, dict)]
+            cursor, n = body.get("cursor"), n + 1
+            if not cursor or (pages and n >= pages):
+                return out
+
+    def get(self, tab, keys):
+        out = {}
+        for i in range(0, len(keys), CI_PAGE):
+            body = self.tool("ledger_rows_get", {"workbook_id": self.wb, "tab": tab, "keys": keys[i:i + CI_PAGE]},
+                             f"reading {tab}", missing_ok=True)
+            for r in (body or {}).get("rows") or []:
+                if isinstance(r, dict) and isinstance(r.get("key"), str):
+                    out[r["key"]] = r
+        return out
+
+    def first_pass(self, key):
+        """Move the failure row's passes from 0 to 1, saved only if unchanged (if_version). True when this call did it
+        (the caller then adds flaky_commits once); False when passes was already set by another report."""
+        q = urllib.parse.urlencode({"workbook_id": self.wb, "tab": CI_FAILURES, "key": key}, quote_via=urllib.parse.quote)
+        for _ in range(CI_CAS_TRIES):
+            row = self._call("reading Test failures", lambda t: api_json("GET", ROWS_PATH + "/key?" + q, self.key, timeout=t))
+            if _ci_num((row.get("cells") or {}).get("passes")) > 0:
+                return False
+            body = {"workbook_id": self.wb, "tab": CI_FAILURES, "key": "key", "row": {"key": key, "passes": 1},
+                    "if_version": row.get("row_version")}
+
+            def save(timeout):
+                try:
+                    api_json("POST", ROWS_PATH, self.key, body=body, timeout=timeout)
+                    return True
+                except ApiError as e:
+                    if e.status == 409:
+                        return False  # another report moved the row since it was read: read it again
+                    raise
+            if self._call("writing Test failures", save):
+                return True
+        raise CiProblem("writing Test failures: the row kept changing; flaky not recorded this time")
+
+
+def _ci_num(v):
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ci_ids_text(ids):
+    """The failed ids for a Test runs row (one per line) and whether the list is complete."""
+    out, n = [], 0
+    for t in ids:
+        n += len(t) + 1
+        if n > CI_IDS_CHARS:
+            return "\n".join(out), False
+        out.append(t)
+    return "\n".join(out), True
+
+
+def ci_pass_hash(t):
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()[:CI_PASS_HASH]
+
+
+def ci_report(paths, repo, sha, branch, run_url, job, default_branch, key, wb, on_main=None, now=None, local=False):
+    """Send one CI report. Returns a summary dict; raises CiProblem with a plain reason. local: a run on this computer
+    (maybe on uncommitted edits): never main's state and never the commit's flaky bookkeeping (Test failures, Test runs)."""
+    now = time.time() if now is None else now
+    tests = ci_parse(paths)
+    if not tests:
+        raise CiProblem("no test cases in " + ", ".join(os.path.basename(p) for p in paths))
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
+    week, base_week = ci_iso_week(now), ci_iso_week(now - 28 * 86400)
+    on_main = False if local else ((branch == default_branch) if on_main is None else on_main)
+    client = CiClient(key, wb, time.time() + CI_WAIT_SECONDS)
+    tag = "ci-report-" + secrets.token_hex(8)
+    failed = sorted(t for t, v in tests.items() if v["fails"])
+    passed = sorted(t for t, v in tests.items() if v["passes"])
+    executed = sorted(t for t, v in tests.items() if v["passes"] or v["fails"])
+    tkey = lambda t: f"{repo} / {t}"  # noqa: E731
+    fkey = lambda t: f"{repo} / {sha} / {t}"  # noqa: E731
+
+    # 1. This report's outcome on the commit, before anything is read: its failure rows and its Test runs rows (the
+    # first holds the failed ids; each holds up to CI_IDS_CHARS of passed-test hashes). Never for a --local run.
+    set_hash = hashlib.sha256("\n".join(executed).encode("utf-8")).hexdigest()
+    ids, complete = _ci_ids_text(failed)
+    run_key = f"{repo} / {sha} / {set_hash[:16]} / {hashlib.sha256(ids.encode('utf-8')).hexdigest()[:16]}"
+    if not local:
+        client.upsert(CI_FAILURES, [{
+            "key": fkey(t), "repo": repo, "sha": sha, "test": t, "branch": branch, "run_url": run_url,
+            "error_class": tests[t]["error_class"], "error_hash": tests[t]["error_hash"], "fails": {"inc": tests[t]["fails"]},
+        } for t in failed], tag + "-f")
+        per = CI_IDS_CHARS // (CI_PASS_HASH + 1)
+        hashes = sorted({ci_pass_hash(t) for t in passed})
+        parts = [hashes[i:i + per] for i in range(0, len(hashes), per)] or [[]]
+        runs = [{
+            "key": run_key, "repo": repo, "sha": sha, "branch": branch, "job": job, "set_hash": set_hash,
+            "tests": len(executed), "failed_count": len(failed), "failed_ids": ids, "failed_listed": complete,
+            "passed_hashes": "\n".join(parts[0]), "parts": len(parts),
+            "reports": {"inc": 1}, "first_seen": {"min": iso}, "last_seen": {"max": iso},
+        }]
+        runs += [{"key": f"{run_key} / {i}", "repo": repo, "sha": sha, "job": job, "set_hash": set_hash, "part": i,
+                  "passed_hashes": "\n".join(part), "first_seen": {"min": iso}, "last_seen": {"max": iso}}
+                 for i, part in enumerate(parts[1:], 1)]
+        client.upsert(CI_RUNS, runs, tag + "-r")
+
+    # 2. Reads that must come before the Tests rows move: main's last outcome, and each file's week four weeks back.
+    broke = set()
+    if on_main and failed:
+        prev = client.get(CI_TESTS, [tkey(t) for t in failed])
+        broke = {t for t in failed if str((prev.get(tkey(t)) or {}).get("main_outcome") or "") == "pass"}
+    files = {}
+    for t, v in tests.items():
+        f = files.setdefault(v["file"], {"runs": 0, "fails": 0, "ms": 0})
+        f["runs"] += v["passes"] + v["fails"]
+        f["fails"] += v["fails"]
+        f["ms"] += v["ms"]
+    base = client.get(CI_WEEKS, [f"{repo} / {f} / {base_week}" for f in sorted(files)])
+
+    # 3. One Tests row per test, one Test weeks row per file, folded with ops.
+    rows = []
+    for t, v in sorted(tests.items()):
+        ran = v["passes"] + v["fails"]
+        outcome = "fail" if v["fails"] else ("pass" if v["passes"] else "skip")
+        r = {"key": tkey(t), "repo": repo, "test": t, "file": v["file"], "runs": {"inc": ran}, "fails": {"inc": v["fails"]},
+             "skips": {"inc": v["skips"]}, "ms_sum": {"inc": v["ms"]}, "last_outcome": outcome, "last_sha": sha,
+             "first_seen": {"min": iso}, "last_seen": {"max": iso}}
+        if ran:
+            r["last_ms"] = v["ms"] // ran
+        if on_main and ran:
+            r["main_outcome"], r["main_sha"] = outcome, sha
+        if t in broke:
+            r["main_broke_at"] = sha
+        rows.append(r)
+    client.upsert(CI_TESTS, rows, tag + "-t")
+    wrows = []
+    for f, v in sorted(files.items()):
+        r = {"key": f"{repo} / {f} / {week}", "repo": repo, "file": f, "week": week, "runs": {"inc": v["runs"]},
+             "fails": {"inc": v["fails"]}, "ms_sum": {"inc": v["ms"]}}
+        b = base.get(f"{repo} / {f} / {base_week}") or {}
+        avg = _ci_num(b.get("avg_ms")) or (_ci_num(b.get("ms_sum")) / _ci_num(b.get("runs")) if _ci_num(b.get("runs")) else 0)
+        if avg > 0:
+            r["base_avg_ms"] = round(avg, 3)
+        wrows.append(r)
+    client.upsert(CI_WEEKS, wrows, tag + "-w")
+
+    if local:
+        return {"tests": len(tests), "files": len(files), "failed": len(failed), "flaky": [], "new_flaky": [],
+                "broke": []}
+
+    # 4. Flaky, order-independent: read the commit's failures and runs only now, after this report's own writes. One
+    # rule whichever report comes first and whatever tests each ran: a recorded pass and a recorded failure.
+    here = {"and": [{"eq": ["repo", repo]}, {"eq": ["sha", sha]}]}
+    failed_here = {str(r.get("test")) for r in client.filter(CI_FAILURES, here) if _ci_num(r.get("fails")) > 0}
+    flaky = {t for t in passed if t in failed_here}  # it failed in another job or run on this commit
+    flaky |= {t for t in failed if tests[t]["passes"]}  # failed and passed in this report (a retry)
+    passed_there = set()
+    for r in client.filter(CI_RUNS, here):
+        k = str(r.get("key") or "")
+        if k == run_key or k.startswith(run_key + " / "):
+            continue  # this report's own rows (or a report with the same outcome)
+        passed_there |= set(str(r.get("passed_hashes") or "").split("\n"))
+    flaky |= {t for t in failed if ci_pass_hash(t) in passed_there}  # it passed in another job or run on this commit
+    new, more = [], []
+    for t in sorted(flaky):
+        if client.first_pass(fkey(t)):
+            new.append(t)
+        elif tests[t]["passes"]:
+            more.append({"key": fkey(t), "passes": {"inc": tests[t]["passes"]}})
+    client.upsert(CI_FAILURES, more, tag + "-p")
+    client.upsert(CI_TESTS, [{"key": tkey(t), "flaky_commits": {"inc": 1}} for t in new], tag + "-k")
+
+    # 5. Test runs rows are needed only while a commit's jobs report: remove this repo's rows past CI_RUNS_KEEP_DAYS.
+    cutoff = now - CI_RUNS_KEEP_DAYS * 86400
+    old = [r["key"] for r in client.filter(CI_RUNS, {"eq": ["repo", repo]}, order=[{"column": "last_seen", "dir": "asc"}],
+                                           pages=1)
+           if isinstance(r.get("key"), str) and (ci_instant(r.get("last_seen")) or now) < cutoff]
+    if old:
+        client.tool("ledger_rows_delete", {"workbook_id": wb, "tab": CI_RUNS, "keys": old}, "tidying Test runs")
+    return {"tests": len(tests), "files": len(files), "failed": len(failed), "flaky": sorted(flaky), "new_flaky": new,
+            "broke": sorted(broke)}
+
+
+def _ci_args(args):
+    opts = {"paths": [], "repo": None, "sha": None, "branch": None, "run_url": None, "job": os.environ.get("GITHUB_JOB", ""),
+            "default_branch": "main", "workbook": os.environ.get("DATASTASH_WORKBOOK_ID", ""), "local": False}
+    flags = {"--repo": "repo", "--sha": "sha", "--branch": "branch", "--run-url": "run_url", "--job": "job",
+             "--default-branch": "default_branch", "--workbook": "workbook"}
+    it = iter(args)
+    for a in it:
+        if a in flags:
+            v = next(it, None)
+            if v is None:
+                raise CiProblem(f"{a} needs a value. {CI_USAGE}")
+            opts[flags[a]] = v
+        elif a == "--local":
+            opts["local"] = True
+        elif a.startswith("--"):
+            raise CiProblem(f"unknown option {ci_clean(a, 40)}. {CI_USAGE}")
+        else:
+            opts["paths"].append(a)
+    if opts["local"]:  # a run on this computer: the repo, commit and branch from git; never the default branch's state
+        top = _fp_git(os.getcwd(), "rev-parse", "--show-toplevel")
+        if top:
+            opts["repo"] = opts["repo"] or _fp_repo(top)
+            opts["sha"] = opts["sha"] or _fp_git(top, "rev-parse", "--verify", "-q", "HEAD")
+            opts["branch"] = opts["branch"] or _fp_git(top, "rev-parse", "--abbrev-ref", "HEAD")
+        opts["run_url"] = opts["run_url"] or ""
+    if not opts["paths"]:
+        raise CiProblem("name the JUnit XML file(s). " + CI_USAGE)
+    for k in ("repo", "sha", "branch", "run_url"):
+        if opts[k] is None or (k != "run_url" and not str(opts[k]).strip()):
+            raise CiProblem(f"--{k.replace('_', '-')} is missing. {CI_USAGE}")
+    if not CI_REPO_RE.fullmatch(opts["repo"].strip()):
+        raise CiProblem("--repo takes owner/name")
+    if not CI_SHA_RE.fullmatch(opts["sha"].strip()):
+        raise CiProblem("--sha takes the commit's hex id")
+    if opts["run_url"]:
+        u = urllib.parse.urlsplit(opts["run_url"].strip())
+        if u.scheme != "https" or not u.hostname or u.username is not None or u.password is not None:
+            raise CiProblem("--run-url takes an https address with no user or password in it")
+    if not CI_WB_RE.fullmatch(opts["workbook"].strip()):
+        raise CiProblem("set DATASTASH_WORKBOOK_ID (or --workbook) to the agent workbook's id")
+    return {"paths": opts["paths"], "repo": opts["repo"].strip(), "sha": opts["sha"].strip().lower(),
+            "branch": ci_clean(opts["branch"], 200), "run_url": opts["run_url"].strip(), "job": ci_clean(opts["job"], 200),
+            "default_branch": ci_clean(opts["default_branch"], 200), "wb": opts["workbook"].strip().lower(),
+            "local": opts["local"]}
+
+
+def cmd_ci_report(args):
+    """datastash ci-report: always exits 0 (a reporting problem never fails a build); prints one line."""
+    if any(a in ("-h", "--help") for a in args):
+        print(CI_USAGE)
+        return 0
+    try:
+        o = _ci_args(args)
+        key = os.environ.get("DATASTASH_AGENT_KEY", "").strip()
+        if not re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key):
+            raise CiProblem("set DATASTASH_AGENT_KEY (a CI secret) to the agent's key (ldgr_ag_...)")
+        s = ci_report(o["paths"], o["repo"], o["sha"], o["branch"], o["run_url"], o["job"], o["default_branch"], key,
+                      o["wb"], local=o["local"])
+        extra = (f", flaky on this commit: {len(s['flaky'])}" if s["flaky"] else "") + \
+                (f", main broke: {len(s['broke'])}" if s["broke"] else "")
+        print(f"datastash ci-report: {s['tests']} tests from {s['files']} files sent for {o['repo']} "
+              f"{o['sha'][:12]} ({s['failed']} failed{extra})")
+    except CiProblem as e:
+        print(f"datastash ci-report: not sent: {ci_clean(e, 300)}")
+    except SystemExit:
+        print("datastash ci-report: not sent: stopped")
+    except Exception as e:  # noqa: BLE001 a reporting problem must never fail the build
+        print(f"datastash ci-report: not sent: unexpected {type(e).__name__}")
+    return 0
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     args = sys.argv[2:]
@@ -11637,7 +12162,7 @@ def main():
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
-             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update}
+             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
