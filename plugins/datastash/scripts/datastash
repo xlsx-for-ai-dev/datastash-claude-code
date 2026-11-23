@@ -1657,7 +1657,7 @@ def notice_text(kind, agent=None, names=None):
                 "this agent's key on any other computer.)")
     if kind == "noagent":
         return (f"{NOTICE}: this computer has no datastash agent yet, so no session here gets messages. "
-                + _fix("Sign this computer in to datastash."))
+                + "To set it up, the person types /datastash:install.")
     # XLI-375: person sentences (the person reads them; the AI only relays them as they are)
     if kind == "waiting":
         return (f'{NOTICE}: agent "{disp(agent["name"])}" waits for your OK. Open {AGENTS_URL} and press Allow; it '
@@ -2481,8 +2481,8 @@ def send_hello(agent, key, causes=()):
         log(s, f"hello: HTTP {e.status} {code}")
         if e.status == 403 and code == AGENT_WAITING:
             return "waiting", None
-        if e.status == 401 or code == "agent_switched_off":
-            return "refused", None
+        if e.status == 401 or code in ("agent_switched_off", "agent_removed"):
+            return "refused", None  # agent_removed (410): the listener's poll cleans up (XLI-390 P1)
         if e.status == 404:
             return "missing", None
         return "retry", e.retry_after if e.status == 429 else None
@@ -3062,6 +3062,16 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
                 backoff = BACKOFF_START
             except ApiError as e:
                 code = _code(e)
+                if e.status == 410 and code == "agent_removed" and not is_person(agent):
+                    log(s, "listen: agent removed (410); cleans up and stops")  # logged first: the log goes too
+                    live["key"] = None
+                    msg = agent_removed(agent, key)  # XLI-390 P1: plugin code, never the model
+                    if printer is not None:
+                        printer(msg)
+                        return 0
+                    print(msg, file=sys.stderr)
+                    sys.stderr.flush()
+                    return 2
                 if e.status == 410:
                     gone += 1
                     reset_cursor(agent)
@@ -3592,11 +3602,15 @@ def placeholder_applies():
     return effective_signin() == SIGNIN_DEVICE
 
 
+HOOK_SIGN_IN = False  # XLI-390 P1: the hooks never start a datastash login
+
+
 def hooks_offer_sign_in():
     """The hooks start and show a device sign-in only on a terminal Claude Code (DEVICE_HOSTS) with file locking: never
     where it could not be kept alive, and not on other hosts, where the host's own sign-in door is the way in (and
-    `claude -p` / SDK runs start no code)."""
-    return fcntl is not None and device_host() and signin_state().get("mode") != SIGNIN_OLD
+    `claude -p` / SDK runs start no code). XLI-390 P1: never (HOOK_SIGN_IN): no flow starts a datastash login any more;
+    an agent gets its key through /datastash:install."""
+    return HOOK_SIGN_IN and fcntl is not None and device_host() and signin_state().get("mode") != SIGNIN_OLD
 
 
 def legacy_warning():
@@ -10882,6 +10896,7 @@ CMD_TAG_RE = re.compile(r"\s*<command-name>(/datastash:(?:un)?install)</command-
 CMD_MAX_AGE = 1800  # a command's list and pick are good for this long in the session that showed them
 COLLECT_PATH = "/api/v1/agent/collect"  # X1: {verifier, mint_id} -> {agent_id, name, key, answer_key, workbook_id?}
 UNINSTALL_SELF_PATH = "/api/v1/agent/uninstall"  # X2: {scope: "self"} on the agent's own key
+UNINSTALL_CONFIRM_PATH = "/api/v1/agent/uninstall/confirm"  # X2: the dead key's one allowed call after 410
 NOTE_PROOF_LABEL = "datastash-agents-note/v1"
 NOTE_FIELD = "datastash_note"  # the one field of a datastash tool answer an install note is read from (EPM MUST 3)
 AGENT_ANSWER_RE = r"[A-Za-z0-9_\-]{43}"
@@ -10905,6 +10920,8 @@ NO_ANSWER_KEY_LINE = "Not done: this agent has no datastash answer key yet. Type
 INSTALL_FAILED_LINE = "datastash could not finish the install here. Type /datastash:install again."
 OTHERS_FAILED_LINE = "datastash could not reach your other agents just now. Type /datastash:install again."
 MAIN_HERE_LINE = "This is your datastash main session, not an agent: type /datastash:install in an agent's session."
+REMOVED_HERE_LINE = ("datastash removed this agent from this computer: its listener, key, settings and local copies are "
+                     "gone. Your data in datastash stays.")
 _SAY = "The plugin adds every secret and proof itself and shows the person the result. Never send a code_challenge, " \
        "typed_proof, targets or list_id yourself, never read or print a key, and say at most one short line."
 INSTALL_AI = (f"{CMD_NOTE}: the person typed the datastash install command. In this turn make exactly these datastash "
@@ -11350,6 +11367,17 @@ def note_result(inp, rec, body):
     lines = [OFF_LINE.format(names=", ".join(f'"{names[t]}"' for t in targets if t in names)),
              REMOVED_LINE.format(n=len(targets))]
     return " ".join(lines + ([UNCONFIRMED_LINE.format(names=", ".join(waiting))] if waiting else []) + [CONNECTOR_SAME_LINE])
+
+
+def agent_removed(agent, key):
+    """A 410 agent_removed on this agent's own key: confirm with the dead key (its one allowed call), then the local
+    cleanup of the fixed paths. The fixed line for the session."""
+    try:
+        api_json("POST", UNINSTALL_CONFIRM_PATH, key, body={}, timeout=15)
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        pass  # the key is dead server-side anyway; the cleanup goes on
+    remove_agent_here(agent["slug"])
+    return REMOVED_HERE_LINE
 
 
 def main():
