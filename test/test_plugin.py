@@ -43,6 +43,7 @@ loader = importlib.machinery.SourceFileLoader("datastash_bin", BIN)
 spec = importlib.util.spec_from_loader("datastash_bin", loader)
 ds = importlib.util.module_from_spec(spec)
 loader.exec_module(ds)
+ds.HOOK_SIGN_IN = True  # XLI-390 P1: the hooks start no login any more; these tests keep the older sign-in code covered
 
 for _name in ("HOME", "CONF", "STATE", "CLAUDE_DIR", "CLAUDE_USER_CONFIG", "LOGIN_FILE", "LOGIN_REFRESH_FILE"):
     if not _under_tmp(getattr(ds, _name)):
@@ -3724,7 +3725,7 @@ class Xli374(Base):
                          ("unlinked", {"names": ["Alpha", "Beta"]})):
             t = ds.notice_text(kind, **kw)
             self.assertTrue(t.startswith(ds.NOTICE), kind)
-            self.assertRegex(t, r'says to Claude( one of)?: "[^"]+\."', kind)
+            self.assertRegex(t, r'says to Claude( one of)?: "[^"]+\."|the person types /datastash:install\.$', kind)  # XLI-390
             self.assertNotIn("ldgr_", t)
         self.assertIn('"Link this folder to datastash agent Alpha." / "Link this folder to datastash agent Beta."',
                       ds.notice_text("unlinked", names=["Beta", "Alpha"]))
@@ -3765,8 +3766,8 @@ class Xli374(Base):
         ds.signed_in = lambda: True
         self.assertNotIn("To fix it", self.check())  # XLI-375: signed in, the plugin sets the agents up itself
         ds.signed_in = lambda: False  # signed out, with no sign-in line out (a computer the hooks can't sign in)
-        self.assertIn('"Sign this computer in to datastash."', self.check())
-        self.assertNotIn("To fix it", self.check())
+        self.assertIn("the person types /datastash:install.", self.check())  # XLI-390 P1: no sign-in, the command
+        self.assertNotIn("/datastash:install", self.check())
         self.assertEqual(self.listen(), (0, ""))  # nothing to listen for; it never pretends
         self.agent("Solo", projects=[os.path.join(ROOT, "elsewhere")])
         self.check()

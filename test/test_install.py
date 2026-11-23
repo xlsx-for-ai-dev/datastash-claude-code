@@ -6,6 +6,7 @@
 - Uninstall: the list, then names or "all" typed by the person, signed over agent ids from the list id; model-typed
   text and a note with no command are refused; names that differ only by case or look-alike letters are refused.
 - Cleanup: every row of the cleanup table goes, and nothing else; the box goes with its last agent.
+- 410 agent_removed: the listener confirms with the dead key and cleans up by itself; a plain 410 does not.
 No network; a throwaway HOME and config folder, enforced by test/harness.py.
 Run: python3 -I test/test_install.py"""
 import hashlib
@@ -270,11 +271,41 @@ class Cleanup(Base):
         self.assertEqual(self.kc, {})
 
 
+class Removed410(Base):
+    def listen(self, err):
+        agent = dict(ds.read_json(ds.conf_path("web-app"), {}), slug="web-app")
+        saved = {k: getattr(ds, k) for k in ("fetch_page", "start_beat", "start_hello", "start_status_refresher",
+                                             "start_map_refresher", "_sleep")}
+        self.addCleanup(lambda: [setattr(ds, k, v) for k, v in saved.items()])
+        ds.fetch_page = lambda *a, **k: (_ for _ in ()).throw(err)
+        ds.start_beat = ds.start_hello = ds.start_status_refresher = ds.start_map_refresher = lambda *a, **k: None
+        ds._sleep = lambda *a: (_ for _ in ()).throw(KeyboardInterrupt)
+        lines = []
+        try:
+            rc = ds._listen_loop(agent, "web-app", "s1", lines.append)
+        except KeyboardInterrupt:
+            rc = "kept polling"
+        return rc, lines
+
+    def test_agent_removed_confirms_with_the_dead_key_then_cleans_up(self):
+        self.installed()
+        self.answers[ds.UNINSTALL_CONFIRM_PATH] = (200, {"ok": True})
+        self.assertEqual(self.listen(ds.ApiError(410, {"error": "agent_removed"})), (0, [ds.REMOVED_HERE_LINE]))
+        self.assertIn(("POST", ds.UNINSTALL_CONFIRM_PATH, KEY, {}), self.calls)
+        self.assertFalse(os.path.exists(ds.CONF))
+
+    def test_a_plain_410_is_a_cursor_reset_not_a_removal(self):
+        self.installed()
+        self.assertEqual(self.listen(ds.ApiError(410, {"error": "cursor_expired"}))[0], "kept polling")
+        self.assertTrue(os.path.exists(ds.key_path("web-app")))
+
+
 class Commands(unittest.TestCase):
     def test_the_commands_are_the_persons_only_and_no_hook_starts_a_login(self):
         for n in ("install", "uninstall"):
             with open(os.path.join(HERE, "..", "plugins", "datastash", "commands", n + ".md")) as f:
                 self.assertIn("\ndisable-model-invocation: true\n", f.read())
+        self.assertFalse(ds.hooks_offer_sign_in())
         self.assertIsNone(ds.UNINSTALL_RE.fullmatch("please datastash uninstall"))
         self.assertEqual(ds.show_name("a\u202eb\x07c\n"), "abc")
 
