@@ -185,13 +185,15 @@ those inputs, computed on this computer in plain code:
 - `datastash fingerprint <paths...>`: each file as `{kind: "file", repo, path, fp}`, where fp is the git blob SHA of the
   file as it is on disk now (tracked files; the same as `git ls-tree` and GitHub show for an unchanged file) or its
   sha256 (anything else), and repo is `owner/name` from the git remote (no host, user or token). A folder gives all its
-  files (in git: tracked and not ignored). A missing path is `{..., gone: true}`. The repo's HEAD comes along as
+  files (in git: tracked and not ignored). A file outside any repo is `repo: "local"` with a `~/...` path under the
+  home folder, so the home folder's name never shows. A missing path is `{..., gone: true}`. The repo's HEAD comes along as
   `{kind: "commit", repo, sha, ref}` (`--no-commit` leaves it out).
 - `--url <address>` or `--lookup <stable key>` hashes what is piped in on stdin (a page the agent read, an outside
-  tool's answer) as `{kind: "url", url, fp}` or `{kind: "note", label, fp}`. An address with a user or password is refused.
+  tool's answer) as `{kind: "url", url, fp}` or `{kind: "note", label, fp}`, read in chunks as it streams in (never held
+  whole). An address with a user or password is refused.
 - The output is a JSON list that works as save's `inputs` and as check's `current`. Only hashes, paths and names leave
-  the computer, never a file's or a page's text; the plugin's own key, login and state files are never fingerprinted,
-  and nothing is sent by the command itself.
+  the computer, never a file's or a page's text; the plugin's own key, login, state and pending sign-in files are never
+  fingerprinted (nor a hard link to one), and nothing is sent by the command itself.
 
 ## Lookups kept ready (plugin 0.6.0)
 
@@ -653,7 +655,8 @@ An agent can send datastash a capability request, an error report or anything el
 - `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
   for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
   without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the
-  output, the plugin's own files refused, a FIFO never waited on, and no network.
+  output, the plugin's own files refused (pending/ and hard links too), `~/...` paths outside a repo, stdin hashed in
+  chunks, a FIFO never waited on, and no network.
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key

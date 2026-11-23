@@ -10421,21 +10421,83 @@ def _fp_repo(top):
     return "local/" + (os.path.basename(top.rstrip(os.sep)) or "repo")
 
 
+FP_OWN_SUBDIRS = ("state", "off", "pending")
+
+
 def _fp_own_file(real):
-    """True for the plugin's own files (keys, login, proofs, state): never fingerprinted."""
+    """True for the plugin's own files (keys, login, proofs, state, sign-in codes waiting in pending/): never
+    fingerprinted."""
     conf = os.path.realpath(CONF)
     d = os.path.dirname(real)
-    return d == conf or any(real.startswith(os.path.join(conf, sub) + os.sep) for sub in ("state", "off"))
+    return d == conf or any(real.startswith(os.path.join(conf, sub) + os.sep) for sub in FP_OWN_SUBDIRS)
 
 
-def _fp_hash(path, blob_algo):
-    """The file's fingerprint: the git blob id (blob_algo "sha1" or "sha256") or plain sha256 (blob_algo None)."""
+def _fp_own_ids():
+    """(device, inode) of every file _fp_own_file protects, so a hard link to one (another name, the same file) is
+    refused too."""
+    conf = os.path.realpath(CONF)
+    ids = set()
+
+    def add(path):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return
+        if stat.S_ISREG(st.st_mode):
+            ids.add((st.st_dev, st.st_ino))
+
+    try:
+        top = os.listdir(conf)
+    except OSError:
+        return ids
+    for name in top:
+        add(os.path.join(conf, name))
+    for sub in FP_OWN_SUBDIRS:
+        for d, _dirs, names in os.walk(os.path.join(conf, sub)):
+            for n in names:
+                add(os.path.join(d, n))
+    return ids
+
+
+class _FpOwnFile(Exception):
+    """The file is one of the plugin's own, under another name (a hard link)."""
+
+
+def _fp_shown_path(real):
+    """A file outside any repo, as it is sent: ~/... under the home folder (so the home folder's name never shows),
+    else the absolute path."""
+    home = os.path.realpath(HOME).rstrip(os.sep)
+    if home and (real == home or real.startswith(home + os.sep)):
+        return "~" + real[len(home):].replace(os.sep, "/")
+    return real.replace(os.sep, "/")
+
+
+def _fp_sha256_stream(src):
+    """sha256 of bytes, or of a binary stream read FP_CHUNK at a time (stdin is never held whole in memory)."""
+    h = hashlib.sha256()
+    if isinstance(src, (bytes, bytearray)):
+        h.update(src)
+        return h.hexdigest()
+    while True:
+        b = src.read(FP_CHUNK)
+        if not b:
+            break
+        h.update(b)
+    return h.hexdigest()
+
+
+def _fp_hash(path, blob_algo, own_ids=None):
+    """The file's fingerprint: the git blob id (blob_algo "sha1" or "sha256") or plain sha256 (blob_algo None).
+    own_ids() gives the plugin's own files' (device, inode); a file with more than one name that is one of them raises
+    _FpOwnFile (checked on the opened file, so a swap between the check and the read can't slip one through)."""
     # O_NONBLOCK: a FIFO or device opens at once and is refused below, never waited on.
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     with os.fdopen(fd, "rb") as f:
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode):
             raise IsADirectoryError(path)
+        if own_ids is not None and st.st_nlink > 1 and (st.st_dev, st.st_ino) in own_ids():
+            raise _FpOwnFile(path)
         h = hashlib.new(blob_algo or "sha256")
         if blob_algo:
             h.update(b"blob %d\0" % st.st_size)
@@ -10477,9 +10539,16 @@ def _fp_expand(arg):
 
 def fingerprints(paths, commit=True, url=None, lookup=None, data=None):
     """The inputs list for paths (and the HEAD commit of each repo they are in, or of this folder's repo with no paths),
-    plus one url or lookup input hashed from data (bytes). Raises ValueError with a plain reason."""
+    plus one url or lookup input hashed from data (bytes, or a binary stream read in chunks). Raises ValueError with a
+    plain reason."""
     repos = {}  # top -> {"repo", "algo", "tracked"}
     out, seen = [], set()
+    own = []
+
+    def own_ids():
+        if not own:
+            own.append(_fp_own_ids())
+        return own[0]
 
     def repo_of(top):
         if top not in repos:
@@ -10506,13 +10575,15 @@ def fingerprints(paths, commit=True, url=None, lookup=None, data=None):
                 item = {"kind": "file", "repo": r["repo"], "path": rel}
                 algo = r["algo"] if rel in r["tracked"] else None
             else:
-                item = {"kind": "file", "repo": "local", "path": real.replace(os.sep, "/")}
+                item = {"kind": "file", "repo": "local", "path": _fp_shown_path(real)}
                 algo = None
             if not os.path.exists(real):
                 item["gone"] = True
             else:
                 try:
-                    item["fp"] = _fp_hash(real, algo)
+                    item["fp"] = _fp_hash(real, algo, own_ids)
+                except _FpOwnFile:
+                    raise ValueError(f"{arg}: datastash's own files are never fingerprinted")
                 except IsADirectoryError:
                     raise ValueError(f"{arg}: not a regular file")
                 except OSError as e:
@@ -10536,11 +10607,11 @@ def fingerprints(paths, commit=True, url=None, lookup=None, data=None):
             raise ValueError("--url takes an http(s) address")
         if p.username is not None or p.password is not None:
             raise ValueError("--url: leave the user and password out of the address")
-        out.append({"kind": "url", "url": url, "fp": hashlib.sha256(data).hexdigest()})
+        out.append({"kind": "url", "url": url, "fp": _fp_sha256_stream(data)})
     if lookup is not None:
         if not lookup.strip():
             raise ValueError("--lookup takes a stable key, e.g. gh:pr/449 or linear:XLI-379")
-        out.append({"kind": "note", "label": lookup.strip(), "fp": hashlib.sha256(data).hexdigest()})
+        out.append({"kind": "note", "label": lookup.strip(), "fp": _fp_sha256_stream(data)})
     return out
 
 
@@ -10567,7 +10638,7 @@ def cmd_fingerprint(args):
     if url is not None or lookup is not None:
         if sys.stdin is None or sys.stdin.isatty():
             die("pipe in what you read: e.g. gh pr view 449 --json state | datastash fingerprint --lookup gh:pr/449")
-        data = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read().encode()
+        data = sys.stdin.buffer if hasattr(sys.stdin, "buffer") else sys.stdin.read().encode()  # streamed, not read whole
     try:
         items = fingerprints(paths, commit=commit, url=url, lookup=lookup, data=data)
     except ValueError as e:
