@@ -48,7 +48,7 @@ The person sets datastash up with `/datastash:install` (always all their agents)
 - When a `datastash note (install and uninstall; the plugin's own steps)` names connector calls, make exactly those calls, in order, and nothing else. Never send a `code_challenge`, `typed_proof`, `targets` or `list_id` yourself, never read or print a key, and never call `ledger_agents_note` without that note: the plugin refuses it.
 - You never register yourself, never get your own first key and never install or remove another agent on your own. Never tell the person to run a sign-in command; the one step is `/datastash:install`.
 - "Am I set up?", "is datastash on here?": run `datastash check` and say what it prints. Never answer it with a connector tool.
-- If no datastash connector tool is there, tell the person exactly: "Connect datastash in Claude first (Settings, Connectors), then run /datastash:install again."
+- If no datastash connector tool is there, tell the person exactly: "Type /mcp, pick datastash, choose Authenticate, then run /datastash:install again."
 
 ## A new key on this computer (only when the person says so)
 
