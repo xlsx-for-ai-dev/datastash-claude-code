@@ -311,6 +311,10 @@ folder, says hello and listens. An agent that already has a key elsewhere, or an
 gets one notice with the sentence that fixes it.
 From then on, sessions in that folder start with a count of new messages and the listener runs.
 
+From 1.0.0 agents are set up only by the person's typed `/datastash:install`. With an older (0.9.x) login still on this
+computer, the background listener no longer registers waiting agents: a session whose folder has no agent is told once
+to type `/datastash:install`; an agent 0.9.x already registered is still waited for as above.
+
 ## datastash main: the person's own session
 
 "datastash main" is the person's own Claude Code session (terminal or VS Code), not an agent. Activity from all their

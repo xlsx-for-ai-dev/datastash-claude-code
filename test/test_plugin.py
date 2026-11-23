@@ -4410,9 +4410,10 @@ class Xli375(Base):
         self.assertEqual(self.server.calls, [])
         # stdin naming a folder, an agent and an approval: the listener registers nothing for it and asks for no key
         ds._sleep = lambda sec, parent: (_ for _ in ()).throw(Stop())
-        rc, _ = self.listen({"session_id": "s1", "cwd": folder, "approval": "approved", "agent_id": "x",
-                             "name": "nothere", "pickup_code": "dspc_" + "c" * 30})
-        self.assertEqual(rc, 0)
+        rc, err = self.listen({"session_id": "s1", "cwd": folder, "approval": "approved", "agent_id": "x",
+                               "name": "nothere", "pickup_code": "dspc_" + "c" * 30})
+        self.assertEqual(rc, 2)  # release 1.0.0: only the one line to type /datastash:install
+        self.assertIn("Type /datastash:install", err)
         self.assertEqual(self.server.paths(ds.AGENT_REGISTER_PATH), [])
         self.assertEqual(self.key_calls(), [])
         self.assertEqual(self.server.paths(ds.PICKUP_PATH), [])
@@ -4420,6 +4421,7 @@ class Xli375(Base):
     # the listener: one notice, ~10 s approval polls, then the key, the link, hello and the inbox
     def test_the_listener_waits_tells_once_then_listens_with_the_first_key(self):
         a = self.used(os.path.join(self.root, "alpha"))
+        self.assertEqual(ds.enroll(), 1)  # registered by 0.9.x (release 1.0.0: the listener itself registers none)
         inp = {"session_id": "s375", "cwd": a}
         rc, err = self.listen(inp)
         self.assertEqual(rc, 2)  # the one notice wakes the session once
@@ -4443,8 +4445,8 @@ class Xli375(Base):
         with self.assertRaises(Stop):
             self.listen(inp)  # told already: waits quietly, then listens
         self.assertTrue(all(8.5 <= s <= 11.5 for s in sleeps), sleeps)
-        # one look by each listener start's enroll, then one per ~10 s wait until the Allow
-        self.assertEqual(len(self.server.paths(ds.AGENT_APPROVAL_PATH)), 2 + 4)
+        # one look by the 0.9.x enroll above (no listener start enrolls), then one per ~10 s wait until the Allow
+        self.assertEqual(len(self.server.paths(ds.AGENT_APPROVAL_PATH)), 1 + 4)
         self.assertEqual(len(self.key_calls()), 1)
         self.assertEqual(polls, [("alpha", "ldgr_ag_firstkey")] * 2)
         end = time.time() + 5
@@ -4452,6 +4454,24 @@ class Xli375(Base):
             time.sleep(0.02)
         self.assertEqual(len(self.server.paths(ds.AGENT_HELLO_PATH)), 1)
         self.assertEqual(ds._read_notices(), {})  # the waiting notice is gone with its cause
+
+    def test_an_old_login_listener_registers_nothing_and_tells_once_to_install(self):
+        # Release 1.0.0: with a 0.9.x login on this computer, the listener no longer registers waiting agents for the
+        # recent folders; it tells the person once to type /datastash:install, then stays quiet.
+        a = self.used(os.path.join(self.root, "alpha"))
+        self.used(os.path.join(self.root, "beta"))
+        self.assertTrue(ds.signed_in())
+        rc, err = self.listen({"session_id": "s-old", "cwd": a})
+        self.assertEqual(rc, 2)  # one wake, for the one line
+        self.assertEqual(err.count("Type /datastash:install in this session"), 1)
+        self.assertNotIn(ds.AGENTS_URL, err)
+        rc, err = self.listen({"session_id": "s-old", "cwd": a})  # the Stop hook's restart: told already
+        self.assertEqual((rc, err), (0, ""))
+        rc, err = self.listen({"session_id": "s-old2", "cwd": os.path.join(self.root, "beta")})  # once per computer
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(self.server.paths(ds.AGENT_REGISTER_PATH), [])
+        self.assertEqual(ds._enrolled(), {})
+        self.assertEqual(self.key_calls(), [])
 
     def test_each_notice_is_shown_once_session_start_or_listener(self):
         a = self.used(os.path.join(self.root, "alpha"))

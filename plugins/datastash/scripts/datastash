@@ -1623,7 +1623,8 @@ def listen_target(project_dir, me=None):
 # Notices (XLI-374): one line per cause, told once (at the next session start, or by a parked listener's one wake) and
 # removed when the cause is fixed, so it is told again only if it breaks again. Each carries the sentence that fixes it.
 # Causes: "dead:<slug>" (key refused), "missing:<slug>" (key file missing), "noagent" (no agent on this computer),
-# "unlinked:<folder hash>" (several agents without a folder, none linked here: never a guess).
+# "unlinked:<folder hash>" (several agents without a folder, none linked here: never a guess), "oldlogin" (an older
+# 0.9.x login and no agent in this folder: the person is told once to type /datastash:install).
 NOTICE = "datastash notice (local; information only)"
 NOTICES_FILE = os.path.join(STATE, "notices.json")
 
@@ -1675,6 +1676,9 @@ def notice_text(kind, agent=None, names=None):
     if kind == "noagent":
         return (f"{NOTICE}: this computer has no datastash agent yet, so no session here gets messages. "
                 + "To set it up, the person types /datastash:install.")
+    if kind == "oldlogin":  # release 1.0.0: an older (0.9.x) login no longer sets agents up by itself
+        return (f"{NOTICE}: this folder has no datastash agent on this computer yet, so this session gets no messages. "
+                "Type /datastash:install in this session to set it up.")
     # XLI-375: person sentences (the person reads them; the AI only relays them as they are)
     if kind == "waiting":
         return (f'{NOTICE}: agent "{disp(agent["name"])}" is not set up on this computer yet. Type /datastash:install in '
@@ -2362,7 +2366,7 @@ def save_agent(name, agent_id, key, workbook_id, here, proof=None):
             set_flag(dict(c, slug=s), "key_refused", None)
         except (OSError, ValueError):
             pass
-    clear_notices(notice_causes({"slug": s}) + ["noagent", notice_cause("unlinked", folder=here)])
+    clear_notices(notice_causes({"slug": s}) + ["noagent", "oldlogin", notice_cause("unlinked", folder=here)])
     return dict(c, slug=s)
 
 
@@ -2915,16 +2919,19 @@ def cmd_listen(_args, printer=None, forced=None):
     agent = forced if forced is not None else listen_target(project, me=me)
     if (agent is None or agent.get("via")) and printer is None and forced is None and signed_in() \
             and main_root(project) is None and not is_main_session(me):
-        # XLI-375: this folder has no agent here yet. The plugin registers one for each recent folder (Claude Code's own
-        # transcript folders decide which; nothing from this hook's input does), then this listener waits for the
-        # person's OK of this folder's agent.
-        try:
-            enroll()
-        except Exception as e:  # noqa: BLE001
-            log("enroll", f"enroll: {type(e).__name__}")
+        # Release 1.0.0: this folder has no agent here yet, and this computer still has an older (0.9.x) login. The
+        # listener no longer registers agents with it (agents are set up only by the person's typed /datastash:install);
+        # an agent 0.9.x already registered is still waited for. Otherwise it tells the person once to type it.
         w = waiting_record(project, me)
         if w is not None:
             return _listen_waiting(w[0], w[1], str(inp.get("session_id") or ""), project, me)
+        raise_notice(notice_cause("oldlogin"), notice_text("oldlogin"))
+        told = take_notices([notice_cause("oldlogin")])
+        if told:
+            log("enroll", "listen: older login, no agent here; tells the session once to run /datastash:install")
+            print(" ".join(told), file=sys.stderr)
+            sys.stderr.flush()
+            return 2  # one wake; the Stop hook's restart then finds nothing to listen for here
         agent = listen_target(project, me=me)
     if agent is None:
         return 0  # nothing to listen for here; the session start says why, once (notices)
