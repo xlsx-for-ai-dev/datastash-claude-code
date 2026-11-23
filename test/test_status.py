@@ -262,7 +262,7 @@ class ListFormat(Base):
         self.assertIn("   main · no PR · tests all pass · last: moved invoices to the new table · 1 h ago", lines)
         self.assertTrue(lines[-1].startswith("5. **docs** — _Nothing in flight since Monday._ · 3 d ago"), text)
         self.assertEqual(numbers["2"], {"agent": "web-app", "project": "web-app", "ask": "q2",
-                                        "text": "Change the session length from 1 day to 7 days?"})
+                                        "text": "Change the session length from 1 day to 7 days?", "plain": False})  # XLI-310: effects
         self.assertEqual((numbers["4"]["agent"], numbers["4"]["ask"]), ("api", "q1"))
         self.assertEqual(numbers["5"], {"agent": "docs", "project": "docs", "ask": None})
 
@@ -1164,8 +1164,9 @@ class TypedAnswer(Base):
         super().setUp()
         self.server_rows = [dict(r) for r in TYPED_ROWS]
         self.key = (KEY, GRANT)
-        self.saved_k = (ds.read_answer_key, ds._open_browser)
+        self.saved_k = (ds.read_answer_key, ds._open_browser, ds.answer_key_kept)
         ds.read_answer_key = lambda: self.key
+        ds.answer_key_kept = lambda: self.key is not None
         self.browser = []
         ds._open_browser = lambda url: self.browser.append(url) or True
         self.addCleanup(self.restore_k)
@@ -1190,7 +1191,7 @@ class TypedAnswer(Base):
         self.n = {v["ask"]: int(k) for k, v in nums.items() if isinstance(v, dict) and v.get("ask")}
 
     def restore_k(self):
-        ds.read_answer_key, ds._open_browser = self.saved_k
+        ds.read_answer_key, ds._open_browser, ds.answer_key_kept = self.saved_k
 
     def sent(self):
         return [c for c in self.calls if c[1] == ds.PERSON_ANSWER_PATH]
@@ -1369,7 +1370,7 @@ class ProofBytes(unittest.TestCase):
         r = subprocess.run([node, "-e", "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{for(const s of JSON.parse(d))console.log(JSON.stringify(JSON.stringify(s)))})"],
                            input=json.dumps(samples), capture_output=True, text=True, timeout=20)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual([json.loads(x) for x in r.stdout.splitlines()], [ds.js_json(s) for s in samples])
+        self.assertEqual([json.loads(x) for x in r.stdout.split("\n") if x], [ds.js_json(s) for s in samples])
 
 
 class StatusOff(Base):
