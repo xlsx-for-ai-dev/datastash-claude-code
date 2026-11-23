@@ -195,6 +195,51 @@ those inputs, computed on this computer in plain code:
   the computer, never a file's or a page's text; the plugin's own key, login, state and pending sign-in files are never
   fingerprinted (nor a hard link to one), and nothing is sent by the command itself.
 
+## Flaky and slow tests from CI (plugin 0.9.11)
+
+`datastash ci-report` is one CI step after the tests. It reads the JUnit XML every runner writes (vitest, jest, pytest,
+go-junit-report, gradle) and sends per-test results into the agent workbook's tests tabs (set them up once with
+`ledger_feeds_setup {services: ["tests"]}`): **Tests** (one row per test: runs, fails, skips, times, last outcome, main's
+state), **Test failures** (one row per failing test and commit) and **Test weeks** (one row per test file and week). The
+engine computes flaky, fail_rate, slower, main_red and slowdown. The command also keeps a **Test runs** tab: one row per
+commit and set of tests run, with the ids that failed, kept 14 days.
+
+```yaml
+      - name: Tests
+        run: npx vitest run --reporter=default --reporter=junit --outputFile=junit.xml
+      - name: Report tests to datastash
+        if: always()
+        env:
+          DATASTASH_AGENT_KEY: ${{ secrets.DATASTASH_AGENT_KEY }}
+          DATASTASH_WORKBOOK_ID: ${{ vars.DATASTASH_WORKBOOK_ID }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >
+          python3 path/to/datastash ci-report junit.xml --repo "$REPO" --sha "$SHA" --branch "$BRANCH"
+          --run-url "$RUN_URL" --job "$GITHUB_JOB"
+```
+
+(`path/to/datastash` is `plugins/datastash/scripts/datastash` from this repo; it needs only `python3`. The values go
+through `env`, never pasted into the script, so a branch name can't inject a command.) Pytest:
+`pytest --junitxml=junit.xml`. `--default-branch` (default `main`) names the branch whose red tests set `main_broke_at`.
+`--local` reports a run on this computer, with the repo, commit and branch from git, and never touches main's state.
+
+- **It never fails a build.** Every reporting problem (no key, a bad file, datastash unreachable, a refusal) prints one
+  line and exits 0. A brake (429) or busy answer is waited out (Retry-After), up to 15 minutes in all; each page of
+  1,000 rows carries an idempotency key, so a retry never counts twice.
+- **What leaves CI.** Test ids and file paths as the runner names them, counts, times, the error class (the failure's
+  `type`, as `AssertionError`) and a sha256 of the first message line with numbers and hex ids stripped (so one failure
+  groups across runs). Never a failure message, stack trace, stdout or stderr. The XML is read with Python's own expat
+  parser with no DTD: a DOCTYPE or entity declaration is refused, so no entity expansion or outside fetch.
+- **Flaky in any order.** Each report first records its outcome on the commit (its failure rows and its Test runs row),
+  then reads the commit's failures and runs. Writes to a workbook are one at a time, so of two reports on one commit the
+  later always sees the earlier: a pass sees the failure, a failure sees a run of the same tests that did not fail it.
+  Parallel matrix jobs, re-runs and a retry inside one run are all caught; shards that run different tests are never
+  called flaky. The first report to mark the failure row's `passes` (saved only if unchanged) adds `flaky_commits` once.
+- The key is an agent key kept as a CI secret; it is never printed.
+
 ## Lookups kept ready (plugin 0.6.0)
 
 Agents repeat slow lookups: where a PR stands, how CI went, the state of a card. The plugin counts them on this computer
@@ -652,6 +697,11 @@ An agent can send datastash a capability request, an error report or anything el
 - `python3 -I test/test_proof.py`: each agent's own proof (plugin 0.9.8): only on a datastash connector call made as
   this session's own agent, the AI's own agent_proof always replaced or dropped, never on register or key, never to a
   server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
+- `python3 -I test/test_ci_report.py`: `datastash ci-report` (plugin 0.9.11): a canary in a failure's message, text,
+  stdout and stderr never sent or printed, only allow-listed fields; a DOCTYPE, billion laughs and an outside entity
+  refused; rows folded; flaky in either order, at once (counted once), in a retry, and never for shards, skips or another
+  commit; main_broke_at; the week four weeks back; pages of 1,000 with idempotency keys; 429 and busy waited out; old
+  Test runs rows removed; exit 0 with one line for every problem.
 - `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
   for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
   without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the
