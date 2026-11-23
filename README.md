@@ -176,6 +176,23 @@ MCP tool names and migrations, each with file:line. It maps again only when the 
   own config runs none of these while it is mapped.
 - The session's `datastash` command is `scripts/cli/datastash`, which runs the same helper with its compiled code cached.
 
+## Fingerprints for saved results (plugin 0.9.10)
+
+An agent can save a result (a review of one file, a test run, a summary) with the inputs it rests on
+(`ledger_agent_result`), and later check which inputs changed, so it redoes only those. `datastash fingerprint` gives
+those inputs, computed on this computer in plain code:
+
+- `datastash fingerprint <paths...>`: each file as `{kind: "file", repo, path, fp}`, where fp is the git blob SHA of the
+  file as it is on disk now (tracked files; the same as `git ls-tree` and GitHub show for an unchanged file) or its
+  sha256 (anything else), and repo is `owner/name` from the git remote (no host, user or token). A folder gives all its
+  files (in git: tracked and not ignored). A missing path is `{..., gone: true}`. The repo's HEAD comes along as
+  `{kind: "commit", repo, sha, ref}` (`--no-commit` leaves it out).
+- `--url <address>` or `--lookup <stable key>` hashes what is piped in on stdin (a page the agent read, an outside
+  tool's answer) as `{kind: "url", url, fp}` or `{kind: "note", label, fp}`. An address with a user or password is refused.
+- The output is a JSON list that works as save's `inputs` and as check's `current`. Only hashes, paths and names leave
+  the computer, never a file's or a page's text; the plugin's own key, login and state files are never fingerprinted,
+  and nothing is sent by the command itself.
+
 ## Lookups kept ready (plugin 0.6.0)
 
 Agents repeat slow lookups: where a PR stands, how CI went, the state of a card. The plugin counts them on this computer
@@ -633,6 +650,10 @@ An agent can send datastash a capability request, an error report or anything el
 - `python3 -I test/test_proof.py`: each agent's own proof (plugin 0.9.8): only on a datastash connector call made as
   this session's own agent, the AI's own agent_proof always replaced or dropped, never on register or key, never to a
   server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
+- `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
+  for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
+  without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the
+  output, the plugin's own files refused, a FIFO never waited on, and no network.
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key

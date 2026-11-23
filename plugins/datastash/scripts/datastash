@@ -38,6 +38,12 @@ Subcommands (run `datastash help`):
   where WORDS               where something is in this git project, from the project map (plain code, no AI): file:line
                             and the file's purpose; try it before grep for "where is X"
   file PATH                 a file's purpose and its exports, routes, env vars and MCP tools, from the project map
+  fingerprint [PATH ...] [--no-commit] [--url URL | --lookup KEY]
+                            the inputs a saved result rests on, for ledger_agent_result save (inputs) and check
+                            (current): each file's git blob SHA (sha256 when untracked) with its repo and path, a folder
+                            as all its files, and the repo's HEAD commit; --url URL or --lookup KEY hash what you pipe in
+                            on stdin (a page you read, an outside lookup's answer, under a stable key). Fingerprints
+                            only, never file text; computed here, nothing sent
   off NAME                  turn NAME's folders off on this computer (no datastash calls from them), switch it off on
                             datastash with its own key, and move its key file to ~/.config/datastash/off/
   watch                     print one line each time new messages arrive (for a Monitor loop)
@@ -10377,6 +10383,199 @@ def cmd_file(args):
     return 0
 
 
+# --- XLI-379 PR 3: fingerprints of an agent's inputs, for ledger_agent_result save and check
+
+# `datastash fingerprint` prints the inputs a result rests on, as the server takes them (src/agents/results.ts): a file
+# as {kind: "file", repo, path, fp} (EPM note d: always with its repo), the repo's HEAD as {kind: "commit", repo, sha,
+# ref}, a page the agent read as {kind: "url", url, fp} and an outside lookup as {kind: "note", label, fp}. Only
+# fingerprints leave this computer, never a file's or a page's text: fp is the git blob SHA of the file as it is on disk
+# now (tracked files, so it matches `git ls-tree` and GitHub) or its sha256 (anything else), computed here in plain code,
+# so the model spends no tokens hashing and never pastes file text. The same output serves as save's `inputs` and as
+# check's `current`; a path that is not there is {..., gone: true} (for check). No caps. No network.
+FP_USAGE = ("usage: datastash fingerprint [PATH ...] [--no-commit] [--url URL | --lookup KEY]  (--url and --lookup hash "
+            "what you pipe in on stdin: the page you read, or the lookup's answer)")
+FP_CHUNK = 1 << 20
+FP_REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+?)(?:\.git)?/?$")
+
+
+def _fp_git(top, *args, raw=False):
+    """One git call for fingerprint (git_argv's blanks; a longer wait than _git, for big trees). None on failure."""
+    try:
+        argv, env = git_argv(top, args)
+        r = subprocess.run(argv, capture_output=True, timeout=120, env=env)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout if raw else r.stdout.decode("utf-8", "replace").strip()
+
+
+def _fp_repo(top):
+    """owner/name from the origin remote, else the first remote (no host, user or token ever kept), else
+    local/<folder name>."""
+    names = ["origin"] + [n for n in (_fp_git(top, "remote") or "").splitlines() if n and n != "origin"][:1]
+    for name in names:
+        m = FP_REMOTE_RE.search(_fp_git(top, "remote", "get-url", "--", name) or "")
+        if m:
+            return m.group(1)
+    return "local/" + (os.path.basename(top.rstrip(os.sep)) or "repo")
+
+
+def _fp_own_file(real):
+    """True for the plugin's own files (keys, login, proofs, state): never fingerprinted."""
+    conf = os.path.realpath(CONF)
+    d = os.path.dirname(real)
+    return d == conf or any(real.startswith(os.path.join(conf, sub) + os.sep) for sub in ("state", "off"))
+
+
+def _fp_hash(path, blob_algo):
+    """The file's fingerprint: the git blob id (blob_algo "sha1" or "sha256") or plain sha256 (blob_algo None)."""
+    # O_NONBLOCK: a FIFO or device opens at once and is refused below, never waited on.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise IsADirectoryError(path)
+        h = hashlib.new(blob_algo or "sha256")
+        if blob_algo:
+            h.update(b"blob %d\0" % st.st_size)
+        n = 0
+        while True:
+            b = f.read(FP_CHUNK)
+            if not b:
+                break
+            n += len(b)
+            h.update(b)
+    if blob_algo and n != st.st_size:
+        raise OSError(errno.EAGAIN, "the file changed while it was read; run it again")
+    return h.hexdigest()
+
+
+def _fp_expand(arg):
+    """(top or None, [real file paths]) for one PATH argument: a file, or every file under a folder (in git: tracked and
+    not ignored; elsewhere: every file but .git). A missing path is returned as itself."""
+    real = os.path.join(os.path.realpath(os.path.dirname(os.path.abspath(arg))), os.path.basename(os.path.abspath(arg)))
+    real = os.path.realpath(real) if os.path.isdir(real) else real
+    start = real if os.path.isdir(real) else os.path.dirname(real)
+    while not os.path.isdir(start):
+        start = os.path.dirname(start)
+    top = _fp_git(start, "rev-parse", "--show-toplevel") or None
+    top = os.path.realpath(top) if top else None
+    if not os.path.isdir(real):
+        return top, [real]
+    if top:
+        out = _fp_git(top, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
+                      ":(literal)" + (os.path.relpath(real, top).replace(os.sep, "/")), raw=True) or b""
+        names = sorted({os.fsdecode(x) for x in out.split(b"\0") if x})
+        return top, [os.path.join(top, n) for n in names if not os.path.isdir(os.path.join(top, n))]
+    found = []
+    for d, dirs, names in os.walk(real):
+        dirs[:] = sorted(x for x in dirs if x != ".git")
+        found += [os.path.join(d, n) for n in sorted(names)]
+    return None, found
+
+
+def fingerprints(paths, commit=True, url=None, lookup=None, data=None):
+    """The inputs list for paths (and the HEAD commit of each repo they are in, or of this folder's repo with no paths),
+    plus one url or lookup input hashed from data (bytes). Raises ValueError with a plain reason."""
+    repos = {}  # top -> {"repo", "algo", "tracked"}
+    out, seen = [], set()
+
+    def repo_of(top):
+        if top not in repos:
+            algo = (_fp_git(top, "rev-parse", "--show-object-format") or "sha1").strip()
+            repos[top] = {"repo": _fp_repo(top), "algo": algo if algo in ("sha1", "sha256") else "sha1", "tracked": None}
+        return repos[top]
+
+    for arg in paths:
+        if os.path.isdir(arg) and _fp_own_file(os.path.join(os.path.realpath(arg), "_")):
+            raise ValueError(f"{arg}: datastash's own files are never fingerprinted")
+        top, files = _fp_expand(arg)
+        for real in files:
+            if real in seen:
+                continue
+            seen.add(real)
+            if _fp_own_file(os.path.realpath(real)):
+                raise ValueError(f"{arg}: datastash's own files are never fingerprinted")
+            if top and (real == top or real.startswith(top + os.sep)):
+                r = repo_of(top)
+                rel = os.path.relpath(real, top).replace(os.sep, "/")
+                if r["tracked"] is None:
+                    ls = _fp_git(top, "ls-files", "-z", "--cached", raw=True) or b""
+                    r["tracked"] = {os.fsdecode(x) for x in ls.split(b"\0") if x}
+                item = {"kind": "file", "repo": r["repo"], "path": rel}
+                algo = r["algo"] if rel in r["tracked"] else None
+            else:
+                item = {"kind": "file", "repo": "local", "path": real.replace(os.sep, "/")}
+                algo = None
+            if not os.path.exists(real):
+                item["gone"] = True
+            else:
+                try:
+                    item["fp"] = _fp_hash(real, algo)
+                except IsADirectoryError:
+                    raise ValueError(f"{arg}: not a regular file")
+                except OSError as e:
+                    raise ValueError(f"{arg}: can't be read ({e.strerror or e})")
+            out.append(item)
+    if commit:
+        tops = list(repos) or [t for t in [_fp_git(os.getcwd(), "rev-parse", "--show-toplevel")] if t]
+        for top in tops:
+            top = os.path.realpath(top)
+            sha = _fp_git(top, "rev-parse", "--verify", "-q", "HEAD")
+            if not sha:
+                continue
+            item = {"kind": "commit", "repo": repo_of(top)["repo"], "sha": sha}
+            branch = _fp_git(top, "rev-parse", "--abbrev-ref", "HEAD")
+            if branch and branch != "HEAD":
+                item["ref"] = branch
+            out.append(item)
+    if url is not None:
+        p = urllib.parse.urlsplit(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            raise ValueError("--url takes an http(s) address")
+        if p.username is not None or p.password is not None:
+            raise ValueError("--url: leave the user and password out of the address")
+        out.append({"kind": "url", "url": url, "fp": hashlib.sha256(data).hexdigest()})
+    if lookup is not None:
+        if not lookup.strip():
+            raise ValueError("--lookup takes a stable key, e.g. gh:pr/449 or linear:XLI-379")
+        out.append({"kind": "note", "label": lookup.strip(), "fp": hashlib.sha256(data).hexdigest()})
+    return out
+
+
+def cmd_fingerprint(args):
+    """datastash fingerprint [PATH ...] [--no-commit] [--url URL | --lookup KEY]: the inputs for ledger_agent_result."""
+    paths, commit, url, lookup = [], True, None, None
+    it = iter(args)
+    for a in it:
+        if a == "--no-commit":
+            commit = False
+        elif a in ("--url", "--lookup"):
+            v = next(it, None)
+            if v is None or url is not None or lookup is not None:
+                die(FP_USAGE + "; one --url or --lookup a call (stdin is read once)")
+            url, lookup = (v, lookup) if a == "--url" else (url, v)
+        elif a in ("-h", "--help"):
+            print(FP_USAGE)
+            return 0
+        elif a.startswith("--"):
+            die(FP_USAGE)
+        else:
+            paths.append(a)
+    data = None
+    if url is not None or lookup is not None:
+        if sys.stdin is None or sys.stdin.isatty():
+            die("pipe in what you read: e.g. gh pr view 449 --json state | datastash fingerprint --lookup gh:pr/449")
+        data = sys.stdin.buffer.read() if hasattr(sys.stdin, "buffer") else sys.stdin.read().encode()
+    try:
+        items = fingerprints(paths, commit=commit, url=url, lookup=lookup, data=data)
+    except ValueError as e:
+        die(str(e))
+    print("[" + ",\n ".join(json.dumps(i, ensure_ascii=False) for i in items) + "]")
+    return 0
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     args = sys.argv[2:]
@@ -10387,7 +10586,8 @@ def main():
              "login": cmd_login, "logout": cmd_logout, "token": cmd_token, "unfilter": lambda a: cmd_filter(a, hidden=False),
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
-             "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh}
+             "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
+             "fingerprint": cmd_fingerprint}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

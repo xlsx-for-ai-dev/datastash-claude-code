@@ -3497,8 +3497,9 @@ class Xli374(Base):
 
     @staticmethod
     def _aside():
+        # A sign-in left pending by another file in a one-process run (test_status) silences the "noagent" notice.
         for n in os.listdir(TMP):
-            if re.fullmatch(r"agent-.+\.(json|key)", n):
+            if re.fullmatch(r"agent-.+\.(json|key)", n) or n == os.path.basename(ds.LOGIN_PENDING_FILE):
                 os.replace(os.path.join(TMP, n), os.path.join(TMP, f"old374-{n}-{time.time()}"))
 
     def agent(self, name, projects=(), key=None):
