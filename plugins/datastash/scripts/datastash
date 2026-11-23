@@ -4708,11 +4708,88 @@ def token_tool_deny(inp):
                                    "permissionDecisionReason": TOKEN_DENY}}
 
 
+# XLI-351: each agent's own proof on its datastash connector calls (the XLI-349 binding). The server acts as a bound agent
+# on a sign-in connection only for a call carrying that agent's proof as `agent_proof` (it takes it off before any tool
+# runs, never echoes or logs it). The plugin's own REST calls already send it (register, key) or use the agent's own key
+# (listener, `datastash api`); this is the connector path. The proof is THIS session's agent's (the folder's agent, as
+# resolve says; never picked by the agent_id the AI typed), and only on a call made as that same agent: any other call
+# goes out with no agent_proof at all. Never on register or key (nothing the AI triggers mints or ties with it), never to
+# a server the plugin can't tell is datastash's, never printed but in the hook's updatedInput, never logged.
+PROOF_ARG = "agent_proof"
+NO_PROOF_TOOLS = ("ledger_agent_register", "ledger_agent_key")
+PROOF_DENY = ("datastash: an agent's proof stays with the datastash plugin, which adds it to that agent's own connector "
+              "calls; it never goes to a tool call. Don't read the proof files or enroll.json, and don't work around it.")
+PROOF_FILE_RE = re.compile(r"agent-[^\s/\\'\"]*\.proof(?![\w.-])")
+
+
+def read_proof(s):
+    """The agent's proof (agent-<slug>.proof, a private file of this user), or None. Never printed or logged."""
+    return _read_key_file(proof_path(s), PROOF_RE, s)
+
+
+def _proof_server(inp, name):
+    """True only for a connector whose configured URL is on datastash's own host (the plugin's own connector, or one the
+    person added by that URL); never a server known by name only."""
+    cfg = _mcp_configs(inp).get(name[5:].split("__", 1)[0])
+    return isinstance(cfg, dict) and isinstance(cfg.get("url"), str) and _host_is_datastash(cfg["url"])
+
+
+def _own_proof(inp, name, args):
+    """The proof to send on this call, or None: only a call made as this session's own agent, on a datastash connector."""
+    tool = name[5:].split("__", 1)[1] if "__" in name[5:] else ""
+    aid = args.get("agent_id")
+    if tool in NO_PROOF_TOOLS or not isinstance(aid, str) or not aid.strip() or not _proof_server(inp, name):
+        return None
+    agent = agent_for(project_of(inp), me=this_session(inp))
+    own = agent.get("agent_id") if agent is not None else None
+    if not isinstance(own, str) or own.strip().lower() != aid.strip().lower():
+        return None
+    return read_proof(agent["slug"])
+
+
+def proof_binding(inp, args):
+    """PreToolUse: args (the call's input, or the pickup binding's rewrite of it) with agent_proof set to this session's
+    agent's own proof or taken out (see _own_proof), on a datastash connector call; None when nothing changes. Any
+    agent_proof the AI sent is never passed on."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse" or not isinstance(args, dict):
+        return None
+    name = inp.get("tool_name")
+    if not isinstance(name, str) or not name.startswith("mcp__"):
+        return None
+    if "datastash" not in name[5:].split("__", 1)[0].lower() and not _proof_server(inp, name):
+        return None
+    out = {k: v for k, v in args.items() if k != PROOF_ARG}
+    proof = _own_proof(inp, name, out)
+    if proof is not None:
+        out[PROOF_ARG] = proof
+    return out if out != args else None
+
+
+def proof_file_deny(inp):
+    """PreToolUse: the deny for a Bash or file tool call that names a proof file (agent-*.proof) or the waiting agents'
+    enroll.json in the datastash folder, else None. Best effort, as the token's deny (XLI-310)."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse":
+        return None
+    name, args = inp.get("tool_name"), inp.get("tool_input")
+    args = args if isinstance(args, dict) else {}
+    if name == "Bash":
+        text = args.get("command") if isinstance(args.get("command"), str) else ""
+    elif name in FILE_TOOLS:
+        text = json.dumps(args)
+    else:
+        return None
+    if PROOF_FILE_RE.search(text) is None and not ("enroll.json" in text and _touches_datastash_text(text)):
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": PROOF_DENY}}
+
+
 def cmd_agent_tool(_args):
     """PreToolUse, PostToolUse and PostToolUseFailure hook, every tool: a call that could carry datastash content records this session as an
     agent (never main; see tool_carries_datastash). Never blocks the call. It prints nothing, except (PreToolUse, security
     review H7) for a connector call that asks for a pickup code: then it rewrites the call's input with this machine's
-    code_challenge (pickup_binding). The session id's mark is written first, before the process walk, so a slow box
+    code_challenge (pickup_binding); and (XLI-351) for a datastash connector call made as this session's own agent, or
+    carrying an agent_proof the AI sent: the input with this agent's own proof, or with none (proof_binding). The session id's mark is written first, before the process walk, so a slow box
     can't skip it; the person's main session is never marked."""
     inp = hook_input()
     try:
@@ -4731,6 +4808,10 @@ def cmd_agent_tool(_args):
         tdeny = token_tool_deny(inp)  # XLI-310: the login token never reaches a tool call
     except Exception:  # noqa: BLE001 (can't read the call: nothing to deny on)
         tdeny = None
+    try:
+        tdeny = tdeny or proof_file_deny(inp)  # XLI-351: nor an agent's proof
+    except Exception:  # noqa: BLE001
+        pass
     if tdeny is not None:
         print(json.dumps(tdeny), flush=True)
         return _agent_tool(inp)
@@ -4741,9 +4822,15 @@ def cmd_agent_tool(_args):
             bound = strip_challenge(inp) if isinstance(inp, dict) and inp.get("hook_event_name") == "PreToolUse" else None
         except Exception:
             bound = None
+    try:
+        proofed = proof_binding(inp, bound if bound is not None else inp.get("tool_input"))
+    except (Exception, SystemExit):  # fail closed: the call goes out with no agent_proof at all
+        ti = bound if bound is not None else (inp.get("tool_input") if isinstance(inp, dict) else None)
+        proofed = {k: v for k, v in ti.items() if k != PROOF_ARG} if isinstance(ti, dict) and PROOF_ARG in ti else None
     if bound is not None:
         # Printed first, so the rewrite stands even if the sign-in line or the recording below is slow or fails.
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": bound}}), flush=True)
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                 "updatedInput": bound if proofed is None else proofed}}), flush=True)
         return _agent_tool(inp)
     person = ai = None
     sid = _sid(inp)
@@ -4783,6 +4870,9 @@ def cmd_agent_tool(_args):
         out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
         hs = out["hookSpecificOutput"]
         hs["additionalContext"] = (hs.get("additionalContext", "") + " " + nudge).strip()
+    if proofed is not None:  # XLI-351: the proof rewrite goes out with any sign-in line (PreToolUse only)
+        out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+        out["hookSpecificOutput"]["updatedInput"] = proofed
     if out is not None:
         print(json.dumps(out), flush=True)
     return _agent_tool(inp)

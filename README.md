@@ -106,6 +106,10 @@ About `datastash login`:
   on the datastash site (`/confirm`), which only you can make; the AI asks you when it needs that. The page shows the
   computer, the network it signed in from and when.
 - An agent key never gets a login's reach: each key needs its own click on `/confirm`.
+- Sessions on one login can no longer act as each other's agents (plugin 0.9.8): each agent has a random proof on this
+  computer (`agent-<name>.proof`), and the plugin adds it to that agent's own datastash connector calls, never to a call
+  made as another agent, never to `ledger_agent_register` or `ledger_agent_key`, and never to a server that is not
+  `https://getdatastash.com`. The AI never chooses it, and a Bash or file tool call naming the proof files is refused.
 - If the login is used from a network (or country) you haven't allowed it from, it drops back to its agent workbook until
   you allow that network with one more click on `/confirm`, which names it.
 - Your account page lists every signed-in computer (name, last used, country, network) with **Sign out**, which stops it
@@ -320,6 +324,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | File | Holds |
 |---|---|
 | `agent-<name>.key` | the agent key. Read only by the `datastash` command and the hooks; sent only to `https://getdatastash.com` in an `Authorization` header; never printed, logged or passed on a command line |
+| `agent-<name>.proof` | the agent's proof (plugin 0.9.8): added by the hook only to that agent's own datastash connector calls; never printed, logged or given to a tool call |
 | `agent-<name>.json` | agent name, agent_id, agent workbook id, linked folders |
 | `state/agent-<name>.json` | the inbox cursor, the ids of messages still "new", and the last wake time (no message text) |
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
@@ -604,6 +609,9 @@ An agent can send datastash a capability request, an error report or anything el
   entries without origin fields refused); status off sends nothing and says how to turn it on; the install question and
   "leave <name> off"; the Stop hook; that no answer or undo route is called in the whole run; and the timed read: the
   real hook process answers from a 30 agents x 5 projects copy in under 2 seconds with no request.
+- `python3 -I test/test_proof.py`: each agent's own proof (plugin 0.9.8): only on a datastash connector call made as
+  this session's own agent, the AI's own agent_proof always replaced or dropped, never on register or key, never to a
+  server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
 - `test/person-wake-test.sh` proves "datastash main": an idle person session (watch key from a watch pickup code, in a
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key
