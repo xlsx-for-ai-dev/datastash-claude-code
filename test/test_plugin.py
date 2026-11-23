@@ -1606,8 +1606,8 @@ class CleanSessionOnly(MainBase):
             for gone in ("main --wait", "show code", "/main/approve", "main --key", "main_pickup_code"):
                 self.assertNotIn(gone, text)
         self.assertNotIn('{"action": "main"}', skill)  # XLI-278: no main code from a connector call
-        self.assertIn("datastash login", skill)
-        self.assertIn("https://getdatastash.com/agents", skill)  # XLI-375: the plugin registers; the person allows
+        self.assertIn("/datastash:install", skill)  # XLI-390 P1: no datastash login step any more
+        self.assertNotIn("https://getdatastash.com/agents", skill)  # XLI-390 P1: no allow page in any flow
         self.assertNotIn("MAIN_START_PATH", dir(ds))
         self.assertNotIn("_main_wait", dir(ds))
 
