@@ -2829,6 +2829,30 @@ class Login(Base):
         self.assertNotIn("want_answer_key", self.refresh_bodies[-1])
         self.assertEqual(ds.read_answer_key(), (self.AK, self.GRANT))
 
+    def test_a_lost_key_while_signed_in_is_asked_for_again_on_the_next_refresh(self):
+        # M2: the record says a key is kept, but the keychain entry (or login.answer) is gone
+        for works in (True, False):
+            with self.subTest(keychain=works):
+                self.keychain_works = works
+                self.keychain.clear()
+                self.token_extra = {"answer_key": self.AK, "grant_id": self.GRANT}
+                self.finish_login()
+                self.assertEqual(ds.read_answer_key(), (self.AK, self.GRANT))
+                if works:
+                    self.keychain.pop("ak")
+                else:
+                    os.replace(ds._answer_key_file(), os.path.join(tempfile.mkdtemp(), "lost"))
+                self.assertTrue(os.path.exists(ds._answer_meta_file()))  # the record still says it is kept
+                self.assertIsNone(ds.read_answer_key())
+                self.expire_access()
+                self.refresh_extra = {"answer_key": self.AK, "grant_id": self.GRANT}
+                self.assertIsNotNone(ds.login_token())
+                self.assertIs(self.refresh_bodies[-1].get("want_answer_key"), True)
+                self.assertEqual(ds.read_answer_key(), (self.AK, self.GRANT))
+                self.expire_access()
+                self.assertIsNotNone(ds.login_token())
+                self.assertNotIn("want_answer_key", self.refresh_bodies[-1])
+
     def test_a_new_sign_in_replaces_the_key_and_logout_removes_it(self):
         self.token_extra = {"answer_key": self.AK, "grant_id": self.GRANT}
         self.finish_login()

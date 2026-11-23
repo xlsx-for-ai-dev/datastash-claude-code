@@ -1105,8 +1105,8 @@ class FastAnswer(Base):
 
 
 class DoN(Base):
-    """An ask with no server instance (an older list) or with effects: "do N" shows the ask as before, with one line that
-    it needs the person's click on the site; nothing is sent and no checker starts."""
+    """An ask with no server instance (an older list) or with effects: exactly as in 0.9.8. "do N" shows the ask and
+    says to tell the agent in its own session; "no to N" and "N: text" are ordinary prompts. Nothing is sent, no checker."""
     def setUp(self):
         super().setUp()
         ds.fetch_status({"slug": "web-app", "workbook_id": WB})
@@ -1118,7 +1118,7 @@ class DoN(Base):
         n = self.spawned_before = len(self.spawned)
         text = self.prompt("do 4")
         self.assertEqual(text, 'Answering asks from here is coming. Ask 4, from api: "Delete the old /invoices endpoint?". '
-                               "To answer now, tell api in its own session. " + ds.ANSWER_SITE_LINE)
+                               "To answer now, tell api in its own session.")  # 0.9.8's text, word for word
         self.assertEqual(self.last_hook["decision"], "block")
         self.assertEqual(self.calls, [])
         self.assertEqual(self.spawned[n:], [])  # no checker, no sender
@@ -1128,6 +1128,8 @@ class DoN(Base):
         self.assertIsNone(self.prompt("do 4", sid="sess2"))  # this session showed no list
         self.assertIsNone(self.prompt("no to 1"))
         self.assertIsNone(self.prompt("1: no, keep it"))
+        self.assertIsNone(self.prompt("4: no, keep it"))  # 0.9.8: an ordinary prompt, to the AI
+        self.assertIsNone(self.prompt("no to 4"))
         self.assertEqual(self.calls, [])
 
 
@@ -1158,8 +1160,8 @@ def server_mac(key, grant, wb, instance, answer, p):
 class TypedAnswer(Base):
     """XLI-310 item 2 (plugin 0.9.9): the person types "do N", "no to N" or "N: text" against the numbered list this
     session showed; the transcript checker proves it was typed by them; then the plugin itself (never the model) posts the
-    answer with a typed proof signed with the login's answer key. A missing key or an ask that is not plain falls back
-    to the old "do N" answer with a line that it needs the site click."""
+    answer with a typed proof signed with the login's answer key. A missing key or an ask that is not plain goes exactly
+    as in 0.9.8 (M1)."""
     def setUp(self):
         super().setUp()
         self.server_rows = [dict(r) for r in TYPED_ROWS]
@@ -1262,16 +1264,26 @@ class TypedAnswer(Base):
         ds.cmd_status_verify([rec["pid"]])
         self.assertEqual(len(self.sent()), 1)
 
-    def test_a_missing_key_falls_back_to_the_old_answer_with_the_site_line(self):
-        self.key = None
-        n = self.n["p1"]
+    def assert_like_098(self, n, ask_text):
+        """M1: 0.9.8's behaviour: "do N" shows the old answer (blocked); "no to N" and "N: text" reach the AI as ordinary
+        prompts with nothing added; no checker starts and nothing is sent."""
         s = len(self.spawned)
         text = self.prompt(f"do {n}")
         self.assertEqual(self.last_hook["decision"], "block")
-        self.assertIn('Answering asks from here is coming. Ask %d, from api: "Ship the fix today?".' % n, text)
-        self.assertTrue(text.endswith(ds.ANSWER_SITE_LINE))
+        self.assertEqual(text, 'Answering asks from here is coming. Ask %d, from api: "%s". '
+                               "To answer now, tell api in its own session." % (n, ask_text))
+        for typed in (f"no to {n}", f"{n}: Not today, wait for Monday", f"{n}: US-East"):
+            self.prompt("status of all my agents")  # a fresh list each time: never ordinary only because it is stale
+            self.assertEqual(ds.read_view("sess1")["numbers"][str(n)].get("ask") is not None, True)
+            self.assertIsNone(self.prompt(typed), typed)
+            self.assertIsNone(self.last_hook, typed)
         self.assertEqual(self.spawned[s:], [])
         self.assertEqual(self.sent(), [])
+        self.assertEqual(self.outcomes(), [])
+
+    def test_a_missing_key_goes_exactly_as_in_098(self):
+        self.key = None
+        self.assert_like_098(self.n["p1"], "Ship the fix today?")
 
     def test_a_key_lost_before_the_check_sends_nothing(self):
         n = self.n["p1"]
@@ -1285,19 +1297,15 @@ class TypedAnswer(Base):
         self.key = None
         self.run_checks(s)
         self.assertEqual(self.sent(), [])
-        self.assertEqual(self.outcomes(), [ds.ANSWER_SITE_LINE])
+        self.assertEqual(self.outcomes(), [ds.ANSWER_NO_KEY_LINE])
+        self.assertNotIn("click", ds.ANSWER_NO_KEY_LINE)
 
     def test_an_effect_ask_or_needs_person_falls_back(self):
         for ask in ("p3", "p4"):
             with self.subTest(ask=ask):
                 self.prompt("status of all my agents")
                 n = {v["ask"]: int(k) for k, v in ds.read_view("sess1")["numbers"].items() if v.get("ask")}[ask]
-                s = len(self.spawned)
-                text = self.prompt(f"do {n}")
-                self.assertEqual(self.last_hook["decision"], "block")
-                self.assertTrue(text.endswith(ds.ANSWER_SITE_LINE))
-                self.assertEqual(self.spawned[s:], [])
-        self.assertEqual(self.sent(), [])
+                self.assert_like_098(n, ds.read_view("sess1")["numbers"][str(n)]["text"])
 
     def test_held_changed_and_failed_answers_tell_the_person(self):
         n = self.n["p1"]
@@ -1332,9 +1340,7 @@ class TypedAnswer(Base):
         ds.fetch_status({"slug": "web-app", "workbook_id": WB})
         self.prompt("status of all my agents")
         n = {v["ask"]: int(k) for k, v in ds.read_view("sess1")["numbers"].items() if v.get("ask")}["p9"]
-        text = self.prompt(f"do {n}")
-        self.assertTrue(text.endswith(ds.ANSWER_SITE_LINE))
-        self.assertEqual(self.sent(), [])
+        self.assert_like_098(n, "Go?")
 
 
 class ProofBytes(unittest.TestCase):

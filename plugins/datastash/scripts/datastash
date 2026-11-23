@@ -483,6 +483,19 @@ def answer_key_kept():
     return _answer_meta() is not None
 
 
+def answer_key_readable():
+    """M2: True when the kept answer key can really be read (keychain or login.answer). A record whose key is gone is
+    dropped, so the refresh asks for the key again."""
+    try:
+        if read_answer_key() is not None:
+            return True
+        if _answer_meta() is not None or os.path.lexists(_answer_meta_file()):
+            forget_answer_key()
+    except OSError:
+        pass
+    return False
+
+
 def save_answer_key(key, grant_id):
     """XLI-310 item 2: keeps the login's answer key with its grant id. False (nothing kept) unless both are well formed."""
     if not (isinstance(key, str) and re.fullmatch(ANSWER_KEY_RE, key) and isinstance(grant_id, str)
@@ -689,7 +702,7 @@ def login_token(force=False):
             return None  # no request sent, nothing rotated: the next call refreshes
         try:
             ask = {"refresh_token": rt}
-            if not answer_key_kept():
+            if not answer_key_readable():
                 ask["want_answer_key"] = True  # XLI-310 item 2: an earlier login gets its answer key on a refresh
             _st, _ct, text = http("POST", DEVICE_REFRESH_PATH, body=ask, timeout=min(LOGIN_REFRESH_TIMEOUT, left))
             got = json.loads(text)
@@ -5702,8 +5715,7 @@ INSTALL_ASKED_PATH = os.path.join(STATE, "status-install-asked")
 DO_LATER = ('Answering asks from here is coming. Ask {n}, from {agent}: "{text}". '
             "To answer now, tell {agent} in its own session.")
 # XLI-310 item 2: the typed answer. Only a plain ask, with this login's answer key kept, is answered from here; anything
-# else gets the "do N" answer above plus this line, and nothing is sent.
-ANSWER_SITE_LINE = "Answering this ask from here needs your click on the datastash site, so nothing was sent."
+# else goes exactly as in 0.9.8 ("do N" gets the answer above; any other prompt goes to the AI as an ordinary one).
 PERSON_ANSWER_PATH = "/api/v1/person/status/answer"
 TYPED_PROOF_LABEL = "datastash-typed-answer/v1"
 ANSWER_NOTE = ("{note}: the person typed an answer to ask {n}, from {agent}. The plugin checks it was typed by them and "
@@ -5716,6 +5728,7 @@ ANSWER_HELD_NOLINK = "{agent}'s ask needs your OK on the datastash site; nothing
 ANSWER_CHANGED_LINE = "That ask changed or was already answered, so nothing was sent. Say status again."
 ANSWER_NO_LOGIN_LINE = "Not sent: this computer's datastash login could not be used just now. Try again in a minute."
 ANSWER_UNREACHED_LINE = "Not sent: datastash could not be reached. Try again in a minute."
+ANSWER_NO_KEY_LINE = "Not sent: this computer's datastash login needs a moment to get ready. Try again in a few minutes."
 TURN_ON_LINE = ("To have datastash keep your agents' status, so this answer comes back at once in any session, type: "
                 "Keep my agents' status and what I tell them to remember in datastash")
 _PLAIN = [False]  # True while building the text the plugin shows the person itself (no markdown)
@@ -8278,7 +8291,8 @@ def send_typed_answer(rec, entry):
         return []
     got = read_answer_key()
     if got is None:
-        return [ANSWER_SITE_LINE]
+        forget_answer_key()  # M2: the key is gone (keychain or file): the next refresh asks for it again
+        return [ANSWER_NO_KEY_LINE]
     typed_at = _when(entry.get("timestamp"))
     if typed_at is None:
         return []
@@ -8434,19 +8448,16 @@ def typed_answer_context(inp, text):
     if not isinstance(target, dict) or not target.get("ask") or target.get("lookup"):
         return None
     agent = _clean(target.get("agent"), 64)
-    fallback = {"show": DO_LATER.format(n=n, agent=agent, text=_clean(target.get("text"), 300)) + " " + ANSWER_SITE_LINE}
     wb, inst = view.get("workbook_id"), target.get("instance")
     if not (target.get("plain") is True and isinstance(inst, str) and re.fullmatch(GRANT_ID_RE, inst.lower())
-            and isinstance(wb, str) and re.fullmatch(GRANT_ID_RE, wb.lower())):
-        return fallback
+            and isinstance(wb, str) and re.fullmatch(GRANT_ID_RE, wb.lower()) and answer_key_kept()):
+        return None  # M1: not answered from here; the prompt goes on exactly as in 0.9.8
     opts = target.get("options")
     if isinstance(opts, list) and opts:
         hits = [o for o in opts if isinstance(o, str) and o.strip().lower() == answer.strip().lower()]
         if len(hits) != 1:
             return {"show": ANSWER_OPTIONS_LINE.format(n=n, agent=agent, options=", ".join(_clean(o, 80) for o in opts))}
         answer = hits[0]
-    if not answer_key_kept():
-        return fallback
     shape = hook_shape(inp)
     if shape is None or not start_check(shape, "answer", text, {"workbook": wb, "instance": inst, "answer": answer,
                                                                "agent": agent, "n": n}):
@@ -8593,7 +8604,9 @@ def status_prompt_context(inp):
         target = (view or {}).get("numbers", {}).get(str(arg))
         if isinstance(target, dict) and target.get("lookup"):
             return lookup_do(inp, arg, target)  # XLI-308
-        return None  # not an ask of the list this session just showed (asks are answered above): an ordinary prompt
+        if not isinstance(target, dict) or not target.get("ask"):
+            return None  # not an ask of the list this session just showed: an ordinary prompt
+        return {"show": DO_LATER.format(n=arg, agent=_clean(target.get("agent"), 64), text=_clean(target.get("text"), 300))}
     me = lazy_me(inp)
     if kind in ("details", "more_of"):
         lines = render_status_details(here, me, arg, for_person=True, more=kind == "more_of")

@@ -90,6 +90,12 @@ class Shape(unittest.TestCase):
 
 
 class LookupBase(Base):
+    @staticmethod
+    def move_counts_aside():
+        for p in (ds.LOOKUPS_PATH, ds.LOOKUP_OFFERS_PATH):
+            if os.path.exists(p):
+                os.replace(p, os.path.join(ds.CONF, f"old-{os.path.basename(p)}-{time.time()}"))
+
     def setUp(self):
         super().setUp()
         olds = [ds.LOOKUPS_PATH, ds.LOOKUP_OFFERS_PATH] + [os.path.join(ds.CONF, n) for n in os.listdir(ds.CONF)
@@ -99,6 +105,7 @@ class LookupBase(Base):
         for p in olds:
             if os.path.exists(p):
                 os.replace(p, os.path.join(ds.CONF, f"old-{os.path.basename(p)}-{time.time()}"))
+        self.addCleanup(self.move_counts_aside)  # never leave counts for a later test module in the same process
         base = ds.http
         self.feed_answer = None
 

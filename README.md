@@ -397,9 +397,9 @@ list, asks first and idle agents last, from any session: "status", "status of al
   itself to `POST /api/v1/person/status/answer` with the login token. A headless (`claude -p`) prompt, a prompt the AI
   wrote, or one without those fields sends nothing. The person sees one line at the end of the turn: sent, needs your
   OK on the site (the page opens), or the ask changed. An ask with effects (touches, if yes, if no) or needs_person, an
-  older list with no ask instance, or a login with no answer key yet (it comes with the next sign-in or token refresh)
-  gets the old "do 4" answer plus "Answering this ask from here needs your click on the datastash site", and nothing is
-  sent.
+  older list with no ask instance, or a login with no answer key yet (it comes with the next sign-in or token refresh,
+  and is asked for again if the kept key is lost) goes exactly as in 0.9.8: "do 4" gets the old answer (tell that agent
+  in its own session), and "no to 4" or "4: ..." is an ordinary prompt to the AI.
 - **Keeping (one yes per computer).** The person types "Keep my agents' status and what I tell them to remember in
   datastash" (the install step). The prompt hook recognizes it in plain code (case, punctuation and "my agent's" /
   "my agents'" don't matter) and acts only once a checker confirms it as the person's own typed prompt: the transcript
@@ -626,7 +626,7 @@ An agent can send datastash a capability request, an error report or anything el
   (paged reads to the end, a failure partway keeps the old copy, mode 600, no symlink; the 60 s refresh, skipped when
   another session refreshed, nothing read while keeping is off); the plugin's own fast answer ("status", "status of all
   my agents", "status of <agent>", "full context of N": a block with the list, no network, offline and 404 said
-  plainly); "full context of N" bounded with a "more of N" line, paged through 2,000 cards each once, under 2 seconds; typed answers ("do N", "no to N", "N: text") sent only by the plugin after the typed check, with a proof whose MAC matches the server's (Node vectors), and the old answer plus the site line for a missing key or an ask with effects; keeping only from the person's typed phrase (`claude -p` and
+  plainly); "full context of N" bounded with a "more of N" line, paged through 2,000 cards each once, under 2 seconds; typed answers ("do N", "no to N", "N: text") sent only by the plugin after the typed check, with a proof whose MAC matches the server's (Node vectors), and 0.9.8's behaviour for a missing key or an ask with effects; keeping only from the person's typed phrase (`claude -p` and
   entries without origin fields refused); status off sends nothing and says how to turn it on; the install question and
   "leave <name> off"; the Stop hook; that only typed answers reach the answer route and no undo route is called; and the timed read: the
   real hook process answers from a 30 agents x 5 projects copy in under 2 seconds with no request.

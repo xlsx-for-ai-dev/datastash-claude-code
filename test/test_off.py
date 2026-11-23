@@ -66,6 +66,9 @@ class OffBase(Base):
             os.replace(os.path.join(ds.OFF, n), os.path.join(TMP, f"old-off-{n}-{time.time()}"))
         if os.path.exists(ds.ENROLL_FILE):
             os.replace(ds.ENROLL_FILE, os.path.join(TMP, f"old-enroll-{time.time()}"))
+        for p in (ds.LOOKUPS_PATH, ds.LOOKUP_OFFERS_PATH):  # lookups another test module counted in this process
+            if os.path.exists(p):
+                os.replace(p, os.path.join(TMP, f"old-{os.path.basename(p)}-{time.time()}"))
         for p in (ds.INSTALL_ASKED_PATH, ds.INSTALL_UPDATED_PATH):
             if os.path.exists(p):
                 os.replace(p, os.path.join(TMP, f"old-install-{time.time()}"))
