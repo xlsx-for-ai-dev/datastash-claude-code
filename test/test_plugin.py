@@ -2459,11 +2459,18 @@ class Login(Base):
         ds._keychain_set = lambda t: (self.keychain.__setitem__("rt", t) or True) if self.keychain_works else False
         ds._keychain_get = lambda: self.keychain.get("rt")
         ds._keychain_del = lambda: self.keychain.pop("rt", None)
+        for k in ("_answer_kc_set", "_answer_kc_get", "_answer_kc_del"):
+            self.saved.setdefault(k, getattr(ds, k))
+        ds._answer_kc_set = lambda v: (self.keychain.__setitem__("ak", v) or True) if self.keychain_works else False
+        ds._answer_kc_get = lambda: self.keychain.get("ak")
+        ds._answer_kc_del = lambda: self.keychain.pop("ak", None)
         ds._open_browser = lambda url: self.calls.append(("browser", url)) or True
         self.keychain_works = True
         self.refresh_status = 200
         self.n = 0
         self.refresh_bodies = []
+        self.token_extra = {}  # XLI-310 item 2: what device/token adds (answer_key, grant_id)
+        self.refresh_extra = {}
 
         def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
             self.calls.append((method, path, json.dumps(body)))
@@ -2471,14 +2478,15 @@ class Login(Base):
                 return 200, "application/json", json.dumps({"device_code": "dsdc_" + "d" * 43, "user_code": "BCDF-GHJK",
                                                             "verification_uri": ds.ORIGIN + "/device", "expires_in": 600, "interval": 5})
             if path == ds.DEVICE_TOKEN_PATH:
-                return 200, "application/json", json.dumps({"access_token": "dsat_" + "a" * 43, "refresh_token": "dsrt_" + "r" * 43, "expires_in": 900})
+                return 200, "application/json", json.dumps(dict({"access_token": "dsat_" + "a" * 43, "refresh_token": "dsrt_" + "r" * 43, "expires_in": 900}, **self.token_extra))
             if path == ds.DEVICE_REFRESH_PATH:
                 if self.refresh_status != 200:
                     raise ds.ApiError(self.refresh_status, {"error": "invalid_grant"})
                 self.n += 1
                 # XLI-290: each refresh rotates the refresh token (the old one is retired at datastash).
                 self.refresh_bodies.append(body)
-                return 200, "application/json", json.dumps({"access_token": "dsat_" + str(self.n) * 43, "refresh_token": "dsrt_" + str(self.n) * 43, "expires_in": 900})
+                extra = self.refresh_extra if body.get("want_answer_key") is True else {}
+                return 200, "application/json", json.dumps(dict({"access_token": "dsat_" + str(self.n) * 43, "refresh_token": "dsrt_" + str(self.n) * 43, "expires_in": 900}, **extra))
             if path == ds.DEVICE_LOGOUT_PATH:
                 return 200, "application/json", json.dumps({"revoked": True})
             raise AssertionError(path)
@@ -2774,6 +2782,72 @@ class Login(Base):
         self.assertEqual(ds.login_token(), "dsat_" + "1" * 43)
         self.assertEqual(ds.login_token(), "dsat_" + "1" * 43)
         self.assertEqual(len(self.refresh_bodies), 1)
+
+    # XLI-310 item 2: the login's answer key (signs the typed-answer proof): kept like the refresh token, never shown
+    AK = "dsak_" + "k" * 43
+    GRANT = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    def test_the_answer_key_from_sign_in_is_kept_privately(self):
+        for works in (True, False):
+            with self.subTest(keychain=works):
+                self.keychain_works = works
+                self.keychain.clear()
+                self.token_extra = {"answer_key": self.AK, "grant_id": self.GRANT.upper()}
+                self.finish_login()
+                self.assertEqual(ds.read_answer_key(), (self.AK, self.GRANT))
+                path = ds._answer_key_file()
+                self.assertEqual(os.path.basename(path), "login.answer")
+                if works:
+                    self.assertEqual(self.keychain["ak"], self.AK)
+                    self.assertFalse(os.path.exists(path))
+                else:
+                    self.assertNotIn("ak", self.keychain)
+                    self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+                for f in os.listdir(ds.CONF):
+                    full = os.path.join(ds.CONF, f)
+                    if os.path.isfile(full) and full != path:
+                        self.assertNotIn("dsak_", open(full).read(), f)  # only the key's own file holds it
+
+    def test_an_answer_key_without_a_grant_id_is_not_kept(self):
+        self.token_extra = {"answer_key": self.AK}
+        self.finish_login()
+        self.assertIsNone(ds.read_answer_key())
+        self.token_extra = {"answer_key": "not-a-key", "grant_id": self.GRANT}
+        self.finish_login()
+        self.assertIsNone(ds.read_answer_key())
+
+    def test_a_refresh_asks_for_a_key_only_when_none_is_kept(self):
+        self.finish_login()
+        self.assertIsNone(ds.read_answer_key())
+        self.expire_access()
+        self.refresh_extra = {"answer_key": self.AK, "grant_id": self.GRANT}
+        self.assertEqual(ds.login_token(), "dsat_" + "1" * 43)
+        self.assertIs(self.refresh_bodies[-1].get("want_answer_key"), True)
+        self.assertEqual(ds.read_answer_key(), (self.AK, self.GRANT))
+        self.expire_access()
+        self.assertEqual(ds.login_token(), "dsat_" + "2" * 43)
+        self.assertNotIn("want_answer_key", self.refresh_bodies[-1])
+        self.assertEqual(ds.read_answer_key(), (self.AK, self.GRANT))
+
+    def test_a_new_sign_in_replaces_the_key_and_logout_removes_it(self):
+        self.token_extra = {"answer_key": self.AK, "grant_id": self.GRANT}
+        self.finish_login()
+        other = "dsak_" + "j" * 43
+        self.token_extra = {"answer_key": other, "grant_id": self.GRANT.replace("a", "b")}
+        self.finish_login()
+        self.assertEqual(ds.read_answer_key(), (other, self.GRANT.replace("a", "b")))
+        self.token_extra = {}
+        self.finish_login()  # a sign-in with no key: the old login's key is gone with it
+        self.assertIsNone(ds.read_answer_key())
+        self.token_extra = {"answer_key": self.AK, "grant_id": self.GRANT}
+        self.keychain_works = False
+        self.finish_login()
+        with redirect_stdout(io.StringIO()) as out:
+            ds.cmd_logout([])
+        self.assertNotIn("dsak_", out.getvalue())
+        self.assertIsNone(ds.read_answer_key())
+        self.assertNotIn("ak", self.keychain)
+        self.assertFalse(os.path.exists(ds._answer_key_file()))
 
     def test_revoked_at_datastash_forgets_the_local_login(self):
         self.finish_login()

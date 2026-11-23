@@ -2,8 +2,8 @@
 """Offline tests for the agent status, plugin 0.3.0 (XLI-337): the numbered list (bounded, grouped by agent and project,
 every value with its age), the local copy (paged reads, 60 s refresh, shared between sessions), the plugin's own fast
 answer (no model turn, no network, under 2 seconds), the end-of-turn reminder, the background write (only while keeping
-is on), "full context of N", "do N" (no answers yet: shows the ask, sends nothing), keeping (the person's typed keep
-phrase only), "leave <name> off", and that no answer route is ever called.
+is on), "full context of N", the typed answers "do N", "no to N" and "N: text" (XLI-310 item 2: proved typed, then
+sent by the plugin with a typed proof), keeping (the person's typed keep phrase only), "leave <name> off".
 No network, no key; a throwaway HOME and config folder, enforced by test/harness.py.
 Run: python3 -I test/test_status.py"""
 import importlib.machinery
@@ -45,7 +45,7 @@ if _refresh is not None:
     os.environ["DATASTASH_STATUS_REFRESH_SECONDS"] = _refresh
 
 WB = "11111111-2222-3333-4444-555555555555"
-ALL_CALLS = []  # every request any test made through the plugin (no answer route, ever: see NoAnswerRoute)
+ALL_CALLS = []  # every request any test made through the plugin (answers only from the typed path: see ZzAnswerRoute)
 NOW = time.time()
 
 
@@ -1105,7 +1105,8 @@ class FastAnswer(Base):
 
 
 class DoN(Base):
-    """No answers in 0.3.0: "do N" shows the ask and says answering is coming; nothing is sent."""
+    """An ask with no server instance (an older list) or with effects: "do N" shows the ask as before, with one line that
+    it needs the person's click on the site; nothing is sent and no checker starts."""
     def setUp(self):
         super().setUp()
         ds.fetch_status({"slug": "web-app", "workbook_id": WB})
@@ -1117,7 +1118,7 @@ class DoN(Base):
         n = self.spawned_before = len(self.spawned)
         text = self.prompt("do 4")
         self.assertEqual(text, 'Answering asks from here is coming. Ask 4, from api: "Delete the old /invoices endpoint?". '
-                               "To answer now, tell api in its own session.")
+                               "To answer now, tell api in its own session. " + ds.ANSWER_SITE_LINE)
         self.assertEqual(self.last_hook["decision"], "block")
         self.assertEqual(self.calls, [])
         self.assertEqual(self.spawned[n:], [])  # no checker, no sender
@@ -1125,8 +1126,250 @@ class DoN(Base):
     def test_do_n_that_is_not_an_ask_or_with_no_list_is_ordinary(self):
         self.assertIsNone(self.prompt("do 1"))  # number 1 is an agent, not an ask
         self.assertIsNone(self.prompt("do 4", sid="sess2"))  # this session showed no list
-        self.assertIsNone(self.prompt("4: no, keep it"))
+        self.assertIsNone(self.prompt("no to 1"))
+        self.assertIsNone(self.prompt("1: no, keep it"))
         self.assertEqual(self.calls, [])
+
+
+KEY = "dsak_" + "k" * 43
+GRANT = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+I_PLAIN, I_OPTS, I_EFFECT, I_NP = ("99999999-8888-4777-8666-55555555555" + c for c in "1234")
+TYPED_ROWS = [
+    row("api", "Waiting on the person.", project="api", asks=[
+        {"id": "p1", "text": "Ship the fix today?", "details": "All tests pass.", "instance": I_PLAIN},
+        {"id": "p2", "text": "Which region?", "options": ["eu-west", {"label": "US-East"}], "instance": I_OPTS},
+        {"id": "p3", "text": "Delete the old endpoint?", "touches": "src/routes.ts", "if_yes": "removes it",
+         "if_no": "keeps it", "instance": I_EFFECT},
+        {"id": "p4", "text": "Rotate the key?", "needs_person": True, "instance": I_NP}]),
+]
+
+
+def server_mac(key, grant, wb, instance, answer, p):
+    """The MAC as the server computes it (src/agents/answers.ts checkTypedProof), written here independently: the answer
+    as Node's JSON.stringify writes it (non-ASCII kept, no spaces), then HMAC-SHA256 with the whole key string."""
+    import hashlib
+    import hmac
+    js = json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
+    lines = ["datastash-typed-answer/v1", grant.lower(), wb.lower(), instance.lower(),
+             hashlib.sha256(js.encode()).hexdigest(), p["prompt_id"], p["typed_sha256"], str(p["typed_at"]), str(p["iat"])]
+    return hmac.new(key.encode(), "\n".join(lines).encode(), "sha256").hexdigest()
+
+
+class TypedAnswer(Base):
+    """XLI-310 item 2 (plugin 0.9.9): the person types "do N", "no to N" or "N: text" against the numbered list this
+    session showed; the transcript checker proves it was typed by them; then the plugin itself (never the model) posts the
+    answer with a typed proof signed with the login's answer key. A missing key or an ask that is not plain falls back
+    to the old "do N" answer with a line that it needs the site click."""
+    def setUp(self):
+        super().setUp()
+        self.server_rows = [dict(r) for r in TYPED_ROWS]
+        self.key = (KEY, GRANT)
+        self.saved_k = (ds.read_answer_key, ds._open_browser)
+        ds.read_answer_key = lambda: self.key
+        self.browser = []
+        ds._open_browser = lambda url: self.browser.append(url) or True
+        self.addCleanup(self.restore_k)
+        self.answer_reply = (200, {"how": "click_free", "delivered": True})
+        fake = ds.http
+
+        def answer_http(method, path, key=None, body=None, form=None, timeout=40):
+            if path != ds.PERSON_ANSWER_PATH:
+                return fake(method, path, key=key, body=body, form=form, timeout=timeout)
+            self.calls.append((method, path, key, body))
+            ALL_CALLS.append((method, path, key, body))
+            status, out = self.answer_reply
+            if status >= 400:
+                raise ds.ApiError(status, out)
+            return status, "application/json", json.dumps(out)
+        ds.http = answer_http
+        ds.fetch_status({"slug": "web-app", "workbook_id": WB})
+        ds.write_private(ds.INSTALL_ASKED_PATH, "{}")
+        self.prompt("status of all my agents")
+        self.calls.clear()
+        nums = ds.read_view("sess1")["numbers"]
+        self.n = {v["ask"]: int(k) for k, v in nums.items() if isinstance(v, dict) and v.get("ask")}
+
+    def restore_k(self):
+        ds.read_answer_key, ds._open_browser = self.saved_k
+
+    def sent(self):
+        return [c for c in self.calls if c[1] == ds.PERSON_ANSWER_PATH]
+
+    def test_typed_do_n_is_proved_then_sent_by_the_plugin_with_a_mac_the_server_accepts(self):
+        n = self.n["p1"]
+        note = self.prompt(f"do {n}")
+        self.assertNotEqual((self.last_hook or {}).get("decision"), "block")  # passes through: the transcript gets it
+        self.assertIn("never call", note.lower())
+        self.assertIn("ledger_agent_status", note)
+        [(method, path, key, body)] = self.sent()
+        self.assertEqual((method, key), ("POST", "dsat_person"))  # the login token as bearer; never the answer key
+        self.assertEqual(set(body), {"workbook_id", "instance", "answer", "typed_proof"})
+        self.assertEqual((body["workbook_id"], body["instance"], body["answer"]), (WB, I_PLAIN, "yes"))
+        p = body["typed_proof"]
+        self.assertEqual(set(p), {"v", "prompt_id", "typed_sha256", "typed_at", "iat", "mac"})
+        self.assertEqual(p["v"], 1)
+        import hashlib
+        self.assertEqual(p["typed_sha256"], hashlib.sha256(f"do {n}".encode()).hexdigest())
+        self.assertTrue(0 <= p["iat"] - p["typed_at"] <= 125_000)
+        self.assertLessEqual(abs(time.time() * 1000 - p["iat"]), 60_000)
+        self.assertRegex(p["prompt_id"], "^" + ds.PROMPT_ID_RE + "$")
+        self.assertEqual(p["mac"], server_mac(KEY, GRANT, WB, I_PLAIN, "yes", p))
+        self.assertEqual(self.outcomes(), [f'Sent "yes" to api.'])
+
+    def test_no_to_n_and_n_colon_text(self):
+        n = self.n["p1"]
+        self.prompt(f"no to {n}")
+        self.prompt(f"Don't do {n}")
+        self.prompt(f"{n}: Not today, wait for Monday")
+        answers = [c[3]["answer"] for c in self.sent()]
+        self.assertEqual(answers, ["no", "no", "Not today, wait for Monday"])  # the person's own words, case kept
+        for c in self.sent():
+            self.assertEqual(c[3]["typed_proof"]["mac"], server_mac(KEY, GRANT, WB, I_PLAIN, c[3]["answer"], c[3]["typed_proof"]))
+
+    def test_options_must_match_exactly_one(self):
+        n = self.n["p2"]
+        self.prompt(f"{n}: us-east")
+        self.assertEqual([c[3]["answer"] for c in self.sent()], ["US-East"])  # the option as the agent wrote it
+        self.calls.clear()
+        self.prompt("status of all my agents")
+        self.calls.clear()
+        n = {v["ask"]: int(k) for k, v in ds.read_view("sess1")["numbers"].items() if v.get("ask")}["p2"]
+        text = self.prompt(f"{n}: asia")
+        self.assertEqual(self.last_hook["decision"], "block")
+        self.assertIn("eu-west", text)
+        self.assertIn("US-East", text)
+        self.assertEqual(self.sent(), [])
+
+    def test_headless_ai_typed_system_and_reused_prompts_send_nothing(self):
+        n = self.n["p1"]
+        self.prompt(f"do {n}", writer=self.headless)  # claude -p: promptSource "sdk", no origin
+        self.assertEqual(self.outcomes(), [ds.NOT_PERSON_LINE])
+        self.prompt(f"do {n}", origin={"kind": "system"})  # a task notification or a peer message
+        self.prompt(f"do {n}", origin=False, source=False)  # an older Claude Code: no origin fields
+        pid = str(uuid.uuid4())  # the AI pipes a hook-shaped prompt in a tool call: no typed entry is written
+        self.forged({"session_id": "sess1", "prompt": f"do {n}", "hook_event_name": "UserPromptSubmit", "cwd": self.folder,
+                     "prompt_id": pid, "transcript_path": self.transcript("sess1")})
+        self.typed("sess1", f"do {n} later")  # a typed entry with other words under another id proves nothing
+        self.assertEqual(self.sent(), [])
+        # the same typed prompt id is used once only
+        self.prompt("status of all my agents")  # the list again (it answers for 3 prompts)
+        self.prompt(f"do {n}")
+        self.assertEqual(len(self.sent()), 1)
+        rec = {"kind": "answer", "sid": "sess1", "tp": self.transcript("sess1"), "pid": self.sent()[0][3]["typed_proof"]["prompt_id"],
+               "prompt": f"do {n}", "at": time.time(), "data": {"workbook": WB, "instance": I_PLAIN, "answer": "yes", "agent": "api"}}
+        ds.write_private(ds._pending_path(rec["pid"]), json.dumps(rec))
+        ds.cmd_status_verify([rec["pid"]])
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_a_missing_key_falls_back_to_the_old_answer_with_the_site_line(self):
+        self.key = None
+        n = self.n["p1"]
+        s = len(self.spawned)
+        text = self.prompt(f"do {n}")
+        self.assertEqual(self.last_hook["decision"], "block")
+        self.assertIn('Answering asks from here is coming. Ask %d, from api: "Ship the fix today?".' % n, text)
+        self.assertTrue(text.endswith(ds.ANSWER_SITE_LINE))
+        self.assertEqual(self.spawned[s:], [])
+        self.assertEqual(self.sent(), [])
+
+    def test_a_key_lost_before_the_check_sends_nothing(self):
+        n = self.n["p1"]
+        ds.spawn_detached = lambda argv, cwd: self.spawned.append(argv)
+        s = len(self.spawned)
+        pid = str(uuid.uuid4())
+        inp = {"session_id": "sess1", "prompt": f"do {n}", "hook_event_name": "UserPromptSubmit", "cwd": self.folder,
+               "prompt_id": pid, "transcript_path": self.transcript("sess1")}
+        self.hook(ds.cmd_prompt, inp)
+        self.typed("sess1", f"do {n}", pid)
+        self.key = None
+        self.run_checks(s)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.outcomes(), [ds.ANSWER_SITE_LINE])
+
+    def test_an_effect_ask_or_needs_person_falls_back(self):
+        for ask in ("p3", "p4"):
+            with self.subTest(ask=ask):
+                self.prompt("status of all my agents")
+                n = {v["ask"]: int(k) for k, v in ds.read_view("sess1")["numbers"].items() if v.get("ask")}[ask]
+                s = len(self.spawned)
+                text = self.prompt(f"do {n}")
+                self.assertEqual(self.last_hook["decision"], "block")
+                self.assertTrue(text.endswith(ds.ANSWER_SITE_LINE))
+                self.assertEqual(self.spawned[s:], [])
+        self.assertEqual(self.sent(), [])
+
+    def test_held_changed_and_failed_answers_tell_the_person(self):
+        n = self.n["p1"]
+        url = ds.ORIGIN + "/confirm/abc123"
+        self.answer_reply = (403, {"code": "person_approval_needed", "approve_url": url})
+        self.prompt(f"do {n}")
+        self.assertEqual(self.outcomes(), [f"api's ask needs your OK on the datastash site: {url}"])
+        self.assertEqual(self.browser, [url])
+        self.answer_reply = (409, {"code": "ask_changed"})
+        self.prompt("status of all my agents")
+        self.prompt(f"do {n}")
+        self.assertEqual(self.outcomes(), [ds.ANSWER_CHANGED_LINE])
+        self.answer_reply = (200, {"code": "person_approval_needed", "approve_url": "https://evil.example/x"})
+        self.prompt("status of all my agents")
+        self.prompt(f"do {n}")
+        [line] = self.outcomes()
+        self.assertNotIn("evil.example", line)
+
+    def test_no_token_or_key_in_anything_shown(self):
+        n = self.n["p1"]
+        shown = [self.prompt(f"do {n}"), json.dumps(self.last_hook)] + self.outcomes()
+        self.prompt("status of all my agents")
+        self.prompt(f"no to {n}", writer=self.headless)
+        shown += [json.dumps(self.last_hook)] + self.outcomes()
+        for t in shown:
+            self.assertNotIn("dsak_", t)
+            self.assertNotIn("dsat_", t)
+            self.assertNotIn(KEY, t)
+
+    def test_an_old_list_with_no_instance_falls_back(self):
+        self.server_rows = [row("api", "x", project="api", asks=[{"id": "p9", "text": "Go?"}])]
+        ds.fetch_status({"slug": "web-app", "workbook_id": WB})
+        self.prompt("status of all my agents")
+        n = {v["ask"]: int(k) for k, v in ds.read_view("sess1")["numbers"].items() if v.get("ask")}["p9"]
+        text = self.prompt(f"do {n}")
+        self.assertTrue(text.endswith(ds.ANSWER_SITE_LINE))
+        self.assertEqual(self.sent(), [])
+
+
+class ProofBytes(unittest.TestCase):
+    """The MAC covers sha256(JSON.stringify(answer)) exactly as Node writes it. Vectors made with node 22 from the
+    server's own formula (key dsak_k*43, grant/workbook/instance below, prompt-0001-abcdef, sha256("do 3"),
+    typed_at 1700000000000, iat 1700000003000)."""
+    VECTORS = [
+        ("yes", "0127c8a51702bf8988fa705b0df48293f62441d5e57d81f012f5ec86d4712c2d"),
+        ('Ship it "now" \\ ok\u0001\u001f\t\n\u007f \u00e9 \u65e5\u672c \U0001F600 \u2028 /x',
+         "3172f4fdfd191557f83aa48a3f5b80117646527dfd1fd66f355bd68eb8130288"),
+        ("no", "a98a5490c078f158d1100e9e1f6f6f53a3ce7e319b5a71370a0e71d356c7db9f"),
+        ("\ud800lone", "62f6f3d501dcd6c5d231a02532b9b5f587b336b34bb2f4f44a12326bc88851ef"),
+    ]
+
+    def proof(self, answer):
+        import hashlib
+        return ds.typed_proof(KEY, "AAAAAAAA-bbbb-4ccc-8ddd-eeeeeeeeeeee", WB, "99999999-8888-4777-8666-555555555555", answer,
+                              "prompt-0001-abcdef", "do 3", 1700000000000, 1700000003000)
+
+    def test_node_vectors(self):
+        for answer, mac in self.VECTORS:
+            with self.subTest(answer=answer):
+                p = self.proof(answer)
+                self.assertEqual(p["mac"], mac)
+                self.assertEqual((p["v"], p["typed_at"], p["iat"], p["prompt_id"]), (1, 1700000000000, 1700000003000, "prompt-0001-abcdef"))
+
+    def test_js_json_matches_node(self):
+        import shutil
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("no node here")
+        samples = ["yes", "a\u0000b\u0008\u000c\u000b", "\u2028\u2029\u007f\u0080", "\U0001F600\udfff\ud83d", '"\\/']
+        r = subprocess.run([node, "-e", "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{for(const s of JSON.parse(d))console.log(JSON.stringify(JSON.stringify(s)))})"],
+                           input=json.dumps(samples), capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([json.loads(x) for x in r.stdout.splitlines()], [ds.js_json(s) for s in samples])
 
 
 class StatusOff(Base):
@@ -1379,29 +1622,39 @@ class DetailsBound(Base):
         self.assertEqual(P("more on 12"), ("details", 12))
 
 
-class ZzNoAnswerRoute(unittest.TestCase):
-    """Runs last (the loader sorts classes by name): no request any test made went to an answer or undo route, and the
-    plugin has no answer route or answer command left."""
-    def test_no_answer_route_was_called_in_the_whole_run(self):
+class ZzAnswerRoute(unittest.TestCase):
+    """Runs last (the loader sorts classes by name): XLI-310 item 2: every request any test made to an answer route was
+    the plugin's own typed answer (the login token as bearer, a typed proof in the body); never an undo; no answer
+    command for a tool call to run."""
+    def test_only_typed_answers_went_to_the_answer_route(self):
         self.assertTrue(ALL_CALLS)  # the run did make requests through the recorder
-        self.assertEqual([c for c in ALL_CALLS if "/answer" in c[1] or "/undo" in c[1]], [])
+        self.assertEqual([c for c in ALL_CALLS if "/undo" in c[1]], [])
+        answers = [c for c in ALL_CALLS if "/answer" in c[1]]
+        self.assertTrue(answers)
+        for c in answers:
+            self.assertEqual(len(c), 4, c)  # recorded by the typed-answer tests' own route
+            method, path, key, body = c
+            self.assertEqual((method, path, key), ("POST", ds.PERSON_ANSWER_PATH, "dsat_person"))
+            self.assertEqual(set(body["typed_proof"]), {"v", "prompt_id", "typed_sha256", "typed_at", "iat", "mac"})
 
-    def test_no_answer_route_or_command_in_the_plugin(self):
+    def test_no_answer_command_in_the_plugin(self):
         with open(BIN) as f:
             code = f.read()
-        for word in ("/status/answer", "/answer/undo", "PERSON_STATUS_ANSWER_PATH", '"answer": cmd_answer',
-                     "status-answer-send", "def post_answer", "def deliver_answer", "def undo_answer"):
+        for word in ("/answer/undo", '"answer": cmd_answer', "status-answer-send", "def undo_answer"):
             self.assertNotIn(word, code)
         r = subprocess.run([sys.executable, "-I", BIN, "answer", "3"], capture_output=True, text=True, timeout=20)
         self.assertEqual(r.returncode, 1)  # unknown command: the help text, nothing else
 
-    def test_the_skill_names_the_servers_marker_and_no_answer_steps(self):
+    def test_the_skill_names_the_servers_marker_and_the_typed_phrases(self):
         with open(os.path.join(HERE, "..", "plugins", "datastash", "skills", "datastash-agent", "SKILL.md")) as f:
             skill = f.read()
         self.assertIn("status_answer", skill)
         self.assertNotIn("person_answer", skill)
         self.assertNotIn("undo N", skill)
-        self.assertIn("answering asks from here is coming", skill)
+        self.assertNotIn("answering asks from here is coming", skill)
+        for phrase in ('"do N"', '"no to N"', '"N: <text>"'):
+            self.assertIn(phrase, skill)
+        self.assertIn("never call `ledger_agent_status` with action `answer`", skill)
 
 
 if __name__ == "__main__":

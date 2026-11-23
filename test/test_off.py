@@ -546,6 +546,22 @@ class TokenHelperDeny(OffBase):
                 self.assertTrue(self.denied(out), out)
                 self.assertNotIn(self.TOKEN, json.dumps(out))
 
+    def test_a_tool_call_that_reaches_the_answer_key_or_the_checker_is_denied(self):
+        """XLI-310 item 2: the login's answer key (keychain account "answer-key", else login.answer) and the typed
+        checker (status-verify) are never reachable from a tool call, in their plain forms."""
+        for name, ti in (("Bash", {"command": "cat ~/.config/datastash/login.answer"}),
+                         ("Bash", {"command": "secret-tool lookup service datastash account answer-key"}),
+                         ("Bash", {"command": "security find-generic-password -s datastash -a answer-key -w"}),
+                         ("Bash", {"command": 'python3 "$CLAUDE_PLUGIN_ROOT/scripts/datastash" status-verify abcdef12-3456'}),
+                         ("Bash", {"command": "datastash status-verify 0123456789ab"}),
+                         ("Read", {"file_path": os.path.join(ds.CONF, "login.answer")}),
+                         ("Read", {"file_path": os.path.join(ds.CONF, "login.answer.json")}),
+                         ("Grep", {"pattern": "dsak_", "path": os.path.join(ds.CONF, "login.answer")})):
+            with self.subTest(name=name, ti=ti):
+                out = self.tool(name, tool_input=ti)
+                self.assertTrue(self.denied(out), out)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], ds.TOKEN_DENY)
+
     def test_other_datastash_commands_and_other_tools_are_not_denied(self):
         for name, ti in (("Bash", {"command": "datastash status"}), ("Bash", {"command": "datastash login --check"}),
                          ("Bash", {"command": "git log --oneline -3"}), ("Bash", {"command": "echo token"}),
