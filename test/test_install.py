@@ -205,13 +205,16 @@ class Install(Base):
         done = self.tool("PostToolUse", "ledger_agents_note", got, {"run_id": RUN, "kind": "install", "targets": 2,
                                                                      "status_path": "/api/v1/agent/uninstall/" + RUN})["systemMessage"]
         self.assertEqual(done, "datastash is on for your agents:\n- web-app (public)\n- alpha (private)\n- beta (public)\n"
-                               "To remove one or many: /datastash:uninstall and we'll show you the list of agents.")
+                               "To remove one or many: /datastash:uninstall and we'll show you the list of agents.\n"
+                               "To make one private: say make <name> private.\n"
+                               "To make one public: say make <name> public.")
 
     def test_the_only_agent_gets_the_list_with_no_note(self):
         self.installed()
         self.slash("/datastash:install")
         out = self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:1]))
-        self.assertEqual(out["systemMessage"], "datastash is on for your agents:\n- web-app (public)\n" + ds.REMOVE_LINE)
+        self.assertEqual(out["systemMessage"], "datastash is on for your agents:\n- web-app (public)\n" + ds.REMOVE_LINE
+                         + "\n" + ds.PRIVATE_LINE + "\n" + ds.PUBLIC_LINE)
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_a_list_without_visibility_shows_private(self):

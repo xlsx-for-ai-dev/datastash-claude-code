@@ -2768,7 +2768,7 @@ def cmd_check(_args):
     else:
         # The network part runs in a helper thread and the hook waits at most CHECK_WAIT_SECONDS for it, so a stalled
         # DNS lookup or connection can never hold the session start up (the answer is then "counts unknown").
-        out = {}
+        out = {"sid": _sid(inp)}
         worker = threading.Thread(target=_check_counts, args=(agent, key, name, out), daemon=True)
         worker.start()
         worker.join(CHECK_WAIT_SECONDS)
@@ -2812,6 +2812,7 @@ def _check_counts(agent, key, name, out):
     """The SessionStart check's network part (in a helper thread): sets out["ctx"] and, when there are new items,
     out["ids"] (the ids to mark announced after the line is printed)."""
     s = agent["slug"]
+    out.setdefault("t0", time.time())
     try:
         done = catch_up(agent, key, CHECK_BUDGET_SECONDS)
         ids, n = unannounced(agent)
@@ -2831,6 +2832,11 @@ def _check_counts(agent, key, name, out):
         else:
             key_works(agent)
         out["ids"] = ids
+        if not is_person(agent):  # XLI-391: the person's chatstash setting, said at every session start
+            left = CHECK_WAIT_SECONDS - (time.time() - out.get("t0", time.time())) - 0.5
+            note = chatstash_note(agent, key, out.get("sid"), timeout=max(1.0, min(5.0, left)))
+            if note:
+                ctx += " " + note
     except ApiError as e:
         if e.status == 401 or (e.body.get("error") or e.body.get("code")) == "agent_switched_off":
             set_flag(agent, "key_refused", int(time.time()))
@@ -3003,6 +3009,7 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
     # for, never neither.
     catching_up = True
     pending_since = None  # when the first arrival not yet woken for was seen
+    chat_next = time.time() + CHATSTASH_FIRST  # XLI-391: when to read the person's chatstash setting next
     log(s, f"listen: start session={session_id[:8]} parent={parent}")
     # The local status copy, refreshed beside the inbox poll; for an agent, only while the listener polls with a live
     # key (never while parked on a refused or missing key).
@@ -3047,6 +3054,17 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
                 fresh_key = True
                 continue
             live["key"] = key
+            if not is_person(agent) and session_id and time.time() >= chat_next:
+                chat_next = time.time() + CHATSTASH_EVERY
+                note = chatstash_note(agent, key, session_id, only_changed=True)  # XLI-391: a change, said once
+                if note:
+                    log(s, "listen: chatstash setting changed; tells the session")
+                    if printer is not None:
+                        printer(note)
+                        continue
+                    print(note, file=sys.stderr)
+                    sys.stderr.flush()
+                    return 2
             wait = 0 if catching_up else WAIT_SECONDS
             if pending_since is not None and not catching_up:
                 due = max(pending_since + WAKE_GATHER_SECONDS, _last_wake(agent) + WAKE_MIN_SECONDS)
@@ -4920,7 +4938,8 @@ PROOF_ARG = "agent_proof"
 NO_PROOF_TOOLS = ("ledger_agent_register", "ledger_agent_key")
 PROOF_DENY = ("datastash: an agent's proof stays with the datastash plugin, which adds it to that agent's own connector "
               "calls; it never goes to a tool call. Don't read the proof files or enroll.json, and don't work around it.")
-PROOF_FILE_RE = re.compile(r"agent-[^\s/\\'\"]*\.(?:proof|answer|verifier)(?![\w.-])")  # XLI-390: answer keys, verifiers
+PROOF_FILE_RE = re.compile(r"agent-[^\s/\\'\"]*\.(?:proof|answer|verifier|chatkey)(?![\w.-])")  # XLI-390: answer keys,
+# verifiers; XLI-391: the chat keys the plugin holds
 
 
 def read_proof(s):
@@ -5037,6 +5056,12 @@ def cmd_agent_tool(_args):
     except (Exception, SystemExit):  # fail closed: the call goes out with no agent_proof at all
         ti = bound if bound is not None else (inp.get("tool_input") if isinstance(inp, dict) else None)
         proofed = {k: v for k, v in ti.items() if k != PROOF_ARG} if isinstance(ti, dict) and PROOF_ARG in ti else None
+    try:  # XLI-391: the chat_key the plugin holds for this session, on the connector's chat_save
+        keyed = chat_key_binding(inp, proofed if proofed is not None else inp.get("tool_input"))
+    except (Exception, SystemExit):  # noqa: BLE001  the call goes out as the AI sent it
+        keyed = None
+    if keyed is not None:
+        proofed = keyed
     if bound is not None:
         # Printed first, so the rewrite stands even if the sign-in line or the recording below is slow or fails.
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
@@ -5092,6 +5117,17 @@ def cmd_agent_tool(_args):
             out = out or {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
             hs = out["hookSpecificOutput"]
             hs["additionalContext"] = (hs.get("additionalContext", "") + " " + note_ai).strip()
+        try:  # XLI-391: the held chat_key never reaches the model; a changed chatstash setting in _meta is said once
+            hidden, chat_ai = chat_key_hidden(inp), chatstash_meta_note(inp)
+        except Exception:  # noqa: BLE001  never in the way
+            hidden = chat_ai = None
+        if hidden is not None or chat_ai:
+            out = out or {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
+            hs = out["hookSpecificOutput"]
+            if hidden is not None:
+                hs["updatedMCPToolOutput"] = hidden
+            if chat_ai:
+                hs["additionalContext"] = (hs.get("additionalContext", "") + " " + chat_ai).strip()
     if out is not None:
         print(json.dumps(out), flush=True)
     return _agent_tool(inp)
@@ -10987,6 +11023,10 @@ def cmd_self_update(_args):
 # (MUST 3); an uninstall reaches an agent only as 410 agent_removed, and cleanup touches only the fixed paths (note b).
 INSTALL_RE = re.compile(r"\s*(?:/datastash:install|datastash install)\s*", re.I)
 UNINSTALL_RE = re.compile(r"\s*(?:/datastash:uninstall|datastash uninstall)(?:\s+(\S.*?))?\s*", re.I | re.S)
+# X6: the person's whole typed prompt "make <name> private" / "make <name> public" (names as the list shows them; "all"
+# and "this" are not names here, so "make this private" stays an ordinary prompt).
+VISIBILITY_RE = re.compile(r"\s*make\s+(\S[^\n]{0,199}?)\s+(private|public)\s*[.!]?\s*", re.I)
+VIS_KINDS = ("private", "public")
 # The transcript entry Claude Code 2.1.330 writes for a typed plugin slash command (read from a real interactive session,
 # test/fixtures/slash-command-2.1.330.jsonl): the message tag first, then the name, then the args only when there are
 # some; origin.kind "human", no promptSource, never isMeta (the command's expanded text is a separate isMeta entry with
@@ -11006,6 +11046,9 @@ NO_CONNECTOR_LINE = "Connect datastash in Claude first (Settings, Connectors), t
 MINT_LINE = 'datastash made a key for "{name}" (this session). datastash is on for "{name}".'
 ON_HEAD = "datastash is on for your agents:"
 REMOVE_LINE = "To remove one or many: /datastash:uninstall and we'll show you the list of agents."
+PRIVATE_LINE = "To make one private: say make <name> private."  # X6 (owner 11-23)
+PUBLIC_LINE = "To make one public: say make <name> public."
+AFTER_INSTALL = [REMOVE_LINE, PRIVATE_LINE, PUBLIC_LINE]
 LIST_HEAD = "Your datastash agents:"
 PICK_LINE = "Type the names to remove, separated by commas, or all."
 OFF_LINE = "datastash is off for {names}. Removed: listener, key, settings and local copies."
@@ -11033,6 +11076,16 @@ UNINSTALL_LIST_AI = (f"{CMD_NOTE}: the person typed the datastash uninstall comm
                      f"ledger_agents_list once, then stop and wait for the person's answer. {_SAY}")
 UNINSTALL_NOTE_AI = (f"{CMD_NOTE}: the person picked datastash agents to remove. {{list}}Call the datastash connector's "
                      f'ledger_agents_note once with kind "uninstall". {_SAY}')
+VIS_AI = (f'{CMD_NOTE}: the person typed "make <name> {{kind}}" (one of their datastash agents\' private or public). '
+          "Call the datastash connector's ledger_agents_list once, then stop: the plugin says the next step. " + _SAY)
+VIS_NOTE_AI = (f"{CMD_NOTE}: the person's agent is on the list. Call the datastash connector's ledger_agents_note once "
+               f'with kind "{{kind}}". {_SAY}')
+VIS_NOT_AGENT_AI = (f"{CMD_NOTE}: none of the person's datastash agents has that name, so datastash changed nothing. "
+                    "Make no more datastash calls for it; if the prompt meant something else (code, say), do that the "
+                    "ordinary way.")
+VIS_PICK_LINE = ("Not done: a name you typed matches two of your agents, or is not on your list. Nothing changed. Type "
+                 "the name as /datastash:uninstall lists it.")
+VIS_BRAKED_LINE = "Not done: too many changes just now. Wait a few minutes, then try again."
 NOTE_INSTALL_AI = (f"{CMD_NOTE}: the person installed datastash for all their agents. Call the datastash connector's "
                    'ledger_agent_key now with name "{name}", agent_id "{agent_id}" and only_if_no_key true. ' + _SAY)
 
@@ -11043,7 +11096,7 @@ AGENT_FILES = (
     "{st}/agent-{s}.listener.lock", "{st}/agent-{s}.state.lock", "{st}/agent-{s}.mint.lock", "{st}/agent-{s}.log",
     "{st}/agent-{s}.log.1",
     "{p}/agent-{s}.verifier", "{st}/status-sent-{s}.json", "{st}/status-written-{s}", "{st}/status-out-{s}.json",
-    "{st}/status-snap-{s}.json", "{st}/status-reminded-{s}")
+    "{st}/status-snap-{s}.json", "{st}/status-reminded-{s}", "{st}/agent-{s}.chatkey")
 AGENT_KEYCHAIN = ("agent-answer-{s}",)
 BOX_FILES = ("{m}/" + MAIN_MARKER,)  # outside the config folder: only the main folder's marker
 BOX_KEYCHAIN = (KEYCHAIN_ACCOUNT, ANSWER_KEY_ACCOUNT)  # the older login's refresh token and answer key
@@ -11281,6 +11334,13 @@ def command_prompt(inp):
     if m:
         save_cmd(sid, dict(base, kind="uninstall", picks=m.group(1) or ""))
         return None, UNINSTALL_LIST_AI, False
+    v = VISIBILITY_RE.fullmatch(prompt)
+    if v and _own(inp) is not None:
+        pieces = [p for p in re.split(r"[,\n]+|\s+and\s+", v.group(1)) if p.strip()]
+        if pieces and not any(re.sub(r"\s+", "", p.casefold()) in ("all", "this") for p in pieces):
+            kind = v.group(2).lower()
+            save_cmd(sid, dict(base, kind=kind, picks=v.group(1)))
+            return None, VIS_AI.format(kind=kind), False
     rec = load_cmd(sid)
     if not rec or rec.get("kind") != "uninstall" or rec.get("picks") or not isinstance(rec.get("list"), dict):
         return None
@@ -11540,7 +11600,8 @@ def command_tool(inp):
     if event == "PreToolUse":
         if not m or m.group(1) != "ledger_agents_note":
             return None
-        return note_input(inp, rec) if rec and rec.get("kind") in ("install", "uninstall") else _deny(REFUSED_LINE)
+        return note_input(inp, rec) if rec and rec.get("kind") in ("install", "uninstall") + VIS_KINDS and rec.get("targets") \
+            else _deny(REFUSED_LINE)
     if event not in ("PostToolUse", "PostToolUseFailure") or not name.startswith("mcp__") or "datastash" not in name.lower():
         return None
     body = tool_answer(inp.get("tool_response")) if event == "PostToolUse" else None
@@ -11553,10 +11614,19 @@ def command_tool(inp):
     if tool == "ledger_agent_key" and body is not None:
         line = collect_after_mint(inp, rec, body)
         return _post(line) if line else None
-    if tool == "ledger_agents_list" and rec and rec.get("kind") in ("install", "uninstall"):
+    if tool == "ledger_agents_list" and rec and rec.get("kind") in ("install", "uninstall") + VIS_KINDS:
         lst = norm_list(body)
         if lst is None:
+            if rec["kind"] in VIS_KINDS:
+                _drop(_cmd_path(sid))
             return _post(REFUSED_LINE)
+        if rec["kind"] in VIS_KINDS:  # X6: the typed name, bound to an agent id from this list
+            got = resolve_picks(rec.get("picks") or "", lst, None)
+            if not isinstance(got, list):
+                _drop(_cmd_path(sid))
+                return _post(None, VIS_NOT_AGENT_AI) if got == "none" else _post(VIS_PICK_LINE)
+            save_cmd(sid, dict(rec, list=lst, targets=got))
+            return _post(None, VIS_NOTE_AI.format(kind=rec["kind"]))
         own = _own(inp)
         mine = own["agent_id"].lower() if own else None
         rec = dict(rec, list=lst)
@@ -11564,7 +11634,7 @@ def command_tool(inp):
             rec["targets"] = [a["id"] for a in lst["agents"] if a["id"] != mine]
             if not rec["targets"]:  # this is the account's only agent: no note to send, the list is the whole answer
                 _drop(_cmd_path(sid))
-                return _post("\n".join(list_lines(lst, ON_HEAD) + [REMOVE_LINE]),
+                return _post("\n".join(list_lines(lst, ON_HEAD) + AFTER_INSTALL),
                              "The plugin showed the person the list. Make no more datastash calls; say nothing more.")
         elif rec.get("picks"):
             got = resolve_picks(rec["picks"], lst, mine)
@@ -11579,7 +11649,7 @@ def command_tool(inp):
             return _post("\n".join(list_lines(lst, LIST_HEAD) + [PICK_LINE]), "The plugin showed the person the list. "
                          "Say nothing more; wait for their answer.")
         return None
-    if tool == "ledger_agents_note" and rec and rec.get("kind") in ("install", "uninstall"):
+    if tool == "ledger_agents_note" and rec and rec.get("kind") in ("install", "uninstall") + VIS_KINDS:
         _drop(_cmd_path(sid))
         return _post(note_result(inp, rec, body))
     return None
@@ -11608,12 +11678,14 @@ def note_result(inp, rec, body):
     status_path}): the install list, or what uninstall removed; this agent, when picked, goes last on its own key
     (POST uninstall with the run id), then its local cleanup."""
     lst, targets = rec.get("list") or {"agents": []}, rec.get("targets") or []
+    if rec["kind"] in VIS_KINDS:
+        return visibility_result(rec, lst, targets, body)
     if not isinstance(body, dict) or body.get("error") or body.get("code"):
         code = body.get("code") if isinstance(body, dict) else None
         return OTHERS_FAILED_LINE if rec["kind"] == "install" else (
             BRAKED_LINE if code in ("braked", "rate_limit_exceeded") else REFUSED_LINE)
     if rec["kind"] == "install":
-        return "\n".join(list_lines(lst, ON_HEAD) + [REMOVE_LINE])
+        return "\n".join(list_lines(lst, ON_HEAD) + AFTER_INSTALL)
     names = {a["id"]: a["name"] for a in lst["agents"]}
     own = _own(inp)
     mine = own["agent_id"].lower() if own else None
@@ -11631,6 +11703,53 @@ def note_result(inp, rec, body):
     return " ".join(lines + [CONNECTOR_SAME_LINE])
 
 
+def _vis_line_ok(line, kind, names):
+    """True when the server's line is X6's fixed line (src/agents/agent-notes.ts visibilityLine) over names from this
+    list only: nothing else the server could say is shown as the plugin's line."""
+    if not isinstance(line, str) or len(line) > 4000 or not names:
+        return False
+    alt = "|".join(re.escape(n) for n in sorted(set(names), key=len, reverse=True))
+    q = f'"(?:{alt})"'
+    now = (f"{q} is private now: it shares nothing with your other agents\\." if kind == "private" else f"{q} is public now\\.")
+    same = f"{q}(?:, {q})* (?:is|are) already {kind}, or switched off\\."
+    return re.fullmatch(f"(?:{now})(?: {now})*(?: {same})?|{same} Nothing changed\\.", line) is not None
+
+
+def vis_line(kind, changed, unchanged):
+    """The same fixed line, made here from list names (when the server's is not that line)."""
+    on = kind == "private"
+    lines = [f'"{n}" is private now: it shares nothing with your other agents.' if on else f'"{n}" is public now.'
+             for n in changed]
+    if unchanged:
+        lines.append(", ".join(f'"{n}"' for n in unchanged) + f" {'is' if len(unchanged) == 1 else 'are'} already "
+                     f"{kind}, or switched off.")
+    if not changed:
+        lines.append("Nothing changed.")
+    return " ".join(lines)
+
+
+def visibility_result(rec, lst, targets, body):
+    """X6: the person's line after "make <name> private|public" (X6 answers {kind, changed, line}): the server's fixed
+    line, shown only when it is that line over names on the list; this computer's private record follows what changed."""
+    if not isinstance(body, dict) or body.get("error") or body.get("code"):
+        code = body.get("code") or body.get("error") if isinstance(body, dict) else None
+        return VIS_BRAKED_LINE if code in ("braked", "rate_limit_exceeded") else REFUSED_LINE
+    names = {a["id"]: a["name"] for a in lst["agents"]}
+    changed = body.get("changed") if isinstance(body.get("changed"), list) else []
+    line = body.get("line")
+    if body.get("kind") != rec["kind"]:
+        return REFUSED_LINE
+    said = [show_name(c) for c in changed if isinstance(c, str)]
+    done = [t for t in targets if names.get(t) in said]
+    local = {a["agent_id"].lower(): a.get("slug") for a in all_agents() if isinstance(a.get("agent_id"), str)}
+    for t in done:
+        if t in local:
+            note_private(dict(private=rec["kind"] == "private"), t, local[t])  # the local record only, never a request
+    if _vis_line_ok(line, rec["kind"], list(names.values())):
+        return line
+    return vis_line(rec["kind"], [names[t] for t in done], [names[t] for t in targets if t in names and t not in done])
+
+
 def agent_removed(agent, key):
     """A 410 agent_removed on this agent's own key: confirm with the dead key (its one allowed call), then the local
     cleanup of the fixed paths. The fixed line for the session."""
@@ -11640,6 +11759,182 @@ def agent_removed(agent, key):
         pass  # the key is dead server-side anyway; the cleanup goes on
     remove_agent_here(agent["slug"])
     return REMOVED_HERE_LINE
+
+
+# ------------------------------------------------------------------ XLI-391: the person's chatstash setting, said by the plugin
+# The person's chatstash setting (on or off, who set it and when) reaches every agent session as a datastash note, the
+# trusted channel, never as a line in a tool result: at session start (always) and from the background listener when it
+# changes. The setting and this chat's chat_key come from GET /api/v1/agent/chatstash on the agent's own key. The plugin
+# holds the chat_key (state/agent-<name>.chatkey, mode 600, per session) and adds it to the connector's chat_save calls
+# itself; the model never sees it (the hook takes it out of datastash answers), so saving needs nobody to ask for it.
+CHATSTASH_PATH = "/api/v1/agent/chatstash"  # {chatstash: {state, set_by, set_at}, chat_key}; ?chat_key= keeps one
+CHATSTASH_NOTE = "datastash note (chatstash; the person's own setting)"
+CHATSTASH_ON = (CHATSTASH_NOTE + ": chatstash is on for this account ({who}). After each reply, save the exchange with "
+                "the datastash connector's chat_save (user_message, ai_reply, and turn 1, 2, 3 ...), without asking the "
+                "person; the plugin adds this chat's chat_key itself, so never send, ask for or look for one.")
+CHATSTASH_OFF = (CHATSTASH_NOTE + ": chatstash is off for this account ({who}). Save this chat's exchanges only when "
+                 "the person asks.")
+CHATSTASH_WHO = "set by {by} at {at}"
+CHATSTASH_WHO_BY = "set by {by}; when is not recorded"
+CHATSTASH_WHO_AT = "set at {at}; who set it is not recorded"
+CHATSTASH_WHO_NONE = "who set it and when is not recorded"
+CHATSTASH_EVERY = 60  # the listener reads the setting at most this often
+CHATSTASH_FIRST = 20  # and first this long after it starts (the session start has just said it)
+CHAT_KEY_RE = r"[A-Za-z0-9._:\-]{1,100}"  # the server's own chat_key shape
+CHAT_KEY_HIDDEN = "(this chat's key, held by the datastash plugin)"
+CHAT_SAVE_RE = re.compile(r"mcp__(.+?)__chat_save")
+CHATS_KEEP = 50  # sessions remembered per agent
+_WHEN_RE = re.compile(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d)(?::\d\d(?:\.\d+)?)?(Z|[+-]00:?00)?")
+
+
+def chatkey_path(s):
+    return _fill("{st}/agent-{s}.chatkey", s)
+
+
+def _chat_sessions(s):
+    rec = read_json(chatkey_path(s), {})
+    ses = rec.get("sessions") if isinstance(rec, dict) else None
+    return {k: v for k, v in ses.items() if isinstance(v, dict)} if isinstance(ses, dict) else {}
+
+
+def _chat_put(s, sid, **fields):
+    """Records fields for this session (its chat_key, what it was told), mode 600, the newest CHATS_KEEP sessions."""
+    ensure_dirs()
+    with StateLock(s):
+        ses = _chat_sessions(s)
+        cur = ses.pop(sid, {})
+        cur.update(fields, at=int(time.time()))
+        ses[sid] = cur
+        write_private(chatkey_path(s), json.dumps({"sessions": dict(list(ses.items())[-CHATS_KEEP:])}))
+
+
+def held_chat_key(s, sid):
+    k = _chat_sessions(s).get(sid, {}).get("key") if sid else None
+    return k if isinstance(k, str) and re.fullmatch(CHAT_KEY_RE, k) else None
+
+
+def _when_text(v):
+    m = _WHEN_RE.fullmatch(v.strip()) if isinstance(v, str) else None
+    return f"{m.group(1)} {m.group(2)}{' UTC' if m.group(3) else ''}" if m else None
+
+
+def chatstash_setting(body):
+    """{state, by, at} from the chatstash route's answer or a _meta.datastash_settings object, else None."""
+    c = body.get("chatstash") if isinstance(body, dict) else None
+    if not isinstance(c, dict) or c.get("state") not in ("on", "off"):
+        return None
+    by = c.get("set_by")
+    by = show_name(by).replace('"', "'") if isinstance(by, str) and by.strip() else None
+    return {"state": c["state"], "by": by, "at": _when_text(c.get("set_at"))}
+
+
+def chatstash_line(st):
+    """The fixed note for a setting: on or off, who set it and when."""
+    by = f'"{st["by"]}"' if st["by"] else None
+    who = (CHATSTASH_WHO.format(by=by, at=st["at"]) if by and st["at"] else CHATSTASH_WHO_BY.format(by=by) if by else
+           CHATSTASH_WHO_AT.format(at=st["at"]) if st["at"] else CHATSTASH_WHO_NONE)
+    return (CHATSTASH_ON if st["state"] == "on" else CHATSTASH_OFF).format(who=who)
+
+
+def _chat_sig(st):
+    return [st["state"], st["by"], st["at"]]
+
+
+def chatstash_fetch(agent, key, sid, timeout=10):
+    """The setting, read on the agent's own key, keeping this session's chat_key (the new one is saved, mode 600).
+    Raises the network and HTTP errors; None for an answer of the wrong shape."""
+    held = held_chat_key(agent["slug"], sid)
+    q = "?" + urllib.parse.urlencode({"chat_key": held}) if held else ""
+    body = api_json("GET", CHATSTASH_PATH + q, key, timeout=timeout)
+    st = chatstash_setting(body)
+    ck = body.get("chat_key") if isinstance(body, dict) else None
+    if st is not None and sid and isinstance(ck, str) and re.fullmatch(CHAT_KEY_RE, ck) and ck != held:
+        _chat_put(agent["slug"], sid, key=ck)
+    return st
+
+
+def chatstash_note(agent, key, sid, only_changed=False, timeout=10):
+    """The note for this session: at session start always, from the listener only when the setting differs from what
+    this session was last told. Recorded as told before it is said. None when nothing is to be said or it can't be read."""
+    if is_person(agent) or not sid:
+        return None
+    try:
+        st = chatstash_fetch(agent, key, sid, timeout)
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return None
+    if st is None:
+        return None
+    if only_changed and _chat_sessions(agent["slug"]).get(sid, {}).get("told") == _chat_sig(st):
+        return None
+    _chat_put(agent["slug"], sid, told=_chat_sig(st))
+    return chatstash_line(st)
+
+
+def _datastash_call(inp, name):
+    return name.startswith("mcp__") and ("datastash" in name[5:].split("__", 1)[0].lower() or _proof_server(inp, name))
+
+
+def chat_key_binding(inp, args):
+    """PreToolUse of a datastash connector's chat_save: args with chat_key set to the key the plugin holds for this
+    session (any chat_key the AI sent is replaced; read now when none is held yet), or None when nothing changes."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse" or not isinstance(args, dict):
+        return None
+    name = str(inp.get("tool_name") or "")
+    sid = _sid(inp)
+    if not CHAT_SAVE_RE.fullmatch(name) or not sid or not _datastash_call(inp, name):
+        return None
+    own = _own(inp)
+    if own is None:
+        return None
+    held = held_chat_key(own["slug"], sid)
+    if held is None:
+        try:
+            chatstash_fetch(own, read_key(own["slug"]), sid, timeout=5)
+        except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+            return None
+        held = held_chat_key(own["slug"], sid)
+    if held is None:
+        return None
+    out = dict(args, chat_key=held)
+    return out if out != args else None
+
+
+def _swap(v, old, new):
+    if isinstance(v, str):
+        return v.replace(old, new)
+    if isinstance(v, list):
+        return [_swap(x, old, new) for x in v]
+    if isinstance(v, dict):
+        return {k: _swap(x, old, new) for k, x in v.items()}
+    return v
+
+
+def chat_key_hidden(inp):
+    """PostToolUse of a datastash connector call: its output with this session's held chat_key taken out, or None."""
+    name = str(inp.get("tool_name") or "")
+    sid, tr = _sid(inp), inp.get("tool_response")
+    if inp.get("hook_event_name") != "PostToolUse" or not sid or tr is None or not _datastash_call(inp, name):
+        return None
+    own = _own_agent(inp)
+    held = held_chat_key(own["slug"], sid) if own else None
+    if held is None or held not in json.dumps(tr, ensure_ascii=False):
+        return None
+    return _swap(tr, held, CHAT_KEY_HIDDEN)
+
+
+def chatstash_meta_note(inp):
+    """PostToolUse of a datastash connector call whose answer carries _meta.datastash_settings: the note when the
+    chatstash setting there differs from what this session was last told, else None."""
+    name, sid, tr = str(inp.get("tool_name") or ""), _sid(inp), inp.get("tool_response")
+    meta = tr.get("_meta") if isinstance(tr, dict) else None
+    st = chatstash_setting(meta.get("datastash_settings")) if isinstance(meta, dict) else None
+    if st is None or not sid or not _datastash_call(inp, name):
+        return None
+    own = _own_agent(inp)
+    if own is None or not read_key(own["slug"]) or _chat_sessions(own["slug"]).get(sid, {}).get("told") == _chat_sig(st):
+        return None
+    _chat_put(own["slug"], sid, told=_chat_sig(st))
+    return chatstash_line(st)
 
 
 # --- XLI-378 B: datastash ci-report, per-test results from CI into the "tests" preset (ledger_feeds_setup services

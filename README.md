@@ -315,6 +315,32 @@ From 1.0.0 agents are set up only by the person's typed `/datastash:install`. Wi
 computer, the background listener no longer registers waiting agents: a session whose folder has no agent is told once
 to type `/datastash:install`; an agent 0.9.x already registered is still waited for as above.
 
+After `/datastash:install` the plugin shows which agents datastash is on (name, public or private), then:
+
+```
+To remove one or many: /datastash:uninstall and we'll show you the list of agents.
+To make one private: say make <name> private.
+To make one public: say make <name> public.
+```
+
+**make <name> private / make <name> public** (plugin 1.0.1). Typed as the whole prompt in an agent's session, with the
+name as the list shows it (several names separated by commas; "all" and "this" are not names here, so "make this
+private" stays an ordinary prompt). The AI calls `ledger_agents_list`; if no agent has that name, nothing is sent and the
+prompt is treated as an ordinary one. Otherwise the plugin itself writes the `ledger_agents_note` call (kind `private`
+or `public`, the list id, the agent id from that list and a typed proof signed with this agent's answer key, the same
+check as `/datastash:uninstall`: only a prompt Claude Code marks as typed by the person passes), and shows datastash's
+fixed line, for example `"web-app" is private now: it shares nothing with your other agents.`
+
+**Chatstash in every agent session** (plugin 1.0.1). The person's chatstash setting (they turn it on or off with "sync
+chatstash" in any session) reaches every agent session as a datastash note from the plugin, never as text in a tool
+result: at every session start, and from the background listener (read about once a minute) when it changes, so an
+already running session hears about it too. The note is fixed wording that names who set it and when, for example
+`chatstash is on for this account (set by "Claude Code" at 2026-11-23 14:02 UTC)`, and while it is on the agent saves
+each exchange with `chat_save` without asking. The setting and this chat's `chat_key` come from
+`GET /api/v1/agent/chatstash` on the agent's own key. The plugin keeps the chat_key (`state/agent-<name>.chatkey`, mode
+600, per session), adds it to the connector's `chat_save` calls itself and takes it out of datastash's answers, so the
+model never sees it and nobody has to ask for one; tool calls that name that file are refused like the proof files.
+
 ## datastash main: the person's own session
 
 "datastash main" is the person's own Claude Code session (terminal or VS Code), not an agent. Activity from all their
@@ -423,6 +449,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `agent-<name>.json` | agent name, agent_id, agent workbook id, linked folders |
 | `state/agent-<name>.json` | the inbox cursor, the ids of messages still "new", and the last wake time (no message text) |
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
+| `state/agent-<name>.chatkey` | each recent session's chat_key and the chatstash setting it was last told (plugin 1.0.1); never shown to the model or given to a tool call |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
 | `state/notices.json` | the once-per-cause notices (key refused, key missing, no agent, folder not linked): the line and whether it was told; never a key |
 | `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |
@@ -501,7 +528,7 @@ list, asks first and idle agents last, from any session: "status", "status of al
   datastash", or "datastash off" for this folder) turns that folder OFF (below; saved at once, since it only makes
   agents share less). "keep <name> private": once datastash answers with the private field, "To keep <name> private,
   press 'Turn private on' next to it on the agents page. Until you do, it is on datastash." (before that: private mode is coming).
-  The plugin never sets private itself. After an answer the updated list is shown once.
+  From 1.0.1, "make <name> private" in an agent's session sets it (above). After an answer the updated list is shown once.
 - **OFF folders.** A folder that is off makes no datastash call: no sign-in or inbox count at session start, no
   listener, hello, heartbeat, status, seed, project-map share or lookup counting, and no agent is registered for it.
   Claude Code runs the connector's `headersHelper` in the plugin's own folder with no project folder, so the helper
@@ -512,8 +539,8 @@ list, asks first and idle agents last, from any session: "status", "status of al
   switch it off on datastash; it is off on this computer." An agent still waiting for your OK: "It is off on this
   computer. On the agents page, press Don't allow next to it." "put <name> back on datastash" turns it back on, only as
   your own typed prompt. A 0.9.x "leave <name> off" reads as off.
-- **PRIVATE folders.** Only you set or clear private, with the "Turn private on" button on the agents page; the plugin sends it
-  in no request. It records a folder's agent as private only when datastash's own answer to the plugin's call (the
+- **PRIVATE folders.** Only you set or clear private: by typing "make <name> private" or "make <name> public" (plugin
+  1.0.1; sent by the plugin with your typed proof, never by the AI) or with the button on the agents page. It records a folder's agent as private only when datastash's own answer to the plugin's call (the
   approval check, register or hello) says `private: true`, and forgets it only on `private: false`
   (`status-private.json`); a missing field changes nothing. In a private folder: the connector's `headersHelper` hands
   over the agent's own key, never your login. Since Claude Code runs the helper with no project folder, where the
@@ -728,6 +755,12 @@ An agent can send datastash a capability request, an error report or anything el
   goes, a small tombstone in the temp folder (a time only; it lapses after an hour, and the next `/datastash:install`
   lifts it) keeps the uninstall turn's own hooks from making `~/.config/datastash` again. The rotated log and the
   workbook's status copy go too; no login is started or pointed at.
+- `python3 -I test/test_chatstash.py`: plugin 1.0.1. XLI-391: the chatstash note at session start (on or off, who set
+  it and when) and from the listener only on a change, said once (one session turns it on: an already running session
+  and a new one both get the note); the chat_key held mode 600, added to `chat_save`, taken out of datastash answers and
+  denied to tool calls. X6: "make <name> private" / "make <name> public" signed over the list's agent id like uninstall,
+  the server's fixed line shown only over names on the list, model-typed text refused, unknown names left as ordinary
+  prompts, and the after-install lines.
 - `python3 -I test/test_ci_report.py`: `datastash ci-report` (plugin 0.9.11): a canary in a failure's message, text,
   stdout and stderr never sent or printed, only allow-listed fields; a DOCTYPE, billion laughs and an outside entity
   refused; rows folded; flaky in either order (also across legs that ran different tests), at once (counted once), in a

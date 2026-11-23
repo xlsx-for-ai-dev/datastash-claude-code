@@ -93,7 +93,8 @@ class NeverSetsPrivate(PrivateBase):
             src = f.read()
         # private is only ever read from an answer; no body the plugin builds names it
         self.assertEqual(re.findall(r"[\"']private[\"']\s*:(?!\s*$)", src, re.M), [])
-        self.assertEqual(len(re.findall(r"\bnote_private\(", src)), 4)  # its def, approval, register, hello
+        # its def, approval, register, hello, and X6's typed "make <name> private|public" answer (plugin 1.0.1)
+        self.assertEqual(len(re.findall(r"\bnote_private\(", src)), 5)
 
 
 class Recording(PrivateBase):
