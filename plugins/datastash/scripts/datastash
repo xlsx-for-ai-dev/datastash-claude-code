@@ -106,6 +106,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -4844,7 +4845,7 @@ TOKEN_DENY = ("datastash: this computer's login token goes only to the datastash
               "connector or the other datastash commands.")
 TOKEN_FILE_NAMES = ("login.access.json", "login.refresh", "login.answer")  # where this computer keeps the login's tokens
 # XLI-310 item 2: the answer key's keychain account and the typed checker's command (plain forms only, like the rest)
-TOKEN_DENY_WORDS = (ANSWER_KEY_ACCOUNT, "status-verify")
+TOKEN_DENY_WORDS = (ANSWER_KEY_ACCOUNT, "status-verify", "agent-answer-")  # XLI-390: agents' answer keys too
 TOKEN_HELPER_RE = re.compile(r"datastash[\"']?\s+[\"']?token(?![\w.-])")  # the helper's script, then its subcommand
 
 
@@ -4880,7 +4881,7 @@ PROOF_ARG = "agent_proof"
 NO_PROOF_TOOLS = ("ledger_agent_register", "ledger_agent_key")
 PROOF_DENY = ("datastash: an agent's proof stays with the datastash plugin, which adds it to that agent's own connector "
               "calls; it never goes to a tool call. Don't read the proof files or enroll.json, and don't work around it.")
-PROOF_FILE_RE = re.compile(r"agent-[^\s/\\'\"]*\.proof(?![\w.-])")
+PROOF_FILE_RE = re.compile(r"agent-[^\s/\\'\"]*\.(?:proof|answer|verifier)(?![\w.-])")  # XLI-390: answer keys, verifiers
 
 
 def read_proof(s):
@@ -4976,6 +4977,15 @@ def cmd_agent_tool(_args):
     if tdeny is not None:
         print(json.dumps(tdeny), flush=True)
         return _agent_tool(inp)
+    try:
+        cmd_out = command_tool(inp)  # XLI-390 P1: install and uninstall calls, collect, install notes
+    except (Exception, SystemExit):  # fail closed: a note call goes out only with the plugin's own input
+        is_note = str(inp.get("tool_name") or "").endswith("__ledger_agents_note")
+        cmd_out = _deny(REFUSED_LINE) if inp.get("hook_event_name") == "PreToolUse" and is_note else None
+    if cmd_out is not None:
+        cmd_out["hookSpecificOutput"]["hookEventName"] = inp.get("hook_event_name")
+        print(json.dumps(cmd_out), flush=True)
+        return _agent_tool(inp) if os.path.isdir(CONF) else 0  # an uninstall that removed the box leaves nothing
     try:
         bound = pickup_binding(inp)
     except (Exception, SystemExit):
@@ -5130,6 +5140,18 @@ def cmd_prompt(_args):
     sid = sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None
     turn_started(sid)
     count_prompt(sid)
+    try:
+        got = command_prompt(inp)  # XLI-390 P1: the install and uninstall commands, and the uninstall pick
+    except Exception as e:  # noqa: BLE001  never in the person's way
+        log("status", f"command: {type(e).__name__}")
+        got = None
+    if got is not None:
+        line, ai, block = got
+        print(json.dumps({"decision": "block", "reason": line, "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": True}} if block else
+            {**({"systemMessage": line} if line else {}),
+             "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ai or ""}}))
+        return 0
     if not is_main_phrase(prompt):
         try:
             ctx = (clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
@@ -10845,6 +10867,489 @@ def cmd_self_update(_args):
         if lock is not None:
             os.close(lock)
     return 0
+
+
+# ------------------------------------------------------------------ XLI-390 P1: one install command, one uninstall command
+# The person's typed /datastash:install (always all agents, owner 11-23) or /datastash:uninstall (the list, then names or
+# "all"); the typed phrases "datastash install" / "datastash uninstall" are the fallback. The key comes through the
+# person's connector: the call carries only the S256 challenge; the plugin collects the key with the verifier. Notes carry
+# a typed proof over agent ids from the list id (EPM MUST 2); install notes come only from one dedicated answer field
+# (MUST 3); an uninstall reaches an agent only as 410 agent_removed, and cleanup touches only the fixed paths (note b).
+INSTALL_RE = re.compile(r"\s*(?:/datastash:install|datastash install)\s*", re.I)
+UNINSTALL_RE = re.compile(r"\s*(?:/datastash:uninstall|datastash uninstall)(?:\s+(\S.*?))?\s*", re.I | re.S)
+CMD_TAG_RE = re.compile(r"\s*<command-name>(/datastash:(?:un)?install)</command-name>\s*(?:<command-message>[^<]*"
+                        r"</command-message>\s*)?<command-args>([^<]*)</command-args>\s*", re.S)
+CMD_MAX_AGE = 1800  # a command's list and pick are good for this long in the session that showed them
+COLLECT_PATH = "/api/v1/agent/collect"  # X1: {verifier, mint_id} -> {agent_id, name, key, answer_key, workbook_id?}
+UNINSTALL_SELF_PATH = "/api/v1/agent/uninstall"  # X2: {scope: "self"} on the agent's own key
+NOTE_PROOF_LABEL = "datastash-agents-note/v1"
+NOTE_FIELD = "datastash_note"  # the one field of a datastash tool answer an install note is read from (EPM MUST 3)
+AGENT_ANSWER_RE = r"[A-Za-z0-9_\-]{43}"
+CMD_TOOL_RE = re.compile(r"mcp__.+__(ledger_agent_register|ledger_agent_key|ledger_agents_list|ledger_agents_note)")
+CMD_NOTE = "datastash note (install and uninstall; the plugin's own steps)"
+NO_CONNECTOR_LINE = "Connect datastash in Claude first (Settings, Connectors), then run /datastash:install again."
+MINT_LINE = 'datastash made a key for "{name}" (this session). datastash is on for "{name}".'
+ON_HEAD = "datastash is on for your agents:"
+REMOVE_LINE = "To remove one or many: /datastash:uninstall and we'll show you the list of agents."
+LIST_HEAD = "Your datastash agents:"
+PICK_LINE = "Type the names to remove, separated by commas, or all."
+OFF_LINE = "datastash is off for {names}. Removed: listener, key, settings and local copies."
+REMOVED_LINE = "Removed {n} agents."
+UNCONFIRMED_LINE = "Not yet confirmed: {names} (they clean up when they next start)."
+CONNECTOR_SAME_LINE = "Your datastash connector in Claude is unchanged."
+PICK_UNKNOWN_LINE = ("Not done: a name you typed is not on the list, or matches two agents. Nothing was removed. Type the "
+                     "names as the list shows them, or all.")
+REFUSED_LINE = "Not done: datastash refused it. Nothing changed."
+BRAKED_LINE = "Not done: too many removals just now. Wait a few minutes, then try again."
+NO_ANSWER_KEY_LINE = "Not done: this agent has no datastash answer key yet. Type /datastash:install here first."
+INSTALL_FAILED_LINE = "datastash could not finish the install here. Type /datastash:install again."
+OTHERS_FAILED_LINE = "datastash could not reach your other agents just now. Type /datastash:install again."
+MAIN_HERE_LINE = "This is your datastash main session, not an agent: type /datastash:install in an agent's session."
+_SAY = "The plugin adds every secret and proof itself and shows the person the result. Never send a code_challenge, " \
+       "typed_proof, targets or list_id yourself, never read or print a key, and say at most one short line."
+INSTALL_AI = (f"{CMD_NOTE}: the person typed the datastash install command. In this turn make exactly these datastash "
+              "connector calls, in order, and nothing else: {steps}ledger_agents_list; then ledger_agents_note with kind "
+              f'"install". {_SAY} If no datastash connector tool is there, tell the person exactly: "{NO_CONNECTOR_LINE}"')
+INSTALL_KEY_STEPS = ('ledger_agent_register with name "{name}"; then ledger_agent_key with that name, the agent_id it '
+                     "answered and only_if_no_key true; then ")
+UNINSTALL_LIST_AI = (f"{CMD_NOTE}: the person typed the datastash uninstall command. Call the datastash connector's "
+                     f"ledger_agents_list once, then stop and wait for the person's answer. {_SAY}")
+UNINSTALL_NOTE_AI = (f"{CMD_NOTE}: the person picked datastash agents to remove. {{list}}Call the datastash connector's "
+                     f'ledger_agents_note once with kind "uninstall". {_SAY}')
+NOTE_INSTALL_AI = (f"{CMD_NOTE}: the person installed datastash for all their agents. Call the datastash connector's "
+                   'ledger_agent_key now with name "{name}", agent_id "{agent_id}" and only_if_no_key true. ' + _SAY)
+
+# Every file and keychain item the plugin ever writes, in one table. Per agent ({s}: its local slug, never a server
+# name): exactly these. The box (when its last agent goes): these, every per-agent row, and the whole config folder.
+AGENT_FILES = (
+    "{c}/agent-{s}.key", "{c}/agent-{s}.json", "{c}/agent-{s}.proof", "{c}/agent-{s}.answer", "{st}/agent-{s}.json",
+    "{st}/agent-{s}.listener.lock", "{st}/agent-{s}.state.lock", "{st}/agent-{s}.mint.lock", "{st}/agent-{s}.log",
+    "{p}/agent-{s}.verifier", "{st}/status-sent-{s}.json", "{st}/status-written-{s}", "{st}/status-out-{s}.json",
+    "{st}/status-snap-{s}.json", "{st}/status-reminded-{s}")
+AGENT_KEYCHAIN = ("agent-answer-{s}",)
+BOX_FILES = ("{m}/" + MAIN_MARKER,)  # outside the config folder: only the main folder's marker
+BOX_KEYCHAIN = (KEYCHAIN_ACCOUNT, ANSWER_KEY_ACCOUNT)  # the older login's refresh token and answer key
+BOX_DIRS = ("{c}",)  # the plugin's own folder, whole: every file README's table lists (login, state/, pending/, off/, ...)
+
+
+def _fill(t, s=""):
+    return t.format(c=CONF, st=STATE, p=PENDING, m=MAIN_DIR, s=s)
+
+
+def _kc(op, account, value=None):
+    """The OS keychain (macOS security, Linux secret-tool) under service datastash: put (True when it reads back), get
+    (the value or None), drop. Values go on stdin only, never a command line."""
+    mac, lin = sys.platform == "darwin" and shutil.which("security"), shutil.which("secret-tool")
+    if op == "put":
+        if mac:
+            rc, _ = _run(["security", "-i"], f'add-generic-password -U -s {KEYCHAIN_SERVICE} -a {account} -w "{value}"\n')
+        elif lin:
+            rc, _ = _run(["secret-tool", "store", "--label=datastash", "service", KEYCHAIN_SERVICE, "account", account], value)
+        else:
+            return False
+        return rc == 0 and _kc("get", account) == value
+    if op == "get":
+        rc, out = (_run(["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"]) if mac else
+                   _run(["secret-tool", "lookup", "service", KEYCHAIN_SERVICE, "account", account]) if lin else (1, ""))
+        return (out or "").strip() if rc == 0 and (out or "").strip() else None
+    if mac:
+        _run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account])
+    elif lin:
+        _run(["secret-tool", "clear", "service", KEYCHAIN_SERVICE, "account", account])
+    return None
+
+
+def save_agent_answer(s, key):
+    """The agent's answer key (for typed proofs): the keychain, else a mode-600 file. Never printed."""
+    if _kc("put", f"agent-answer-{s}", key):
+        _drop(_fill("{c}/agent-{s}.answer", s))
+        return "keychain"
+    write_private(_fill("{c}/agent-{s}.answer", s), key + "\n")
+    return "file"
+
+
+def read_agent_answer(s):
+    got = _kc("get", f"agent-answer-{s}") if read_json(conf_path(s), {}).get("answer_store") == "keychain" else \
+        _read_key_file(_fill("{c}/agent-{s}.answer", s), AGENT_ANSWER_RE, s)
+    return got if isinstance(got, str) and re.fullmatch(AGENT_ANSWER_RE, got) else None
+
+
+def _stop_listener(s):
+    """Stop the listener that holds this agent's lock (any session), checked as stop_session_listeners does."""
+    p = lock_path(s)
+    info = read_json(p, {})
+    pid = info.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1 and pid != os.getpid() and _lock_held(p) \
+            and (info.get("start") is None or _proc_start(pid) == info.get("start")) and _is_listener(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def remove_agent_here(s):
+    """Uninstall one agent on this computer: stop its listener, drop its keychain items and every fixed path of the
+    table (plus its folders' maps and waiting records); the whole box when it was the last agent. True when the box
+    went too. Only local fixed paths: nothing the server says picks a path."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,63}", s or ""):
+        return False
+    c = read_json(conf_path(s), {})
+    _stop_listener(s)
+    for a in AGENT_KEYCHAIN:
+        _kc("drop", _fill(a, s))
+    for folder in c.get("projects") or []:
+        if isinstance(folder, str):
+            _drop(map_local_path(folder))
+            try:
+                _set_enrolled(folder, None)
+            except OSError:
+                pass
+    clear_notices(notice_causes({"slug": s}))
+    for t in AGENT_FILES:
+        _drop(_fill(t, s))
+    if any(not is_person(a) for a in all_agents()):
+        return False
+    remove_box()
+    return True
+
+
+def remove_box():
+    """The last agent went: every box row of the table, the keychain items and the plugin's own folder."""
+    for a in BOX_KEYCHAIN:
+        _kc("drop", a)
+    for t in BOX_FILES:
+        _drop(_fill(t))
+    for t in BOX_DIRS:
+        d = _fill(t)
+        home = os.path.realpath(HOME)
+        if os.path.isdir(d) and not os.path.islink(d) and os.path.realpath(d) not in (home, "/") \
+                and (os.path.basename(d) == "datastash" or os.environ.get("DATASTASH_CONFIG_DIR") == d):
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def show_name(v):
+    """An agent name as the person sees it: no control or bidi characters, at most 64 characters (EPM MUST 2)."""
+    v = "".join(ch for ch in str(v) if unicodedata.category(ch)[0] != "C" and ch not in "‎‏‪‫‬"
+                "‭‮⁦⁧⁨⁩")
+    return re.sub(r"\s+", " ", v).strip()[:64] or "?"
+
+
+_LOOKALIKE = str.maketrans("01i|53", "olllse")
+
+
+def fold_name(v):
+    """Names that differ only by case, spaces, dashes or look-alike letters fold the same (EPM MUST 2)."""
+    v = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", show_name(v)).casefold())
+    v = "".join(ch for ch in v if not unicodedata.combining(ch)).replace("rn", "m").translate(_LOOKALIKE)
+    return re.sub(r"[\s_\-.]+", "", v)
+
+
+def norm_list(body):
+    """{list_id, agents: [{id, name, private}]} from a ledger_agents_list answer, or None."""
+    if not isinstance(body, dict) or not isinstance(body.get("list_id"), str) or not re.fullmatch(ANSWER_ID_RE, body["list_id"]):
+        return None
+    out = []
+    for a in body.get("agents") if isinstance(body.get("agents"), list) else []:
+        if isinstance(a, dict) and isinstance(a.get("agent_id"), str) and re.fullmatch(GRANT_ID_RE, a["agent_id"].lower()):
+            out.append({"id": a["agent_id"].lower(), "name": show_name(a.get("name")), "shut": a.get("private") is True})
+    return {"list_id": body["list_id"], "agents": out[:500]}
+
+
+def list_lines(lst, head):
+    return [head] + [f"- {a['name']} ({'private' if a['shut'] else 'public'})" for a in lst["agents"]]
+
+
+def resolve_picks(text, lst, own):
+    """The agent ids the person's typed names pick ("all", "this", names as listed); "none" when no piece names anything
+    (the prompt is something else); None when a piece is unknown or matches two agents."""
+    pieces = [p for p in re.split(r"[,\n]+|\s+and\s+", text.strip()) if p.strip()][:101]
+    folds = {}
+    for a in lst["agents"]:
+        folds.setdefault(fold_name(a["name"]), []).append(a["id"])
+    picked, hits, bad = [], 0, len(pieces) > 100
+    for p in pieces:
+        w = re.sub(r"\s+", "", p.casefold())
+        f = w if w in ("all", "this") else fold_name(p)  # the reserved words first
+        ids = [a["id"] for a in lst["agents"]] if f == "all" else ([own] if own else []) if f == "this" else folds.get(f, [])
+        hits += f in ("all", "this") or f in folds
+        bad = bad or not ids or (f not in ("all", "this") and len(ids) != 1)
+        picked += [i for i in ids if i not in picked]
+    return "none" if hits == 0 else None if bad or not picked else picked
+
+
+def _cmd_path(sid):
+    return os.path.join(STATE, f"command-{sid}.json")
+
+
+def load_cmd(sid):
+    rec = read_json(_cmd_path(sid), None) if sid else None
+    at = rec.get("at") if rec else None
+    return rec if isinstance(at, (int, float)) and time.time() - at <= CMD_MAX_AGE else None
+
+
+def save_cmd(sid, rec):
+    ensure_dirs()
+    write_private(_cmd_path(sid), json.dumps(rec))
+
+
+def _own(inp):
+    a = agent_for(project_of(inp), me=this_session(inp))
+    return a if a is not None and isinstance(a.get("agent_id"), str) and read_key(a["slug"]) else None
+
+
+def command_prompt(inp):
+    """UserPromptSubmit: (line for the person or None, AI context or None, block) for the install or uninstall command,
+    or for the person's pick after the uninstall list; None for any other prompt."""
+    shape, prompt = hook_shape(inp), inp.get("prompt") if isinstance(inp, dict) else None
+    if shape is None or not isinstance(prompt, str) or len(prompt) > 4000:
+        return None
+    sid, tp, pid = shape
+    base = {"sid": sid, "tp": tp, "pid": pid, "prompt": prompt, "at": time.time()}
+    m = UNINSTALL_RE.fullmatch(prompt)
+    if INSTALL_RE.fullmatch(prompt):
+        me, here = this_session(inp), project_of(inp)
+        try:
+            kind, name = auto_name(here, me)
+        except SystemExit:
+            return INSTALL_FAILED_LINE, None, True
+        if kind == "main":
+            return MAIN_HERE_LINE, None, True
+        own = _own(inp)
+        save_cmd(sid, dict(base, kind="install", name=name, here=here))
+        steps = "" if own is not None and read_agent_answer(own["slug"]) else INSTALL_KEY_STEPS.format(name=name)
+        return None, INSTALL_AI.format(steps=steps), False
+    if m:
+        save_cmd(sid, dict(base, kind="uninstall", picks=m.group(1) or ""))
+        return None, UNINSTALL_LIST_AI, False
+    rec = load_cmd(sid)
+    if not rec or rec.get("kind") != "uninstall" or rec.get("picks") or not isinstance(rec.get("list"), dict):
+        return None
+    own = _own(inp)
+    got = resolve_picks(prompt, rec["list"], own["agent_id"].lower() if own else None)
+    if got == "none":
+        _drop(_cmd_path(sid))
+        return None
+    if got is None:
+        return PICK_UNKNOWN_LINE, None, True
+    save_cmd(sid, dict(rec, **base, targets=got))
+    return None, UNINSTALL_NOTE_AI.format(list=""), False
+
+
+def tool_answer(resp):
+    """The one JSON object a connector answer carries (one text block, or the object itself), else None."""
+    if isinstance(resp, dict) and not ({"content", "type", "text"} & set(resp)):
+        return resp
+    texts = [t for t in _strings(resp, []) if t != "text"]
+    try:
+        body = json.loads(texts[0]) if len(texts) == 1 else None
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _typed_entry(rec):
+    """The person's own typed entry for the command's prompt (its slash-command form too), or "not person", or None."""
+    want = rec["prompt"].strip()
+    deadline = time.time() + 3
+    while True:
+        for v in reversed(_jsonl_tail(rec["tp"], 1024 * 1024) if _transcript_ok(rec["tp"], rec["sid"]) else []):
+            t = _typed_text(v)
+            if t is None or v.get("promptId") != rec["pid"]:
+                continue
+            tag = CMD_TAG_RE.fullmatch(t)
+            t = f"{tag.group(1)} {tag.group(2).strip()}".strip() if tag else t.strip()
+            if t != want:
+                return None
+            return v if _person_origin(v) else "not person"
+        if time.time() > deadline:
+            return None
+        time.sleep(0.2)
+
+
+def note_proof(key, signer, list_id, kind, targets, prompt_id, typed_text, typed_at, iat, nonce):
+    """The typed proof of an agents note: HMAC-SHA256 with the agent's answer key over the label, signer, list id, kind,
+    the sorted target ids, prompt id, sha256 of the typed text, typed_at, iat (ms) and a nonce, joined by newlines."""
+    typed_sha = hashlib.sha256(typed_text.encode("utf-8", "surrogatepass")).hexdigest()
+    targets = sorted(t.lower() for t in targets)
+    lines = [NOTE_PROOF_LABEL, signer.lower(), list_id, kind, ",".join(targets), prompt_id, typed_sha, str(typed_at),
+             str(iat), nonce]
+    mac = hmac.new(key.encode(), "\n".join(lines).encode(), hashlib.sha256).hexdigest()
+    return {"v": 1, "signer": signer.lower(), "list_id": list_id, "kind": kind, "targets": targets, "prompt_id": prompt_id,
+            "typed_sha256": typed_sha, "typed_at": typed_at, "iat": iat, "nonce": nonce, "mac": mac}
+
+
+def _deny(line):
+    return {"systemMessage": line, "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                          "permissionDecisionReason": f"{CMD_NOTE}: {line}"}}
+
+
+def _post(line=None, ai=None, event="PostToolUse"):
+    out = {"hookSpecificOutput": {"hookEventName": event, **({"additionalContext": ai} if ai else {})}}
+    return dict(out, systemMessage=line) if line else out
+
+
+def note_input(inp, rec):
+    """PreToolUse of ledger_agents_note: the call's whole input, written by the plugin (kind, list id, target ids and the
+    typed proof), or a deny with its fixed line. Only for the person's own typed command, once, while fresh."""
+    targets, lst, own = rec.get("targets"), rec.get("list"), _own(inp)
+    if not isinstance(targets, list) or not targets or not isinstance(lst, dict) or own is None:
+        return _deny(REFUSED_LINE)
+    used = read_json(_typed_used_path(rec["sid"]), {}).get("ids")
+    used = used if isinstance(used, list) else []
+    entry = None if rec["pid"] in used else _typed_entry(rec)
+    if not isinstance(entry, dict):
+        return _deny(NOT_PERSON_LINE if entry == "not person" else REFUSED_LINE)
+    typed_at = _when(entry.get("timestamp"))
+    write_private(_typed_used_path(rec["sid"]), json.dumps({"ids": (used + [rec["pid"]])[-50:]}))
+    mine = own["agent_id"].lower()
+    if rec["kind"] == "uninstall" and targets == [mine]:
+        return _deny(uninstall_self(own))  # an agent may always end itself, on its own key (no proof needed)
+    key = read_agent_answer(own["slug"])
+    if key is None or typed_at is None:
+        return _deny(NO_ANSWER_KEY_LINE)
+    proof = note_proof(key, mine, lst["list_id"], rec["kind"], targets, rec["pid"], rec["prompt"],
+                       int(typed_at * 1000), int(time.time() * 1000), secrets.token_urlsafe(16))
+    key = None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": {
+        "kind": rec["kind"], "agent_id": mine, "list_id": lst["list_id"], "targets": proof["targets"], "typed_proof": proof}}}
+
+
+def uninstall_self(own):
+    """This agent only: POST uninstall {scope: self} on its own key (braked server-side), then the local cleanup."""
+    try:
+        api_json("POST", UNINSTALL_SELF_PATH, read_key(own["slug"]), body={"scope": "self"}, timeout=20)
+    except ApiError as e:
+        if e.status == 429:
+            return BRAKED_LINE
+        if e.status not in (401, 410):
+            return REFUSED_LINE
+    except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return REFUSED_LINE
+    remove_agent_here(own["slug"])
+    return " ".join([OFF_LINE.format(names=f'"{show_name(own["name"])}"'), CONNECTOR_SAME_LINE])
+
+
+def collect_key(verifier, mint_id):
+    """X1's collect: the key and answer key a connector mint holds for this verifier, once. The answer or None."""
+    try:
+        body = api_json("POST", COLLECT_PATH, None, body={"verifier": verifier, "mint_id": mint_id}, timeout=20)
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return None
+    ok = isinstance(body, dict) and isinstance(body.get("key"), str) and re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", body["key"]) \
+        and isinstance(body.get("answer_key"), str) and re.fullmatch(AGENT_ANSWER_RE, body["answer_key"]) \
+        and isinstance(body.get("agent_id"), str) and re.fullmatch(GRANT_ID_RE, body["agent_id"].lower())
+    return body if ok else None
+
+
+def collect_after_mint(inp, rec, body):
+    """PostToolUse of ledger_agent_key that answered collect: ready: collect with this machine's verifier, save the key
+    (mode 600) and answer key (keychain or mode 600), link this folder. The person's fixed line, or None."""
+    name = (inp.get("tool_input") or {}).get("name")
+    mint = body.get("mint_id")
+    if body.get("collect") != "ready" or not isinstance(name, str) or not isinstance(mint, str) or not re.fullmatch(GRANT_ID_RE, mint.lower()):
+        return None
+    s = slug(name)
+    v = read_verifier(f"agent-{s}")
+    got = collect_key(v, mint) if v else None
+    _drop(verifier_path(f"agent-{s}"))
+    v = None
+    wb = (got or {}).get("workbook_id") or (rec or {}).get("workbook_id")
+    if got is None or not isinstance(wb, str) or not re.fullmatch(AGENT_ID_RE, wb):
+        return INSTALL_FAILED_LINE
+    here = (rec or {}).get("here") or project_of(inp)
+    save_agent(name, got["agent_id"].lower(), got["key"], wb, here)
+    c = read_json(conf_path(s), {})
+    c["answer_store"] = save_agent_answer(s, got["answer_key"])
+    write_private(conf_path(s), json.dumps(c, indent=2))
+    got = None
+    return MINT_LINE.format(name=show_name(name))
+
+
+def install_note_ai(inp, body):
+    """EPM MUST 3: an install note only from the dedicated field of a datastash tool answer, marked sent by the person;
+    the fixed AI step for this session's agent to get its key, or None (this folder's agent already has one)."""
+    note = body.get(NOTE_FIELD) if isinstance(body, dict) else None
+    if not isinstance(note, dict) or note.get("kind") != "install" or note.get("sent_by") != "person" or _own(inp):
+        return None
+    name, aid = note.get("name"), note.get("agent_id")
+    if not (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._\-]{0,63}", name) and isinstance(aid, str)
+            and re.fullmatch(GRANT_ID_RE, aid.lower())) or off_here(inp) or private_here(inp):
+        return None
+    if isinstance(note.get("workbook_id"), str) and re.fullmatch(AGENT_ID_RE, note["workbook_id"]) and _sid(inp):
+        save_cmd(_sid(inp), {"kind": "note", "at": time.time(), "workbook_id": note["workbook_id"], "here": project_of(inp)})
+    return NOTE_INSTALL_AI.format(name=name, agent_id=aid.lower())
+
+
+def command_tool(inp):
+    """PreToolUse / PostToolUse of the install and uninstall calls, and any datastash answer's install note: the hook's
+    output, or None (nothing to do)."""
+    event, name = inp.get("hook_event_name"), str(inp.get("tool_name") or "")
+    m = CMD_TOOL_RE.fullmatch(name)
+    sid = _sid(inp)
+    rec = load_cmd(sid)
+    if event == "PreToolUse":
+        if not m or m.group(1) != "ledger_agents_note":
+            return None
+        return note_input(inp, rec) if rec and rec.get("kind") in ("install", "uninstall") else _deny(REFUSED_LINE)
+    if event not in ("PostToolUse", "PostToolUseFailure") or not name.startswith("mcp__") or "datastash" not in name.lower():
+        return None
+    body = tool_answer(inp.get("tool_response")) if event == "PostToolUse" else None
+    tool = m.group(1) if m else None
+    if tool == "ledger_agent_register" and rec and rec.get("kind") == "install":
+        tabs = [t.get("workbook_id") for t in (body or {}).get("notes_tabs") or [] if isinstance(t, dict)]
+        if tabs:
+            save_cmd(sid, dict(rec, workbook_id=tabs[0]))
+        return None
+    if tool == "ledger_agent_key" and body is not None:
+        line = collect_after_mint(inp, rec, body)
+        return _post(line) if line else None
+    if tool == "ledger_agents_list" and rec and rec.get("kind") in ("install", "uninstall"):
+        lst = norm_list(body)
+        if lst is None:
+            return _post(REFUSED_LINE)
+        own = _own(inp)
+        mine = own["agent_id"].lower() if own else None
+        rec = dict(rec, list=lst)
+        if rec["kind"] == "install":
+            rec["targets"] = [a["id"] for a in lst["agents"] if a["id"] != mine]
+        elif rec.get("picks"):
+            got = resolve_picks(rec["picks"], lst, mine)
+            if not isinstance(got, list):
+                _drop(_cmd_path(sid))
+                return _post(PICK_UNKNOWN_LINE)
+            rec["targets"] = got
+            save_cmd(sid, rec)
+            return _post(None, UNINSTALL_NOTE_AI.format(list=""))
+        save_cmd(sid, rec)
+        if rec["kind"] == "uninstall":
+            return _post("\n".join(list_lines(lst, LIST_HEAD) + [PICK_LINE]), "The plugin showed the person the list. "
+                         "Say nothing more; wait for their answer.")
+        return None
+    if tool == "ledger_agents_note" and rec and rec.get("kind") in ("install", "uninstall"):
+        _drop(_cmd_path(sid))
+        return _post(note_result(inp, rec, body))
+    ai = install_note_ai(inp, body)
+    return _post(None, ai) if ai else None
+
+
+def note_result(inp, rec, body):
+    """The person's fixed lines after the note: the install list, or what uninstall removed (this agent last)."""
+    lst, targets = rec.get("list") or {"agents": []}, rec.get("targets") or []
+    if not isinstance(body, dict) or body.get("error") or body.get("code"):
+        return OTHERS_FAILED_LINE if rec["kind"] == "install" else (
+            BRAKED_LINE if isinstance(body, dict) and body.get("code") == "braked" else REFUSED_LINE)
+    if rec["kind"] == "install":
+        return "\n".join(list_lines(lst, ON_HEAD) + [REMOVE_LINE])
+    names = {a["id"]: a["name"] for a in lst["agents"]}
+    done = {str(x).lower() for x in body.get("confirmed") or [] if isinstance(x, str)}
+    own = _own(inp)
+    if own is not None and own["agent_id"].lower() in targets:
+        remove_agent_here(own["slug"])
+        done.add(own["agent_id"].lower())
+    waiting = [f'"{names[t]}"' for t in targets if t not in done and t in names]
+    lines = [OFF_LINE.format(names=", ".join(f'"{names[t]}"' for t in targets if t in names)),
+             REMOVED_LINE.format(n=len(targets))]
+    return " ".join(lines + ([UNCONFIRMED_LINE.format(names=", ".join(waiting))] if waiting else []) + [CONNECTOR_SAME_LINE])
 
 
 def main():

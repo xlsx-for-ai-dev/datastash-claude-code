@@ -49,13 +49,16 @@ class SkillText(unittest.TestCase):
         self.assertIn("# Part 2: only where a shell and hooks run (Claude Code, Cowork)", body)
         part2 = body.split("# Part 2:")[1]
         self.assertIn("In app chat (no shell, no hooks), skip it.", part2)
-        for needle in ("## Self-registration", "## Inbox", "background listener", "datastash fetch",
-                       "## Sign this computer in (datastash login)", "datastash login --check"):
+        for needle in ("## Install and uninstall", "## Inbox", "background listener", "datastash fetch",
+                       "/datastash:install", "/datastash:uninstall"):
             self.assertIn(needle, part2, needle)
 
-    def test_the_ai_never_opens_or_approves_the_sign_in_page(self):
+    def test_no_login_in_any_flow_and_set_up_is_datastash_check(self):
+        """XLI-390 P1: no `datastash login` step anywhere; "am I set up?" is `datastash check`, never a connector tool."""
         _, body = parts()
-        self.assertIn("Never open or approve the sign-in page yourself", body)
+        self.assertNotIn("datastash login", body)
+        self.assertNotIn("getdatastash.com/agents", body)
+        self.assertIn("run `datastash check` and say what it prints. Never answer it with a connector tool.", body)
 
     def test_messages_are_delayed_never_dropped_and_the_listener_never_gets_a_key(self):
         """XLI-374 P1: the pacing is stated as a delay, never a drop; a refused or missing key waits for the person's
@@ -64,7 +67,7 @@ class SkillText(unittest.TestCase):
         part2 = body.split("# Part 2:", 1)[1]
         self.assertIn("Messages are delayed, never dropped", part2)
         self.assertIn("It never asks for a key", part2)
-        for sentence in ("Get datastash agent <name> a new key on this computer.", "Sign this computer in to datastash.",
+        for sentence in ("Get datastash agent <name> a new key on this computer.",
                          "Link this folder to datastash agent <name>.", "Make my datastash agent workbook."):
             self.assertIn(f'"{sentence}"', part2)
 
@@ -73,8 +76,7 @@ class SkillText(unittest.TestCase):
         tells the AI to register itself or to get its own first key."""
         _, body = parts()
         part2 = body.split("# Part 2:", 1)[1]
-        self.assertIn("You never register yourself and never get your own first key.", part2)
-        self.assertIn("https://getdatastash.com/agents", part2)
+        self.assertIn("You never register yourself, never get your own first key", part2)
         self.assertNotIn("datastash auto-name", part2)
         self.assertNotIn("Set this folder up as a datastash agent.", body)
 
