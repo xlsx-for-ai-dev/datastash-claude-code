@@ -63,7 +63,7 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
    ```
 
    (Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
-   `/plugin install datastash@datastash`.)
+   `/plugin install datastash@datastash`.) When it asks where to install, pick 'for you'.
 2. **Restart Claude Code.**
 3. **Sign in once, from the line the plugin shows.** At the start of the first session, the plugin itself (no AI step)
    starts the sign-in and shows you one line:
