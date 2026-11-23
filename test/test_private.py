@@ -31,7 +31,7 @@ from test_projectmap import MapBase  # noqa: E402
 OWN_ID = "11111111-aaaa-bbbb-cccc-000000000001"
 OTHER_ID = "11111111-aaaa-bbbb-cccc-000000000002"
 COMING = "Private mode is coming."
-LINK_LINE = f"To keep web-app private, press Private next to it on {ds.AGENTS_URL}. Until you do, it is on datastash."
+LINK_LINE = f"To keep web-app private, press 'Turn private on' next to it on {ds.AGENTS_URL}. Until you do, it is on datastash."
 FEED_LINE = "Not set up: a datastash feed would share it with your other agents."
 
 

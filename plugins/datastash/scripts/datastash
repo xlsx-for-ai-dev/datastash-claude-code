@@ -6199,7 +6199,7 @@ def _here_root(here):
 PRIVATE_PATH = os.path.join(CONF, "status-private.json")  # {"agents": {agent_id: {"at", "slug"}}, "field_at"}
 PLUGIN_SERVER = "plugin_datastash_datastash"  # the plugin's own connector, the one whose helper this file is
 PRIVATE_COMING = 'Private mode is coming. Until then, type "leave {name} off" to keep it off datastash.'
-PRIVATE_LINK = "To keep {name} private, press Private next to it on {url}. Until you do, it is on datastash."
+PRIVATE_LINK = "To keep {name} private, press 'Turn private on' next to it on {url}. Until you do, it is on datastash."
 PRIVATE_ALREADY = ('"{name}" is private: datastash shares nothing from it with your other agents. Only you change that, '
                    "on {url}.")
 PRIVATE_STATUS = ("kept on this machine only: this agent is private, so its status is not shared with your other agents "

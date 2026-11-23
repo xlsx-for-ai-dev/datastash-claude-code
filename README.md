@@ -391,7 +391,7 @@ list, asks first and idle agents last, from any session: "status", "status of al
   dark mode to the settings page") is an ordinary prompt and goes through untouched. "leave <name> off" (or "keep <name> off
   datastash", or "datastash off" for this folder) turns that folder OFF (below; saved at once, since it only makes
   agents share less). "keep <name> private": once datastash answers with the private field, "To keep <name> private,
-  press Private next to it on the agents page. Until you do, it is on datastash." (before that: private mode is coming).
+  press 'Turn private on' next to it on the agents page. Until you do, it is on datastash." (before that: private mode is coming).
   The plugin never sets private itself. After an answer the updated list is shown once.
 - **OFF folders.** A folder that is off makes no datastash call: no sign-in or inbox count at session start, no
   listener, hello, heartbeat, status, seed, project-map share or lookup counting, and no agent is registered for it.
@@ -403,7 +403,7 @@ list, asks first and idle agents last, from any session: "status", "status of al
   switch it off on datastash; it is off on this computer." An agent still waiting for your OK: "It is off on this
   computer. On the agents page, press Don't allow next to it." "put <name> back on datastash" turns it back on, only as
   your own typed prompt. A 0.9.x "leave <name> off" reads as off.
-- **PRIVATE folders.** Only you set or clear private, with the Private button on the agents page; the plugin sends it
+- **PRIVATE folders.** Only you set or clear private, with the "Turn private on" button on the agents page; the plugin sends it
   in no request. It records a folder's agent as private only when datastash's own answer to the plugin's call (the
   approval check, register or hello) says `private: true`, and forgets it only on `private: false`
   (`status-private.json`); a missing field changes nothing. In a private folder: the connector's `headersHelper` hands
