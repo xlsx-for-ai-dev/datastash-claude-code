@@ -3774,7 +3774,7 @@ class Xli374(Base):
         self.assertNotIn("To fix it", self.check())  # XLI-375: signed in, the plugin sets the agents up itself
         ds.signed_in = lambda: False  # signed out, with no sign-in line out (a computer the hooks can't sign in)
         self.assertIn("the person types /datastash:install.", self.check())  # XLI-390 P1: no sign-in, the command
-        self.assertNotIn("/datastash:install", self.check())
+        self.assertNotIn("the person types /datastash:install.", self.check())  # the notice, once (the AI line stays)
         self.assertEqual(self.listen(), (0, ""))  # nothing to listen for; it never pretends
         self.agent("Solo", projects=[os.path.join(ROOT, "elsewhere")])
         self.check()

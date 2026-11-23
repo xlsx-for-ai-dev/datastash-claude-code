@@ -2925,8 +2925,12 @@ def cmd_listen(_args, printer=None, forced=None):
         w = waiting_record(project, me)
         if w is not None:
             return _listen_waiting(w[0], w[1], str(inp.get("session_id") or ""), project, me)
-        raise_notice(notice_cause("oldlogin"), notice_text("oldlogin"))
-        told = take_notices([notice_cause("oldlogin")])
+        told = []
+        # A fallback agent (the one agent with no folder) still listens here, and several agents with no folder have
+        # their own "unlinked" notice: nothing more to tell then.
+        if agent is None and len(unlinked_agents()) < 2:
+            raise_notice(notice_cause("oldlogin"), notice_text("oldlogin"))
+            told = take_notices([notice_cause("oldlogin")])
         if told:
             log("enroll", "listen: older login, no agent here; tells the session once to run /datastash:install")
             print(" ".join(told), file=sys.stderr)
