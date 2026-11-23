@@ -5073,6 +5073,13 @@ def cmd_agent_tool(_args):
         print(json.dumps(tdeny), flush=True)
         return _agent_tool(inp)
     try:
+        cdeny = clean_block(inp)  # XLI-396: clean sessions enforces subagents (the main session's writes are refused)
+    except Exception:  # noqa: BLE001  can't read the choice or the call: no refusal on a guess
+        cdeny = None
+    if cdeny is not None:
+        print(json.dumps(cdeny), flush=True)
+        return 0  # the call never runs, so it carries nothing to record
+    try:
         cmd_out = command_tool(inp)  # XLI-390 P1: install and uninstall calls, collect, install notes
     except (Exception, SystemExit):  # fail closed: a note call goes out only with the plugin's own input
         is_note = str(inp.get("tool_name") or "").endswith("__ledger_agents_note")
@@ -5134,14 +5141,6 @@ def cmd_agent_tool(_args):
         out = out or {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
         hs = out["hookSpecificOutput"]
         hs["additionalContext"] = (hs.get("additionalContext", "") + " " + hint).strip()
-    try:
-        nudge = clean_nudge(inp)  # XLI-386: the main session's Bash call, while commands through subagents is on
-    except Exception:
-        nudge = None
-    if nudge:
-        out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
-        hs = out["hookSpecificOutput"]
-        hs["additionalContext"] = (hs.get("additionalContext", "") + " " + nudge).strip()
     if proofed is not None:  # XLI-351: the proof rewrite goes out with any sign-in line (PreToolUse only)
         out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
         out["hookSpecificOutput"]["updatedInput"] = proofed
@@ -6871,10 +6870,10 @@ def install_update_lines():
 # a personal thing"; each is chosen by itself). Kept in the per-person settings file beside the keep answer.
 CLEAN_DEFAULTS = {"commands": True, "no_code": False}  # commands through subagents: on; no code in sessions: off
 CLEAN_NOTE = "datastash note (clean sessions; the person's own choices)"
-CLEAN_NUDGE = "Clean sessions: hand this to a subagent."
-CLEAN_NUDGE_EVERY = 300  # seconds: at most one nudge per session in this time
-CLEAN_COMMANDS_RULE = ("Commands through subagents is on: hand shell commands to a subagent instead of running them in "
-                       "this session, and ask it to report back in plain words only (what changed, the result, any "
+CLEAN_BLOCK = "Clean sessions is on: hand this to a subagent (Agent tool), then report the result in plain words."
+CLEAN_COMMANDS_RULE = ("Commands through subagents is on: this session doesn't edit files or run shell commands itself (the "
+                       "plugin refuses them here; only a short read-only lookup runs). Hand the work to a subagent "
+                       "(Agent tool), and ask it to report back in plain words only (what changed, the result, any "
                        "blocker), with no commands or output.")
 CLEAN_NO_CODE_RULE = ("No code in sessions is on: code reading and writing go to a subagent too, and this session shows "
                       "no code and no code blocks; the subagent reports in plain words.")
@@ -6917,31 +6916,103 @@ def clean_session_text(cur=None):
             "choice; never comment on it.")
 
 
-def _clean_nudge_path(sid):
-    return os.path.join(STATE, f"clean-nudge-{sid}.json")
+# XLI-396 (owner 11-23: clean sessions ENFORCES subagents; a block, not a nudge). The main session's (no agent_id)
+# code-writing tools are refused; a Bash call runs only as one short read-only lookup from this allow-list, or the
+# plugin's own datastash command. No code in sessions also refuses the lookups that show file text.
+CLEAN_WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+CLEAN_LOOKUPS = {"ls": None, "cat": None, "head": None, "tail": None, "grep": None, "wc": None,
+                 "git": ("status", "log", "diff", "show"), "gh": ("pr view",), "curl": None}
+CLEAN_SHOWS_CODE = ("cat", "head", "tail", "grep", "git diff", "git show")  # refused too while no code in sessions is on
+CLEAN_CURL_FLAGS = {"-s", "-S", "-f", "-L", "-I", "-sS", "-fsS", "-sSf", "-fsSL", "-sL", "-sSL", "-fs", "-sf", "-fsL",
+                    "--silent", "--show-error", "--fail", "--location", "--head"}
+_CLEAN_OPS = set(";&|<>()")
 
 
-def clean_nudge(inp):
-    """PreToolUse Bash in the main session (Claude Code's hook input carries agent_id only inside a subagent) while
-    commands through subagents is on: the one nudge line, at most once per CLEAN_NUDGE_EVERY per session; else None.
-    Never a block, and the command itself is never read. The person's datastash main session is never nudged."""
-    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse" or inp.get("tool_name") != "Bash":
+def _clean_ds_call(words):
+    """True when the words run this plugin's own datastash command: bare (on PATH), from ${CLAUDE_PLUGIN_ROOT}, or
+    this very script, optionally after python3."""
+    if words[:1] == ["python3"]:
+        words = words[1:]
+    me = os.path.realpath(__file__)
+    return bool(words) and (words[0] in ("datastash", "${CLAUDE_PLUGIN_ROOT}/scripts/datastash",
+                                         "${CLAUDE_PLUGIN_ROOT}/bin/datastash", me)
+                            or os.path.realpath(words[0]) == me)
+
+
+def clean_lookup_ok(cmd, no_code=False):
+    """True only for one short read-only lookup: a single command from CLEAN_LOOKUPS (or the plugin's own datastash
+    command) with no redirect, pipe, chain, subshell or command substitution. Anything it can't parse is refused."""
+    if not isinstance(cmd, str) or not cmd.strip() or len(cmd) > 2000 or "\n" in cmd or "\r" in cmd:
+        return False
+    if MAIN_STEP_RE.fullmatch(cmd):
+        return True  # the person's own switch-on steps
+    if "`" in cmd or "$(" in cmd or "<(" in cmd or ">(" in cmd:
+        return False
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return False
+    ops = [i for i, w in enumerate(words) if w and set(w) <= _CLEAN_OPS]
+    if len(ops) == 1 and words[ops[0]] == "|" and words[:1] == ["printf"] and 3 <= ops[0] <= 4 \
+            and words[1] in ("%s", "%s\\n") and _clean_ds_call(words[ops[0] + 1:]):
+        return True  # printf '%s' '<json>' | datastash status-set - (the skill's own form)
+    if not words or ops:
+        return False
+    if _clean_ds_call(words):
+        return True  # the plugin's own datastash command, as one call
+    name, args = words[0], words[1:]
+    if name not in CLEAN_LOOKUPS:
+        return False
+    subs = CLEAN_LOOKUPS[name]
+    if subs is not None:
+        sub = next((x for x in subs if words[1:1 + len(x.split())] == x.split()), None)
+        if sub is None:
+            return False
+        shown = f"{name} {sub}"
+        args = words[1 + len(sub.split()):]
+    else:
+        shown = name
+    if no_code and shown in CLEAN_SHOWS_CODE:
+        return False
+    if any(a.startswith("--output") or a in ("--ext-diff", "--web", "-w") for a in args):
+        return False  # git's --output writes a file, --ext-diff runs a program; gh --web opens a browser
+    short = [a[1:] for a in args if a.startswith("-") and not a.startswith("--")]
+    if name == "tail" and (any("f" in a or "F" in a for a in short) or any(a.startswith(("--follow", "--retry"))
+                                                                            for a in args)):
+        return False  # not short: it never ends
+    if no_code and name == "git" and (any(a.startswith(("--patch", "-p", "-u")) for a in args)):
+        return False  # a log with patches shows code
+    if name == "curl":
+        urls = [a for a in args if not a.startswith("-")]
+        return (len(urls) == 1 and re.fullmatch(r"https?://[^\s]+", urls[0]) is not None
+                and all(a in CLEAN_CURL_FLAGS for a in args if a.startswith("-"))
+                and ("--silent" in args or any("s" in a for a in short)))  # -s: a quiet GET to stdout, nothing else
+    return True
+
+
+def clean_block(inp):
+    """XLI-396: the PreToolUse deny for the main session (Claude Code's hook input carries agent_id only inside a
+    subagent) while either clean sessions choice is on, or None. A subagent is never refused; nor is the person's
+    datastash main session (it keeps its own rules). The refusal is the one fixed line; the command is never repeated."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse" or inp.get("agent_id"):
         return None
-    if inp.get("agent_id"):
+    tool = inp.get("tool_name")
+    if tool not in CLEAN_WRITE_TOOLS and tool != "Bash":
         return None
     sid = inp.get("session_id")
-    if not (isinstance(sid, str) and re.fullmatch(SID_RE, sid)) or os.path.exists(_main_path(sid)):
+    if isinstance(sid, str) and re.fullmatch(SID_RE, sid) and os.path.exists(_main_path(sid)):
         return None
-    if not clean_settings()["commands"]:
+    cur = clean_settings()
+    if not (cur["commands"] or cur["no_code"]):
         return None
-    path = _clean_nudge_path(sid)
-    now = int(time.time())
-    last = read_json(path, {}).get("at")
-    if isinstance(last, int) and 0 <= now - last < CLEAN_NUDGE_EVERY:
-        return None
-    ensure_dirs()
-    write_private(path, json.dumps({"at": now}))
-    return CLEAN_NUDGE
+    if tool == "Bash":
+        ti = inp.get("tool_input")
+        if isinstance(ti, dict) and not ti.get("run_in_background") and clean_lookup_ok(ti.get("command"), cur["no_code"]):
+            return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": CLEAN_BLOCK}}
 
 
 CLEAN_PHRASES = (

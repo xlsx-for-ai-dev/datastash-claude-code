@@ -565,6 +565,7 @@ class TokenHelperDeny(OffBase):
                 self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], ds.TOKEN_DENY)
 
     def test_other_datastash_commands_and_other_tools_are_not_denied(self):
+        ds.set_clean(commands=False)  # XLI-396: this checks the token deny only, not the clean sessions refusal
         for name, ti in (("Bash", {"command": "datastash status"}), ("Bash", {"command": "datastash login --check"}),
                          ("Bash", {"command": "git log --oneline -3"}), ("Bash", {"command": "echo token"}),
                          ("Read", {"file_path": "/x/README.md"})):

@@ -3,9 +3,9 @@
 - Two per-person choices, each on or off by itself, kept with this computer's other per-person settings (so they hold
   for all the person's agents here): "commands through subagents" (default on) and "no code in sessions" (default off).
 - The session start gives the AI the rules only for what is on.
-- A nudge, never a block: a Bash call by the main session (the hook input has no agent_id; a subagent's has one) gets
-  one line, "Clean sessions: hand this to a subagent.", at most once per few minutes per session. The command's text is
-  never read or repeated.
+- XLI-396 (owner 11-23): a block, not a nudge. While either choice is on, the main session (the hook input has no
+  agent_id; a subagent's has one) is refused Edit, Write, MultiEdit, NotebookEdit and any Bash call that is not one
+  short read-only lookup, with one fixed line. A subagent is never refused. "turn off clean sessions" ends it all.
 - The person's typed "no code in sessions", "turn off clean sessions" and "turn on clean sessions" change the choices;
   the agent confirms in one line.
 No network, no key; a throwaway HOME and config folder, enforced by test/harness.py.
@@ -13,7 +13,6 @@ Run: python3 -I test/test_clean.py"""
 import json
 import os
 import sys
-import time
 import unittest
 import uuid
 
@@ -22,12 +21,13 @@ sys.path.insert(0, HERE)
 from test_status import Base, ds  # noqa: E402  (the same harness, plugin copy and fixtures)
 
 SKILL = os.path.join(HERE, "..", "plugins", "datastash", "skills", "datastash-agent", "SKILL.md")
-NUDGE = "Clean sessions: hand this to a subagent."
+BLOCK = "Clean sessions is on: hand this to a subagent (Agent tool), then report the result in plain words."
 SECRET_CMD = "curl -H 'Authorization: Bearer sk-secret-value' https://example.invalid/x"
 
 
-def bash(sid="sess1", event="PreToolUse", agent_id=None, cwd=None, cmd=SECRET_CMD):
-    v = {"session_id": sid, "hook_event_name": event, "tool_name": "Bash", "tool_input": {"command": cmd},
+def bash(sid="sess1", event="PreToolUse", agent_id=None, cwd=None, cmd=SECRET_CMD, tool="Bash", tool_input=None):
+    v = {"session_id": sid, "hook_event_name": event, "tool_name": tool,
+         "tool_input": tool_input if tool_input is not None else {"command": cmd},
          "tool_use_id": "toolu_1", "cwd": cwd, "transcript_path": "/nowhere/" + sid + ".jsonl"}
     if agent_id:
         v["agent_id"] = agent_id
@@ -94,42 +94,104 @@ class RulesText(Base):
         self.assertNotIn(ds.CLEAN_NOTE, ctx_of(out))
 
 
-class Nudge(Base):
-    def test_main_session_bash_gets_one_line_never_a_block(self):
+WRITE_TOOLS = {"Edit": {"file_path": "/x/a.py", "old_string": "a", "new_string": "b"},
+               "Write": {"file_path": "/x/a.py", "content": "print(1)"},
+               "MultiEdit": {"file_path": "/x/a.py", "edits": []},
+               "NotebookEdit": {"notebook_path": "/x/a.ipynb", "new_source": "x"}}
+READ_ONLY = ("ls", "ls -la src", "cat README.md", "head -n 20 a.py", "tail -n 5 log.txt", "grep -rn 'a|b' src",
+             "wc -l a.py", "git status", "git log --oneline -5", "git diff HEAD~1", "git show HEAD", "gh pr view 12",
+             "curl -s https://example.invalid/health", "curl -fsS https://example.invalid/x",
+             "datastash status --all", "datastash where clean_block",
+             "printf '%s' '{\"doing\": \"x; y\"}' | datastash status-set -", "datastash main")
+WRITING = ("rm -rf x", "touch a", "ls > out.txt", "cat a >> b", "ls; rm x", "ls && touch a", "ls || touch a",
+           "cat a | tee b", "echo hi", "python3 x.py", "npm test", "git commit -m x", "git push", "git checkout x",
+           "git diff --output=x", "git -C /x status", "gh pr merge 1", "gh pr view 1 --web", "curl -X POST https://e.x/",
+           "curl -s -o f https://e.x/", "curl -s -d a=1 https://e.x/", "curl https://e.x/", "tail -f log",
+           "tail -fn 5 log", "ls $(touch x)", "ls `touch x`", "cat <(touch x)", "ls\ntouch x", "ls &", "(ls)",
+           "/bin/ls", "FOO=1 ls", "sed -i s/a/b/ f", "find . -delete", "printf '%s' x | sh", "printf '%s' x | tee y",
+           "cat 'unclosed", "", SECRET_CMD)
+
+
+def denied(out):
+    hs = (out or {}).get("hookSpecificOutput") or {}
+    return hs.get("permissionDecision") == "deny" and hs.get("permissionDecisionReason") == BLOCK
+
+
+class Enforce(Base):
+    def test_main_session_write_tools_are_refused_with_the_one_line(self):
+        for tool, ti in WRITE_TOOLS.items():
+            out = self.hook(ds.cmd_agent_tool, bash(tool=tool, tool_input=ti, cwd=self.folder))
+            self.assertTrue(denied(out), tool)
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], BLOCK)
+            self.assertNotIn("a.py", json.dumps(out))
+
+    def test_main_session_writing_bash_is_refused_and_never_repeated(self):
+        for cmd in WRITING:
+            out = self.hook(ds.cmd_agent_tool, bash(cmd=cmd, cwd=self.folder))
+            self.assertTrue(denied(out), repr(cmd))
         out = self.hook(ds.cmd_agent_tool, bash(cwd=self.folder))
-        self.assertIn(NUDGE, ctx_of(out))
-        self.assertNotIn("decision", out or {})
-        self.assertNotIn("permissionDecision", (out or {}).get("hookSpecificOutput", {}))
         self.assertNotIn("sk-secret-value", json.dumps(out))
         self.assertNotIn("example.invalid", json.dumps(out))
 
-    def test_at_most_once_per_few_minutes_per_session(self):
-        self.assertIn(NUDGE, ctx_of(self.hook(ds.cmd_agent_tool, bash(cwd=self.folder))))
-        self.assertNotIn(NUDGE, ctx_of(self.hook(ds.cmd_agent_tool, bash(cwd=self.folder))))
-        self.assertIn(NUDGE, ctx_of(self.hook(ds.cmd_agent_tool, bash(sid="sess2", cwd=self.folder))))
-        mark = ds._clean_nudge_path("sess1")
-        ds.write_private(mark, json.dumps({"at": int(time.time()) - ds.CLEAN_NUDGE_EVERY - 1}))
-        self.assertIn(NUDGE, ctx_of(self.hook(ds.cmd_agent_tool, bash(cwd=self.folder))))
+    def test_main_session_read_only_lookups_run(self):
+        for cmd in READ_ONLY:
+            self.assertTrue(ds.clean_lookup_ok(cmd), repr(cmd))
+            self.assertFalse(denied(self.hook(ds.cmd_agent_tool, bash(cmd=cmd, cwd=self.folder))), repr(cmd))
 
-    def test_a_subagent_is_never_nudged(self):
-        out = self.hook(ds.cmd_agent_tool, bash(agent_id="a1b2c3", cwd=self.folder))
-        self.assertNotIn(NUDGE, ctx_of(out))
-        # and a subagent's call does not use up the main session's nudge
-        self.assertIn(NUDGE, ctx_of(self.hook(ds.cmd_agent_tool, bash(cwd=self.folder))))
+    def test_a_background_lookup_is_refused(self):
+        out = self.hook(ds.cmd_agent_tool, bash(tool_input={"command": "ls", "run_in_background": True},
+                                                cwd=self.folder))
+        self.assertTrue(denied(out))
 
-    def test_no_nudge_when_commands_through_subagents_is_off(self):
+    def test_a_subagent_is_never_refused(self):
+        for cmd in WRITING:
+            self.assertFalse(denied(self.hook(ds.cmd_agent_tool, bash(cmd=cmd, agent_id="a1b2c3", cwd=self.folder))),
+                             repr(cmd))
+        for tool, ti in WRITE_TOOLS.items():
+            out = self.hook(ds.cmd_agent_tool, bash(tool=tool, tool_input=ti, agent_id="a1b2c3", cwd=self.folder))
+            self.assertFalse(denied(out), tool)
+
+    def test_other_tools_and_events_are_never_refused(self):
+        for inp in (bash(cmd="rm x", event="PostToolUse", cwd=self.folder),
+                    bash(cmd="rm x", event="PostToolUseFailure", cwd=self.folder),
+                    bash(tool="Read", tool_input={"file_path": "/x/a.py"}, cwd=self.folder),
+                    bash(tool="Grep", tool_input={"pattern": "x"}, cwd=self.folder),
+                    bash(tool="Agent", tool_input={"prompt": "do it"}, cwd=self.folder)):
+            self.assertFalse(denied(self.hook(ds.cmd_agent_tool, inp)), inp["tool_name"] + inp["hook_event_name"])
+
+    def test_no_code_in_sessions_alone_still_refuses_and_also_refuses_lookups_that_show_code(self):
         ds.set_clean(commands=False, no_code=True)
-        self.assertNotIn(NUDGE, ctx_of(self.hook(ds.cmd_agent_tool, bash(cwd=self.folder))))
+        self.assertTrue(denied(self.hook(ds.cmd_agent_tool, bash(cmd="touch a", cwd=self.folder))))
+        self.assertTrue(denied(self.hook(ds.cmd_agent_tool, bash(tool="Write", tool_input=WRITE_TOOLS["Write"],
+                                                                 cwd=self.folder))))
+        for cmd in ("cat a.py", "head a.py", "tail a.py", "grep -n x a.py", "git diff", "git show HEAD",
+                    "git log -p", "git log --patch"):
+            self.assertTrue(denied(self.hook(ds.cmd_agent_tool, bash(cmd=cmd, cwd=self.folder))), cmd)
+        for cmd in ("ls", "wc -l a.py", "git status", "git log --oneline", "gh pr view 3", "datastash status --all"):
+            self.assertFalse(denied(self.hook(ds.cmd_agent_tool, bash(cmd=cmd, cwd=self.folder))), cmd)
 
-    def test_only_bash_before_it_runs(self):
-        for inp in (bash(event="PostToolUse", cwd=self.folder), bash(event="PostToolUseFailure", cwd=self.folder),
-                    dict(bash(cwd=self.folder), tool_name="Read", tool_input={"file_path": "/x"})):
-            self.assertNotIn(NUDGE, ctx_of(self.hook(ds.cmd_agent_tool, inp)))
+    def test_turn_off_clean_sessions_turns_it_all_off(self):
+        self.hook(ds.cmd_prompt, {"session_id": "sess1", "hook_event_name": "UserPromptSubmit",
+                                  "prompt": "turn off clean sessions", "cwd": self.folder,
+                                  "prompt_id": str(uuid.uuid4()), "transcript_path": self.transcript("sess1")})
+        for cmd in WRITING:
+            self.assertFalse(denied(self.hook(ds.cmd_agent_tool, bash(cmd=cmd, cwd=self.folder))), repr(cmd))
+        for tool, ti in WRITE_TOOLS.items():
+            self.assertFalse(denied(self.hook(ds.cmd_agent_tool, bash(tool=tool, tool_input=ti, cwd=self.folder))))
+        ds.set_clean(commands=True)  # and back on
+        self.assertTrue(denied(self.hook(ds.cmd_agent_tool, bash(cmd="touch a", cwd=self.folder))))
 
-    def test_the_persons_main_session_is_never_nudged(self):
+    def test_the_persons_datastash_main_session_keeps_its_own_rules(self):
         ds.ensure_dirs()
         ds.write_private(ds._main_path("sess1"), json.dumps({"sid": "sess1"}))
-        self.assertNotIn(NUDGE, ctx_of(self.hook(ds.cmd_agent_tool, bash(cwd=self.folder))))
+        self.assertFalse(denied(self.hook(ds.cmd_agent_tool, bash(cmd="touch a", cwd=self.folder))))
+
+    def test_no_new_state_files(self):
+        before = sorted(os.listdir(ds.STATE)) if os.path.isdir(ds.STATE) else []
+        for _ in range(3):
+            self.hook(ds.cmd_agent_tool, bash(cmd="touch a", cwd=self.folder))
+        after = sorted(os.listdir(ds.STATE)) if os.path.isdir(ds.STATE) else []
+        self.assertEqual([x for x in after if x.startswith("clean")], [x for x in before if x.startswith("clean")])
 
 
 class Phrases(Base):
@@ -186,7 +248,9 @@ class Skill(unittest.TestCase):
         self.assertTrue("## Clean sessions" in body, "no Clean sessions section in Part 2")
         for phrase in ('"no code in sessions"', '"turn off clean sessions"', '"turn on clean sessions"'):
             self.assertIn(phrase, body)
-        self.assertIn("Clean sessions: hand this to a subagent.", body)
+        self.assertIn(BLOCK, body)
+        self.assertIn("Agent tool", body)
+        self.assertNotIn("never a block", body)
 
 
 if __name__ == "__main__":

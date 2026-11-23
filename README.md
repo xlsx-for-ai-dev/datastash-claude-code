@@ -159,11 +159,19 @@ Two choices of your own, each on or off by itself, for all your agents on this c
   back in plain words, so your session stays readable and its context stays small.
 - **No code in sessions** (off from the start): code reading, writing and code blocks stay in subagents too.
 
-The session start gives the agent the rules only for what is on. While commands through subagents is on, a Bash call by
-the main session (Claude Code's hook input carries `agent_id` only inside a subagent) gets one line, "Clean sessions: hand
-this to a subagent.", at most once every 5 minutes per session. It is a nudge, never a block, and the command itself is
-never read. Type "no code in sessions", "turn off clean sessions", "turn on clean sessions" or "code in sessions"; the
-plugin saves it and the agent confirms in one line.
+The session start gives the agent the rules only for what is on. Clean sessions enforces subagents (plugin 1.0.2,
+XLI-396): while either choice is on, the main session (Claude Code's hook input carries `agent_id` only inside a
+subagent) is refused Edit, Write, MultiEdit and NotebookEdit, and any Bash call that is not one short read-only lookup,
+with one fixed line: "Clean sessions is on: hand this to a subagent (Agent tool), then report the result in plain
+words." A read-only lookup is a single command from this list, with no redirect, pipe, `;`, `&&`, `||`, subshell,
+command substitution or background run: `ls`, `cat`, `head`, `tail` (not `-f`), `grep`, `wc`, `git status`, `git log`,
+`git diff`, `git show` (no `--output`, no `--ext-diff`, no `git -C`), `gh pr view` (not `--web`), `curl -s <url>` (a GET
+to stdout: only `-s -S -f -L -I` and their long forms), and the plugin's own `datastash` command (also as
+`printf '%s' '<json>' | datastash status-set -`). With no code in sessions on, `cat`, `head`, `tail`, `grep`,
+`git diff`, `git show` and `git log -p` are refused too. Subagents are never refused, and neither is your datastash main
+session. Nothing is capped and no command text is repeated. Type "no code in sessions", "turn off clean sessions"
+(which turns both off, and with them every refusal), "turn on clean sessions" or "code in sessions"; the plugin saves
+it and the agent confirms in one line.
 
 ## Project map (plugin 0.7.0)
 
@@ -782,6 +790,11 @@ An agent can send datastash a capability request, an error report or anything el
   is said again by the listener. X6: "make <name> private" / "make <name> public" signed over the list's agent id like uninstall,
   the server's fixed line shown only over names on the list, model-typed text refused, unknown names left as ordinary
   prompts, and the after-install lines.
+- `python3 -I test/test_clean.py`: clean sessions (plugin 0.8.0; enforced in 1.0.2, XLI-396): the two choices and their
+  phrases, the session-start rules, and the refusal: the main session's Edit, Write, MultiEdit and NotebookEdit and its
+  writing Bash (redirects, pipes, chains, substitutions, background runs, anything off the list) refused with the one
+  line, read-only lookups and the `datastash` command let through, no code in sessions refusing the lookups that show
+  code, subagents never refused, and "turn off clean sessions" ending it all.
 - `python3 -I test/test_ci_report.py`: `datastash ci-report` (plugin 0.9.11): a canary in a failure's message, text,
   stdout and stderr never sent or printed, only allow-listed fields; a DOCTYPE, billion laughs and an outside entity
   refused; rows folded; flaky in either order (also across legs that ran different tests), at once (counted once), in a
