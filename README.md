@@ -728,7 +728,7 @@ An agent can send datastash a capability request, an error report or anything el
   stdout and stderr never sent or printed, only allow-listed fields; a DOCTYPE, billion laughs and an outside entity
   refused; rows folded; flaky in either order (also across legs that ran different tests), at once (counted once), in a
   retry, and never for shards, skips, another commit or a `--local` run; main_broke_at; the week four weeks back; pages of 1,000 with idempotency keys; 429 and busy waited out; old
-  Test runs rows removed; exit 0 with one line for every problem, a bad wait setting and a server that does not answer.
+  Test runs rows removed; exit 0 with one line for every problem, a bad wait or retry setting and a server that does not answer.
 - `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
   for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
   without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the

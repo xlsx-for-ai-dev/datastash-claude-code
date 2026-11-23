@@ -534,6 +534,32 @@ class CiReport(unittest.TestCase):
         finally:
             os.environ.pop("DATASTASH_CI_WAIT_SECONDS", None)
 
+    def test_bad_retry_setting_falls_back_and_exits_zero(self):
+        # Release 1.0.0: a bad DATASTASH_CI_RETRY_SECONDS falls back to the default like the wait setting (0 stays 0).
+        for bad in ("abc", "nan", "inf", "-5", ""):
+            os.environ["DATASTASH_CI_RETRY_SECONDS"] = bad
+            try:
+                self.assertEqual(ds._ci_env_seconds("DATASTASH_CI_RETRY_SECONDS", 2.0, zero_ok=True), 2.0, bad)
+            finally:
+                os.environ.pop("DATASTASH_CI_RETRY_SECONDS", None)
+        for bad in ("abc", "-5"):  # the script itself (it used to stop at import); the default waits run here
+            p = self.file(junit([("t", "a", "pass", 1)]))
+            env = dict(os.environ, DATASTASH_NO_NETWORK="1", DATASTASH_CI_RETRY_SECONDS=bad, DATASTASH_AGENT_KEY=KEY,
+                       DATASTASH_WORKBOOK_ID=WB)
+            r = subprocess.run([sys.executable, "-I", BIN, "ci-report", p, "--repo", "acme/widgets", "--sha", SHA,
+                                "--branch", "b", "--run-url", "https://x.example/1"], capture_output=True, text=True,
+                               env=env, timeout=60)
+            self.assertEqual(r.returncode, 0, bad)
+            lines = (r.stdout + r.stderr).strip().splitlines()
+            self.assertEqual(len(lines), 1, (bad, lines))
+            self.assertIn("can't be reached", lines[0])
+        for good, want in (("0", 0.0), ("0.5", 0.5)):
+            os.environ["DATASTASH_CI_RETRY_SECONDS"] = good
+            try:
+                self.assertEqual(ds._ci_env_seconds("DATASTASH_CI_RETRY_SECONDS", 2.0, zero_ok=True), want)
+            finally:
+                os.environ.pop("DATASTASH_CI_RETRY_SECONDS", None)
+
     def test_hung_server_stops_within_the_short_total(self):
         # Review cycle 2 item 3: each call is given at most CI_CALL_SECONDS and unanswered calls CI_HANG_SECONDS in all,
         # however long the brake wait (CI_WAIT_SECONDS) is.

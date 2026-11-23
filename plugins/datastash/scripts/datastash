@@ -11659,20 +11659,21 @@ CI_TESTS, CI_FAILURES, CI_WEEKS, CI_RUNS = "Tests", "Test failures", "Test weeks
 CI_PAGE = 1000  # rows per upsert or read (a transport detail, not a cap)
 
 
-def _ci_env_seconds(name, default):
-    """A positive number of seconds from the environment; anything else (empty, text, nan, 0 or less) is the default."""
+def _ci_env_seconds(name, default, zero_ok=False):
+    """A positive number of seconds from the environment (0 too when zero_ok); anything else (empty, text, nan, inf, less
+    than that) is the default."""
     try:
         v = float(os.environ.get(name) or default)
     except (TypeError, ValueError):
         return default
-    return v if math.isfinite(v) and v > 0 else default
+    return v if math.isfinite(v) and (v > 0 or (zero_ok and v == 0)) else default
 
 
 CI_WAIT_SECONDS = _ci_env_seconds("DATASTASH_CI_WAIT_SECONDS", 900.0)
 CI_CALL_SECONDS = 60.0  # the longest one call may go unanswered
 CI_HANG_SECONDS = 180.0  # unanswered calls (timeouts, network errors) in all, before the report stops
 CI_RETRIES = 4  # tries for a network or server error that is not a brake
-CI_RETRY_SECONDS = float(os.environ.get("DATASTASH_CI_RETRY_SECONDS", "2"))
+CI_RETRY_SECONDS = _ci_env_seconds("DATASTASH_CI_RETRY_SECONDS", 2.0, zero_ok=True)  # a bad value: the default
 CI_IDS_CHARS = 60_000  # failed ids listed on a Test runs row; past it the row says the list is not complete
 CI_PASS_HASH = 12  # hex characters of sha256(test id) listed per passed test, CI_IDS_CHARS per Test runs row
 CI_RUNS_KEEP_DAYS = 14  # Test runs rows are needed only while a commit's jobs report; older ones are removed
