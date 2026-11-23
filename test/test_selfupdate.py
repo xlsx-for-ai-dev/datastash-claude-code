@@ -8,7 +8,7 @@ and a release is tagged and pinned only at a reviewed commit.
 - The next session start of a newer version says "datastash updated to vX" once.
 - Every REST call sends X-Datastash-Plugin-Version and a User-Agent with the real version.
 - tools/release-gate: refuses to tag (or pin, or approve main) without a recorded PASS at that exact commit; the pin is
-  set only by its pin step (this branch's catalog carries none).
+  set only by its pin step, and the catalog pins the newest v* tag at that tag's exact commit.
 - The person's typed "turn off self-update" / "turn on self-update" is saved by the plugin (only the whole typed prompt
   counts); while it is off, self_update() checks nothing and runs nothing.
 No network, no Claude Code run (both are faked); a throwaway HOME and config folder, enforced by test/harness.py.
@@ -16,6 +16,7 @@ Run: python3 -I test/test_selfupdate.py"""
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -291,12 +292,28 @@ class Wiring(Base):
         self.assertTrue(ups[0]["async"])
         self.assertNotIn("asyncRewake", ups[0])
 
-    def test_the_branch_catalog_carries_no_pin(self):
-        # Review 1: the pin is set only by the release step (release-gate pin, checked by release-gate main).
+    def test_the_catalog_pins_the_newest_tag_at_its_exact_commit(self):
+        # Main pins the newest reviewed tag by design; the same check as tools/release-gate main.
         with open(os.path.join(ROOT, ".claude-plugin", "marketplace.json")) as f:
             cat = json.load(f)
-        self.assertIsNone(ds.catalog_pin(cat))
-        self.assertEqual(next(p for p in cat["plugins"] if p["name"] == "datastash")["source"], "./plugins/datastash")
+        pin = ds.catalog_pin(cat)
+        self.assertIsNotNone(pin, "the catalog does not pin a tag and a full commit sha")
+        ref, sha = pin
+        src = next(p for p in cat["plugins"] if p["name"] == "datastash")["source"]
+        self.assertEqual(src["source"], "git-subdir")
+        try:
+            names = git(ROOT, "tag", "--list", "v*").split()
+        except (subprocess.CalledProcessError, OSError):
+            names = []
+        vt = lambda v: tuple(int(x) for x in v.split("."))  # noqa: E731
+        release = {t[1:]: git(ROOT, "rev-list", "-n", "1", t) for t in names
+                   if re.fullmatch(r"v\d{1,4}\.\d{1,4}\.\d{1,4}", t)}
+        if not release:
+            self.skipTest("no v* tags in this checkout (a shallow clone without tags)")
+        self.assertTrue(isinstance(ref, str) and ref.startswith("v"), ref)
+        self.assertEqual(release.get(ref[1:]), sha, f"the catalog pins {ref} at {sha[:12]}, not that tag's commit")
+        newest = max(release, key=vt)
+        self.assertEqual(ref[1:], newest, f"the catalog pins {ref}, not the newest release v{newest}")
 
     def test_the_menu_readme_and_hooks_name_the_off_switch(self):
         self.assertTrue(any('"turn off self-update"' in x and '"turn on self-update"' in x for x in ds.INSTALL_TAIL))
