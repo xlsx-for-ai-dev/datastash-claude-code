@@ -1,0 +1,20 @@
+[
+ {
+  "session_id": "00000000-0000-4000-8000-0000000000aa",
+  "transcript_path": "/home/person/.claude/projects/-home-person-project/00000000-0000-4000-8000-0000000000aa.jsonl",
+  "cwd": "/home/person/project",
+  "prompt_id": "bfeac48b-eb44-42c5-8080-0d45ff7ad713",
+  "permission_mode": "auto",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "/datastash:install"
+ },
+ {
+  "session_id": "00000000-0000-4000-8000-0000000000aa",
+  "transcript_path": "/home/person/.claude/projects/-home-person-project/00000000-0000-4000-8000-0000000000aa.jsonl",
+  "cwd": "/home/person/project",
+  "prompt_id": "ff426edd-d715-4e56-92b0-43c45b0b5c55",
+  "permission_mode": "auto",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "/datastash:uninstall alpha, beta"
+ }
+]

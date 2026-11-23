@@ -674,7 +674,8 @@ class Keeping(Base):
         self.assertIn("no typed keep phrase from the person was confirmed", out)
         self.assertIsNone(ds.keep_state())
 
-    def test_not_signed_in_starts_the_device_sign_in(self):
+    def test_not_signed_in_starts_no_sign_in(self):
+        """XLI-390 P1: keep --on never starts a datastash login: no device code, no page, no login step."""
         ds.signed_in = lambda: False
         base = ds.http
 
@@ -695,9 +696,9 @@ class Keeping(Base):
         finally:
             ds._open_browser, ds.subprocess.Popen = saved
         self.assertEqual(rc, 0, err)
-        self.assertIn("code: BCDF-GHJK", out)
-        self.assertIn("Type the code BCDF-GHJK there.", out)
-        self.assertIn("datastash keep --on` again", out)
+        self.assertNotIn("BCDF-GHJK", out)
+        self.assertNotIn("datastash login", out)
+        self.assertEqual([c for c in self.calls if c[1] == ds.DEVICE_START_PATH], [])
         self.assertEqual(ds.keep_state(), "yes")
 
     def test_n2_server_keep_value_is_ignored(self):

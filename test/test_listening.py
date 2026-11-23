@@ -52,19 +52,19 @@ class Listening(Base):
     def test_waiting_and_not_listening_lines_in_the_status(self):
         self.person_fetch()
         out = self.shown()
-        self.assertIn(f"Waiting for your OK: Builder (Laptop), Docs (Desk). Allow them at {ds.AGENTS_URL}", out)
+        self.assertIn("Not set up yet: Builder (Laptop), Docs (Desk). Type /datastash:install in their sessions.", out)
         self.assertIn("Not listening: Web (Desk): its datastash hooks are off. Fix: on that computer, run claude plugin "
                       "enable datastash, then restart Claude Code.", out)
         self.assertIn("Not listening: Api (Laptop): it never checked in after you allowed it.", out)
         for line in out.splitlines():
-            if line.startswith(("Waiting for your OK", "Not listening")):
+            if line.startswith(("Not set up yet", "Not listening")):
                 self.assertLess(len(line), 240, line)  # short
 
     def test_none_no_lines(self):
         self.extra = {"waiting_agents": [], "approve_url": ds.AGENTS_URL, "not_listening": []}
         self.person_fetch()
         out = self.shown()
-        self.assertNotIn("Waiting for your OK", out)
+        self.assertNotIn("Not set up yet", out)
         self.assertNotIn("Not listening", out)
 
     def test_the_link_is_only_datastashs_own_page(self):
@@ -72,7 +72,7 @@ class Listening(Base):
         self.person_fetch()
         out = self.shown()
         self.assertNotIn("evil.example", out)
-        self.assertIn(f"Allow them at {ds.AGENTS_URL}", out)
+        self.assertIn("Type /datastash:install in their sessions.", out)  # no link at all now (XLI-390 P1)
 
     def test_unknown_causes_and_bad_shapes(self):
         self.extra["not_listening"] = [{"name": "Odd\x07\"one", "server": "Box", "causes": ["made_up", 7]},
@@ -83,7 +83,7 @@ class Listening(Base):
         self.assertIn("Not listening: Odd one (Box): something on its computer stops it. Fix: run datastash doctor "
                       "there.", out)
         self.assertNotIn("made_up", out)
-        self.assertIn("Waiting for your OK: Ok. Allow", out)
+        self.assertIn("Not set up yet: Ok. Type /datastash:install in its session.", out)
         self.assertNotIn("\x07", out)
 
     def test_every_known_cause_has_words_and_a_fix(self):
@@ -95,7 +95,7 @@ class Listening(Base):
     def test_for_the_ai_the_names_are_framed_as_data(self):
         self.person_fetch()
         out = ds.render_status_all(self.folder, ds.this_session())
-        i = next(n for n, x in enumerate(out) if x.startswith("Waiting for your OK"))
+        i = next(n for n, x in enumerate(out) if x.startswith("Not set up yet"))
         opens = [n for n, x in enumerate(out[:i]) if x.startswith("<<datastash-data ")]
         closes = [n for n, x in enumerate(out[:i]) if x.startswith("<<end datastash-data ")]
         self.assertGreater(len(opens), len(closes))
@@ -153,8 +153,8 @@ class Listening(Base):
         self.morning = {"day": today, "lines": ["New agents waiting for your OK:", "Builder (Laptop)", ds.AGENTS_URL]}
         self.person_fetch()
         out = self.shown()
-        self.assertNotIn("Waiting for your OK: Builder", out)
-        self.assertIn("Waiting for your OK: Builder", self.shown())  # the next status has it again
+        self.assertNotIn("Not set up yet: Builder", out)
+        self.assertIn("Not set up yet: Builder", self.shown())  # the next status has it again
 
 
 

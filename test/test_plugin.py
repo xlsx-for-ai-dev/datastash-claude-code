@@ -1124,6 +1124,7 @@ class MainAnySession(MainBase):
         rc, out, _ = self.main_cmd("--on")
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), ds.LOGIN_STEP)
+        self.assertNotIn("run datastash login", out)  # XLI-390 P1: main --on never points at a login
         self.assertNotIn("ledger_person_watch", out)
         self.assertEqual(self.sent, [])
         self.assertFalse(ds.is_main_session(self.be("sess-A", (1001, "tA"))))
@@ -1570,8 +1571,8 @@ class CleanSessionOnly(MainBase):
         self.tool_hook(sid, ds.MAIN_CODE_TOOL, {"action": "main"}, event="Other", response=self.main_answer())
         self.assertTrue(self.recorded(sid, proc))
 
-    def test_the_first_agent_on_a_machine_signs_the_computer_in_first(self):
-        """XLI-278: not signed in: the first agent's auto-name says to run datastash login first; signed in: the name."""
+    def test_the_first_agent_on_a_machine_needs_no_login(self):
+        """XLI-390 P1 (was XLI-278): signed in or not, the first agent's auto-name is the name; no login step."""
         # P2 add (the order-dependent test): every agent file another test left here goes aside first (a leftover agent
         # of that name made this "reports-2" when the file order put it first), not just this class's own "builder".
         for n in os.listdir(TMP):
@@ -1584,7 +1585,8 @@ class CleanSessionOnly(MainBase):
         ds.signed_in = lambda: False
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ds.cmd_auto_name([]), 0)
-        self.assertEqual(out.getvalue().splitlines()[0], ds.LOGIN_FIRST)  # the setup check may name it again below
+        self.assertEqual(out.getvalue().splitlines()[0], "name: reports")
+        self.assertNotIn("datastash login", out.getvalue())
         self.assertTrue(self.recorded("sess-F1", (7801, "tF1")))  # an agent session from its first step
         with redirect_stdout(io.StringIO()) as out:
             ds.cmd_auto_name(["--no-login"])
@@ -2379,7 +2381,8 @@ class SignInHint(Base):
         self.assertIsNone(found["not_signed_in"]["cmd"])
         err = io.StringIO()
         ds.auto_setup_check(self.proj, stream=err)
-        self.assertIn("run datastash login", err.getvalue())
+        self.assertIn("types /datastash:install", err.getvalue())
+        self.assertNotIn("datastash login", err.getvalue())  # XLI-390 P1: no login path
         self.login_on_file()
         self.assertNotIn("not_signed_in", {f["id"] for f in ds.setup_findings(self.proj)})
         with redirect_stdout(io.StringIO()) as out:
@@ -4416,7 +4419,8 @@ class Xli375(Base):
         inp = {"session_id": "s375", "cwd": a}
         rc, err = self.listen(inp)
         self.assertEqual(rc, 2)  # the one notice wakes the session once
-        self.assertIn(f"waits for your OK. Open {ds.AGENTS_URL} and press Allow", err)
+        self.assertIn("is not set up on this computer yet. Type /datastash:install in its session", err)
+        self.assertNotIn(ds.AGENTS_URL, err)  # XLI-390 P1: the notice no longer points at /agents
         sleeps = []
 
         def sl(sec, parent):
@@ -4454,11 +4458,11 @@ class Xli375(Base):
         with redirect_stdout(out):
             ds.cmd_check([])
         ctx = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
-        self.assertEqual(ctx.count("waits for your OK"), 1)
+        self.assertEqual(ctx.count("is not set up on this computer yet"), 1)
         out = io.StringIO()
         with redirect_stdout(out):
             ds.cmd_check([])
-        self.assertNotIn("waits for your OK", out.getvalue())
+        self.assertNotIn("is not set up on this computer yet", out.getvalue())
         ds.resolve = self.saved["resolve"]
         ds._sleep = lambda sec, parent: (_ for _ in ()).throw(Stop())
         with self.assertRaises(Stop):

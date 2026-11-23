@@ -7,6 +7,13 @@
   text and a note with no command are refused; names that differ only by case or look-alike letters are refused.
 - Cleanup: every row of the cleanup table goes, and nothing else; the box goes with its last agent.
 - 410 agent_removed: the listener confirms with the dead key and cleans up by itself; a plain 410 does not.
+- Review 1 (cycle 2): the slash commands pass the typed check in the real Claude Code 2.1.330 shape
+  (test/fixtures/slash-command-2.1.330.jsonl and -hooks.json: copied from a real interactive session on a throwaway
+  plugin, only renamed to datastash and given placeholder ids and paths) and nothing like it; the list's 'visibility', the
+  note proof's exact shape and the note call's exact fields (X2 #467); install notes only from a datastash result's
+  _meta.datastash_note (the hook's tool_response or the transcript's mcpMeta) and only for this agent's own id; the
+  signer goes last on its own key with the run id; the uninstall turn's own hooks make no folder again; the rotated log
+  and the workbook's status copy go; no login path is left.
 No network; a throwaway HOME and config folder, enforced by test/harness.py.
 Run: python3 -I test/test_install.py"""
 import hashlib
@@ -30,12 +37,24 @@ import harness  # noqa: E402
 WB = "11111111-2222-3333-4444-555555555555"
 OWN, ALPHA, BETA = (str(uuid.UUID(int=i)) for i in (1, 2, 3))
 MINT = str(uuid.UUID(int=9))
+LIST_ID, RUN = str(uuid.UUID(int=0xA1)), str(uuid.UUID(int=0xB2))
+FIXTURES = os.path.join(HERE, "fixtures")
 KEY, ANSWER = "ldgr_ag_" + "k" * 40, "A" * 43
-LIST = {"list_id": "list-1", "agents": [{"agent_id": OWN, "name": "web-app", "private": False},
-                                        {"agent_id": ALPHA, "name": "alpha‮", "private": True},
-                                        {"agent_id": BETA, "name": "beta", "private": False}]}
+LIST = {"list_id": LIST_ID, "expires_in_seconds": 600,
+        "agents": [{"agent_id": OWN, "name": "web-app", "visibility": "public"},
+                   {"agent_id": ALPHA, "name": "alpha‮", "visibility": "private"},
+                   {"agent_id": BETA, "name": "beta", "visibility": "public"}]}
 TOOL = "mcp__claude_ai_datastash__"
-PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener")
+PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path")
+
+
+def real_entries(name):
+    """The real Claude Code 2.1.330 transcript entries of one typed slash command (its own entry and its isMeta
+    companion), from the fixture."""
+    with open(os.path.join(FIXTURES, "slash-command-2.1.330.jsonl")) as f:
+        rows = [json.loads(x) for x in f if x.strip()]
+    own = [r for r in rows if isinstance(r["message"]["content"], str) and f"<command-name>/{name}</command-name>" in r["message"]["content"]][0]
+    return own, [r for r in rows if r["promptId"] == own["promptId"] and r is not own][0]
 
 
 class Base(unittest.TestCase):
@@ -51,6 +70,8 @@ class Base(unittest.TestCase):
         self.calls, self.answers, self.kc = [], {}, {}
         ds._claude_chain = lambda: [[4242, "start-A"]]
         ds._stop_listener = lambda s: self.calls.append(("stop", s))
+        gone = os.path.join(root, "gone-tombstone")
+        ds._gone_path = lambda: gone
 
         def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept=None):
             self.calls.append((method, path, key, body))
@@ -76,7 +97,7 @@ class Base(unittest.TestCase):
             os.environ["DATASTASH_CONFIG_DIR"] = self.env
 
     def transcript(self, sid):
-        d = os.path.join(ds.CLAUDE_DIR, "projects", "-install")
+        d = os.path.join(ds.CLAUDE_DIR, "projects", "-install-" + self.id().rsplit(".", 1)[-1][:60])  # one per test
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, f"{sid}.jsonl")
 
@@ -102,6 +123,30 @@ class Base(unittest.TestCase):
             self.typed(sid, entry or text, pid, source)  # Claude Code writes the entry after the prompt hook
         return v, pid
 
+    def slash(self, text, sid="s1", **change):
+        """The person types a slash command: the real hook input shape (fixture), then the real transcript entries
+        Claude Code writes for it (its own entry and the isMeta companion), with `change` applied to its own entry."""
+        name, _, args = text[1:].partition(" ")
+        with open(os.path.join(FIXTURES, "slash-command-2.1.330-hooks.json")) as f:
+            shapes = {h["prompt"].split(" ")[0]: h for h in json.load(f)}
+        pid = str(uuid.uuid4())
+        inp = dict(shapes["/datastash:uninstall" if "uninstall" in name else "/datastash:install"], session_id=sid,
+                   prompt=text, cwd=self.folder, prompt_id=pid, transcript_path=self.transcript(sid))
+        v = self.hook(ds.cmd_prompt, inp)
+        own, meta = real_entries(name if name in ("datastash:install", "datastash:uninstall") else "datastash:install")
+        c = f"<command-message>{name}</command-message>\n<command-name>/{name}</command-name>"
+        own = dict(own, promptId=pid, sessionId=sid, message={"role": "user", "content": c + (
+            f"\n<command-args>{args}</command-args>" if args else "")},
+                   timestamp=time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()))
+        for k, val in change.items():
+            if val is None:
+                own.pop(k, None)
+            else:
+                own[k] = val
+        with open(self.transcript(sid), "a") as f:
+            f.write(json.dumps(own) + "\n" + json.dumps(dict(meta, promptId=pid, sessionId=sid)) + "\n")
+        return v, pid
+
     def tool(self, event, name, tool_input=None, answer=None, sid="s1"):
         inp = {"session_id": sid, "hook_event_name": event, "tool_name": TOOL + name, "tool_input": tool_input or {},
                "cwd": self.folder}
@@ -117,15 +162,19 @@ class Base(unittest.TestCase):
 
 
 def proof_ok(p, kind, targets, pid, typed):
-    lines = ["datastash-agents-note/v1", OWN, "list-1", kind, ",".join(sorted(targets)), pid,
-             hashlib.sha256(typed.encode()).hexdigest(), str(p["typed_at"]), str(p["iat"]), p["nonce"]]
+    """X2's checkNoteProof, line for line: exactly these 7 fields, and the MAC over its 9-line proofInput."""
+    if sorted(p) != ["agent_id", "iat", "mac", "prompt_id", "typed_at", "typed_sha256", "v"] or p["v"] != 1:
+        return False
+    if p["agent_id"] != OWN or p["prompt_id"] != pid or not 0 <= p["iat"] - p["typed_at"] <= 125000:
+        return False
+    lines = ["datastash-agents-note/v1", OWN, LIST_ID.lower(), kind, ",".join(sorted(t.lower() for t in targets)), pid,
+             hashlib.sha256(typed.encode()).hexdigest(), str(p["typed_at"]), str(p["iat"])]
     return hmac.compare_digest(p["mac"], hmac.new(ANSWER.encode(), "\n".join(lines).encode(), hashlib.sha256).hexdigest())
 
 
 class Install(Base):
     def test_install_collects_the_key_and_shows_the_fixed_list_with_no_computer(self):
-        v, pid = self.prompt("/datastash:install", entry="<command-name>/datastash:install</command-name>\n"
-                             "<command-message>datastash:install</command-message>\n<command-args></command-args>")
+        v, pid = self.slash("/datastash:install")
         ai = v["hookSpecificOutput"]["additionalContext"]
         self.assertIn('ledger_agent_register with name "web-app"', ai)
         self.assertNotIn("datastash login", ai)
@@ -134,7 +183,8 @@ class Install(Base):
         bound = self.tool("PreToolUse", "ledger_agent_key", {"name": "web-app", "code_challenge": "ai-made"})
         challenge = bound["hookSpecificOutput"]["updatedInput"]["code_challenge"]
         self.assertNotEqual(challenge, "ai-made")
-        self.answers[ds.COLLECT_PATH] = (200, {"agent_id": OWN, "name": "web-app", "key": KEY, "answer_key": ANSWER})
+        self.answers[ds.COLLECT_PATH] = (200, {"agent_id": OWN, "name": "web-app", "workbook_id": WB, "key": KEY,
+                                               "answer_key": ANSWER})
         out = self.tool("PostToolUse", "ledger_agent_key", {"name": "web-app"},
                         {"collect": "ready", "mint_id": MINT, "name": "web-app", "notice": "server words"})
         self.assertEqual(out["systemMessage"], ds.MINT_LINE.format(name="web-app"))
@@ -149,11 +199,27 @@ class Install(Base):
         self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
         note = self.tool("PreToolUse", "ledger_agents_note", {"kind": "uninstall", "targets": [OWN]})
         got = note["hookSpecificOutput"]["updatedInput"]
-        self.assertEqual((got["kind"], got["targets"]), ("install", sorted([ALPHA, BETA])))
+        self.assertEqual(sorted(got), ["kind", "list_id", "targets", "typed_proof"])  # X2: additionalProperties false
+        self.assertEqual((got["kind"], got["list_id"], got["targets"]), ("install", LIST_ID, sorted([ALPHA, BETA])))
         self.assertTrue(proof_ok(got["typed_proof"], "install", [ALPHA, BETA], pid, "/datastash:install"))
-        done = self.tool("PostToolUse", "ledger_agents_note", got, {"run_id": "r1"})["systemMessage"]
+        done = self.tool("PostToolUse", "ledger_agents_note", got, {"run_id": RUN, "kind": "install", "targets": 2,
+                                                                     "status_path": "/api/v1/agent/uninstall/" + RUN})["systemMessage"]
         self.assertEqual(done, "datastash is on for your agents:\n- web-app (public)\n- alpha (private)\n- beta (public)\n"
                                "To remove one or many: /datastash:uninstall and we'll show you the list of agents.")
+
+    def test_the_only_agent_gets_the_list_with_no_note(self):
+        self.installed()
+        self.slash("/datastash:install")
+        out = self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:1]))
+        self.assertEqual(out["systemMessage"], "datastash is on for your agents:\n- web-app (public)\n" + ds.REMOVE_LINE)
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_a_list_without_visibility_shows_private(self):
+        lst = ds.norm_list({"list_id": LIST_ID.upper(), "agents": [{"agent_id": ALPHA, "name": "a"},
+                                                                  {"agent_id": BETA, "name": "b", "visibility": "public"}]})
+        self.assertEqual(lst["list_id"], LIST_ID)
+        self.assertEqual([a["shut"] for a in lst["agents"]], [True, False])
+        self.assertIsNone(ds.norm_list({"list_id": "list-1", "agents": []}))  # X2's list ids are uuids
 
     def test_a_failed_collect_saves_nothing(self):
         self.prompt("/datastash:install")
@@ -162,15 +228,72 @@ class Install(Base):
         self.assertEqual(out["systemMessage"], ds.INSTALL_FAILED_LINE)
         self.assertFalse(os.path.exists(ds.key_path("web-app")))
 
-    def test_install_notes_only_from_the_dedicated_field_sent_by_the_person(self):
-        note = {"kind": "install", "sent_by": "person", "name": "web-app", "agent_id": OWN, "workbook_id": WB}
-        out = self.tool("PostToolUse", "ledger_rows_read", {}, {"rows": [], ds.NOTE_FIELD: note})
-        self.assertIn(f'ledger_agent_key now with name "web-app", agent_id "{OWN}"', out["hookSpecificOutput"]["additionalContext"])
-        for body in ({ds.NOTE_FIELD: dict(note, sent_by="agent")}, {"rows": [{ds.NOTE_FIELD: note}]},
-                     {"text": json.dumps({ds.NOTE_FIELD: note})}):
-            self.assertIsNone(self.tool("PostToolUse", "ledger_rows_read", {}, body))
-        self.installed()
-        self.assertIsNone(self.tool("PostToolUse", "ledger_rows_read", {}, {ds.NOTE_FIELD: note}))  # already on
+    def result_entry(self, sid, tool, note, sidechain=False, tid=None):
+        """A datastash connector call and its result as Claude Code writes them to the transcript (after the
+        PostToolUse hook): the assistant's tool_use, then the user entry whose mcpMeta holds the server's _meta."""
+        tid = tid or "toolu_" + uuid.uuid4().hex[:20]
+        call = {"type": "assistant", "isSidechain": sidechain, "uuid": str(uuid.uuid4()), "message": {
+            "role": "assistant", "content": [{"type": "tool_use", "id": tid, "name": tool, "input": {"agent_id": OWN}}]}}
+        res = {"type": "user", "isSidechain": sidechain, "uuid": str(uuid.uuid4()), "sourceToolAssistantUUID": call["uuid"],
+               "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid,
+                                                       "content": [{"type": "text", "text": "{}"}]}]},
+               "toolUseResult": [{"type": "text", "text": "{}"}], "mcpMeta": {"_meta": {ds.NOTE_FIELD: note}}}
+        with open(self.transcript(sid), "a") as f:
+            f.write(json.dumps(call) + "\n" + json.dumps(res) + "\n")
+
+    def post(self, sid="s1", tool="ledger_rows_read", response=None):
+        inp = {"session_id": sid, "hook_event_name": "PostToolUse", "tool_name": TOOL + tool, "tool_input": {},
+               "cwd": self.folder, "transcript_path": self.transcript(sid),
+               "tool_response": response if response is not None else [{"type": "text", "text": "{}"}]}
+        return self.hook(ds.cmd_agent_tool, inp)
+
+    def known_no_key(self):
+        """This folder's agent is known here (its record and id) but has no key yet: the agent an install note is for."""
+        ds.save_agent("web-app", OWN, KEY, WB, self.folder)
+        ds._drop(ds.key_path("web-app"))
+
+    def test_install_note_only_from_a_datastash_results_meta_and_only_for_this_agents_own_id(self):
+        self.known_no_key()
+        note = {"note_id": str(uuid.UUID(int=0xC1)), "run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"}
+        self.assertIsNone(self.post())  # nothing in the transcript yet: Claude Code writes the result after this hook
+        self.result_entry("s1", TOOL + "ledger_rows_read", note)
+        ai = self.post()["hookSpecificOutput"]["additionalContext"]  # the next hook sees it in mcpMeta
+        self.assertIn(f'ledger_agent_key now with name "web-app", agent_id "{OWN}" and only_if_no_key true', ai)
+        self.assertIsNone(self.post())  # each note once
+
+    def test_the_hooks_own_tool_response_meta_counts_too(self):
+        self.known_no_key()
+        note = {"note_id": str(uuid.UUID(int=0xC2)), "run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"}
+        out = self.post(response={"content": [{"type": "text", "text": "{}"}], "_meta": {ds.NOTE_FIELD: note}})
+        self.assertIn("ledger_agent_key now", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_a_note_for_another_agent_or_from_anywhere_else_does_nothing(self):
+        self.known_no_key()
+        good = {"run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"}
+        n = iter(range(0xD0, 0xE0))
+        nid = lambda: str(uuid.UUID(int=next(n)))  # noqa: E731
+        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid(), agent_id=ALPHA))  # another agent's
+        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid(), sent_by="agent"))
+        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid(), kind="uninstall"))
+        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid()), sidechain=True)  # a subagent's
+        self.result_entry("s1", "mcp__claude_ai_other__read", dict(good, note_id=nid()))  # not a datastash call
+        self.assertIsNone(self.post())
+        # the result's text, a row or a message never counts: only the _meta field
+        for body in ({ds.NOTE_FIELD: dict(good, note_id=nid())}, {"rows": [{ds.NOTE_FIELD: dict(good, note_id=nid())}]}):
+            self.assertIsNone(self.post(response=[{"type": "text", "text": json.dumps(body)}]))
+        self.installed()  # already has its key: nothing to do
+        self.result_entry("s1", TOOL + "ledger_rows_read", dict(good, note_id=nid()))
+        self.assertIsNone(self.post())
+
+    def test_a_note_at_the_turns_end_is_picked_up_by_the_stop_hook(self):
+        self.known_no_key()
+        self.result_entry("s1", TOOL + "ledger_rows_read",
+                          {"note_id": str(uuid.UUID(int=0xC3)), "run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"})
+        stop = {"session_id": "s1", "hook_event_name": "Stop", "cwd": self.folder, "transcript_path": self.transcript("s1")}
+        out = self.hook(ds.cmd_status_check, stop)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("ledger_agent_key now", out["reason"])
+        self.assertIsNone(self.hook(ds.cmd_status_check, dict(stop, stop_hook_active=True)))
 
     def test_a_note_call_without_the_persons_command_is_refused(self):
         self.installed()
@@ -196,15 +319,27 @@ class Uninstall(Base):
         got = self.tool("PreToolUse", "ledger_agents_note", {"targets": [OWN, ALPHA]})["hookSpecificOutput"]["updatedInput"]
         self.assertEqual(got["targets"], [BETA])  # never the model's targets
         self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [BETA], pid, "Beta"))
+        self.assertEqual(sorted(got), ["kind", "list_id", "targets", "typed_proof"])
         again = self.tool("PreToolUse", "ledger_agents_note", {})  # used once
         self.assertEqual(again["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_all_in_one_go_removes_this_agent_last_and_says_who_is_unconfirmed(self):
-        self.prompt("/datastash:uninstall all")
+        v, pid = self.slash("/datastash:uninstall all")  # the real slash-command entry, with args
+        self.assertIsNone(v.get("decision"))
         self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
         got = self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]
         self.assertEqual(got["targets"], sorted([OWN, ALPHA, BETA]))
-        line = self.tool("PostToolUse", "ledger_agents_note", got, {"run_id": "r1", "confirmed": [BETA]})["systemMessage"]
+        self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [OWN, ALPHA, BETA], pid, "/datastash:uninstall all"))
+        status = "/api/v1/agent/uninstall/" + RUN
+        self.answers[status] = (200, {"run_id": RUN, "kind": "uninstall", "total": 3, "confirmed": ["beta"],
+                                      "not_confirmed": ["alpha", "web-app"]})
+        self.answers[ds.UNINSTALL_SELF_PATH] = (200, {"result": "removed", "run_id": RUN})
+        line = self.tool("PostToolUse", "ledger_agents_note", got, {
+            "run_id": RUN, "kind": "uninstall", "targets": 3, "removed": ["alpha", "beta"], "this_agent_last": True,
+            "status_path": status})["systemMessage"]
+        self.assertIn(("GET", status, KEY, None), self.calls)  # who confirmed, on this agent's still-live key
+        self.assertIn(("POST", ds.UNINSTALL_SELF_PATH, KEY, {"run_id": RUN}), self.calls)  # then this agent, last
+        self.assertLess(self.calls.index(("GET", status, KEY, None)), self.calls.index(("POST", ds.UNINSTALL_SELF_PATH, KEY, {"run_id": RUN})))
         self.assertEqual(line, 'datastash is off for "web-app", "alpha", "beta". Removed: listener, key, settings and local '
                                'copies. Removed 3 agents. Not yet confirmed: "alpha" (they clean up when they next start). '
                                "Your datastash connector in Claude is unchanged.")
@@ -218,7 +353,7 @@ class Uninstall(Base):
         self.assertTrue(os.path.exists(ds.key_path("web-app")))
 
     def test_look_alike_names_are_refused_and_other_prompts_pass(self):
-        lst = dict(LIST, agents=LIST["agents"] + [{"agent_id": str(uuid.UUID(int=4)), "name": "Be ta", "private": False}])
+        lst = dict(LIST, agents=LIST["agents"] + [{"agent_id": str(uuid.UUID(int=4)), "name": "Be ta", "visibility": "public"}])
         self.prompt("/datastash:uninstall")
         self.tool("PostToolUse", "ledger_agents_list", {}, lst)
         v, _ = self.prompt("beta")
@@ -233,7 +368,119 @@ class Uninstall(Base):
         out = self.tool("PreToolUse", "ledger_agents_note", {})
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn('datastash is off for "web-app"', out["systemMessage"])
-        self.assertIn(("POST", ds.UNINSTALL_SELF_PATH, KEY, {"scope": "self"}), self.calls)
+        self.assertIn(("POST", ds.UNINSTALL_SELF_PATH, KEY, {}), self.calls)
+
+
+class RealSlashShape(Base):
+    """Review 1 HIGH 1: the real Claude Code 2.1.330 entry of a typed slash command passes; nothing else like it does."""
+
+    def setUp(self):
+        super().setUp()
+        self.installed()
+
+    def note_after(self, **change):
+        self.slash("/datastash:uninstall all", **change)
+        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        return self.tool("PreToolUse", "ledger_agents_note", {})
+
+    def test_the_fixture_is_the_real_shape(self):
+        own, meta = real_entries("datastash:uninstall")
+        self.assertEqual(own["message"]["content"], "<command-message>datastash:uninstall</command-message>\n"
+                         "<command-name>/datastash:uninstall</command-name>\n<command-args>alpha, beta</command-args>")
+        self.assertEqual((own["origin"], own["entrypoint"], own["isSidechain"], "promptSource" in own, own.get("isMeta")),
+                         ({"kind": "human"}, "cli", False, False, None))
+        self.assertTrue(meta["isMeta"])  # the expanded command text: never the typed entry
+        bare, _ = real_entries("datastash:install")
+        self.assertNotIn("<command-args>", bare["message"]["content"])  # no args: no args tag at all
+        self.assertTrue(ds._command_origin(own) and ds._command_origin(bare))
+        self.assertTrue(ds.CMD_TAG_RE.fullmatch(own["message"]["content"]) and ds.CMD_TAG_RE.fullmatch(bare["message"]["content"]))
+
+    def test_the_real_entry_passes_and_the_list_then_typed_names_works_after_a_bare_command(self):
+        got = self.note_after()["hookSpecificOutput"]
+        self.assertEqual(got["updatedInput"]["targets"], sorted([OWN, ALPHA, BETA]))
+        self.slash("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        self.prompt("alpha")
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]["targets"], [ALPHA])
+
+    def test_anything_else_is_refused(self):
+        for change in ({"entrypoint": "sdk-cli"}, {"entrypoint": None}, {"promptSource": "sdk"},
+                       {"promptSource": "typed"}, {"isMeta": True}, {"isSidechain": True}, {"isSidechain": None},
+                       {"origin": {"kind": "task-notification"}}, {"origin": None}, {"turnOrigin": "system"}):
+            out = self.note_after(**change)
+            self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny", change)
+        self.assertTrue(os.path.exists(ds.key_path("web-app")))
+
+    def test_the_older_tag_order_and_a_name_that_differs_are_refused(self):
+        for content in ("<command-name>/datastash:uninstall</command-name>\n<command-message>datastash:uninstall"
+                        "</command-message>\n<command-args>all</command-args>",
+                        "<command-message>datastash:install</command-message>\n<command-name>/datastash:uninstall"
+                        "</command-name>\n<command-args>all</command-args>"):
+            out = self.note_after(message={"role": "user", "content": content})
+            self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny")
+
+
+class NothingLeft(Base):
+    """Review 1 MEDIUM and LOW: the uninstall turn's own hooks make no folder again; no login path; the rotated log and
+    the workbook's status copy go."""
+
+    def remove_all(self):
+        self.installed()
+        self.answers[ds.UNINSTALL_SELF_PATH] = (200, {"result": "removed", "run_id": RUN})
+        self.slash("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:1]))
+        self.prompt("this")
+        out = self.tool("PreToolUse", "ledger_agents_note", {})
+        self.assertIn('datastash is off for "web-app"', out["systemMessage"])
+        self.assertFalse(os.path.exists(ds.CONF))
+
+    def test_the_uninstall_turns_own_hooks_make_no_folder_again(self):
+        self.remove_all()
+        base = {"session_id": "s1", "cwd": self.folder, "transcript_path": self.transcript("s1")}
+        self.tool("PostToolUse", "ledger_agents_note", {}, {"run_id": RUN})
+        self.hook(ds.cmd_status_check, dict(base, hook_event_name="Stop"))
+        self.hook(ds.cmd_agent_tool, dict(base, hook_event_name="PreToolUse", tool_name="Bash", tool_input={"command": "ls"}))
+        self.hook(ds.cmd_prompt, dict(base, hook_event_name="UserPromptSubmit", prompt="thanks", prompt_id=str(uuid.uuid4())))
+        ds.log("web-app", "a late line from the listener's hello thread")
+        ds.log("status", "status-check: a late line")
+        self.assertFalse(os.path.exists(ds.CONF))
+        self.slash("/datastash:install")  # the person's own install sets it up again
+        self.assertTrue(os.path.isdir(ds.CONF))
+
+    def test_a_late_log_line_for_a_removed_agent_makes_no_file(self):
+        ds.save_agent("other", str(uuid.UUID(int=5)), KEY, WB, self.folder + "-2")
+        self.installed()
+        ds.remove_agent_here("web-app")
+        ds.log("web-app", "late")
+        self.assertFalse(os.path.exists(ds.log_path("web-app")))
+        self.assertTrue(os.path.isdir(ds.STATE))
+
+    def test_the_rotated_log_and_the_workbooks_status_copy_go(self):
+        other_wb = "99999999-2222-3333-4444-555555555555"
+        ds.save_agent("other", str(uuid.UUID(int=5)), KEY, other_wb, self.folder + "-2")
+        self.installed()
+        for p in (ds.log_path("web-app") + ".1", ds.status_cache_path(WB), ds.status_cache_path(other_wb)):
+            ds.write_private(p, "x")
+        ds.remove_agent_here("web-app")
+        self.assertFalse(os.path.exists(ds.log_path("web-app") + ".1"))
+        self.assertFalse(os.path.exists(ds.status_cache_path(WB)))  # no agent here uses that workbook any more
+        self.assertTrue(os.path.exists(ds.status_cache_path(other_wb)))  # the other agent's stays
+
+    def test_a_shared_workbooks_status_copy_stays_while_an_agent_uses_it(self):
+        ds.save_agent("other", str(uuid.UUID(int=5)), KEY, WB, self.folder + "-2")
+        self.installed()
+        ds.write_private(ds.status_cache_path(WB), "x")
+        ds.remove_agent_here("web-app")
+        self.assertTrue(os.path.exists(ds.status_cache_path(WB)))
+
+    def test_no_login_path_is_left(self):
+        for text in (ds.LOGIN_STEP, ds.notice_text("waiting", agent={"name": "x"})):
+            self.assertNotIn("datastash login", text)
+            self.assertNotIn(ds.AGENTS_URL, text)
+        self.assertFalse(hasattr(ds, "LOGIN_FIRST"))
+        src = open(ds.__file__).read()
+        keep = src[src.index("def cmd_keep("):src.index("def ", src.index("def cmd_keep(") + 10)]
+        self.assertNotIn("cmd_login(", keep)
 
 
 class Cleanup(Base):

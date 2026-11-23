@@ -662,6 +662,18 @@ An agent can send datastash a capability request, an error report or anything el
 - `python3 -I test/test_proof.py`: each agent's own proof (plugin 0.9.8): only on a datastash connector call made as
   this session's own agent, the AI's own agent_proof always replaced or dropped, never on register or key, never to a
   server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
+- `python3 -I test/test_install.py`: `/datastash:install` and `/datastash:uninstall` (plugin 1.0.0). The slash commands
+  pass the typed check only in the entry shape Claude Code 2.1.330 really writes for a typed plugin command
+  (`test/fixtures/slash-command-2.1.330.jsonl` and `-hooks.json`, copied from a real interactive session and only renamed
+  and given placeholder ids): the message tag, then the name, the args only when there are some; origin human, no
+  promptSource, entrypoint `cli`, not meta, not a side chain. The list's `visibility`, the note proof's exact 7 fields and
+  9-line MAC input, and the note call's exact fields, as the server checks them. Install notes are read only from the
+  `_meta.datastash_note` of a datastash connector result (the hook's own `tool_response`, or the transcript entry's
+  `mcpMeta`, which Claude Code writes after the call and the next hook or the Stop hook reads), once each, and only for
+  this agent's own id. The agent that sends an uninstall goes last, on its own key with the run id. After the last agent
+  goes, a small tombstone in the temp folder (a time only; it lapses after an hour, and the next `/datastash:install`
+  lifts it) keeps the uninstall turn's own hooks from making `~/.config/datastash` again. The rotated log and the
+  workbook's status copy go too; no login is started or pointed at.
 - `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
   for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
   without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the
