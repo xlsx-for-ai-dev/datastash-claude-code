@@ -15,7 +15,9 @@ Subcommands (run `datastash help`):
   status --all [--install]  every agent's status as one bounded numbered list (asks first; idle agents last, one line
                             each), from this machine's copy (refreshed by the listener every minute); --install adds
                             the install lines and the question
-  status --details N        the full context stored for number N of the list this session showed (nobody is woken)
+  status --details N        the full context stored for number N of the list this session showed (nobody is woken),
+                            one bounded screen; past it, how many more lines
+  status --more N           the next screen of number N ("more of N"), from where the last one stopped
   status-set - [--project DIR]
                             this agent's own status for this project, JSON on stdin ({"doing", "details", "asks",
                             "cards", "running", "health", "tests", "last_change"}); the branch comes from git.
@@ -3197,15 +3199,17 @@ def cmd_link(args):
 
 
 def cmd_status(args):
-    if args[:1] == ["--details"]:
+    if args[:1] in (["--details"], ["--more"]):
         if len(args) != 2 or not re.fullmatch(r"\d{1,3}", args[1]):
-            die("usage: datastash status --details N")
-        print("\n".join(render_status_details(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), lazy_me(), int(args[1]))))
+            die(f"usage: datastash status {args[0]} N")
+        print("\n".join(render_status_details(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), lazy_me(), int(args[1]),
+                                              more=args[0] == "--more")))
         return 0
     if args and set(args) <= {"--all", "--install"}:
         return cmd_status_all(args)
     if args:
-        die("usage: datastash status  |  datastash status --all [--install]  |  datastash status --details N")
+        die("usage: datastash status  |  datastash status --all [--install]  |  datastash status --details N  |  "
+            "datastash status --more N")
     auto_setup_check(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), me=this_session())
     agents = all_agents()
     person = person_for(None)
@@ -7001,38 +7005,109 @@ def render_status_all(here, me, install=False, live_timeout=10, only=None, for_p
     return out
 
 
-def render_status_details(here, me, n, live_timeout=10, for_person=False):
+def _page_path(sid):
+    return os.path.join(STATE, f"status-page-{sid}.json")
+
+
+def _read_page(sid, n):
+    """XLI-339: where this session's last page of number n stopped, while it still answers (at most 30 minutes and 3
+    prompts after that page), else None. Its own life, so the pages carry on past the list's 3 prompts."""
+    if not sid:
+        return None
+    rec = _read_private_big(_page_path(sid))
+    if not (isinstance(rec, dict) and rec.get("n") == n and isinstance(rec.get("target"), dict)
+            and isinstance(rec.get("next"), int) and _num_ok(rec.get("at")) and isinstance(rec.get("prompt_n"), int)):
+        return None
+    if time.time() - rec["at"] > VIEW_MAX_AGE or prompt_count(sid) - rec["prompt_n"] > VIEW_MAX_PROMPTS:
+        return None
+    return rec
+
+
+def _save_page(sid, n, wb, target, nxt):
+    if not sid:
+        return
+    try:
+        ensure_dirs()
+        if nxt is None:
+            write_private(_page_path(sid), "{}")
+        else:
+            write_private(_page_path(sid), json.dumps({"n": n, "workbook_id": wb, "target": target, "next": nxt,
+                                                       "at": time.time(), "prompt_n": prompt_count(sid)}))
+    except OSError:
+        pass
+
+
+def _detail_lines(row, target, n, now):
+    """(head, items): everything stored for number n, one line per card, running item, waiting and done entry, so a
+    screen can stop between any two of them. The agent's own words come first."""
+    if row is None:
+        return [f'{n} was "{_clean(target["agent"], 64)}", which has no status now.'], []
+    if target.get("ask"):
+        a = next((x for x in row["asks"] if x["id"] == target["ask"]), None)
+        if a is None:
+            return [f"Ask {n} of \"{row['agent']}\" is answered or gone."], []
+        return [f"{n}. Ask from {_b(row['agent'])}: {ask_line(a)}", f"   {context_line(row, now)}",
+                a["details"] or "(no more detail stored for this ask)"], []
+    head = [f"{n}. {_b(row['agent'])}" + (f" · {row['project']}" if row.get("project") else "") + f" — {_doing(row, now)}",
+            f"   {context_line(row, now)}", row["details"] or "(no more detail stored)"]
+    items = [card_line(c) for c in row["cards"]]
+    items += ["running: " + x["what"] + (f" on {x['on']}" if x["on"] else "") + (" (STUCK)" if x["stuck"] else "")
+              for x in row["running"]]
+    items += [x for x in extra_lines(dict(row, cards=[], running=[], waiting_on=[], done_asked=[]))]  # health, one line
+    items += ["waiting on: " + (f"{x['who']} for " if x["who"] else "") + x["what"] for x in row["waiting_on"]]
+    items += ["you asked: " + x["request"] + (" ✓" + (f" ({x['proof']})" if x["proof"] else "") if x["done"]
+                                              else " (not done yet)") for x in row["done_asked"]]
+    return head, [f"   {x}" for x in items]
+
+
+def render_status_details(here, me, n, live_timeout=10, for_person=False, more=False):
     """'full context of N': straight from the stored row, against the list this session showed. for_person: the local
-    copy only, as plain text the plugin shows itself. Returns [] when this session showed no number N."""
-    view = read_view(_sid_of(me))
-    target = (view or {}).get("numbers", {}).get(str(n))
-    if target is None:
-        return []
+    copy only, as plain text the plugin shows itself. Returns [] when this session showed no number N.
+    XLI-339: one bounded screen (SHOW_CHARS; a display bound, nothing stored is cut); past it, how many more lines and
+    "say 'more of N'". more ("more of N"): the next screen after this session's last one of N, else from the top."""
+    sid = _sid_of(me)
+    page = _read_page(sid, n) if more else None
+    if page is not None:
+        target, wb = page["target"], page.get("workbook_id")
+    else:
+        view = read_view(sid)
+        target = (view or {}).get("numbers", {}).get(str(n))
+        if target is None:
+            return []
+        wb = view.get("workbook_id")
     c, note = load_status(here, me, live_timeout=live_timeout, live=not for_person)
-    if c is None or c.get("workbook_id") != view.get("workbook_id"):
+    if c is None or c.get("workbook_id") != wb:
         return []
     key = (str(target["agent"]).lower(), str(target.get("project") or "").lower())
     row = next((r for r in c.get("agents", []) if _row_key(r) == key), None)
     now = time.time()
     _PLAIN[0] = for_person
     try:
-        if row is None:
-            body = [f'{n} was "{_clean(target["agent"], 64)}", which has no status now.']
-        elif target.get("ask"):
-            a = next((x for x in row["asks"] if x["id"] == target["ask"]), None)
-            if a is None:
-                body = [f"Ask {n} of \"{row['agent']}\" is answered or gone."]
-            else:
-                body = [f"{n}. Ask from {_b(row['agent'])}: {ask_line(a)}", f"   {context_line(row, now)}",
-                        a["details"] or "(no more detail stored for this ask)"]
-        else:
-            body = ([f"{n}. {_b(row['agent'])}" + (f" · {row['project']}" if row.get("project") else "") + f" — {_doing(row, now)}",
-                     f"   {context_line(row, now)}"] + [f"   {x}" for x in extra_lines(row)]
-                    + [row["details"] or "(no more detail stored)"])
+        head, items = _detail_lines(row, target, n, now)
     finally:
         _PLAIN[0] = False
+    start = min(page["next"], len(items)) if page is not None else 0
+    screen = _Screen(SHOW_CHARS - 300)  # room for the head line and the "more" line
+    if start == 0:
+        screen.add(head)
+    else:
+        screen.add([head[0] + " (continued)"])
+    i = start
+    while i < len(items) and (i == start or screen.fits([items[i]])):
+        screen.add([items[i]])
+        i += 1
+    body = screen.lines
+    if i < len(items):
+        rest = len(items) - i
+        body.append(f"{rest:,} more line{'s' if rest != 1 else ''} not shown: say 'more of {n}' to see the next ones.")
+        _save_page(sid, n, wb, target, i)
+    else:
+        if start > 0:
+            body.append(f"That is all of {n}.")
+        _save_page(sid, n, wb, target, None)
+    what = "more of" if start > 0 else "full context of"
     if for_person:
-        return [f"{STATUS_HEAD}: full context of {n} {_freshness(c, now, note)}", STATUS_WORDS_LINE] + body
+        return [f"{STATUS_HEAD}: {what} {n} {_freshness(c, now, note)}", STATUS_WORDS_LINE] + body
     return _framed_block(body) + [_freshness(c, now, note)]
 
 
@@ -7656,6 +7731,7 @@ STATUS_ALL_RES = [re.compile(p) for p in (
 )]
 STATUS_DETAILS_RE = re.compile(r"(give me |show me |show )?(the )?(full context|context|more|details|detail) (of|on|for|about) #?(\d{1,3})"
                                r"|(details|more) #?(\d{1,3})")
+STATUS_MORE_OF_RE = re.compile(r"(?:show )?more of #?(\d{1,3})")  # XLI-339
 STATUS_MORE_ON_RE = re.compile(r"more (on|about|for) ([a-z0-9][a-z0-9 ._\-]{0,63})")
 STATUS_BARE_RE = re.compile(r"status|statuses|status of all|all statuses")
 STATUS_OF_RE = re.compile(r"(what is |what's |show |show me |give me )?(the )?status (of|for) ([a-z0-9][a-z0-9._\-]{0,63})")
@@ -7680,6 +7756,9 @@ def status_phrase(text):
         return None
     if any(r.fullmatch(t) for r in STATUS_ALL_RES) or STATUS_BARE_RE.fullmatch(t):
         return "all", None
+    m = STATUS_MORE_OF_RE.fullmatch(t)
+    if m:
+        return "more_of", int(m.group(1))  # XLI-339: the next screen of number N
     m = STATUS_DETAILS_RE.fullmatch(t)
     if m:
         return "details", int(m.group(5) or m.group(7))
@@ -7846,8 +7925,8 @@ def status_prompt_context(inp):
             return None  # not an ask of the list this session just showed: an ordinary prompt
         return {"show": DO_LATER.format(n=arg, agent=_clean(target.get("agent"), 64), text=_clean(target.get("text"), 300))}
     me = lazy_me(inp)
-    if kind == "details":
-        lines = render_status_details(here, me, arg, for_person=True)
+    if kind in ("details", "more_of"):
+        lines = render_status_details(here, me, arg, for_person=True, more=kind == "more_of")
         return {"show": "\n".join(lines)} if lines else None
     main = bool(sid) and os.path.exists(_main_path(sid))
     if keep_state() != "yes":

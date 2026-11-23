@@ -1255,6 +1255,130 @@ class TimedRead(Base):
         print(f"\n  timed read (hook process, 30 agents x 5 projects, local copy): {took * 1000:.0f} ms", file=sys.stderr)
 
 
+class DetailsBound(Base):
+    """XLI-339 (EPM 0.3.0 review LOW-1): "full context of N" is one bounded screen (a display bound, not a data cap:
+    nothing stored is cut); when there is more it says how much and how to see the rest ("more of N"), a page at a
+    time, from this computer's copy only. The status list stays under 2 seconds."""
+    CARDS, RUNNING = 2000, 500
+
+    def setUp(self):
+        super().setUp()
+        big = row("web-app", "Working through a very long card queue.", ago=30, project="web-app",
+                  details="The agent's own words: the queue is long because the import is slow.",
+                  context={"branch": "queue", "tests": "all pass"}, asks=[{"id": "qb", "text": "Split the queue?"}],
+                  cards=[{"id": f"XLI-{k:04d}", "title": f"card number {k}", "step": "built"} for k in range(self.CARDS)],
+                  running=[{"what": f"builder {k}", "on": f"XLI-{k:04d}"} for k in range(self.RUNNING)],
+                  waiting_on=[{"what": "the EPM pass", "who": "EPM"}],
+                  done_asked=[{"request": "post the summary", "done": True, "proof": "posted"}])
+        self.server_rows = [big, dict(EXAMPLE[1])]
+        ds.fetch_status({"slug": "web-app", "workbook_id": WB})
+        ds.write_private(ds.INSTALL_ASKED_PATH, "{}")
+        self.calls.clear()
+
+    def shown_ids(self, text):
+        return re.findall(r"XLI-\d{4} card", text)
+
+    def test_status_list_with_2000_cards_stays_under_2_seconds_and_bounded(self):
+        t = time.time()
+        text = self.prompt("status of all my agents")
+        took = time.time() - t
+        self.assertLess(took, 2.0)
+        self.assertLessEqual(len(text), 8500, len(text))
+        self.assertIn("say 'more on web-app'", text)
+        self.assertEqual(self.calls, [])
+
+    def test_full_context_of_n_is_bounded_with_a_more_line(self):
+        self.prompt("status of all my agents")
+        t = time.time()
+        text = self.prompt("full context of 1")
+        self.assertLess(time.time() - t, 2.0)
+        self.assertEqual(self.last_hook["decision"], "block")
+        self.assertTrue(text.startswith("Status of your agents: full context of 1"))
+        self.assertLessEqual(len(text), 8500, len(text))
+        self.assertIn("The agent's own words", text)  # the agent's own details are on the first screen
+        self.assertIn("XLI-0000 card number 0", text)
+        m = re.search(r"([\d,]+) more lines? not shown: say 'more of 1'", text)
+        self.assertIsNotNone(m, text[-400:])
+        shown = len(self.shown_ids(text))
+        # every card, every running item, the waiting and done lines: one line each
+        self.assertEqual(int(m.group(1).replace(",", "")), self.CARDS + self.RUNNING + 2 - shown)
+        # a display bound only: nothing stored is cut
+        c = ds.read_status_cache(WB)
+        mine = next(r for r in c["agents"] if r["agent"] == "web-app")
+        self.assertEqual(len(mine["cards"]), self.CARDS)
+        self.assertEqual(len(mine["running"]), self.RUNNING)
+        self.assertEqual(self.calls, [])
+
+    def test_more_of_n_pages_through_everything_once(self):
+        self.prompt("status of all my agents")
+        text = self.prompt("full context of 1")
+        seen = self.shown_ids(text)
+        running = len(re.findall(r"^   running: builder \d+", text, re.M))
+        pages = 1
+        while "say 'more of 1'" in text:
+            t = time.time()
+            text = self.prompt("more of 1")
+            self.assertLess(time.time() - t, 2.0)
+            self.assertIsNotNone(text, f"page {pages + 1} was not answered")
+            self.assertTrue(text.startswith("Status of your agents: more of 1"), text[:200])
+            self.assertLessEqual(len(text), 8500, len(text))
+            seen += self.shown_ids(text)
+            running += len(re.findall(r"^   running: builder \d+", text, re.M))
+            pages += 1
+            self.assertLess(pages, 200)
+        self.assertGreater(pages, 3)  # past the 3-prompt life of the list: the pages carry on
+        self.assertEqual(seen, [f"XLI-{k:04d} card" for k in range(self.CARDS)])  # each once, in order
+        self.assertEqual(running, self.RUNNING)
+        self.assertIn("waiting on: EPM for the EPM pass", text)
+        self.assertIn("That is all of 1.", text)
+        self.assertEqual(self.calls, [])
+
+    def test_more_of_n_without_an_earlier_page_starts_at_the_top(self):
+        self.prompt("status of all my agents")
+        text = self.prompt("more of 1")
+        self.assertIn("The agent's own words", text)
+        self.assertIn("XLI-0000 card number 0", text)
+        self.assertIsNone(self.prompt("more of 40"))  # no such number: an ordinary prompt
+        self.assertIsNone(self.prompt("more of 1", sid="sess2"))  # another session's list never counts
+
+    def test_full_context_starts_again_at_the_top(self):
+        self.prompt("status of all my agents")
+        self.prompt("full context of 1")
+        self.prompt("more of 1")
+        text = self.prompt("full context of 1")
+        self.assertIn("XLI-0000 card number 0", text)
+
+    def test_a_short_row_has_no_more_line(self):
+        self.prompt("status of all my agents")
+        lines = ds.render_status_details(self.folder, ds.lazy_me(), 4, for_person=True)
+        text = "\n".join(lines)
+        self.assertIn("Delete the old /invoices endpoint", text)
+        self.assertNotIn("more of", text)
+
+    def test_the_ai_path_is_bounded_and_framed_with_its_own_more(self):
+        self.prompt("status of all my agents")
+        rc, out, err = self.run_cmd(ds.cmd_status, ["--details", "1"])
+        self.assertEqual(rc, 0, err)
+        self.assertLessEqual(len(out), 9000, len(out))
+        inner = framed_inner(out)
+        self.assertIn("XLI-0000 card number 0", "\n".join(inner))
+        self.assertTrue(any("say 'more of 1'" in x for x in inner))
+        first = self.shown_ids(out)
+        rc, out, err = self.run_cmd(ds.cmd_status, ["--more", "1"])
+        self.assertEqual(rc, 0, err)
+        self.assertLessEqual(len(out), 9000, len(out))
+        nxt = self.shown_ids(out)
+        self.assertTrue(nxt)
+        self.assertEqual(nxt[0], f"XLI-{len(first):04d} card")
+
+    def test_phrases(self):
+        P = ds.status_phrase
+        self.assertEqual(P("more of 4"), ("more_of", 4))
+        self.assertEqual(P("More of #4."), ("more_of", 4))
+        self.assertEqual(P("full context of 4"), ("details", 4))
+        self.assertEqual(P("more on 12"), ("details", 12))
+
+
 class ZzNoAnswerRoute(unittest.TestCase):
     """Runs last (the loader sorts classes by name): no request any test made went to an answer or undo route, and the
     plugin has no answer route or answer command left."""

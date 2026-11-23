@@ -352,6 +352,11 @@ on, what the person asked of it, and its asks of the person (shown as text). The
 list, asks first and idle agents last, from any session: "status", "status of all my agents", "status of api",
 "full context of 4".
 
+- **Bounded full context (0.9.4).** "full context of 4" is one screen of about 8,000 characters: the agent's own
+  words first, then one line per card, running item, wait and request. It is a display bound only: nothing stored or
+  sent is cut. When there is more it ends "1,950 more lines not shown: say 'more of 4' to see the next ones", and each
+  "more of 4" shows the next screen, from this computer's copy, until "That is all of 4." An agent reads the same
+  screens with `datastash status --details 4` and `datastash status --more 4`.
 - **Fast (0.3.0).** When keeping is on and this session's agent already has a saved status, the prompt hook answers
   these itself, in plain code, from this computer's copy: no model turn and no network call, so the answer shows in
   well under 2 seconds. It starts with "Status of your agents (refreshed N min ago)", says "offline" when the last
@@ -571,7 +576,7 @@ An agent can send datastash a capability request, an error report or anything el
   (paged reads to the end, a failure partway keeps the old copy, mode 600, no symlink; the 60 s refresh, skipped when
   another session refreshed, nothing read while keeping is off); the plugin's own fast answer ("status", "status of all
   my agents", "status of <agent>", "full context of N": a block with the list, no network, offline and 404 said
-  plainly); "do N" shows the ask and sends nothing; keeping only from the person's typed phrase (`claude -p` and
+  plainly); "full context of N" bounded with a "more of N" line, paged through 2,000 cards each once, under 2 seconds; "do N" shows the ask and sends nothing; keeping only from the person's typed phrase (`claude -p` and
   entries without origin fields refused); status off sends nothing and says how to turn it on; the install question and
   "leave <name> off"; the Stop hook; that no answer or undo route is called in the whole run; and the timed read: the
   real hook process answers from a 30 agents x 5 projects copy in under 2 seconds with no request.
