@@ -57,6 +57,37 @@ class Shape(unittest.TestCase):
             self.assertIsNone(ds.lookup_shape(cmd), cmd)
         self.assertIsNone(ds.lookup_shape(None))
 
+    def test_no_shape_keeps_a_target_name(self):
+        # XLI-323: the word after linear, jira or sentry-cli is kept only when it is a known subcommand; a team,
+        # project, org, host or any other name in that place is never kept (allow only what is known safe).
+        for cmd in ("linear acme-team", "linear ops issue list", "jira myproj", "jira acme-corp issue list",
+                    "sentry-cli acme-org", "sentry-cli my-host issues", "linear person-name", "jira bucket"):
+            got = ds.lookup_shape(cmd)
+            if got is not None:
+                self.assertEqual(len(got[1].split()), 2, cmd)
+                self.assertNotIn(got[1].split()[1], ("acme-team", "ops", "myproj", "acme-corp", "acme-org",
+                                                     "my-host", "person-name", "bucket"), cmd)
+        # Names after a known subcommand (an org, a project, a host, a card id) are never kept.
+        cases = {
+            "linear team list": ("linear", "linear team"),
+            "linear issue view XLI-1 --team acme": ("linear", "linear issue"),
+            "jira project list": ("jira", "jira project"),
+            "jira issue view PROJ-7 --server https://x.example": ("jira", "jira issue"),
+            "sentry-cli issues list --org acme": ("sentry", "sentry-cli issues"),
+            "sentry-cli releases list -p web": ("sentry", "sentry-cli releases"),
+            "gh pr view 123 --repo acme/web": ("github", "gh pr view"),
+        }
+        for cmd, want in cases.items():
+            self.assertEqual(ds.lookup_shape(cmd), want, cmd)
+        # Every word of every kept shape comes from the plugin's own fixed list, never from the command.
+        known = {w for v in ds.LOOKUP_SUBCOMMANDS.values() for w in v} | set(ds.LOOKUP_TOOLS) | {"api", "pulls",
+                                                                                                 "actions"}
+        known |= set(ds._GH_LOOKUPS) | {w for v in ds._GH_LOOKUPS.values() for w in v}
+        for cmd in ("linear acme-team", "jira myproj", "sentry-cli acme-org", "linear issue", "gh run watch 5"):
+            got = ds.lookup_shape(cmd)
+            if got is not None:
+                self.assertTrue(set(got[1].split()) <= known, (cmd, got))
+
 
 class LookupBase(Base):
     def setUp(self):

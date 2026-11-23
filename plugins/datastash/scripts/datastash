@@ -8074,8 +8074,16 @@ LOOKUP_TOPIC = {"github": "where PRs stand", "linear": "where Linear cards stand
                 "sentry": "about Sentry errors"}
 FEED_TAB = {"github": ("PRs and CI", "owner/repo #123"), "linear": ("Cards", "XLI-12"), "jira": ("Issues", "PROJ-7")}
 _GH_LOOKUPS = {"pr": ("view", "list", "checks", "status"), "run": ("list", "view", "watch")}
+# XLI-323: the second word kept for these tools, from this fixed list only. Any other word in that place (a team,
+# project, org, host or other name) is never kept and the command is not counted.
+LOOKUP_SUBCOMMANDS = {
+    "linear": ("issue", "issues", "team", "teams", "project", "projects", "cycle", "cycles", "milestone", "label",
+               "labels", "document", "documents", "initiative", "user", "users", "me"),
+    "jira": ("issue", "epic", "sprint", "board", "project", "release", "me"),
+    "sentry-cli": ("issues", "events", "releases", "projects", "organizations", "deploys", "monitors", "repos",
+                   "info"),
+}
 _SEG_RE = re.compile(r"&&|\|\||[;|&\n()`]")
-_WORD_RE = re.compile(r"[a-z][a-z\-]{0,30}")
 HOOK_ID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 LOOKUP_DO_NOTE = ("{note}: the person typed \"do {n}\": yes to datastash keeping {topic} ready. The plugin checks it was "
                   "typed by them, then sets up the {label} feed with the agent key of \"{who}\". Run `datastash lookups "
@@ -8121,7 +8129,8 @@ def gh_api_writes(args):
 
 def lookup_shape(cmd):
     """(service, shape) for a shell command that looks something up in an outside tool, else None. The shape is the
-    tool and its subcommand only ("gh pr view", "gh api pulls", "linear issue"): no argument is ever kept."""
+    tool and its subcommand only ("gh pr view", "gh api pulls", "linear issue"), every word from a fixed list: no
+    argument or name is ever kept."""
     if not isinstance(cmd, str) or len(cmd) > 100000:
         return None
     for seg in _SEG_RE.split(cmd):
@@ -8148,7 +8157,7 @@ def lookup_shape(cmd):
                     if any(re.search(rf"(^|/){part}(/|\?|$)", w) for w in paths):
                         return service, f"gh api {part}"
             continue
-        if _WORD_RE.fullmatch(words[1]):
+        if words[1] in LOOKUP_SUBCOMMANDS.get(tool, ()):
             return service, f"{tool} {words[1]}"
     return None
 

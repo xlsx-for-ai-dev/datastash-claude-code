@@ -159,7 +159,9 @@ MCP tool names and migrations, each with file:line. It maps again only when the 
 Agents repeat slow lookups: where a PR stands, how CI went, the state of a card. The plugin counts them on this computer
 in plain code (no tokens): `gh pr view|list|checks|status`, `gh run`, `gh api` reads on pulls or actions (a write, with `-X`/`--method` other than GET or a `-f`/`-F`/`--field`/`--raw-field`/`--input` body, is not counted), `linear`, `jira` and
 `sentry-cli`, per agent and per day, by command shape only (never the output, the arguments or anything that could hold
-a secret; `~/.config/datastash/lookups.json`). When one service passes 10 in a day, your status shows one numbered ask,
+a secret; `~/.config/datastash/lookups.json`). Every word of a shape comes from the plugin's own fixed list of
+subcommands (0.9.5): `linear issue`, `jira project`, `sentry-cli releases`; a team, project, org or host name in that
+place is never kept and that command is not counted. When one service passes 10 in a day, your status shows one numbered ask,
 once: "Your agents asked where PRs stand N times today. Want datastash to keep that ready? (do K)".
 
 - **do K** (typed by you; the plugin checks it): for GitHub, Linear or Jira the plugin sets up that feed in the agent's
