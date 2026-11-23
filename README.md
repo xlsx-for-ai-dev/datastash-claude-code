@@ -44,9 +44,12 @@ What it adds:
 - **Updates itself** (1.0): at most once a day, in the background at session start, the plugin looks for a newer
   release tag (`vX.Y.Z`; never a branch head) and, when Claude Code's refreshed copy of this marketplace pins exactly
   that tag's commit, runs Claude Code's own `claude plugin update datastash@datastash`. The next session start says
-  "datastash updated to vX" once. Every call to datastash names the plugin's version (`X-Datastash-Plugin-Version`
-  and the User-Agent). Releases: `tools/release-gate` tags, pins and approves main only at commits with a recorded
-  independent review PASS.
+  "datastash updated to vX" once. It is on from the start and the person's own choice: type "turn off self-update"
+  to stop it, or "turn on self-update" to turn it back on (saved by the plugin for this computer, kept in
+  `~/.config/datastash/status-consent.json`; while it is off there is no check and no update). Every call to
+  datastash names the plugin's version (`X-Datastash-Plugin-Version` and the User-Agent). Releases:
+  `tools/release-gate` tags, pins and approves main only at commits with a recorded independent review PASS; the
+  catalog pin is set only by the release step (`release-gate pin vX.Y.Z`), never on a feature branch.
 
 Requires `python3` (3.8 or later, standard library only) and Claude Code with plugin hooks.
 

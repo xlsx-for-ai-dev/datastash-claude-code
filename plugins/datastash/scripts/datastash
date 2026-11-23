@@ -5133,7 +5133,7 @@ def cmd_prompt(_args):
     if not is_main_phrase(prompt):
         try:
             ctx = (clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
-                   or status_prompt_context(inp))
+                   or self_update_prompt_context(inp) or status_prompt_context(inp))
         except Exception as e:  # never in the person's way
             log("status", f"prompt: {type(e).__name__}")
             ctx = None
@@ -5783,7 +5783,10 @@ INSTALL_TAIL = ("Ask any of them about the others, from any project.",
                 # XLI-375 P2: the standing yes, stated at install
                 "Your agents answer each other and take hand-offs without asking you; they still ask you first before "
                 "running code they were sent, sending private data out of your account, or giving personal data to "
-                'another agent. To be asked about everything, type "turn off the standing yes".')
+                'another agent. To be asked about everything, type "turn off the standing yes".',
+                # XLI-390 P2: self-update, the person's own off switch
+                'datastash updates itself to each reviewed release; to stop that, type "turn off self-update" '
+                '("turn on self-update" turns it back on).')
 KEEP_PHRASE = "Keep my agents' status and what I tell them to remember in datastash"  # owner's words (11-20)
 TEST_CMD_RE = re.compile(r"(?:^|[\s;&|(/])(?:pytest|vitest|jest|mocha|rspec|phpunit|tox|xpm-vitest|go test|cargo test|"
                          r"(?:npm|pnpm|yarn|bun)(?: run)? test|make test|python3? (?:-\w+ )*-m (?:pytest|unittest)|"
@@ -10775,9 +10778,67 @@ def _run_claude(args):
         return 1
 
 
+# The person's own off switch (review 1, owner 11-23): Claude Code keeps its own auto-update toggle for the person, so the
+# plugin's self-update has one too. On from the start; the person's typed "turn off self-update" / "turn on self-update"
+# is saved by the plugin (like the clean sessions phrases), kept with the other per-person settings on this computer.
+SELF_UPDATE_NOTE = "datastash note (self-update; the person's own choice)"
+SELF_UPDATE_PHRASES = (
+    ("off", re.compile(r"turn off (datastash )?self[- ]?updates?|(datastash )?self[- ]?updates? off")),
+    ("on", re.compile(r"turn on (datastash )?self[- ]?updates?|(datastash )?self[- ]?updates? on")),
+)
+SELF_UPDATE_OFF_SAY = ('Self-update is off: datastash no longer updates itself on this computer. Type "turn on '
+                       'self-update" to turn it back on.')
+SELF_UPDATE_ON_SAY = ('Self-update is on: datastash checks for a reviewed release once a day and updates itself. Type '
+                      '"turn off self-update" to stop it.')
+
+
+def self_update_on():
+    """The person's self-update choice on this computer: True (the default) unless they typed it off."""
+    v = read_json(CONSENT_PATH, {})
+    v = v.get("self_update") if isinstance(v, dict) else None
+    return not (isinstance(v, dict) and v.get("on") is False)
+
+
+def set_self_update(on):
+    """Save the choice; every other per-person setting stays."""
+    whole = read_json(CONSENT_PATH, {})
+    whole = whole if isinstance(whole, dict) else {}
+    whole["self_update"] = {"on": bool(on), "at": int(time.time())}
+    ensure_dirs()
+    write_private(CONSENT_PATH, json.dumps(whole))
+    return bool(on)
+
+
+def self_update_phrase(text):
+    """"off", "on" or None: only the person's whole short prompt counts."""
+    if not isinstance(text, str) or len(text) > 200:
+        return None
+    t = _phrase(text)
+    return next((k for k, r in SELF_UPDATE_PHRASES if r.fullmatch(t)), None)
+
+
+def self_update_prompt_context(inp):
+    """The UserPromptSubmit note for the person's typed self-update phrase (saved here), or None for any other prompt.
+    The agent confirms in one line."""
+    kind = self_update_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
+    if kind is None or hook_shape(inp) is None:
+        return None
+    try:
+        on = set_self_update(kind == "on")
+    except OSError:
+        return (f"{SELF_UPDATE_NOTE}: the choice could not be saved (the datastash config folder is not writable); "
+                "nothing changed. Tell the person so in one line.")
+    say = SELF_UPDATE_ON_SAY if on else SELF_UPDATE_OFF_SAY
+    return (f"{SELF_UPDATE_NOTE}: the person changed their self-update choice; it is saved for this computer. "
+            f'Confirm it to the person in one line, as it is: "{say}"')
+
+
 def self_update(now=None):
-    """One self-update pass; returns what happened (one word, also recorded). At most once a day."""
+    """One self-update pass; returns what happened (one word, also recorded). At most once a day; never while the
+    person has turned self-update off."""
     now = time.time() if now is None else now
+    if not self_update_on():
+        return "off"  # the person's choice: no check, no network, no Claude Code run
     st = read_json(SELF_UPDATE_FILE, {})
     last = st.get("checked_at")
     if isinstance(last, (int, float)) and 0 <= now - last < SELF_UPDATE_EVERY:

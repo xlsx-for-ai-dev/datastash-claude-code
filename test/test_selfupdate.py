@@ -7,7 +7,10 @@ and a release is tagged and pinned only at a reviewed commit.
   runs. A copy not installed from the datastash marketplace never updates itself.
 - The next session start of a newer version says "datastash updated to vX" once.
 - Every REST call sends X-Datastash-Plugin-Version and a User-Agent with the real version.
-- tools/release-gate: refuses to tag (or pin, or approve main) without a recorded PASS at that exact commit.
+- tools/release-gate: refuses to tag (or pin, or approve main) without a recorded PASS at that exact commit; the pin is
+  set only by its pin step (this branch's catalog carries none).
+- The person's typed "turn off self-update" / "turn on self-update" is saved by the plugin (only the whole typed prompt
+  counts); while it is off, self_update() checks nothing and runs nothing.
 No network, no Claude Code run (both are faked); a throwaway HOME and config folder, enforced by test/harness.py.
 Run: python3 -I test/test_selfupdate.py"""
 import io
@@ -21,7 +24,9 @@ from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_status import ds, TMP  # noqa: E402  (the same harness and plugin copy)
+from test_status import ds, TMP, Base as StatusBase  # noqa: E402  (the same harness and plugin copy)
+import time  # noqa: E402
+import uuid  # noqa: E402
 
 ROOT = os.path.join(HERE, "..")
 GATE = os.path.join(ROOT, "tools", "release-gate")
@@ -57,6 +62,8 @@ class Base(unittest.TestCase):
                 os.unlink(p)
             except OSError:
                 pass
+        if os.path.exists(ds.CONSENT_PATH):  # the person's choices start fresh (self-update on)
+            os.replace(ds.CONSENT_PATH, os.path.join(TMP, f"old-consent-{time.time()}"))
 
 
 class NewestRelease(Base):
@@ -167,6 +174,17 @@ class SelfUpdate(Base):
         self.assertEqual(ds.self_update(now=1000), "not-installed")
         self.assertEqual(self.calls, [])
 
+    def test_turned_off_by_the_person_nothing_is_checked_or_run(self):
+        self.ls, self.cat = tags((B, "refs/tags/v1.1.0")), catalog("v1.1.0", B)
+        ds.set_self_update(False)
+        self.assertEqual(ds.self_update(now=1000), "off")
+        self.assertEqual(self.calls, [])  # no tag check, no Claude Code run
+        self.assertEqual(self.state(), {})  # not stamped: turning it back on checks at once
+        ds.set_self_update(True)
+        self.assertEqual(ds.self_update(now=1000 + 60), "updated")
+        self.assertEqual(self.calls, ["ls-remote", "plugin marketplace update datastash",
+                                      "plugin update datastash@datastash"])
+
     def test_hook_prints_nothing_and_exits_0(self):
         self.ls, self.cat = tags((B, "refs/tags/v1.1.0")), catalog("v1.1.0", B)
         self.patch("hook_input", lambda: {})
@@ -273,11 +291,82 @@ class Wiring(Base):
         self.assertTrue(ups[0]["async"])
         self.assertNotIn("asyncRewake", ups[0])
 
-    def test_the_catalog_pins_a_tag_at_a_full_commit(self):
+    def test_the_branch_catalog_carries_no_pin(self):
+        # Review 1: the pin is set only by the release step (release-gate pin, checked by release-gate main).
         with open(os.path.join(ROOT, ".claude-plugin", "marketplace.json")) as f:
-            pin = ds.catalog_pin(json.load(f))
-        self.assertIsNotNone(pin)
-        self.assertRegex(pin[0], r"^v\d+\.\d+\.\d+$")
+            cat = json.load(f)
+        self.assertIsNone(ds.catalog_pin(cat))
+        self.assertEqual(next(p for p in cat["plugins"] if p["name"] == "datastash")["source"], "./plugins/datastash")
+
+    def test_the_menu_readme_and_hooks_name_the_off_switch(self):
+        self.assertTrue(any('"turn off self-update"' in x and '"turn on self-update"' in x for x in ds.INSTALL_TAIL))
+        with open(os.path.join(ROOT, "README.md")) as f:
+            readme = f.read()
+        with open(os.path.join(ROOT, "plugins", "datastash", "hooks", "hooks.json")) as f:
+            desc = json.load(f)["description"]
+        for text in (readme, desc):
+            self.assertIn('"turn off self-update"', text)
+            self.assertIn('"turn on self-update"', text)
+
+
+class OffSwitch(StatusBase):
+    """The person's typed phrase, caught and saved like the clean sessions phrases: only the whole typed prompt."""
+
+    def prompt(self, text, sid="sess1"):
+        return self.hook(ds.cmd_prompt, {"session_id": sid, "hook_event_name": "UserPromptSubmit", "prompt": text,
+                                         "cwd": tempfile.mkdtemp(prefix="su-", dir=TMP), "prompt_id": str(uuid.uuid4()),
+                                         "transcript_path": self.transcript(sid)})
+
+    @staticmethod
+    def ctx(out):
+        return ((out or {}).get("hookSpecificOutput") or {}).get("additionalContext") or ""
+
+    def test_on_from_the_start(self):
+        self.assertTrue(ds.self_update_on())
+
+    def test_the_phrases_are_recognised_forgivingly(self):
+        for t in ("turn off self-update", "Turn off self update.", '  "turn off selfupdate!"', "self-update off",
+                  "turn off datastash self-updates"):
+            self.assertEqual(ds.self_update_phrase(t), "off", t)
+        for t in ("turn on self-update", "Turn on self update", "self-update on"):
+            self.assertEqual(ds.self_update_phrase(t), "on", t)
+        for t in ("please turn off self-update for the other computer later", "self-update", "turn off updates", "",
+                  None, "turn off self-update " + "x" * 300):
+            self.assertIsNone(ds.self_update_phrase(t), t)
+
+    def test_turn_off_then_on_is_saved_and_confirmed_in_one_line(self):
+        out = self.prompt("turn off self-update")
+        self.assertFalse(ds.self_update_on())
+        with open(ds.CONSENT_PATH) as f:
+            self.assertIs(json.load(f)["self_update"]["on"], False)
+        ctx = self.ctx(out)
+        self.assertIn(ds.SELF_UPDATE_NOTE, ctx)
+        self.assertIn("one line", ctx)
+        self.assertIn(ds.SELF_UPDATE_OFF_SAY, ctx)
+        out = self.prompt("turn on self-update")
+        self.assertTrue(ds.self_update_on())
+        self.assertIn(ds.SELF_UPDATE_ON_SAY, self.ctx(out))
+
+    def test_kept_beside_the_other_per_person_choices(self):
+        ds.set_clean(no_code=True)
+        self.prompt("turn off self-update")
+        self.assertEqual(ds.clean_settings(), {"commands": True, "no_code": True})
+        ds.set_clean(commands=False)
+        self.assertFalse(ds.self_update_on())
+
+    def test_an_ordinary_prompt_or_a_forged_hook_changes_nothing(self):
+        self.prompt("can you turn off self-update on my other computer later")
+        self.assertTrue(ds.self_update_on())
+        self.assertIsNone(ds.self_update_prompt_context({"prompt": "turn off self-update"}))  # not the hook's shape
+        self.assertIsNone(ds.self_update_prompt_context({"hook_event_name": "UserPromptSubmit",
+                                                         "prompt": "turn off self-update", "session_id": "s"}))
+        self.assertTrue(ds.self_update_on())
+
+    def test_a_broken_value_means_on(self):
+        ds.write_private(ds.CONSENT_PATH, json.dumps({"self_update": {"on": "no"}}))
+        self.assertTrue(ds.self_update_on())
+        ds.write_private(ds.CONSENT_PATH, json.dumps({"self_update": False}))
+        self.assertTrue(ds.self_update_on())
 
 
 class ReleaseGate(Base):
@@ -379,6 +468,18 @@ class ReleaseGate(Base):
         self.record(f"opus review: PASS at {p}")
         rc, out = self.gate("main")
         self.assertEqual(rc, 0, out)
+
+    def test_pin_turns_the_unpinned_catalog_into_the_tag_pin(self):
+        self.write_cat({"name": "datastash", "plugins": [{"name": "datastash", "source": "./plugins/datastash",
+                                                          "description": "d"}]})
+        r = self.release("1.0.0")
+        self.record(f"opus review: PASS at {r}")
+        self.assertEqual(self.gate("main")[0], 1)  # no pin: main refused
+        self.assertEqual(self.gate("tag")[0], 0)
+        rc, out = self.gate("pin", "v1.0.0")
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(self.repo, ".claude-plugin/marketplace.json")) as f:
+            self.assertEqual(ds.catalog_pin(json.load(f)), ("v1.0.0", r))
 
     def test_pin_refused_for_an_unreviewed_tag_and_main_for_a_wrong_pin(self):
         r = self.release("1.0.0")
