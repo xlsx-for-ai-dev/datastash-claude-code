@@ -11203,9 +11203,10 @@ def bind_session_agent(sid, s, agent_id):
 
 
 def session_agent(inp):
-    """This session's agent when the folder has none: the one its own install made here (bound to the session id),
-    else the one agent on this computer with no folder of its own (the agent this session listens for). Only an
-    agent whose config, id and key are all on this computer; never in the person's main session or folder."""
+    """This session's agent when the folder has none: the one its own install made (bound to the session id), else,
+    ONLY in a folder the plugin can't link (home or "/"), the one agent on this computer with no folder of its own. In
+    any other folder the one-agent fallback is never used here, so /datastash:install there registers that folder's own
+    agent. Only an agent whose config, id and key are all on this computer; never in the person's main session or folder."""
     me, here = this_session(inp), project_of(inp)
     if not _fallback_allowed(here, me):
         return None
@@ -11217,10 +11218,24 @@ def session_agent(inp):
         if isinstance(c, dict) and c.get("name") and c.get("workbook_id") \
                 and str(c.get("agent_id") or "").lower() == str(rec.get("agent_id") or "-").lower():
             a = dict(c, slug=rec["slug"])
-    if a is None:
+    if a is None and _home_or_root(here):
         a = only_agent()
     return a if a is not None and isinstance(a.get("agent_id"), str) and re.fullmatch(GRANT_ID_RE, a["agent_id"].lower()) \
         and read_key(a["slug"]) else None
+
+
+def _drop_session_agents(s):
+    """Uninstall: every state/session-agent-<sid>.json that names agent `s` (fixed file names; the slug read from each)."""
+    try:
+        names = os.listdir(STATE)
+    except OSError:
+        return
+    for f in names:
+        m = re.fullmatch(r"session-agent-(" + SID_RE + r")\.json", f)
+        if m:
+            rec = read_json(_session_agent_path(m.group(1)), None)
+            if not isinstance(rec, dict) or rec.get("slug") == s:
+                _drop(_session_agent_path(m.group(1)))
 
 
 def _session_name(inp):
@@ -11281,6 +11296,7 @@ def remove_agent_here(s):
     clear_notices(notice_causes({"slug": s}))
     for t in AGENT_FILES:
         _drop(_fill(t, s))
+    _drop_session_agents(s)
     left = [a for a in all_agents() if not is_person(a)]
     wb = c.get("workbook_id")
     if isinstance(wb, str) and wb and not any(a.get("workbook_id") == wb for a in left):

@@ -318,8 +318,9 @@ to type `/datastash:install`; an agent 0.9.x already registered is still waited 
 From 1.0.2 (XLI-390 install fix) `/datastash:install` works in any folder, the home folder too. The new agent is named
 after the session's own agent (`claude --agent NAME`), else the folder; never after the home folder (that name is the
 computer's user), which gives "agent". In a folder it can't link (home, `/`), the agent the install made is kept for that
-session (`state/session-agent-<session>.json`: its local name and id only), and the one agent with no folder of its own
-is used as the session's agent, so typing `/datastash:install` again reuses it and makes no "-2". Any refusal is one line
+session (`state/session-agent-<session>.json`: its local name and id only), and there (home or `/` only) the one agent
+with no folder of its own is used as the session's agent, so typing `/datastash:install` again reuses it and makes no
+"-2". In any other folder `/datastash:install` makes that folder's own agent (after a home-folder install too). Any refusal is one line
 that says why and who refused (the plugin here, before anything is sent, or datastash, with its code and message). With
 no datastash connector the line is "Type /mcp, pick datastash, choose Authenticate, then run /datastash:install again."
 
@@ -464,7 +465,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-<name>.json` | the inbox cursor, the ids of messages still "new", and the last wake time (no message text) |
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
 | `state/agent-<name>.chatkey` | each recent session's chat_key and the chatstash setting it was last told (plugin 1.0.1); never shown to the model or given to a tool call |
-| `state/session-agent-<session>.json` | the agent a session's own `/datastash:install` made, for a folder it can't link (home, `/`): its local name and id only, no key (plugin 1.0.2) |
+| `state/session-agent-<session>.json` | the agent a session's own `/datastash:install` made, for a folder it can't link (home, `/`): its local name and id only, no key (plugin 1.0.2); removed when that agent is uninstalled |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
 | `state/notices.json` | the once-per-cause notices (key refused, key missing, no agent, folder not linked): the line and whether it was told; never a key |
 | `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |

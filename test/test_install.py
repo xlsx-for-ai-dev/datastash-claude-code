@@ -161,13 +161,13 @@ class Base(unittest.TestCase):
         ds.write_private(ds.conf_path("web-app"), json.dumps(c))
 
 
-def proof_ok(p, kind, targets, pid, typed):
+def proof_ok(p, kind, targets, pid, typed, own=OWN):
     """X2's checkNoteProof, line for line: exactly these 7 fields, and the MAC over its 9-line proofInput."""
     if sorted(p) != ["agent_id", "iat", "mac", "prompt_id", "typed_at", "typed_sha256", "v"] or p["v"] != 1:
         return False
-    if p["agent_id"] != OWN or p["prompt_id"] != pid or not 0 <= p["iat"] - p["typed_at"] <= 125000:
+    if p["agent_id"] != own or p["prompt_id"] != pid or not 0 <= p["iat"] - p["typed_at"] <= 125000:
         return False
-    lines = ["datastash-agents-note/v1", OWN, LIST_ID.lower(), kind, ",".join(sorted(t.lower() for t in targets)), pid,
+    lines = ["datastash-agents-note/v1", own, LIST_ID.lower(), kind, ",".join(sorted(t.lower() for t in targets)), pid,
              hashlib.sha256(typed.encode()).hexdigest(), str(p["typed_at"]), str(p["iat"])]
     return hmac.compare_digest(p["mac"], hmac.new(ANSWER.encode(), "\n".join(lines).encode(), hashlib.sha256).hexdigest())
 
@@ -584,7 +584,7 @@ class HomeFolderInstall(Base):
     def setUp(self):
         super().setUp()
         self.home_saved = ds.HOME
-        self.folder = os.path.join(os.path.dirname(self.folder), "robertsenoff")  # the person's home folder
+        self.folder = os.path.join(os.path.dirname(self.folder), "home-user")  # the person's home folder (its name is the computer's user)
         os.makedirs(self.folder)
         ds.HOME = self.folder
 
@@ -600,21 +600,103 @@ class HomeFolderInstall(Base):
         out = self.tool("PostToolUse", "ledger_agent_key", {"name": name}, {"collect": "ready", "mint_id": MINT, "name": name}, sid=sid)
         self.assertEqual(out["systemMessage"], ds.MINT_LINE.format(name=name))
 
-    def list_and_note(self, real_input, pid, sid="s1"):
+    def list_and_note(self, real_input, pid, sid="s1", own=OWN):
         self.assertIsNone(self.tool("PostToolUse", "ledger_agents_list", {}, LIST, sid=sid))
         note = self.tool("PreToolUse", "ledger_agents_note", real_input, sid=sid)["hookSpecificOutput"]
         self.assertNotEqual(note.get("permissionDecision"), "deny", note)
         got = note["updatedInput"]
+        others = sorted({OWN, ALPHA, BETA} - {own})
         self.assertEqual(sorted(got), ["kind", "list_id", "targets", "typed_proof"])  # the model's agent_id is gone
-        self.assertEqual((got["kind"], got["list_id"], got["targets"]), ("install", LIST_ID, sorted([ALPHA, BETA])))
-        self.assertTrue(proof_ok(got["typed_proof"], "install", [ALPHA, BETA], pid, "/datastash:install"))
+        self.assertEqual((got["kind"], got["list_id"], got["targets"]), ("install", LIST_ID, others))
+        self.assertTrue(proof_ok(got["typed_proof"], "install", others, pid, "/datastash:install", own=own))
         return got
+
+    def go(self, name):
+        """The person's next session runs in this folder ("home" is the home folder)."""
+        home = self.folder if os.path.realpath(self.folder) == os.path.realpath(ds.HOME) else ds.HOME
+        self.folder = home if name == "home" else os.path.join(os.path.dirname(home), name)
+        os.makedirs(self.folder, exist_ok=True)
+
+    def install(self, sid, register=None, own=OWN, real=REAL_NOTE_1):
+        """/datastash:install in this session: `register` is the new agent's name the plugin asks for (None: it reuses
+        this session's agent and registers nothing); then the install note goes out signed by `own`."""
+        v, pid = self.slash("/datastash:install", sid=sid)
+        ai = v["hookSpecificOutput"]["additionalContext"]
+        if register is None:
+            self.assertNotIn("ledger_agent_register", ai)
+        else:
+            self.assertIn(f'ledger_agent_register with name "{register}"', ai)
+            self.mint(register, agent_id=own, sid=sid)
+        self.list_and_note(real, pid, sid=sid, own=own)
+
+    def agents(self):
+        return {a["name"]: [os.path.basename(p) for p in a.get("projects") or []] for a in ds.all_agents()}
+
+    def test_home_install_then_a_new_session_in_web_app_makes_a_web_app_agent(self):
+        self.install("s1", register="agent")
+        self.go("web-app")
+        self.install("s2", register="web-app", own=ALPHA)  # not the home agent: this folder gets its own
+        self.assertEqual(self.agents(), {"agent": [], "web-app": ["web-app"]})
+        self.install("s2", own=ALPHA, real=REAL_NOTE_2)  # a retry in the same session: the same agent, no -2
+        self.go("web-app")
+        self.install("s3", own=ALPHA)  # a later session in the folder: its linked agent
+        self.go("home")
+        self.install("s4")  # a later session in the home folder: the home agent (the one with no folder)
+        self.assertEqual(self.agents(), {"agent": [], "web-app": ["web-app"]})
+
+    def test_folder_install_then_home_makes_a_home_agent(self):
+        self.go("web-app")
+        self.install("s1", register="web-app")
+        self.go("home")
+        self.install("s2", register="agent", own=ALPHA)  # the folder's agent is never the home folder's
+        self.install("s2", own=ALPHA, real=REAL_NOTE_2)  # retry, same session
+        self.install("s3", own=ALPHA)  # a new session in home: the one agent with no folder
+        self.assertEqual(self.agents(), {"agent": [], "web-app": ["web-app"]})
+
+    def test_two_folders_each_make_their_own_agent(self):
+        self.go("web-app")
+        self.install("s1", register="web-app")
+        self.go("api")
+        self.install("s2", register="api", own=ALPHA)
+        self.install("s2", own=ALPHA, real=REAL_NOTE_2)
+        self.assertEqual(self.agents(), {"web-app": ["web-app"], "api": ["api"]})
+        self.go("web-app")
+        self.install("s3")
+
+    def test_two_folders_after_a_home_install(self):
+        self.install("s1", register="agent")
+        self.go("web-app")
+        self.install("s2", register="web-app", own=ALPHA)
+        self.go("api")
+        self.install("s3", register="api", own=BETA)
+        self.assertEqual(self.agents(), {"agent": [], "web-app": ["web-app"], "api": ["api"]})
+
+    def test_no_folder_fallback_in_a_folder_it_can_link(self):
+        self.install("s1", register="agent")
+        self.go("web-app")
+        inp = {"session_id": "s2", "cwd": self.folder, "hook_event_name": "PreToolUse"}
+        self.assertIsNone(ds.session_agent(inp))
+        self.assertIsNone(ds._own(inp))
+        self.go("home")
+        self.assertEqual(ds.session_agent(dict(inp, cwd=self.folder))["name"], "agent")  # home: the fallback holds
+
+    def test_uninstall_drops_the_session_record(self):
+        self.install("s1", register="agent")
+        self.go("web-app")
+        self.install("s2", register="web-app", own=ALPHA)
+        rec = lambda sid: os.path.exists(os.path.join(ds.STATE, f"session-agent-{sid}.json"))
+        self.assertTrue(rec("s1") and rec("s2"))
+        self.assertFalse(ds.remove_agent_here("agent"))  # web-app is left
+        self.assertFalse(rec("s1"))
+        self.assertTrue(rec("s2"))
+        self.assertTrue(ds.remove_agent_here("web-app"))
+        self.assertFalse(rec("s2"))
 
     def test_fresh_home_folder_install_sends_the_note_and_a_retry_reuses_the_agent(self):
         v, pid = self.slash("/datastash:install")
         ai = v["hookSpecificOutput"]["additionalContext"]
         self.assertIn('ledger_agent_register with name "agent"', ai)  # not the computer's user (the home folder's name)
-        self.assertNotIn("robertsenoff", ai)
+        self.assertNotIn("home-user", ai)
         self.mint("agent")
         self.list_and_note(REAL_NOTE_1, pid)
         # The retry, in the same session: no new agent, and the note goes again (the model's call 2 shape: no list id).
