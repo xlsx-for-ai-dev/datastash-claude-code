@@ -55,31 +55,40 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
 
 ## Install
 
-1. **Install.** In your shell:
+1. **Add the marketplace.** Inside a Claude Code session:
 
    ```
-   claude plugin marketplace add xlsx-for-ai-dev/datastash-claude-code
-   claude plugin install datastash@datastash
+   /plugin marketplace add xlsx-for-ai-dev/datastash-claude-code
    ```
 
-   (Or inside a Claude Code session: `/plugin marketplace add xlsx-for-ai-dev/datastash-claude-code`, then
-   `/plugin install datastash@datastash`.) When it asks where to install, pick 'for you'.
-2. **Restart Claude Code.** Then type `/mcp`, pick datastash, choose Authenticate, and sign in once.
-3. **Sign in once, from the line the plugin shows.** At the start of the first session, the plugin itself (no AI step)
-   starts the sign-in and shows you one line:
+2. **Install the plugin.** Then:
 
    ```
-   To add this computer to your datastash, open https://getdatastash.com/agents and type the code BCDF-GHJK (it works for 10 more minutes).
+   /plugin install datastash@datastash
    ```
 
-   Open the page on any device (it works on a remote computer too: no localhost redirect; Google sign-in only when that
-   browser never signed in to datastash) and type the code. A background helper finishes the login. If this computer has a desktop browser, the page
-   also opens there (at most once a day). Not approved yet? The next session start, and your first datastash use in a
-   session, show the same link and code again while it is good; a new code is made only after the old one ends.
-4. **Connect in the session you're in.** After you approve, that session shows "datastash is signed in. Type /mcp
-   reconnect all to connect it in this session; new sessions connect by themselves." (Claude Code connects a connector
-   only when a session starts or on `/mcp reconnect`.) From then on every session connects to datastash already signed in.
-5. **See the difference.** In a Claude Code session, ask "What's the status of all my agents?" (the agent goes and
+   When it asks where to install, pick "for you". (Or in your shell: `claude plugin marketplace add
+   xlsx-for-ai-dev/datastash-claude-code`, then `claude plugin install datastash@datastash`.)
+3. **Restart Claude Code.**
+4. **Connect once.** Type `/mcp`, pick datastash, choose Authenticate, and sign in. This is needed only once.
+5. **Make this session an agent.** Type `/datastash:install`. If it says "Type /mcp, pick datastash, choose
+   Authenticate, then run /datastash:install again.", do that one step and type `/datastash:install` again.
+
+If the first session instead shows the plugin's own sign-in line (the plugin itself, no AI step):
+
+```
+To add this computer to your datastash, open https://getdatastash.com/agents and type the code BCDF-GHJK (it works for 10 more minutes).
+```
+
+open the page on any device (it works on a remote computer too: no localhost redirect; Google sign-in only when that
+browser never signed in to datastash) and type the code. A background helper finishes the login. If this computer has
+a desktop browser, the page also opens there (at most once a day). Not approved yet? The next session start, and your
+first datastash use in a session, show the same link and code again while it is good; a new code is made only after the
+old one ends. After you approve, that session shows "datastash is signed in. Type /mcp reconnect all to connect it in
+this session; new sessions connect by themselves." (Claude Code connects a connector only when a session starts or on
+`/mcp reconnect`.) From then on every session connects to datastash already signed in.
+
+6. **See the difference.** In a Claude Code session, ask "What's the status of all my agents?" (the agent goes and
    looks). Then type:
 
    ```
