@@ -1644,7 +1644,7 @@ def _beat_loop(agent, project, live, stop):
         wait = BEAT_SECONDS
         try:
             key = live.get("key")
-            if key:
+            if key and shares_from(agent):  # XLI-328 card 3: a private agent's presence stays on this computer
                 send_beat(agent, key, project)
             else:
                 wait = min(BEAT_SECONDS, PARK_CHECK_SECONDS)  # not polling yet, or parked: look again soon, no beat
@@ -1883,7 +1883,15 @@ def _free_name(folder, taken=None, prefer=None):
 
 def _register(tok, folder, rec=None, prefer=None):
     """Register folder's agent on the login (rec: the one registered earlier, reused by name and agent_id, never a
-    second agent). Returns (rec, answer). Raises ApiError / network errors."""
+    second agent). Returns (rec, answer). Raises ApiError / network errors. XLI-328 card 3: the answer's private field
+    is recorded for that agent."""
+    rec, ans = _register_once(tok, folder, rec, prefer)
+    if rec is not None:
+        note_private(ans, rec["agent_id"], slug(rec["name"]))
+    return rec, ans
+
+
+def _register_once(tok, folder, rec=None, prefer=None):
     if rec is not None:
         ans = api_json("POST", AGENT_REGISTER_PATH, tok, body={"name": rec["name"], "agent_id": rec["agent_id"],
                                                                 "agent_proof": rec["proof"]}, timeout=30)
@@ -2017,6 +2025,7 @@ def _approval(tok, rec):
         if e.status == 404:
             return "not_found"
         raise
+    note_private(ans, rec["agent_id"], slug(rec["name"]))  # XLI-328 card 3: only an answer saying so changes it
     st = ans.get("approval") if isinstance(ans, dict) else None
     return st if st in ("approved", "waiting_for_person", "switched_off") else "waiting_for_person"
 
@@ -2310,7 +2319,7 @@ def send_hello(agent, key, causes=()):
     """One hello: (outcome, wait). outcome: ok, blocked, waiting, refused, missing (no such route yet), retry, network."""
     s = agent["slug"]
     body = {"workbook_id": agent["workbook_id"]}
-    causes = [c for c in causes if c in BLOCKED_CAUSES]
+    causes = [c for c in causes if c in BLOCKED_CAUSES] if shares_from(agent) else []  # private: the causes stay here
     if causes:
         body["blocked"] = list(causes)
     try:
@@ -2329,6 +2338,7 @@ def send_hello(agent, key, causes=()):
         log(s, f"hello: network_blocked ({type(e).__name__})")
         return "network", _net_why(e)
     r = r if isinstance(r, dict) else {}
+    note_private(r, agent.get("agent_id") or r.get("agent_id"), s)  # XLI-328 card 3
     got = [c for c in (r.get("causes") if isinstance(r.get("causes"), list) else []) if c in BLOCKED_CAUSES]
     result = "hello_blocked" if r.get("result") == "hello_blocked" else "hello_ok"
     log(s, f"hello: {result}" + (" " + ",".join(got) if got else ""))
@@ -3174,6 +3184,10 @@ def cmd_link(args):
                 "turns it on by typing the keep phrase), or the person left that folder off")
     if is_off(proj_opt or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()):
         die(OFF_REFUSAL.format(folder=os.path.realpath(proj_opt or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())))
+    refused = private_link_refusal(slug(name), proj_opt or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
+                                   os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())  # XLI-328 card 3
+    if refused:
+        die(refused)
     s = slug(name)
     me = this_session()
     _no_agent_in_main(me, "links an agent")
@@ -4485,8 +4499,16 @@ def cmd_auto_name(args):
     here = os.path.realpath(project or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     if is_off(here):
         die(OFF_REFUSAL.format(folder=here))
+    cur = os.path.realpath(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    if here != cur and is_private(cur):
+        die(PRIVATE_REFUSAL.format(folder=cur, url=AGENTS_URL))  # XLI-328 card 3: a private session names no other agent
     me = this_session()
     kind, name = auto_name(here, me, after)
+    if kind == "linked":
+        sess = session_for(here, me=me)
+        if agent_private(sess) and (sess.get("via") or not any(
+                _within(here, os.path.realpath(p)) for p in (sess.get("projects") or []) if isinstance(p, str))):
+            die(PRIVATE_REFUSAL.format(folder=here, url=AGENTS_URL))  # a private agent is never reused in another folder
     if kind != "main":
         mark_agent_use(me, "auto-name")  # self-registration has begun: this session is an agent, never main
     if kind == "main":
@@ -4699,9 +4721,9 @@ def cmd_agent_tool(_args):
         deny = None
         name = str(inp.get("tool_name") or "") if isinstance(inp, dict) else ""
         if inp.get("hook_event_name") == "PreToolUse" and name.startswith("mcp__") and "datastash" in name.lower() \
-                and off_here(inp):
+                and (off_here(inp) or private_here(inp)):
             deny = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                           "permissionDecisionReason": OFF_DENY}}
+                                           "permissionDecisionReason": OFF_DENY if off_here(inp) else PRIVATE_DENY}}
     if deny is not None:
         print(json.dumps(deny), flush=True)
         return 0
@@ -5412,16 +5434,23 @@ def cmd_token(args):
     Never a token on a terminal or to a tool call (connector_helper_call), never logs, never the refresh token."""
     if args != ["--header"]:
         die("usage: datastash token --header   (for the datastash connector only)")
-    tok = None
+    tok = head = None
     try:
         if not sys.stdout.isatty() and connector_helper_call():
-            tok = login_token()
+            try:
+                head = private_helper_header()  # XLI-328 card 3: a private folder's connector carries its agent's key
+            except BaseException:
+                head = None if not os.path.exists(PRIVATE_PATH) else {"Authorization": f"Bearer {SIGNED_OUT_BEARER}"}
+            if head is None:
+                tok = login_token()
         else:
             print("datastash token --header gives a token only to the datastash connector (Claude Code's headersHelper), "
                   "never to a terminal or a tool call", file=sys.stderr)
     except BaseException:  # never a failed helper, never {} (an empty answer would bring back the OAuth door)
         tok = None
-    if isinstance(tok, str) and re.fullmatch(ACCESS_RE, tok):
+    if head is not None:
+        pass
+    elif isinstance(tok, str) and re.fullmatch(ACCESS_RE, tok):
         head = {"Authorization": f"Bearer {tok}"}
     else:
         try:
@@ -6048,22 +6077,26 @@ def off_here(inp):
 
 def off_connector_deny(inp):
     """PreToolUse: the deny for a datastash connector call (any datastash MCP server, by name or by its URL, or any ledger_ tool) in a folder
-    the person left off, else None."""
+    the person left off, else None. XLI-328 card 3: also in a private folder, except on the plugin's own connector once
+    this session's helper handed it the folder's agent key (a claude.ai connector carries the person's login)."""
     if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse":
         return None
     name = inp.get("tool_name")
     if not isinstance(name, str) or not name.startswith("mcp__"):
         return None
     server, _, tool = name[5:].partition("__")
-    if not off_here(inp):
+    why = OFF_DENY if off_here(inp) else (PRIVATE_DENY if private_here(inp) else None)
+    if why is None:
         return None
     if "datastash" not in server.lower() and not tool.startswith("ledger_"):
         # a ledger_ tool is datastash's own, on any server: a claude.ai connector the person renamed is in no local config
         cfg = _mcp_configs(inp).get(server)
         if cfg is None or not _server_carries_datastash(cfg):
             return None
+    if why is PRIVATE_DENY and server == PLUGIN_SERVER and _helper_served(inp):
+        return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                   "permissionDecisionReason": OFF_DENY}}
+                                   "permissionDecisionReason": why}}
 
 
 def switch_off_on_datastash(agent):
@@ -6154,6 +6187,191 @@ def _here_root(here):
     return rp, _project_name(rp)
 
 
+# --- XLI-328 card 3: PRIVATE folders. Private is set and cleared only by the person, on the agents page (ruling D2):
+# the plugin never sets it and sends it in no request. It records an agent as private only from datastash's own answer
+# to the plugin's own call (the approval poll, register or hello) that says private: true, and forgets it only on
+# private: false; a missing field, an error or an answer about another agent changes nothing. In a private folder:
+# the connector's headersHelper hands over the agent's own key (D3), never the person's login. Claude Code runs the
+# helper with no project folder, so where it can't tell the folder the PreToolUse hook denies the datastash connector
+# there (the whole server, as for OFF), unless this very Claude Code process's helper handed that folder's agent key.
+# Status, hello's causes, the heartbeat, the map's tab share and lookup feeds stay on this computer; the map, `where`,
+# lookup counting, nudges and check-backs keep working. The server enforces private either way (agent_private).
+PRIVATE_PATH = os.path.join(CONF, "status-private.json")  # {"agents": {agent_id: {"at", "slug"}}, "field_at"}
+PLUGIN_SERVER = "plugin_datastash_datastash"  # the plugin's own connector, the one whose helper this file is
+PRIVATE_COMING = 'Private mode is coming. Until then, type "leave {name} off" to keep it off datastash.'
+PRIVATE_LINK = "To keep {name} private, press Private next to it on {url}. Until you do, it is on datastash."
+PRIVATE_ALREADY = ('"{name}" is private: datastash shares nothing from it with your other agents. Only you change that, '
+                   "on {url}.")
+PRIVATE_STATUS = ("kept on this machine only: this agent is private, so its status is not shared with your other agents "
+                  "(the person changes private on the agents page)")
+PRIVATE_FEED = "Not set up: a datastash feed would share it with your other agents."
+PRIVATE_DENY = ("This folder's agent is private, and this session's datastash connector does not carry its own key, so "
+                "no datastash connector call runs here (it would go out as the person). Don't retry it or work around "
+                "it: use the datastash command here (`datastash api ...`), which uses the agent's own key. Only the "
+                "person changes private, on the agents page.")
+PRIVATE_REFUSAL = ("{folder}: this folder's agent is private, so it is never put into another folder and no other agent "
+                   "is linked here (only the person changes private, on {url})")
+
+
+def _private_rec():
+    rec = read_json(PRIVATE_PATH, {})
+    rec = rec if isinstance(rec, dict) else {}
+    agents = rec.get("agents") if isinstance(rec.get("agents"), dict) else {}
+    return {"agents": {k.lower(): (v if isinstance(v, dict) else {}) for k, v in agents.items()
+                       if isinstance(k, str) and re.fullmatch(AGENT_ID_RE, k)},
+            "field_at": rec.get("field_at") if _num_ok(rec.get("field_at")) else None}
+
+
+def note_private(answer, agent_id, agent_slug=None):
+    """Record what datastash's answer to the plugin's own call about agent_id says: private: true records the agent as
+    private, private: false forgets it. Anything else (no field, not a boolean, not a dict, another agent's id in the
+    answer, no agent asked about) changes nothing. Returns the boolean recorded, or None. Never raises."""
+    if not isinstance(answer, dict) or not isinstance(agent_id, str) or not re.fullmatch(AGENT_ID_RE, agent_id):
+        return None
+    v = answer.get("private")
+    if not isinstance(v, bool):
+        return None
+    said = answer.get("agent_id")
+    if said is not None and (not isinstance(said, str) or said.lower() != agent_id.lower()):
+        return None
+    try:
+        ensure_dirs()
+        with StateLock("private"):
+            rec = _private_rec()
+            if v:
+                rec["agents"][agent_id.lower()] = {"at": int(time.time()),
+                                                   "slug": agent_slug if isinstance(agent_slug, str) else None}
+            else:
+                rec["agents"].pop(agent_id.lower(), None)
+            rec["field_at"] = int(time.time())
+            write_private(PRIVATE_PATH, json.dumps(rec))
+    except OSError:
+        return None
+    return v
+
+
+def private_field_seen():
+    """True once a datastash answer carried the private field (card 2 is live): private can be offered."""
+    return _private_rec()["field_at"] is not None
+
+
+def agent_private(agent):
+    """True when datastash told this computer that this agent is private."""
+    if not isinstance(agent, dict) or is_person(agent):
+        return False
+    rec = _private_rec()["agents"]
+    if not rec:
+        return False
+    aid = agent.get("agent_id")
+    if isinstance(aid, str) and aid:
+        return aid.lower() in rec
+    return any(v.get("slug") == agent.get("slug") for v in rec.values())  # an older config without its agent_id
+
+
+def shares_from(agent):
+    """True when this agent's sharing calls (status, heartbeat, map tab, feeds) may go to datastash."""
+    return not agent_private(agent)
+
+
+def is_private(folder):
+    """True when folder's agent (or the agent it waits for) is private. Can't tell, with private agents recorded: True
+    (private only ever means less sharing)."""
+    if not folder:
+        return False
+    try:
+        rec = _private_rec()["agents"]
+        if not rec:
+            return False
+        here = os.path.realpath(folder)
+        a = agent_for(here)
+        if a is not None:
+            return agent_private(a)
+        w = waiting_record(here)
+        return w is not None and isinstance(w[1].get("agent_id"), str) and w[1]["agent_id"].lower() in rec
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def private_here(inp):
+    """True when this hook's session works in a private folder (its project folder or its cwd)."""
+    inp = inp if isinstance(inp, dict) else {}
+    cwd = inp.get("cwd") if isinstance(inp.get("cwd"), str) else None
+    return any(is_private(f) for f in (os.environ.get("CLAUDE_PROJECT_DIR"), cwd) if f)
+
+
+def _helper_mark_path(proc):
+    return os.path.join(STATE, f"private-helper-{int(proc[0])}-{re.sub(r'[^A-Za-z0-9]', '_', str(proc[1]))[:40]}.json")
+
+
+def private_helper_header():
+    """token --header: the header for a private folder the helper can see (CLAUDE_PROJECT_DIR, or a cwd outside the
+    plugin's own folder): the agent's own key, or the signed-out placeholder when it has none (never the person's
+    login). None when the helper sees no private folder. Records which folder this Claude Code process got the key for,
+    so the PreToolUse hook lets the connector run there."""
+    folder = os.environ.get("CLAUDE_PROJECT_DIR")
+    if not folder:
+        cwd = os.path.realpath(os.getcwd())
+        if _within(cwd, os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))):
+            return None  # Claude Code's usual helper folder: the plugin's own; the hook is the fallback
+        folder = cwd
+    if not is_private(folder):
+        return None
+    agent = agent_for(folder)
+    key = read_key(agent["slug"]) if agent is not None else None
+    if not (isinstance(key, str) and re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key)):
+        return {"Authorization": f"Bearer {SIGNED_OUT_BEARER}"}
+    me = this_session()
+    if me["proc"] is not None:
+        try:
+            ensure_dirs()
+            write_private(_helper_mark_path(me["proc"]), json.dumps(
+                {"folder": linked_folder(agent, folder), "slug": agent["slug"], "at": int(time.time())}))
+        except OSError:
+            pass  # no mark: the hook keeps denying the connector there (less, never more)
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _helper_served(inp):
+    """True when this session's own Claude Code process had its connector helper hand this folder's agent key."""
+    me = this_session(inp)
+    if me["proc"] is None:
+        return False
+    mark = read_json(_helper_mark_path(me["proc"]), None)
+    if not isinstance(mark, dict) or not isinstance(mark.get("folder"), str):
+        return False
+    here = os.path.realpath(project_of(inp))
+    agent = agent_for(here)
+    return agent is not None and mark.get("slug") == agent["slug"] and _within(here, os.path.realpath(mark["folder"]))
+
+
+def private_link_refusal(agent_slug, target, current):
+    """The refusal (a line) when linking agent_slug into target would put a private folder's agent into another folder,
+    or another agent into a private folder; else None."""
+    target, current = os.path.realpath(target), os.path.realpath(current)
+    if target != current and is_private(current):
+        return PRIVATE_REFUSAL.format(folder=current, url=AGENTS_URL)
+    c = read_json(conf_path(agent_slug), None) if agent_slug else None
+    if isinstance(c, dict) and agent_private(dict(c, slug=agent_slug)) \
+            and not any(_within(target, os.path.realpath(p)) for p in (c.get("projects") or []) if isinstance(p, str)):
+        return PRIVATE_REFUSAL.format(folder=target, url=AGENTS_URL)
+    if is_private(target):
+        a = agent_for(target)
+        if a is None or a["slug"] != agent_slug:
+            return PRIVATE_REFUSAL.format(folder=target, url=AGENTS_URL)
+    return None
+
+
+def private_answer(name):
+    """The plugin's own answer to the person's typed "keep X private". It sets nothing and calls nothing."""
+    n = _clean(name, 64)
+    folders = _leave_folders(name)
+    if folders and all(is_private(f) for f in folders):
+        return PRIVATE_ALREADY.format(name=n, url=AGENTS_URL)
+    if private_field_seen():
+        return PRIVATE_LINK.format(name=n, url=AGENTS_URL)
+    return PRIVATE_COMING.format(name=n)
+
+
 def install_window(sid):
     """True while the install question this session showed still takes "add <folder>" (30 minutes)."""
     rec = read_json(INSTALL_ASKED_PATH, {})
@@ -6173,10 +6391,10 @@ def install_update_lines():
     for a in all_agents():
         projects = [p for p in (a.get("projects") or []) if isinstance(p, str)]
         if not is_person(a) and not (projects and all(is_off(p) for p in projects)):
-            on.append(disp(a["name"]))
+            on.append(disp(a["name"]) + (": private" if agent_private(a) else ""))
     for f, rec in sorted(_enrolled().items()):
         if not is_off(f) and not _folder_has_agent(f):
-            on.append(f"{disp(rec['name'])} (waiting for your OK on {AGENTS_URL})")
+            on.append(f"{disp(rec['name'])}{': private' if is_private(f) else ''} (waiting for your OK on {AGENTS_URL})")
     off = [_clean(n or os.path.basename(f.rstrip("/")), 64) for f, n in sorted(off_folders().items())]
     out = ["Your agents on datastash now: " + (", ".join(on) if on else "none") + "."]
     if off:
@@ -6421,8 +6639,9 @@ def status_refresher(sess, wake, stop=None, live=None):
             else:
                 time.sleep(min(pause, PARK_CHECK_SECONDS))
             continue
-        if keep_state() != "yes" or (not woken and _copy_fresh(sess["workbook_id"])):
-            # status off on this computer (nothing is read or sent), or another session refreshed the shared copy
+        if keep_state() != "yes" or not shares_from(sess) or (not woken and _copy_fresh(sess["workbook_id"])):
+            # status off on this computer (nothing is read or sent), a private agent (XLI-328 card 3: its own rows never
+            # land in the copy other agents here read), or another session refreshed the shared copy
             woken = wake.wait(pause)
             wake.clear()
             continue
@@ -7273,7 +7492,8 @@ def save_own_status(agent, here, data):
     for a, w in zip(row["asks"], whole["asks"]):
         a["id"] = w["id"]  # one id for an ask, from its whole words
     s = agent["slug"]
-    ok = consent_for(folder)
+    private = agent_private(agent)  # XLI-328 card 3: kept in the outbox only, never sent or put in the shared copy
+    ok = consent_for(folder) and not private
     ensure_dirs()
     seq = secrets.token_hex(6)
     ctx_given = data.get("context") if isinstance(data.get("context"), dict) else {}
@@ -7281,12 +7501,15 @@ def save_own_status(agent, here, data):
     write_private(_outbox_path(s), json.dumps({"seq": seq, "here": here, "body": status_body(whole, agent["workbook_id"]),
                                                "pr_given": bool(row["context"]["pr"]), "cards_given": bool(row["cards"]),
                                                "last_given": last_given, "consent": ok, "written_at": row["updated_at"]}))
-    put_own_row(agent["workbook_id"], row)
+    if not private:
+        put_own_row(agent["workbook_id"], row)
     write_private(_written_path(s), json.dumps({"at": time.time()}))
     try:
         write_private(_snap_path(s), json.dumps({"at": time.time()}))
     except OSError:
         pass
+    if private:
+        return row, PRIVATE_STATUS
     if not ok:
         return row, ("kept on this machine only: the person has not turned on keeping for this project (they turn it "
                      "on by typing the keep phrase)")
@@ -7359,6 +7582,8 @@ def cmd_status_send(args):
     body = out.get("body") if isinstance(out.get("body"), dict) else None
     if body is None or not isinstance(out.get("here"), str) or not consent_for(out["here"]):
         return 0
+    if not shares_from(dict(c, slug=s)):
+        return 0  # XLI-328 card 3: private now (an older unsent status included): never sent
     if door_missing():
         return 0  # no status door yet: the listener sends it once the door answers
     for i, pause in enumerate((0.0,) + STATUS_SEND_RETRIES):
@@ -7965,7 +8190,7 @@ def status_prompt_context(inp):
     if kind == "private":
         if not _leave_folders(arg):
             return None
-        return {"show": f'Private mode is coming. Until then, type "leave {_clean(arg, 64)} off" to keep it off datastash.'}
+        return {"show": private_answer(arg)}  # XLI-328 card 3: the person presses Private on the agents page
     view = read_view(sid)
     if kind == "do":
         target = (view or {}).get("numbers", {}).get(str(arg))
@@ -8362,6 +8587,9 @@ def lookup_do(inp, n, target):
             return {"show": "The datastash config folder is not writable. Nothing changed."}
         return {"show": f"datastash doesn't keep {label} ready yet, so nothing changed: your agents keep asking {label} "
                         "directly. This offer is saved as declined for now."}
+    asker = next((a for a in all_agents() if a["slug"] == who), None) if isinstance(who, str) else None
+    if private_here(inp) or agent_private(asker):
+        return {"show": PRIVATE_FEED}  # XLI-328 card 3: a feed is kept for all the person's agents
     shape = hook_shape(inp)
     if shape is None or not start_check(shape, "lookup", inp.get("prompt"), {"service": svc, "agent": who}):
         return None
@@ -8443,6 +8671,9 @@ def lookup_setup(data, sid):
     key = read_key(agent["slug"]) if agent else None
     if agent is None or key is None:
         _lookup_failed(svc, sid, "no agent with a key on this computer asked those lookups.")
+        return
+    if agent_private(agent):
+        add_outcome(sid, f"The {label} feed was not set up: {PRIVATE_FEED}")
         return
     args = {"workbook_id": agent["workbook_id"], "services": [svc], "code_challenge": new_challenge(f"hook-{svc}")}
     if svc == "github":
@@ -9502,7 +9733,7 @@ def map_refresh(agent, folder, key, upload=True):
     if not re.fullmatch(r"[0-9a-f]{40,64}", head):
         return "none"
     share = bool(key) and isinstance(agent, dict) and bool(agent.get("workbook_id")) and not is_person(agent) \
-        and not agent.get("via") and consent_for(root)
+        and not agent.get("via") and consent_for(root) and shares_from(agent)  # XLI-328 card 3: private maps locally
     net = (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError)
     with _MapLock(root) as got:
         if not got:

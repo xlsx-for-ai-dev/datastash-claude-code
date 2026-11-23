@@ -344,6 +344,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `off/` | key and config files of agents switched off on this machine |
 | `status-<workbook>.json` | this machine's copy of every agent's status in that agent workbook (plain words, context, asks), one row per agent and project, refreshed by the listener every ~60 s and by this machine's own writes; notes when the last refresh failed |
 | `status-consent.json` | the person's yes or no for keeping this computer's agents' status in datastash (and per project folder: "leave <name> off") |
+| `status-private.json` | which of this computer's agents datastash said are private (agent id, when), and that datastash answers with the private field; `state/private-helper-<pid>-<start>.json`: the folder whose agent key that Claude Code process's connector helper handed over |
 | `state/status-view-<id>.json`, `state/status-prompts-<id>.json`, `state/status-typed-<id>.json` | what that session showed last (number -> agent, project, ask id), its prompt count, and the typed transcript entries already used once |
 | `state/status-out-<name>.json`, `state/status-sent-<name>.json`, `state/status-written-<name>`, `state/status-snap-<name>.json`, `state/status-reminded-<name>` | the agent's newest status waiting to be sent and whether it was, when it was last written (twice: time only), and when it was last reminded |
 | `state/status-install-asked` | the install question was shown once on this computer |
@@ -389,7 +390,9 @@ list, asks first and idle agents last, from any session: "status", "status of al
   yours on this computer joins now (checked as your own typed prompt; you allow its agent on the agents page). Only a folder datastash has seen counts; any other "add ..." (say "add
   dark mode to the settings page") is an ordinary prompt and goes through untouched. "leave <name> off" (or "keep <name> off
   datastash", or "datastash off" for this folder) turns that folder OFF (below; saved at once, since it only makes
-  agents share less). "keep <name> private": private mode is coming. After an answer the updated list is shown once.
+  agents share less). "keep <name> private": once datastash answers with the private field, "To keep <name> private,
+  press Private next to it on the agents page. Until you do, it is on datastash." (before that: private mode is coming).
+  The plugin never sets private itself. After an answer the updated list is shown once.
 - **OFF folders.** A folder that is off makes no datastash call: no sign-in or inbox count at session start, no
   listener, hello, heartbeat, status, seed, project-map share or lookup counting, and no agent is registered for it.
   Claude Code runs the connector's `headersHelper` in the plugin's own folder with no project folder, so the helper
@@ -400,7 +403,20 @@ list, asks first and idle agents last, from any session: "status", "status of al
   switch it off on datastash; it is off on this computer." An agent still waiting for your OK: "It is off on this
   computer. On the agents page, press Don't allow next to it." "put <name> back on datastash" turns it back on, only as
   your own typed prompt. A 0.9.x "leave <name> off" reads as off.
-- **What OFF and private stop.** OFF (and, later, private) stop a careless agent: one that would otherwise share by
+- **PRIVATE folders.** Only you set or clear private, with the Private button on the agents page; the plugin sends it
+  in no request. It records a folder's agent as private only when datastash's own answer to the plugin's call (the
+  approval check, register or hello) says `private: true`, and forgets it only on `private: false`
+  (`status-private.json`); a missing field changes nothing. In a private folder: the connector's `headersHelper` hands
+  over the agent's own key, never your login. Since Claude Code runs the helper with no project folder, where the
+  helper can't tell the folder the PreToolUse hook refuses every datastash connector call in a private folder (as for
+  OFF), unless that same Claude Code process's helper handed over the folder's agent key; the `datastash` command
+  still works there with the agent's key. Status writes stay on this computer (not in the copy other agents read),
+  hello sends no causes, no heartbeat, the project map is kept locally only (no tab share), and "do N" for a feed
+  answers "Not set up: a datastash feed would share it with your other agents." The map, `datastash where`, lookup
+  counting, nudges and check-backs keep working. The updated list shows "<name>: private". `datastash link` and
+  `datastash auto-name` refuse to put a private folder's agent into another folder, or another agent into it.
+  datastash itself refuses a private agent's sharing calls (`agent_private`).
+- **What OFF and private stop.** OFF and private stop a careless agent: one that would otherwise share by
   mistake. They do not stop a hostile program running as the same user on this computer, which can read the same
   files the plugin reads.
 - **Writing.** `datastash status-set -` (JSON on stdin) saves it on this machine at once and, while keeping is on for

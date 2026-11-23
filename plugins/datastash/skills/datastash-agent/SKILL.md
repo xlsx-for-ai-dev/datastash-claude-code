@@ -101,7 +101,8 @@ These come only from the person typing them in this chat. When keeping is on and
 - "full context of N", "details N": the stored details for number N, one bounded screen. No note: `datastash status --details N`. Never ask or wake the other agent for it.
 - "more of N": the next screen of number N when the last one said there is more. No note: `datastash status --more N`.
 - "do N": answering asks from here is coming; the plugin shows the ask and says so. You never send an answer on the person's behalf.
-- The list after install ends with "Did we miss any of your agents, or is there one you don't want on datastash?". The person may name a folder (it joins when they first open it there), type "leave <name> off" (the plugin stops keeping it at once), or "keep <name> private" (private mode is coming; the plugin says so).
+- The list after install ends with "Did we miss any of your agents, or is there one you don't want on datastash?". The person may name a folder (it joins when they first open it there), type "leave <name> off" (the plugin stops keeping it at once), or "keep <name> private" (the plugin answers itself: the person presses Private on the agents page; you never set private).
+- In a private folder (the person made its agent private on the agents page) nothing from it is shared with the other agents: your status stays on this computer, and the datastash connector may be refused there; use `datastash api ...`, which uses your own key. A call datastash answers `agent_private` is refused by design: don't retry it or work around it.
 
 ## Keeping status (once per computer)
 
