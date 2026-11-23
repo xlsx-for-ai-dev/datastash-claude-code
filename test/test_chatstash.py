@@ -301,7 +301,7 @@ class Visibility(Base):
         self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
         got = self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]
         out = self.tool("PostToolUse", "ledger_agents_note", got, {"error": "not_typed", "code": "not_typed"})
-        self.assertEqual(out["systemMessage"], ds.REFUSED_LINE)
+        self.assertEqual(out["systemMessage"], "Not done: datastash refused it (not_typed). Nothing changed.")  # 1.0.2: the reason
 
     def test_model_typed_text_is_refused(self):
         self.ask(source="sdk")  # not marked typed by the person

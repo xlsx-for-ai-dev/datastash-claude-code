@@ -315,6 +315,15 @@ From 1.0.0 agents are set up only by the person's typed `/datastash:install`. Wi
 computer, the background listener no longer registers waiting agents: a session whose folder has no agent is told once
 to type `/datastash:install`; an agent 0.9.x already registered is still waited for as above.
 
+From 1.0.2 (XLI-390 install fix) `/datastash:install` works in any folder, the home folder too. The new agent is named
+after the session's own agent (`claude --agent NAME`), else the folder; never after the home folder (that name is the
+computer's user), which gives "agent". In a folder it can't link (home, `/`), the agent the install made is kept for that
+session (`state/session-agent-<session>.json`: its local name and id only), and there (home or `/` only) the one agent
+with no folder of its own is used as the session's agent, so typing `/datastash:install` again reuses it and makes no
+"-2". In any other folder `/datastash:install` makes that folder's own agent (after a home-folder install too). Any refusal is one line
+that says why and who refused (the plugin here, before anything is sent, or datastash, with its code and message). With
+no datastash connector the line is "Type /mcp, pick datastash, choose Authenticate, then run /datastash:install again."
+
 After `/datastash:install` the plugin shows which agents datastash is on (name, public or private), then:
 
 ```
@@ -456,6 +465,7 @@ All in `~/.config/datastash/` (folder mode 700, files mode 600):
 | `state/agent-<name>.json` | the inbox cursor, the ids of messages still "new", and the last wake time (no message text) |
 | `state/agent-<name>.log` | listener log: start, wake counts, HTTP status codes; never the key or message text |
 | `state/agent-<name>.chatkey` | each recent session's chat_key and the chatstash setting it was last told (plugin 1.0.1); never shown to the model or given to a tool call |
+| `state/session-agent-<session>.json` | the agent a session's own `/datastash:install` made, for a folder it can't link (home, `/`): its local name and id only, no key (plugin 1.0.2); removed when that agent is uninstalled |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
 | `state/notices.json` | the once-per-cause notices (key refused, key missing, no agent, folder not linked): the line and whether it was told; never a key |
 | `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |
@@ -749,7 +759,8 @@ An agent can send datastash a capability request, an error report or anything el
 - `python3 -I test/test_proof.py`: each agent's own proof (plugin 0.9.8): only on a datastash connector call made as
   this session's own agent, the AI's own agent_proof always replaced or dropped, never on register or key, never to a
   server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
-- `python3 -I test/test_install.py`: `/datastash:install` and `/datastash:uninstall` (plugin 1.0.0). The slash commands
+- `python3 -I test/test_install.py`: `/datastash:install` and `/datastash:uninstall` (plugin 1.0.0; the home-folder
+  install with the owner's real 1.0.1 note inputs, the reused session agent and the one-line refusals in 1.0.2). The slash commands
   pass the typed check only in the entry shape Claude Code 2.1.330 really writes for a typed plugin command
   (`test/fixtures/slash-command-2.1.330.jsonl` and `-hooks.json`, copied from a real interactive session and only renamed
   and given placeholder ids): the message tag, then the name, the args only when there are some; origin human, no

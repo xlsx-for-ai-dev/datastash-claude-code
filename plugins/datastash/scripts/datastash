@@ -4658,17 +4658,22 @@ def _next_name(name):
     return f"{name}-2"
 
 
-def auto_name(here, me, after=None):
+def _home_or_root(here):
+    """The home folder or "/": a folder whose own name is the computer's user (or nothing), never an agent's name."""
+    return bool(here) and os.path.realpath(here) in ("/", os.path.realpath(HOME))
+
+
+def auto_name(here, me, after=None, session_name=None):
     """("linked", name) when this folder already has its agent (reuse it), ("main", None) for the person's session (never
-    registers), else ("name", the name to register): the folder's name, with -2, -3 when another agent on this
-    machine has it (or datastash refused `after` as taken)."""
+    registers), else ("name", the name to register): the session's own agent name (`claude --agent`), else the folder's
+    name (never for the home folder or "/": the home folder's name is the computer's user, so it is "agent" there), with -2, -3 when another agent on this machine has it (or datastash refused `after` as taken)."""
     if is_main_session(me) or main_root(here) is not None:
         return "main", None
     sess = session_for(here, me=me)
     if sess is not None:
         return ("main", None) if is_person(sess) else ("linked", sess["name"])
     mine = {a["slug"]: a for a in all_agents()}
-    name = _next_name(after) if after else _folder_name(here)
+    name = _next_name(after) if after else session_name or ("agent" if _home_or_root(here) else _folder_name(here))
     for _ in range(1000):
         other = mine.get(slug(name))
         here_linked = other is not None and any(os.path.realpath(p) == here for p in other.get("projects") or [])
@@ -5065,7 +5070,7 @@ def cmd_agent_tool(_args):
         cmd_out = command_tool(inp)  # XLI-390 P1: install and uninstall calls, collect, install notes
     except (Exception, SystemExit):  # fail closed: a note call goes out only with the plugin's own input
         is_note = str(inp.get("tool_name") or "").endswith("__ledger_agents_note")
-        cmd_out = _deny(REFUSED_LINE) if inp.get("hook_event_name") == "PreToolUse" and is_note else None
+        cmd_out = _deny(PLUGIN_ERROR_LINE) if inp.get("hook_event_name") == "PreToolUse" and is_note else None
     if cmd_out is not None:
         cmd_out["hookSpecificOutput"]["hookEventName"] = inp.get("hook_event_name")
         print(json.dumps(cmd_out), flush=True)
@@ -11077,7 +11082,7 @@ NOTE_FIELD = "datastash_note"  # the one field of a datastash tool answer an ins
 AGENT_ANSWER_RE = r"[A-Za-z0-9_\-]{43}"
 CMD_TOOL_RE = re.compile(r"mcp__.+__(ledger_agent_register|ledger_agent_key|ledger_agents_list|ledger_agents_note)")
 CMD_NOTE = "datastash note (install and uninstall; the plugin's own steps)"
-NO_CONNECTOR_LINE = "Connect datastash in Claude first (Settings, Connectors), then run /datastash:install again."
+NO_CONNECTOR_LINE = "Type /mcp, pick datastash, choose Authenticate, then run /datastash:install again."  # XLI-390: one line
 MINT_LINE = 'datastash made a key for "{name}" (this session). datastash is on for "{name}".'
 ON_HEAD = "datastash is on for your agents:"
 REMOVE_LINE = "To remove one or many: /datastash:uninstall and we'll show you the list of agents."
@@ -11093,6 +11098,15 @@ CONNECTOR_SAME_LINE = "Your datastash connector in Claude is unchanged."
 PICK_UNKNOWN_LINE = ("Not done: a name you typed is not on the list, or matches two agents. Nothing was removed. Type the "
                      "names as the list shows them, or all.")
 REFUSED_LINE = "Not done: datastash refused it. Nothing changed."
+# XLI-390 install fix: every refusal is ONE line that says why, and who refused (the plugin here, or datastash).
+NO_STEP_LINE = ("Not done: no /datastash:install or /datastash:uninstall is open in this session, so the plugin sent "
+                "nothing. Nothing changed.")
+NO_OWN_AGENT_LINE = ("Not done: this session has no datastash agent key on this computer yet, so the plugin sent nothing. "
+                     "Type /datastash:install again. Nothing changed.")
+NOT_TYPED_LINE = ("Not done: the plugin could not find your typed command in this session's transcript, so it sent "
+                  "nothing. Type the command again. Nothing changed.")
+USED_LINE = "Not done: that typed command was already used once. Type it again. Nothing changed."
+PLUGIN_ERROR_LINE = "Not done: the plugin hit an error on this computer, so it sent nothing. Nothing changed."
 BRAKED_LINE = "Not done: too many removals just now. Wait a few minutes, then try again."
 NO_ANSWER_KEY_LINE = "Not done: this agent has no datastash answer key yet. Type /datastash:install here first."
 INSTALL_FAILED_LINE = "datastash could not finish the install here. Type /datastash:install again."
@@ -11165,6 +11179,74 @@ def _kc(op, account, value=None):
     return None
 
 
+def server_refused(body, failed=None):
+    """ONE line for a refusal datastash answered: its code and its own message (made plain and short), or `failed`
+    (else REFUSED_LINE) when the answer carries no readable code."""
+    code = (body.get("code") or body.get("error")) if isinstance(body, dict) else None
+    if not isinstance(code, str) or not re.fullmatch(r"[a-z0-9_]{1,48}", code):
+        return failed or REFUSED_LINE
+    msg = body.get("message") if isinstance(body.get("message"), str) else ""
+    msg = re.sub(r"\s+", " ", "".join(ch for ch in msg if unicodedata.category(ch)[0] != "C")).strip()[:240]
+    msg = re.sub(r"\s*Nothing changed\.?$", "", msg).rstrip(" .")
+    return f"Not done: datastash refused it ({code}{': ' + msg if msg else ''}). Nothing changed."
+
+
+def _session_agent_path(sid):
+    return os.path.join(STATE, f"session-agent-{sid}.json")
+
+
+def bind_session_agent(sid, s, agent_id):
+    """XLI-390 install fix: the agent this session's own /datastash:install made, kept for the session (a folder that
+    can't be linked, such as the home folder, has no other way to find it again)."""
+    if sid and re.fullmatch(SID_RE, sid):
+        write_private(_session_agent_path(sid), json.dumps({"slug": s, "agent_id": agent_id.lower(), "at": int(time.time())}))
+
+
+def session_agent(inp):
+    """This session's agent when the folder has none: the one its own install made (bound to the session id), else,
+    ONLY in a folder the plugin can't link (home or "/"), the one agent on this computer with no folder of its own. In
+    any other folder the one-agent fallback is never used here, so /datastash:install there registers that folder's own
+    agent. Only an agent whose config, id and key are all on this computer; never in the person's main session or folder."""
+    me, here = this_session(inp), project_of(inp)
+    if not _fallback_allowed(here, me):
+        return None
+    sid = _sid(inp)
+    rec = read_json(_session_agent_path(sid), None) if sid else None
+    a = None
+    if isinstance(rec, dict) and isinstance(rec.get("slug"), str) and re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,63}", rec["slug"]):
+        c = read_json(conf_path(rec["slug"]), None)
+        if isinstance(c, dict) and c.get("name") and c.get("workbook_id") \
+                and str(c.get("agent_id") or "").lower() == str(rec.get("agent_id") or "-").lower():
+            a = dict(c, slug=rec["slug"])
+    if a is None and _home_or_root(here):
+        a = only_agent()
+    return a if a is not None and isinstance(a.get("agent_id"), str) and re.fullmatch(GRANT_ID_RE, a["agent_id"].lower()) \
+        and read_key(a["slug"]) else None
+
+
+def _drop_session_agents(s):
+    """Uninstall: every state/session-agent-<sid>.json that names agent `s` (fixed file names; the slug read from each)."""
+    try:
+        names = os.listdir(STATE)
+    except OSError:
+        return
+    for f in names:
+        m = re.fullmatch(r"session-agent-(" + SID_RE + r")\.json", f)
+        if m:
+            rec = read_json(_session_agent_path(m.group(1)), None)
+            if not isinstance(rec, dict) or rec.get("slug") == s:
+                _drop(_session_agent_path(m.group(1)))
+
+
+def _session_name(inp):
+    """The name Claude Code gives this session's own agent (`claude --agent NAME`: the hook input's agent_type, never a
+    subagent's), made plain as a folder name is; None when there is none."""
+    if not isinstance(inp, dict) or inp.get("agent_id") is not None or not isinstance(inp.get("agent_type"), str):
+        return None
+    n = _folder_name(inp["agent_type"])
+    return None if n == "agent" or n.lower() in ("general-purpose", "default") else n
+
+
 def save_agent_answer(s, key):
     """The agent's answer key (for typed proofs): the keychain, else a mode-600 file. Never printed."""
     if _kc("put", f"agent-answer-{s}", key):
@@ -11214,6 +11296,7 @@ def remove_agent_here(s):
     clear_notices(notice_causes({"slug": s}))
     for t in AGENT_FILES:
         _drop(_fill(t, s))
+    _drop_session_agents(s)
     left = [a for a in all_agents() if not is_person(a)]
     wb = c.get("workbook_id")
     if isinstance(wb, str) and wb and not any(a.get("workbook_id") == wb for a in left):
@@ -11340,8 +11423,10 @@ def save_cmd(sid, rec):
 
 
 def _own(inp):
+    """This session's agent with its key: the folder's, else the session's own (session_agent)."""
     a = agent_for(project_of(inp), me=this_session(inp))
-    return a if a is not None and isinstance(a.get("agent_id"), str) and read_key(a["slug"]) else None
+    a = a if a is not None and isinstance(a.get("agent_id"), str) and read_key(a["slug"]) else None
+    return a if a is not None else session_agent(inp)
 
 
 def command_prompt(inp):
@@ -11357,12 +11442,14 @@ def command_prompt(inp):
         _mark_gone(False)  # the person's own install: the plugin may set itself up here again
         me, here = this_session(inp), project_of(inp)
         try:
-            kind, name = auto_name(here, me)
+            kind, name = auto_name(here, me, session_name=_session_name(inp))
         except SystemExit:
             return INSTALL_FAILED_LINE, None, True
         if kind == "main":
             return MAIN_HERE_LINE, None, True
         own = _own(inp)
+        if own is not None and read_agent_answer(own["slug"]):
+            name = own["name"]  # XLI-390 install fix: this session's agent again, never a new "-2"
         save_cmd(sid, dict(base, kind="install", name=name, here=here))
         steps = "" if own is not None and read_agent_answer(own["slug"]) else INSTALL_KEY_STEPS.format(name=name)
         return None, INSTALL_AI.format(steps=steps), False
@@ -11463,13 +11550,17 @@ def note_input(inp, rec):
     """PreToolUse of ledger_agents_note: the call's whole input, written by the plugin (kind, list id, target ids and the
     typed proof), or a deny with its fixed line. Only for the person's own typed command, once, while fresh."""
     targets, lst, own = rec.get("targets"), rec.get("list"), _own(inp)
-    if not isinstance(targets, list) or not targets or not isinstance(lst, dict) or own is None:
-        return _deny(REFUSED_LINE)
+    if not isinstance(targets, list) or not targets or not isinstance(lst, dict):
+        return _deny(NO_STEP_LINE)
+    if own is None:
+        return _deny(NO_OWN_AGENT_LINE)
     used = read_json(_typed_used_path(rec["sid"]), {}).get("ids")
     used = used if isinstance(used, list) else []
-    entry = None if rec["pid"] in used else _typed_entry(rec)
+    if rec["pid"] in used:
+        return _deny(USED_LINE)
+    entry = _typed_entry(rec)
     if not isinstance(entry, dict):
-        return _deny(NOT_PERSON_LINE if entry == "not person" else REFUSED_LINE)
+        return _deny(NOT_PERSON_LINE if entry == "not person" else NOT_TYPED_LINE)
     typed_at = _when(entry.get("timestamp"))
     write_private(_typed_used_path(rec["sid"]), json.dumps({"ids": (used + [rec["pid"]])[-50:]}))
     mine = own["agent_id"].lower()
@@ -11535,6 +11626,7 @@ def collect_after_mint(inp, rec, body):
     c = read_json(conf_path(s), {})
     c["answer_store"] = save_agent_answer(s, got["answer_key"])
     write_private(conf_path(s), json.dumps(c, indent=2))
+    bind_session_agent(_sid(inp), s, got["agent_id"])  # XLI-390 install fix: found again in a folder it can't link
     got = None
     return MINT_LINE.format(name=show_name(name))
 
@@ -11596,7 +11688,7 @@ def result_notes(inp):
 
 def _own_agent(inp):
     """This session's own agent (its local record with an agent_id; a key is not needed), or None."""
-    a = agent_for(project_of(inp), me=this_session(inp))
+    a = agent_for(project_of(inp), me=this_session(inp)) or session_agent(inp)
     return a if a is not None and not is_person(a) and isinstance(a.get("agent_id"), str) \
         and re.fullmatch(GRANT_ID_RE, a["agent_id"].lower()) else None
 
@@ -11637,7 +11729,7 @@ def command_tool(inp):
         if not m or m.group(1) != "ledger_agents_note":
             return None
         return note_input(inp, rec) if rec and rec.get("kind") in ("install", "uninstall") + VIS_KINDS and rec.get("targets") \
-            else _deny(REFUSED_LINE)
+            else _deny(NO_STEP_LINE)
     if event not in ("PostToolUse", "PostToolUseFailure") or not name.startswith("mcp__") or "datastash" not in name.lower():
         return None
     body = tool_answer(inp.get("tool_response")) if event == "PostToolUse" else None
@@ -11655,7 +11747,7 @@ def command_tool(inp):
         if lst is None:
             if rec["kind"] in VIS_KINDS:
                 _drop(_cmd_path(sid))
-            return _post(REFUSED_LINE)
+            return _post(server_refused(body))
         if rec["kind"] in VIS_KINDS:  # X6: the typed name, bound to an agent id from this list
             got = resolve_picks(rec.get("picks") or "", lst, None)
             if not isinstance(got, list):
@@ -11718,8 +11810,8 @@ def note_result(inp, rec, body):
         return visibility_result(rec, lst, targets, body)
     if not isinstance(body, dict) or body.get("error") or body.get("code"):
         code = body.get("code") if isinstance(body, dict) else None
-        return OTHERS_FAILED_LINE if rec["kind"] == "install" else (
-            BRAKED_LINE if code in ("braked", "rate_limit_exceeded") else REFUSED_LINE)
+        return server_refused(body, OTHERS_FAILED_LINE) if rec["kind"] == "install" else (
+            BRAKED_LINE if code in ("braked", "rate_limit_exceeded") else server_refused(body))
     if rec["kind"] == "install":
         return "\n".join(list_lines(lst, ON_HEAD) + AFTER_INSTALL)
     names = {a["id"]: a["name"] for a in lst["agents"]}
@@ -11769,7 +11861,7 @@ def visibility_result(rec, lst, targets, body):
     line, shown only when it is that line over names on the list; this computer's private record follows what changed."""
     if not isinstance(body, dict) or body.get("error") or body.get("code"):
         code = body.get("code") or body.get("error") if isinstance(body, dict) else None
-        return VIS_BRAKED_LINE if code in ("braked", "rate_limit_exceeded") else REFUSED_LINE
+        return VIS_BRAKED_LINE if code in ("braked", "rate_limit_exceeded") else server_refused(body)
     names = {a["id"]: a["name"] for a in lst["agents"]}
     changed = body.get("changed") if isinstance(body.get("changed"), list) else []
     line = body.get("line")
