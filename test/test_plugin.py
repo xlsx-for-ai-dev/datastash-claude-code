@@ -1652,6 +1652,10 @@ class SelfRegistration(MainBase):
         ctx = json.loads(out.getvalue())["hookSpecificOutput"]["additionalContext"]
         self.assertIn("not a datastash agent yet", ctx)
         self.assertIn("never register an agent or get a key yourself", ctx)  # XLI-375: the plugin sets it up
+        # Release 1.0.0: the line points to /datastash:install, not to allowing it on /agents.
+        self.assertIn("/datastash:install", ctx)
+        self.assertNotIn("/agents", ctx)
+        self.assertNotIn("allows it on", ctx)
         # After register + fetch + link (the skill's steps), the folder is that agent.
         os.environ["CLAUDE_PROJECT_DIR"] = proj
         with redirect_stdout(io.StringIO()):

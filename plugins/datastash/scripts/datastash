@@ -2739,9 +2739,9 @@ def cmd_check(_args):
                 s_w = slug(w[1]["name"])
                 raise_notice(notice_cause("waiting", s_w), notice_text("waiting", agent={"name": w[1]["name"]}))
                 warn = warn + take_notices([notice_cause("waiting", s_w)])
-            warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. The datastash plugin sets this '
-                           "folder's agent up by itself once this computer is signed in, and the person allows it on "
-                           f"{AGENTS_URL}; never register an agent or get a key yourself."]
+            warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. To set it up, the person types '
+                           "/datastash:install in this session (the plugin does it); never register an agent or get a "
+                           "key yourself."]
         emit(" ".join(warn + _no_agent_notices(project, me)) + tail)
         return 0
     pre = "".join(w + " " for w in warn)
