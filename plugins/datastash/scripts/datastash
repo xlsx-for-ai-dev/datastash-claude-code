@@ -2074,7 +2074,7 @@ def _free_name(folder, taken=None, prefer=None):
     mine = {a["slug"] for a in all_agents()} | {slug(r["name"]) for r in _enrolled().values()}
     name = _next_name(taken) if taken else (_folder_name(prefer) if prefer else _folder_name(folder))
     for _ in range(1000):
-        if name.strip().lower() not in RESERVED_NAMES and slug(name) not in mine:
+        if not name_reserved(name) and slug(name) not in mine:
             return name
         name = _next_name(name)
     return None
@@ -3503,6 +3503,8 @@ def cmd_fetch(args):
     if len(args) not in (1, 2):
         die("usage: datastash fetch NAME [-|PICKUP_CODE] [--force]  (\"-\" or no code: read the code from stdin)")
     name = args[0].strip()
+    if pick_word_like(name):
+        die(RESERVED_NAME_LINE.format(name=disp(name)) + " The code was not used.")
     if len(args) == 1 or args[1] == "-":
         code = sys.stdin.readline(512).strip()
     else:
@@ -3544,6 +3546,8 @@ def cmd_link(args):
     if not args:
         die("usage: datastash link NAME --workbook WORKBOOK_ID [--agent-id ID] [--project DIR]")
     name = args[0].strip()
+    if pick_word_like(name):
+        die(RESERVED_NAME_LINE.format(name=disp(name)))
     opts = {}
     it = iter(args[1:])
     for a in it:
@@ -4645,6 +4649,9 @@ def cmd_api(args):
     if not path_ok(path):
         die(f"PATH must start with {API_PREFIX} (no \"..\" segments, no fragment)")
     body = api_body(args[2]) if len(args) > 2 else None
+    if posixpath.normpath(urllib.parse.unquote(path.split("?", 1)[0])).rstrip("/").lower() == AGENT_REGISTER_PATH \
+            and isinstance(body, dict) and isinstance(body.get("name"), str) and pick_word_like(body["name"]):
+        die(RESERVED_NAME_LINE.format(name=disp(body["name"])))
     here = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     me = this_session()
     if main_root(here) is not None:
@@ -4798,6 +4805,29 @@ def make_main_dir():
 
 
 RESERVED_NAMES = ("person", "datastash", "@feedback")
+# 1.0.11 review 2: the words the name commands (uninstall, make <names> private/public) read as words, never as names:
+# "all" (every agent), "this" (this session's agent) and "and" (a separator). No agent is ever named like one of them.
+PICK_WORDS = ("all", "this", "and")
+# Latin look-alikes of the letters in PICK_WORDS (Cyrillic, Greek, fullwidth is folded by NFKC), for name_reserved only.
+_PICK_LOOKALIKE = str.maketrans("аαіιɩӏⅼѕτһԁոпη", "aaiiillsthdnnn")
+
+
+def pick_word_like(v):
+    """The pick word (all, this, and) a name reads as, compared case-insensitively, trimmed, and folded the way the name
+    commands fold names (spaces, dashes, dots, look-alike letters), else None."""
+    if not isinstance(v, str):
+        return None
+    f = fold_name(v.translate(_PICK_LOOKALIKE))
+    return next((w for w in PICK_WORDS if v.strip().casefold() == w or f == fold_name(w)), None)
+
+
+def name_reserved(name):
+    """True when a new agent may never be named `name`: a reserved name (person, datastash, @feedback) or a pick word."""
+    return not isinstance(name, str) or name.strip().lower() in RESERVED_NAMES or pick_word_like(name) is not None
+
+
+RESERVED_NAME_LINE = ('"{name}" is a word the datastash name commands keep ("all", "this", "and"), so no agent is named '
+                      "like it. Pick another name. Nothing was saved.")
 
 
 def _folder_name(here):
@@ -4834,7 +4864,7 @@ def auto_name(here, me, after=None, session_name=None):
     for _ in range(1000):
         other = mine.get(slug(name))
         here_linked = other is not None and any(os.path.realpath(p) == here for p in other.get("projects") or [])
-        if name.strip().lower() not in RESERVED_NAMES and (other is None or here_linked):
+        if not name_reserved(name) and (other is None or here_linked):
             return "name", name
         name = _next_name(name)
     die("no free agent name for this folder")
@@ -12306,11 +12336,16 @@ def remove_box():
     _mark_gone(True)
 
 
-def show_name(v):
-    """An agent name as the person sees it: no control or bidi characters, at most 64 characters (EPM MUST 2)."""
+def _shown_full(v):
+    """show_name without the 64-character cut ("" when nothing is left)."""
     v = "".join(ch for ch in str(v) if unicodedata.category(ch)[0] != "C" and ch not in "‎‏‪‫‬"
                 "‭‮⁦⁧⁨⁩")
-    return re.sub(r"\s+", " ", v).strip()[:64] or "?"
+    return re.sub(r"\s+", " ", v).strip()
+
+
+def show_name(v):
+    """An agent name as the person sees it: no control or bidi characters, at most 64 characters (EPM MUST 2)."""
+    return _shown_full(v)[:64] or "?"
 
 
 _LOOKALIKE = str.maketrans("01i|53", "olllse")
@@ -12343,51 +12378,88 @@ _PICK_TOKEN_RE = re.compile(r'"([^"]*)"|“([^”"]*)”|([^\s,"“”]+)|(["“
 _RESERVED = ("all", "this")
 
 
-def pick_tokens(text):
+def pick_tokens(text, keep_and=False):
     """The typed names as ([(token, quoted)], error | None). Tokens are split at whitespace, commas and the word "and";
-    a name with spaces counts only in double quotes. Tokens are never joined into a longer name."""
+    a name with spaces counts only in double quotes. Tokens are never joined into a longer name. keep_and: a bare "and"
+    is kept as a token too (pick_check tells it from a name)."""
     out, err = [], None
     for m in _PICK_TOKEN_RE.finditer(text or ""):
         q, cq, word, stray = m.groups()
         if stray is not None:
             err = err or "quote"
         elif word is not None:
-            if word.casefold() != "and":
+            if keep_and or word.casefold() != "and":
                 out.append((word, False))
         else:
             out.append((q if q is not None else cq, True))
     return out, err
 
 
-def _pick_match(tok, quoted, lst):
-    """("reserved" | "one" | "two" | "unknown", ids) for one token: equal to exactly one listed name, ignoring case, and
-    no other listed name that differs from it only by case, spaces, dashes or look-alike letters."""
-    if not quoted and tok.casefold() in _RESERVED:
-        return "reserved", []
-    t = show_name(tok).casefold() if tok.strip() else ""
-    same = [a for a in lst["agents"] if a["name"].casefold() == t]
+def _pick_index(lst):
+    """(listed names by casefold, how many listed names share each fold, [(pick word, agent)] for every listed agent
+    named like a pick word): built once per pick, so every token is matched in constant time."""
+    low, folds, kept = {}, {}, []
+    for a in lst["agents"]:
+        low.setdefault(a["name"].casefold(), []).append(a)
+        f = fold_name(a["name"])
+        folds[f] = folds.get(f, 0) + 1
+        w = pick_word_like(a["name"])
+        if w:
+            kept.append((w, a))
+    return low, folds, kept
+
+
+def _pick_match(tok, quoted, idx):
+    """("reserved" | "kept" | "skip" | "one" | "two" | "unknown", ids) for one token. A pick word is never a name: a
+    token that reads as one is "kept" when a listed agent is named like that word (ambiguous: refused), else the word
+    itself unquoted ("reserved"; a bare "and" is a separator, "skip"), else "unknown". Otherwise the token must equal
+    exactly one listed name, ignoring case, with no other listed name that differs from it only by case, spaces,
+    dashes or look-alike letters; in double quotes, a name typed character for character as exactly one listed name
+    picks it even then."""
+    low, folds, kept = idx
+    w = pick_word_like(tok)
+    if w is not None:
+        if any(k == w for k, _ in kept):
+            return "kept", []
+        if not quoted and tok.casefold() == "and":
+            return "skip", []
+        if not quoted and tok.casefold() in _RESERVED:
+            return "reserved", []
+        return "unknown", []
+    full = _shown_full(tok)
+    if not full or len(full) > 64:  # cycle 2 LOW 1: never a match on the first 64 characters of a longer token
+        return "unknown", []
+    same = low.get(full.casefold(), [])
     if not same:
         return "unknown", []
-    near = [a for a in lst["agents"] if fold_name(a["name"]) == fold_name(tok)]
-    return ("one", [same[0]["id"]]) if len(same) == 1 and len(near) <= 1 else ("two", [])
+    if len(same) == 1 and folds.get(fold_name(full), 0) <= 1:
+        return "one", [same[0]["id"]]
+    exact = [a for a in same if a["name"] == full]
+    return ("one", [exact[0]["id"]]) if quoted and len(exact) == 1 else ("two", [])
 
 
 def pick_check(text, lst, own, reserved=True):
     """The one strict parser for every command that takes agent names (uninstall, make <names> private/public).
     (picked ids | "none" | None, the token that failed or None, why). "none" when no token names anything (the prompt is
     something else, and the failing token, if any, is still given); None refuses the whole command, changing nothing:
-    a token unknown ("unknown") or matching two agents ("two"), "all"/"this" next to any other token ("mixed") or where
-    they are not names ("reserved", when reserved is False), an unclosed quote ("quote"), more than 100 names ("many")."""
-    toks, err = pick_tokens(text)
-    if len(toks) > 100:
-        return None, None, "many"
-    seen = [(t, q, *_pick_match(t, q, lst)) for t, q in toks]
-    hits = sum(1 for _, _, k, _ in seen if k in ("one", "two") or (reserved and k == "reserved"))
+    a token unknown ("unknown") or matching two agents ("two"), a pick word while a listed agent is named like it
+    ("kept"), "all"/"this" next to any other token ("mixed") or where they are not names ("reserved", when reserved is
+    False), an unclosed quote ("quote"), more than 100 names ("many")."""
+    toks, err = pick_tokens(text, keep_and=True)
+    idx = _pick_index(lst)
+    seen = [(t, q, *_pick_match(t, q, idx)) for t, q in toks]
+    seen = [x for x in seen if x[2] != "skip"]
+    hits = sum(1 for _, _, k, _ in seen if k in ("one", "two", "kept") or (reserved and k == "reserved"))
     first_bad = next(((t, k) for t, _, k, _ in seen if k in ("unknown", "two")), (None, "unknown"))
     if hits == 0:
         return "none", *first_bad
+    if len(seen) > 100:  # cycle 2 LOW 2: after "names nothing", so a long ordinary prompt passes through
+        return None, None, "many"
     if err:
         return None, '"', "quote"
+    kept = next((t for t, _, k, _ in seen if k == "kept"), None)
+    if kept is not None:
+        return None, kept, "kept"
     res = [t for t, _, k, _ in seen if k == "reserved"]
     if res:
         if not reserved:
@@ -12421,7 +12493,13 @@ def pick_refused_why(text, lst, own, reserved=True):
         return "a quote is not closed; put a name with spaces in double quotes"
     if tok is None:
         return None
-    t, names = show_name(tok), [a["name"] for a in lst["agents"]]
+    t, names = show_name(tok) + ("..." if len(_shown_full(tok)) > 64 else ""), [a["name"] for a in lst["agents"]]
+    if why == "kept":
+        w = pick_word_like(tok)
+        kept = [a["name"] for k, a in _pick_index(lst)[2] if k == w]
+        return (f'"{t}" is a word this command keeps, never a name, and your agent '
+                f'{", ".join(chr(34) + n + chr(34) for n in kept)} is named like it, so that agent can\'t be picked by '
+                "name: it must be renamed first (the plugin picks agents only by name, never by id)")
     if why == "mixed":
         return f'"{t}" must be typed alone, never with other names'
     if why == "reserved":
@@ -12429,10 +12507,11 @@ def pick_refused_why(text, lst, own, reserved=True):
     if why == "two":
         close = [n for n in names if fold_name(n) == fold_name(tok)]
         head = f'"{t}" matches more than one agent'
-    else:
-        low = {n.casefold(): n for n in names}
-        close = [low[c] for c in difflib.get_close_matches(t.casefold(), list(low), n=3, cutoff=0.5)]
-        head = f'"{t}" is not on the list'
+        tail = "; type one in double quotes exactly as the list shows it"
+        return head + (f" (closest exact names: {', '.join(chr(34) + n + chr(34) for n in close)})" if close else "") + tail
+    low = {n.casefold(): n for n in names}
+    close = [low[c] for c in difflib.get_close_matches(t.casefold(), list(low), n=3, cutoff=0.5)]
+    head = f'"{t}" is not on the list'
     return head + (f" (closest exact names: {', '.join(chr(34) + n + chr(34) for n in close)})" if close else "")
 
 
@@ -12767,6 +12846,10 @@ def command_tool(inp):
     sid = _sid(inp)
     rec = load_cmd(sid)
     if event == "PreToolUse":
+        if m and m.group(1) == "ledger_agent_register":  # 1.0.11 review 2: no agent is ever named like a pick word
+            ti = inp.get("tool_input") if isinstance(inp.get("tool_input"), dict) else {}
+            nm = ti.get("name")
+            return _deny(RESERVED_NAME_LINE.format(name=disp(nm))) if isinstance(nm, str) and pick_word_like(nm) else None
         if not m or m.group(1) != "ledger_agents_note":
             return None
         return note_input(inp, rec) if rec and rec.get("kind") in ("install", "uninstall") + VIS_KINDS and rec.get("targets") \

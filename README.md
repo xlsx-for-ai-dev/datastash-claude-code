@@ -467,6 +467,15 @@ typed twice picks its agent once. "all" works only when it is the single token (
 private/public). If any token is unknown or ambiguous, or "all" is typed next to another token, the whole command is
 refused and nothing changes: the refusal names the failing token and its closest exact names, and the AI is told to say
 only "Nothing was removed." (or "Nothing was changed.").
+"all", "this" and "and" are words of these commands, never agent names (compared ignoring case, spaces, dashes, dots
+and look-alike letters, so "ALL", "a-ll" and a fullwidth "ａｌｌ" count too). No naming path gives one: a folder or
+`claude --agent` name that is one gets the next free name by the install rule (a folder named "all" is agent "all-2"),
+and `datastash link`, `datastash fetch`, `datastash api POST /api/v1/agent/register` and the AI's own
+`ledger_agent_register` call refuse it. An agent that already has such a name (made before names were checked) is never
+picked by name: typing the word, quoted or not, refuses the whole command and says that agent must be renamed first (the
+plugin picks agents only by name, never by id); every other name still works. Two names that differ only by case, a
+dot, a dash or a space are picked one at a time in double quotes, typed character for character as the list shows them.
+A token longer than 64 characters is never a name.
 
 **make <name> private / make <name> public** (plugin 1.0.1). Typed as the whole prompt in an agent's session, with the
 name as the list shows it (several names separated by commas or spaces; "all" and "this" are not names here, so "make this
