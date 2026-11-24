@@ -70,7 +70,7 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
 
    When it asks where to install, pick "for you". (Or in your shell: `claude plugin marketplace add
    xlsx-for-ai-dev/datastash-claude-code`, then `claude plugin install datastash@datastash`.)
-3. **Restart Claude Code.**
+3. **Type `/exit`, then start `claude` again.**
 4. **Connect once.** Type `/mcp`, pick datastash, choose Authenticate, and sign in. This is needed only once.
 5. **Make this session an agent.** Type `/datastash:install`. If it says "Type /mcp, pick datastash, choose
    Authenticate, then run /datastash:install again.", do that one step and type `/datastash:install` again.
@@ -97,12 +97,11 @@ In Claude chat on claude.ai, the desktop app and Cowork, nothing changes: the da
 usual **Connect** button. The plugin needs no shell or keychain there.
 
 **Updating from 0.1.x.** An install that signed in through `/mcp` Authenticate keeps that sign-in working. The plugin
-decides this from its own files only: if an earlier datastash version left any state on this computer, it is an
-updated install and keeps the connector's own sign-in; with no datastash state at all it is a fresh install, which
-signs in with `/mcp` Authenticate. It never opens, reads or checks Claude Code's own sign-in file or keychain entries. An updated
-install's session start shows the same device link and code, worded as "datastash has a new sign-in for this
-computer"; once you approve one, the new sign-in takes over for good. Thirty days after the first run of 0.2.0 it
-takes over anyway, with one line a week before. `datastash doctor` shows the mode, since when, and what the connector gets on this host.
+decides this from its own files only and never opens, reads or checks Claude Code's own sign-in file or keychain
+entries. Since 1.0.0 no session start shows a sign-in link or code and the plugin starts no sign-in by itself: a
+computer that already has a datastash login from an earlier version (`datastash login`) keeps using it, and anything
+else signs in with `/mcp` Authenticate (step 4). If `/mcp` shows datastash as not connected after an update, choose
+Authenticate there once. `datastash doctor` shows the mode, since when, and what the connector gets on this host.
 
 About `datastash login`:
 
@@ -159,7 +158,7 @@ Two choices of your own, each on or off by itself, for all your agents on this c
   back in plain words, so your session stays readable and its context stays small.
 - **No code in sessions** (off from the start): code reading, writing and code blocks stay in subagents too.
 
-The session start gives the agent the rules only for what is on. Clean sessions enforces subagents (plugin 1.0.2,
+The session start gives the agent the rules only for what is on. Clean sessions enforces subagents (plugin 1.0.3,
 XLI-396): while either choice is on, the main session (Claude Code's hook input carries `agent_id` only inside a
 subagent) is refused Edit, Write, MultiEdit and NotebookEdit, and any Bash call that is not one short read-only lookup,
 with one fixed line: "Clean sessions is on: hand this to a subagent (Agent tool), then report the result in plain
@@ -793,7 +792,7 @@ An agent can send datastash a capability request, an error report or anything el
   is said again by the listener. X6: "make <name> private" / "make <name> public" signed over the list's agent id like uninstall,
   the server's fixed line shown only over names on the list, model-typed text refused, unknown names left as ordinary
   prompts, and the after-install lines.
-- `python3 -I test/test_clean.py`: clean sessions (plugin 0.8.0; enforced in 1.0.2, XLI-396): the two choices and their
+- `python3 -I test/test_clean.py`: clean sessions (plugin 0.8.0; enforced in 1.0.3, XLI-396): the two choices and their
   phrases, the session-start rules, and the refusal: the main session's Edit, Write, MultiEdit and NotebookEdit and its
   writing Bash (redirects, pipes, chains, substitutions, background runs, anything off the list) refused with the one
   line, read-only lookups and the `datastash` reads let through (bypass tricks such as `ls x#;touch F` tried in a real bash, never running), datastash writes and abbreviated long options refused, no code in sessions refusing the lookups that show
