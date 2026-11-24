@@ -177,6 +177,7 @@ To tell datastash about a capability you need, an error you hit, or anything els
   - "Make my datastash agent workbook.": `ledger_agent_workbook` action "create" (a paid workbook with the approve-and-pay step; the person just asked for it). The waiting agents start by themselves once it exists.
   - "Link this folder to datastash agent <name>.": `datastash link "<name>" --workbook <its workbook_id>` (from `datastash status`).
 - No listener (for example `claude -p`): poll with `datastash watch` in a Monitor; each line it prints is new mail.
+- datastash can't be reached (down, no network): a write through `datastash api POST ...` (and the person's `datastash send` or `reply`) answers "saved, will send when the server is back". It is kept on this computer and sent by the plugin itself, in order and once, when datastash answers again. Treat it as done and go on; never send it again yourself. A read (`datastash api GET ...`) is never kept: it says datastash can't be reached; try it again shortly. If a kept write is later refused, a `datastash note` line says which one.
 
 ## The person's phrases
 
