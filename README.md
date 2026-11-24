@@ -274,6 +274,31 @@ the commit's flaky bookkeeping (no Test failures or Test runs rows), since the r
   `flaky_commits` once.
 - The key is an agent key kept as a CI secret; it is never printed.
 
+## Eval tracking (plugin 1.0.6)
+
+`datastash eval-report` sends one eval run into the agent workbook's evals tabs. Set them up once with
+`ledger_feeds_setup {services: ["evals"]}`. **Evals** has one row per suite, case, model and version (runs, passes, scores,
+times, tokens, the eval tool's own cost). **Eval versions** has one row per suite, model and version. The engine computes
+pass_rate, avg_score, delta_vs_prev, worse_count and got_worse (the answer has a ready watch, "an eval got worse").
+
+```
+datastash eval-report results.jsonl --suite checkout --version v12 --model model-a --vs v11
+```
+
+- **Formats.** JSONL has one object per case run: `case` (or `id`/`name`), `passed` (or `pass`/`success`), `score`,
+  `ms`, `tokens`, `cost`, `model`, `output`. A case with no pass field passes when its score is at least `--pass-at`
+  (default 1.0). promptfoo's JSON output (`promptfoo eval -o out.json`) and an Inspect eval log (JSON) are also read.
+- **--vs PREV** reads PREV's rows of the same cases first and copies each one's pass as `prev_passed`, so the engine's
+  `worse` column flags a case that passed before and fails now. The cases that got worse are one filter on tab Evals
+  (`version_key` and `worse` 1).
+- **What is sent.** Suite, case, model and version names, pass, scores, counts, times, tokens, cost and a sha256 of the
+  output (`--no-output-hash` leaves it out). Never prompts, vars, outputs, expected answers or grader text. Keep customer
+  data out of case names.
+- Scores go in as `score_milli` (times 1000) and cost as `cost_micros`, because the server's add-to-count takes whole
+  numbers. Every rate is the engine's formula, never this command's math.
+- Like ci-report, it never fails a build: every problem prints one line and exits 0. It uses the same agent key
+  (`DATASTASH_AGENT_KEY`), workbook (`DATASTASH_WORKBOOK_ID` or `--workbook`), brake waits and idempotent 1,000-row pages.
+
 ## Time per card (plugin 1.0.5)
 
 `datastash time-per-card on`, run once in a project folder by its agent, turns time per card on for that folder and sets
@@ -884,6 +909,10 @@ An agent can send datastash a capability request, an error report or anything el
   refused; rows folded; flaky in either order (also across legs that ran different tests), at once (counted once), in a
   retry, and never for shards, skips, another commit or a `--local` run; main_broke_at; the week four weeks back; pages of 1,000 with idempotency keys; 429 and busy waited out; old
   Test runs rows removed; exit 0 with one line for every problem, a bad wait or retry setting and a server that does not answer.
+- `python3 -I test/test_eval_report.py`: `datastash eval-report` (plugin 1.0.6): a canary in prompts, vars, expected
+  answers and outputs never sent or printed, only allow-listed fields; JSONL, promptfoo and Inspect read; runs folded with
+  whole-number incs; `--vs` copying prev_passed (read before the write) and none for a new case; exit 0 with one line for
+  every problem.
 - `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5): off until `on` (which sets up the tabs), the
   hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's
   tokens counted once; active minutes only (no question, permission prompt, compaction or pause time; whole minutes

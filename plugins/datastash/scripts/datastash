@@ -49,6 +49,12 @@ Subcommands (run `datastash help`):
                             "tests"), with flaky and main-broke bookkeeping. Agent key in DATASTASH_AGENT_KEY, workbook id
                             in DATASTASH_WORKBOOK_ID. Only ids, counts, times, the error class and a hash of the first
                             message line are sent, never message text. Always exits 0 (never fails a build)
+  eval-report <results ...> --suite S --version V [--model M] [--vs PREV]
+                            eval results (JSONL, promptfoo JSON or an Inspect log) into the agent workbook's evals tabs
+                            (ledger_feeds_setup "evals"): one row per case, model and version; --vs copies each case's
+                            pass at PREV so the engine flags the cases that got worse. Only names, pass, scores, counts,
+                            times, tokens, cost and a hash of the output are sent, never prompts or outputs. Agent key and
+                            workbook as for ci-report. Always exits 0
   time-per-card [on | off]  time per card for this folder's agent (off until on; on sets up the tabs Burn, Cards cost
                             and Prices): at each subagent stop and session end the plugin reads this session's own Claude
                             Code transcripts here and sends minutes, tool calls and token counts per card, activity and
@@ -13319,6 +13325,256 @@ def cmd_ci_report(args):
     return 0
 
 
+# --- XLI-378 D: datastash eval-report, eval results into the "evals" preset (ledger_feeds_setup services ["evals"]:
+# Evals, one row per suite, case, model and version; Eval versions, one row per suite, model and version).
+#
+# Reads a results file on this computer or in CI: JSONL (one object per case run: case, passed, score, ms, tokens, cost,
+# model, output), promptfoo's JSON output (results.results[]) or an Inspect eval log (samples[]). Privacy (plan section 1):
+# prompts, vars, outputs, expected answers and grader text are never sent or printed; only suite, case, model and version
+# names, pass, score, counts, times, tokens, the tool's own cost and (unless --no-output-hash) a sha256 of the output.
+# Runs of one case fold into its row with inc; inc takes whole numbers, so a score goes in as score_milli (times 1000) and a
+# cost as cost_micros (millionths). Every rate (pass_rate, delta_vs_prev, worse_count, ...) is the engine's formula column;
+# this command does no math on them. With --vs PREV it first reads PREV's rows of the same cases and copies each one's
+# passed as prev_passed, so the engine's worse column can see a case that passed before and fails now.
+# Like ci-report, a reporting problem never fails the build: one line, exit 0 (the same client: brakes waited out, pages of
+# 1,000 rows with an idempotency key each).
+EV_USAGE = ("usage: datastash eval-report <results.jsonl | promptfoo.json | inspect-log.json ...> --suite S --version V "
+            "[--model M] [--vs PREV] [--pass-at 1.0] [--no-output-hash] [--workbook ID]  (agent key in "
+            "DATASTASH_AGENT_KEY, workbook id in DATASTASH_WORKBOOK_ID or --workbook)")
+EV_EVALS, EV_VERSIONS = "Evals", "Eval versions"
+EV_INSPECT_PASS = {"C": True, "I": False}  # Inspect's correct / incorrect marks; P (partial) and N count as not passed
+
+
+def _ev_num(v):
+    """A finite number from a result field (not a bool), or None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v) if math.isfinite(v) else None
+
+
+def _ev_hash(out):
+    if out is None or out == "":
+        return None
+    text = out if isinstance(out, str) else json.dumps(out, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _ev_record(case, passed, score, ms, tokens, cost, model, output):
+    return {"case": ci_clean(case, 400), "passed": passed, "score": score, "ms": ms, "tokens": tokens, "cost": cost,
+            "model": ci_clean(model, 200) if isinstance(model, str) else "", "output": output}
+
+
+def _ev_promptfoo(doc):
+    res = doc.get("results")
+    rows = res.get("results") if isinstance(res, dict) else res
+    out = []
+    for i, r in enumerate(rows if isinstance(rows, list) else []):
+        if not isinstance(r, dict):
+            continue
+        tc = r.get("testCase") if isinstance(r.get("testCase"), dict) else {}
+        resp = r.get("response") if isinstance(r.get("response"), dict) else {}
+        usage = resp.get("tokenUsage") if isinstance(resp.get("tokenUsage"), dict) else (
+            r.get("tokenUsage") if isinstance(r.get("tokenUsage"), dict) else {})
+        prov = r.get("provider")
+        model = (prov.get("label") or prov.get("id")) if isinstance(prov, dict) else prov
+        case = tc.get("description") or r.get("description") or f"test-{r.get('testIdx', i)}"
+        out.append(_ev_record(case, r.get("success") if isinstance(r.get("success"), bool) else None, _ev_num(r.get("score")),
+                              _ev_num(r.get("latencyMs")), _ev_num(usage.get("total")), _ev_num(r.get("cost")), model,
+                              resp.get("output")))
+    return out
+
+
+def _ev_inspect(doc):
+    ev = doc.get("eval") if isinstance(doc.get("eval"), dict) else {}
+    model = ev.get("model") if isinstance(ev.get("model"), str) else ""
+    out = []
+    for s in doc.get("samples") if isinstance(doc.get("samples"), list) else []:
+        if not isinstance(s, dict):
+            continue
+        scores = s.get("scores") if isinstance(s.get("scores"), dict) else {}
+        first = next((v for v in scores.values() if isinstance(v, dict)), {})
+        val = first.get("value")
+        passed, score = None, _ev_num(val)
+        if isinstance(val, str) and val in EV_INSPECT_PASS:
+            passed, score = EV_INSPECT_PASS[val], (1.0 if EV_INSPECT_PASS[val] else 0.0)
+        elif isinstance(val, str):
+            passed, score = False, (0.5 if val == "P" else 0.0)
+        elif isinstance(val, bool):
+            passed, score = val, (1.0 if val else 0.0)
+        usage = s.get("model_usage") if isinstance(s.get("model_usage"), dict) else {}
+        tokens = sum(_ev_num(u.get("total_tokens")) or 0 for u in usage.values() if isinstance(u, dict)) or None
+        t = _ev_num(s.get("total_time"))
+        out.append(_ev_record(str(s.get("id", "")), passed, score, t * 1000 if t is not None else None, tokens, None, model,
+                              (s.get("output") or {}).get("completion") if isinstance(s.get("output"), dict) else None))
+    return out
+
+
+def ev_parse(paths):
+    """The case runs in the results files, as records; raises CiProblem with a plain reason. Only the fields the records
+    keep are read (vars, prompts and expected answers are never looked at)."""
+    recs = []
+    for path in paths:
+        name = os.path.basename(path)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError as e:
+            raise CiProblem(f"{name}: can't be read ({e.strerror or e})")
+        doc = None
+        if text.lstrip().startswith(("{", "[")):
+            try:
+                doc = json.loads(text)
+            except ValueError:
+                doc = None  # JSONL: one object per line
+        if isinstance(doc, dict) and "samples" in doc and "eval" in doc:
+            recs += _ev_inspect(doc)
+            continue
+        if isinstance(doc, dict) and "results" in doc:
+            recs += _ev_promptfoo(doc)
+            continue
+        lines = doc if isinstance(doc, list) else None
+        if lines is None:
+            lines = []
+            for n, line in enumerate(text.splitlines(), 1):
+                if not line.strip():
+                    continue
+                try:
+                    lines.append(json.loads(line))
+                except ValueError:
+                    raise CiProblem(f"{name}: line {n} is not JSON (JSONL, promptfoo or Inspect JSON expected)")
+        for r in lines:
+            if not isinstance(r, dict):
+                continue
+            passed = next((r[k] for k in ("passed", "pass", "success") if isinstance(r.get(k), bool)), None)
+            recs.append(_ev_record(r.get("case") or r.get("id") or r.get("name") or "", passed, _ev_num(r.get("score")),
+                                   _ev_num(r.get("ms") if "ms" in r else r.get("latency_ms")), _ev_num(r.get("tokens")),
+                                   _ev_num(r.get("cost")), r.get("model"), r.get("output")))
+    return recs
+
+
+def eval_report(paths, suite, version, model, prev, key, wb, pass_at=1.0, output_hash=True, now=None):
+    """Send one eval run. Returns a summary dict; raises CiProblem with a plain reason."""
+    now = time.time() if now is None else now
+    recs = ev_parse(paths)
+    cases = {}
+    for r in recs:
+        m = model or r["model"]
+        if not r["case"]:
+            raise CiProblem("a result has no case name (case, id or name)")
+        if not m:
+            raise CiProblem(f"no model for case {ci_clean(r['case'], 60)}: pass --model")
+        passed = r["passed"] if r["passed"] is not None else (r["score"] is not None and r["score"] >= pass_at)
+        c = cases.setdefault((r["case"], m), {"runs": 0, "passes": 0, "score_milli": 0, "ms": 0, "tokens": 0, "cost_micros": 0})
+        c["runs"] += 1
+        c["passes"] += 1 if passed else 0
+        c["passed"] = passed
+        score = r["score"] if r["score"] is not None else (1.0 if passed else 0.0)
+        c["last_score"] = score
+        c["score_milli"] += int(round(score * 1000))
+        for f, v, mul in (("ms", r["ms"], 1), ("tokens", r["tokens"], 1), ("cost_micros", r["cost"], 1_000_000)):
+            if v is not None and v >= 0:
+                c[f] += int(round(v * mul))
+        h = _ev_hash(r["output"]) if output_hash else None
+        if h:
+            c["output_hash"] = h
+    if not cases:
+        raise CiProblem("no eval results in " + ", ".join(os.path.basename(p) for p in paths))
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
+    ekey = lambda case, m, v: f"{suite} / {case} / {m} / {v}"  # noqa: E731
+    vkey = lambda m, v: f"{suite} / {m} / {v}"  # noqa: E731
+    client = CiClient(key, wb, time.time() + CI_WAIT_SECONDS)
+    tag = "eval-report-" + secrets.token_hex(8)
+    before = {}
+    if prev:  # each case's passed at the version this one is compared with (a copy; the engine decides "worse")
+        before = client.get(EV_EVALS, [ekey(c, m, prev) for c, m in sorted(cases)])
+    rows = []
+    for (case, m), c in sorted(cases.items()):
+        r = {"key": ekey(case, m, version), "suite": suite, "case": case, "model": m, "version": version,
+             "version_key": vkey(m, version), "runs": {"inc": c["runs"]}, "passes": {"inc": c["passes"]},
+             "score_milli": {"inc": c["score_milli"]}, "last_score": c["last_score"], "passed": c["passed"],
+             "ms_sum": {"inc": c["ms"]}, "tokens": {"inc": c["tokens"]}, "cost_micros": {"inc": c["cost_micros"]},
+             "first_seen": {"min": iso}, "last_seen": {"max": iso}}
+        p = (before.get(ekey(case, m, prev)) or {}).get("passed") if prev else None
+        if isinstance(p, bool):
+            r["prev_passed"] = p
+        if c.get("output_hash"):
+            r["output_hash"] = c["output_hash"]
+        rows.append(r)
+    client.upsert(EV_EVALS, rows, tag + "-e")
+    models = sorted({m for _c, m in cases})
+    vrows = []
+    for m in models:
+        v = {"key": vkey(m, version), "suite": suite, "model": m, "version": version, "first_seen": {"min": iso},
+             "last_seen": {"max": iso}}
+        if prev:
+            v["prev_version"] = prev
+        vrows.append(v)
+    client.upsert(EV_VERSIONS, vrows, tag + "-v")
+    return {"cases": len(cases), "runs": sum(c["runs"] for c in cases.values()),
+            "passed": sum(1 for c in cases.values() if c["passed"]), "models": models,
+            "compared": sum(1 for r in rows if "prev_passed" in r)}
+
+
+def _ev_args(args):
+    opts = {"paths": [], "suite": None, "version": None, "model": "", "vs": "", "pass_at": "1.0",
+            "workbook": os.environ.get("DATASTASH_WORKBOOK_ID", ""), "output_hash": True}
+    flags = {"--suite": "suite", "--version": "version", "--model": "model", "--vs": "vs", "--pass-at": "pass_at",
+             "--workbook": "workbook"}
+    it = iter(args)
+    for a in it:
+        if a in flags:
+            v = next(it, None)
+            if v is None:
+                raise CiProblem(f"{a} needs a value. {EV_USAGE}")
+            opts[flags[a]] = v
+        elif a == "--no-output-hash":
+            opts["output_hash"] = False
+        elif a.startswith("--"):
+            raise CiProblem(f"unknown option {ci_clean(a, 40)}. {EV_USAGE}")
+        else:
+            opts["paths"].append(a)
+    if not opts["paths"]:
+        raise CiProblem("name the results file(s). " + EV_USAGE)
+    for k in ("suite", "version"):
+        if not ci_clean(opts[k], 200):
+            raise CiProblem(f"--{k} is missing. {EV_USAGE}")
+    try:
+        pass_at = float(opts["pass_at"])
+    except (TypeError, ValueError):
+        pass_at = float("nan")
+    if not math.isfinite(pass_at):
+        raise CiProblem("--pass-at takes a number (the score at which a case without a pass field passes)")
+    if not CI_WB_RE.fullmatch(opts["workbook"].strip()):
+        raise CiProblem("set DATASTASH_WORKBOOK_ID (or --workbook) to the agent workbook's id")
+    return {"paths": opts["paths"], "suite": ci_clean(opts["suite"], 200), "version": ci_clean(opts["version"], 200),
+            "model": ci_clean(opts["model"], 200), "vs": ci_clean(opts["vs"], 200), "pass_at": pass_at,
+            "wb": opts["workbook"].strip().lower(), "output_hash": opts["output_hash"]}
+
+
+def cmd_eval_report(args):
+    """datastash eval-report: always exits 0 (a reporting problem never fails a build); prints one line."""
+    if any(a in ("-h", "--help") for a in args):
+        print(EV_USAGE)
+        return 0
+    try:
+        o = _ev_args(args)
+        key = os.environ.get("DATASTASH_AGENT_KEY", "").strip()
+        if not re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key):
+            raise CiProblem("set DATASTASH_AGENT_KEY (a CI secret) to the agent's key (ldgr_ag_...)")
+        s = eval_report(o["paths"], o["suite"], o["version"], o["model"], o["vs"], key, o["wb"], pass_at=o["pass_at"],
+                        output_hash=o["output_hash"])
+        vs = f", {s['compared']} compared with {o['vs']}" if o["vs"] else ""
+        print(f"datastash eval-report: {s['cases']} cases ({s['runs']} runs, {s['passed']} passed last) sent for "
+              f"{o['suite']} {o['version']}{vs}; pass_rate, delta_vs_prev and worse_count are on tab \"Eval versions\"")
+    except CiProblem as e:
+        print(f"datastash eval-report: not sent: {ci_clean(e, 300)}")
+    except SystemExit:
+        print("datastash eval-report: not sent: stopped")
+    except Exception as e:  # noqa: BLE001 a reporting problem must never fail the build
+        print(f"datastash eval-report: not sent: unexpected {type(e).__name__}")
+    return 0
+
+
 # --- XLI-378 E: time per card. The plugin side of ledger_feeds_setup services ["burn"] (tabs Burn, Cards cost, Prices):
 # at each subagent stop and session end it reads this session's own Claude Code transcripts (the main one and its
 # subagents' files) ON THIS COMPUTER and sends, per card, activity and model, the minutes, tool calls and token counts.
@@ -14217,7 +14473,7 @@ def main():
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
-             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report,
+             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report,
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat}
     if cmd not in table:
         print(__doc__)
