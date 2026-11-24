@@ -2909,19 +2909,128 @@ def _take_listener_lock(s, session_id):
         return None
     os.ftruncate(fd, 0)
     # P2 add (EPM LOW): the holder's start time too, so a reused pid is never taken for it
-    os.write(fd, json.dumps({"pid": os.getpid(), "start": _proc_start(os.getpid()), "session_id": session_id,
-                             "since": int(time.time())}).encode())
+    rec = {"pid": os.getpid(), "start": _proc_start(os.getpid()), "session_id": session_id, "since": int(time.time())}
+    if _LISTEN_PARENT:  # XLI-374 (11-24): the holder's Claude Code process, so a standby can tell a live session's turn
+        rec["parent"], rec["parent_start"] = _LISTEN_PARENT[0], _LISTEN_PARENT[1]
+    os.write(fd, json.dumps(rec).encode())
     return fd
+
+
+# XLI-374 (11-24, owner: "every datastash message wakes the receiving agent"): self-healing without the person.
+# - Standby: a session whose agent's listener lock is held by ANOTHER session (an old session of the same agent that
+#   has not ended yet, a restarted session, a second window) no longer gives up until its next turn. It waits beside
+#   it, local only (no network, no key read), one standby per session, and takes the lock once it is free: the old
+#   session ended (its listener stops within seconds), or it was woken and did not start listening again. While the
+#   last holder's Claude Code process still runs, the standby leaves it STANDBY_GRACE_SECONDS to restart its own
+#   listener first (its Stop hook), so two live sessions of one agent don't swap wakes back and forth. One listener per
+#   agent stays (the lock); nothing is dropped (the new holder catches up on what arrived meanwhile).
+# - A fault the listener does not know (any exception) is logged by its type only and retried after the backoff,
+#   inside the loop and around its start, instead of ending the listener with nobody to restart it.
+# - The idle notice: Claude Code's Notification hook "idle_prompt" (the session sat waiting for input) starts the
+#   listener too, so a session whose turn ended with no Stop hook (an interrupt, an API error) listens again by itself.
+#   With a listener or standby of this session already running it ends at once.
+STANDBY_GRACE_SECONDS = float(os.environ.get("DATASTASH_STANDBY_GRACE_SECONDS", "180"))
+CRASH_BACKOFF_START, CRASH_BACKOFF_MAX = 5, 300
+_LISTEN_PARENT = []  # [pid, start] of this listener's Claude Code process, once known
+
+
+def standby_path(s, session_id):
+    h = hashlib.sha256(session_id.encode()).hexdigest()[:16]
+    return os.path.join(STATE, f"agent-{s}.standby-{h}.listener.lock")
+
+
+def _take_standby_lock(s, session_id):
+    """This session's one standby for agent s (None when this session already has one)."""
+    ensure_dirs()
+    fd = os.open(standby_path(s, session_id), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, json.dumps({"pid": os.getpid(), "start": _proc_start(os.getpid()), "session_id": session_id,
+                             "since": int(time.time()), "standby": True}).encode())
+    return fd
+
+
+def _holder_session_live(rec, parent):
+    """The last holder's Claude Code process still runs (and is not this session's own)."""
+    pid = rec.get("parent")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1 or pid == parent:
+        return False
+    return _alive(pid) and rec.get("parent_start") is not None and _proc_start(pid) == rec.get("parent_start")
+
+
+def _standby(agent, s, session_id, project, me, parent):
+    """Wait for another session's listener of agent s to let go, then hold the lock (returns its fd). None when this
+    session has nothing to wait for: no session id, this session already listens or waits, the session ended, it became
+    the person's main session, or its folder no longer listens for s."""
+    if not session_id or fcntl is None or is_person(agent):
+        return None
+    if read_json(lock_path(s), {}).get("session_id") == session_id:
+        return None  # this session's own listener runs (a second hook of the same session)
+    sb = _take_standby_lock(s, session_id)
+    if sb is None:
+        return None
+    try:
+        log(s, "listen: another session listens for this agent; this session waits beside it (local only)")
+        free_since = None
+        while True:
+            _sleep(PARK_CHECK_SECONDS, parent)
+            if parent is not None and not _parent_alive(parent):
+                log(s, "listen: standby's session gone; stops")
+                return None
+            if me is not None and is_main_session(me):
+                return None
+            if not _still_mine(s, project, me):
+                log(s, "listen: standby's folder no longer listens for this agent; stops")
+                return None
+            rec = read_json(lock_path(s), {})
+            if _lock_held(lock_path(s)):
+                free_since = None
+                if rec.get("session_id") == session_id:
+                    return None  # this session listens again (its own hook took the lock)
+                continue
+            now = time.time()
+            if free_since is None:
+                free_since = now
+            if _holder_session_live(rec, parent) and now - free_since < STANDBY_GRACE_SECONDS:
+                continue  # its own session may start listening again first
+            fd = _take_listener_lock(s, session_id)
+            if fd is not None:
+                log(s, "listen: the other session's listener let go; this session listens now")
+                return fd
+    finally:
+        os.close(sb)
 
 
 def cmd_listen(_args, printer=None, forced=None):
     """Background hook (async + asyncRewake). Long-polls the inbox; exit 2 wakes the session when new items arrive.
     With printer (the watch command), prints a line per wake instead and keeps going.
     Pacing: a burst of arrivals is gathered into one wake, and wakes are at least WAKE_MIN_SECONDS apart (the time of
-    the last wake is kept in the state, so a listener restarted by the Stop hook keeps the same pace)."""
+    the last wake is kept in the state, so a listener restarted by the Stop hook keeps the same pace).
+    XLI-374 (11-24): a hook listener that hits a fault it does not know starts over after a backoff (while its session
+    runs) instead of ending with nobody to restart it."""
     inp = hook_input() if printer is None else {}
     if printer is None:
         hook_heartbeat("listen", inp)
+    if printer is not None or forced is not None:
+        return _listen_start(inp, printer, forced)
+    parent = _session_pid()
+    wait = CRASH_BACKOFF_START
+    while True:
+        try:
+            return _listen_start(inp, printer, forced)
+        except Exception as e:  # noqa: BLE001
+            log("listen", f"listen: unexpected {type(e).__name__} at start; starts over in {wait}s")
+        _sleep(wait * random.uniform(0.8, 1.2), parent)
+        if parent is not None and not _parent_alive(parent):
+            return 0
+        wait = min(wait * 2, CRASH_BACKOFF_MAX)
+
+
+def _listen_start(inp, printer, forced):
     me = this_session(inp) if printer is None else this_session()
     project = project_of(inp)
     if forced is None and (off_here(inp) or is_off(project)):
@@ -2953,11 +3062,21 @@ def cmd_listen(_args, printer=None, forced=None):
         mark_agent_use(me, "listen")  # this session is that agent (its inbox wakes it): never main
     s = agent["slug"]
     session_id = str(inp.get("session_id") or "")
+    parent = _session_pid() if printer is None else None
+    if parent is not None and not _LISTEN_PARENT:
+        _LISTEN_PARENT[:] = [parent, _proc_start(parent)]
     lock = _take_listener_lock(s, session_id)
     if lock is None:
         if printer is not None:
             printer(f'datastash: a listener for "{disp(agent["name"])}" is already running here; no watch needed.')
-        return 0  # one listener per agent: another one is running
+            return 0
+        if forced is not None:
+            return 0
+        # One listener per agent: another one is running. XLI-374 (11-24): when it is another session's, this session
+        # waits beside it and takes over once it lets go (the old session ended), instead of staying deaf.
+        lock = _standby(agent, s, session_id, project, me, parent)
+        if lock is None:
+            return 0
     try:
         if printer is not None and not is_person(agent):
             # The watch runs where the hooks may be off: the setup causes it finds are told here, once each.
@@ -3032,165 +3151,171 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
 
     try:
         while True:
-            if parent is not None and not _parent_alive(parent):
-                log(s, "listen: session gone; stops")
-                return 0
-            if me is not None and not is_person(agent) and is_main_session(me):
-                # This session became the person's main session: it never wakes as an agent again. (Its Stop hook starts
-                # the person's listener.)
-                log(s, "listen: this session is now the person's datastash main; agent listener stops")
-                return 0
-            if mine is not None and not mine():
-                log(s, "listen: this folder's agent changed (linked elsewhere, or no longer the only agent); lets go")
-                return 0
-            key = read_key(s)
-            if key is None and person_slug(s) and signed_in():
-                fail("datastash login token not refreshed (network?)")  # XLI-290: a refresh blip backs off, never stops
-                continue
-            if key is None and is_person(agent):
-                log(s, "listen: no usable key file; stops")
-                return 0
-            if key is None:
-                live["key"] = None
-                r = _park(agent, s, "missing", None, parent, printer, me, mine)
-                if r is not None:
-                    return r
-                fresh_key = True
-                continue
-            live["key"] = key
-            if not is_person(agent) and session_id and time.time() >= chat_next:
-                chat_next = time.time() + CHATSTASH_EVERY
-                note = chatstash_note(agent, key, session_id, only_changed=True)  # XLI-391: a change, said once
-                if note:
-                    log(s, "listen: chatstash setting changed; tells the session")
-                    if printer is not None:
-                        printer(note[0])
-                        chat_told(s, session_id, note[1])
-                        continue
-                    print(note[0], file=sys.stderr)
-                    sys.stderr.flush()
-                    chat_told(s, session_id, note[1])
-                    return 2
-            wait = 0 if catching_up else WAIT_SECONDS
-            if pending_since is not None and not catching_up:
-                due = max(pending_since + WAKE_GATHER_SECONDS, _last_wake(agent) + WAKE_MIN_SECONDS)
-                left = due - time.time()
-                if left <= 0:
-                    try:
-                        ids, n = unannounced(agent)
-                        ids, paused_until = due_ids(agent, ids, time.time())
-                    except OSError as e:
-                        fail(f"state not read ({type(e).__name__})")
-                        continue
-                    pending_since = None
-                    if not ids:
-                        if paused_until is not None:
-                            # Only items of senders whose wakes brought nothing handled: they wake the session after their
-                            # pause, with whatever else has come by then. Nothing is dropped.
-                            pending_since = paused_until - WAKE_GATHER_SECONDS
-                            log(s, f"listen: paused sender(s); next wake check in {int(paused_until - time.time())}s")
-                        continue  # read or handled meanwhile: nothing to wake for
-                    if me is not None and not is_person(agent) and is_main_session(me):
-                        log(s, "listen: this session is now the person's datastash main; agent listener stops")
-                        return 0
-                    msg = wake_text(agent, n, ids)
-                    log(s, f"listen: wake, {len(ids)} arrived, {n} new")
-                    if printer is not None:
-                        printer(msg)
-                    else:
-                        print(msg, file=sys.stderr)
-                        sys.stderr.flush()
-                    try:
-                        announce_ids(agent, ids, time.time())  # told first, then marked
-                    except OSError as e:
-                        log(s, f"listen: announced state not saved ({type(e).__name__})")  # re-counted later, not lost
-                    if printer is not None:
-                        continue
-                    return 2
-                if left < 1:
-                    pause(left)
-                    continue
-                wait = min(WAIT_SECONDS, int(left))  # keep gathering until the wake is due
-            cur = load_state(agent).get("cursor")
-            t0 = time.time()
             try:
-                items, nxt, more = fetch_page(agent, key, cur, wait)
-                backoff = BACKOFF_START
-            except ApiError as e:
-                code = _code(e)
-                if e.status == 410 and code == "agent_removed" and not is_person(agent):
-                    log(s, "listen: agent removed (410); cleans up and stops")  # logged first: the log goes too
-                    live["key"] = None
-                    msg = agent_removed(agent, key)  # XLI-390 P1: plugin code, never the model
-                    if printer is not None:
-                        printer(msg)
-                        return 0
-                    print(msg, file=sys.stderr)
-                    sys.stderr.flush()
-                    return 2
-                if e.status == 410:
-                    gone += 1
-                    reset_cursor(agent)
-                    if gone <= GONE_LIMIT:
-                        log(s, "listen: cursor expired; starts over")
-                        continue
-                    fail(f"cursor expired {gone} times in a row")
+                if parent is not None and not _parent_alive(parent):
+                    log(s, "listen: session gone; stops")
+                    return 0
+                if me is not None and not is_person(agent) and is_main_session(me):
+                    # This session became the person's main session: it never wakes as an agent again. (Its Stop hook starts
+                    # the person's listener.)
+                    log(s, "listen: this session is now the person's datastash main; agent listener stops")
+                    return 0
+                if mine is not None and not mine():
+                    log(s, "listen: this folder's agent changed (linked elsewhere, or no longer the only agent); lets go")
+                    return 0
+                key = read_key(s)
+                if key is None and person_slug(s) and signed_in():
+                    fail("datastash login token not refreshed (network?)")  # XLI-290: a refresh blip backs off, never stops
                     continue
-                if e.status == 401 or code == "agent_switched_off":
-                    set_flag(agent, "key_refused", int(time.time()))
-                    if is_person(agent):
-                        log(s, f"listen: key refused (HTTP {e.status} {code}); stops")
-                        return 0
+                if key is None and is_person(agent):
+                    log(s, "listen: no usable key file; stops")
+                    return 0
+                if key is None:
                     live["key"] = None
-                    log(s, f"listen: key refused (HTTP {e.status} {code}); parks")
-                    r = _park(agent, s, "dead", _key_digest(key), parent, printer, me, mine)
+                    r = _park(agent, s, "missing", None, parent, printer, me, mine)
                     if r is not None:
                         return r
                     fresh_key = True
                     continue
-                if e.status == 404:
-                    log(s, f"listen: not found (HTTP 404 {code}); retry in {NOT_FOUND_BACKOFF}s")
-                    pause(NOT_FOUND_BACKOFF)
+                live["key"] = key
+                if not is_person(agent) and session_id and time.time() >= chat_next:
+                    chat_next = time.time() + CHATSTASH_EVERY
+                    note = chatstash_note(agent, key, session_id, only_changed=True)  # XLI-391: a change, said once
+                    if note:
+                        log(s, "listen: chatstash setting changed; tells the session")
+                        if printer is not None:
+                            printer(note[0])
+                            chat_told(s, session_id, note[1])
+                            continue
+                        print(note[0], file=sys.stderr)
+                        sys.stderr.flush()
+                        chat_told(s, session_id, note[1])
+                        return 2
+                wait = 0 if catching_up else WAIT_SECONDS
+                if pending_since is not None and not catching_up:
+                    due = max(pending_since + WAKE_GATHER_SECONDS, _last_wake(agent) + WAKE_MIN_SECONDS)
+                    left = due - time.time()
+                    if left <= 0:
+                        try:
+                            ids, n = unannounced(agent)
+                            ids, paused_until = due_ids(agent, ids, time.time())
+                        except OSError as e:
+                            fail(f"state not read ({type(e).__name__})")
+                            continue
+                        pending_since = None
+                        if not ids:
+                            if paused_until is not None:
+                                # Only items of senders whose wakes brought nothing handled: they wake the session after their
+                                # pause, with whatever else has come by then. Nothing is dropped.
+                                pending_since = paused_until - WAKE_GATHER_SECONDS
+                                log(s, f"listen: paused sender(s); next wake check in {int(paused_until - time.time())}s")
+                            continue  # read or handled meanwhile: nothing to wake for
+                        if me is not None and not is_person(agent) and is_main_session(me):
+                            log(s, "listen: this session is now the person's datastash main; agent listener stops")
+                            return 0
+                        msg = wake_text(agent, n, ids)
+                        log(s, f"listen: wake, {len(ids)} arrived, {n} new")
+                        if printer is not None:
+                            printer(msg)
+                        else:
+                            print(msg, file=sys.stderr)
+                            sys.stderr.flush()
+                        try:
+                            announce_ids(agent, ids, time.time())  # told first, then marked
+                        except OSError as e:
+                            log(s, f"listen: announced state not saved ({type(e).__name__})")  # re-counted later, not lost
+                        if printer is not None:
+                            continue
+                        return 2
+                    if left < 1:
+                        pause(left)
+                        continue
+                    wait = min(WAIT_SECONDS, int(left))  # keep gathering until the wake is due
+                cur = load_state(agent).get("cursor")
+                t0 = time.time()
+                try:
+                    items, nxt, more = fetch_page(agent, key, cur, wait)
+                    backoff = BACKOFF_START
+                except ApiError as e:
+                    code = _code(e)
+                    if e.status == 410 and code == "agent_removed" and not is_person(agent):
+                        log(s, "listen: agent removed (410); cleans up and stops")  # logged first: the log goes too
+                        live["key"] = None
+                        msg = agent_removed(agent, key)  # XLI-390 P1: plugin code, never the model
+                        if printer is not None:
+                            printer(msg)
+                            return 0
+                        print(msg, file=sys.stderr)
+                        sys.stderr.flush()
+                        return 2
+                    if e.status == 410:
+                        gone += 1
+                        reset_cursor(agent)
+                        if gone <= GONE_LIMIT:
+                            log(s, "listen: cursor expired; starts over")
+                            continue
+                        fail(f"cursor expired {gone} times in a row")
+                        continue
+                    if e.status == 401 or code == "agent_switched_off":
+                        set_flag(agent, "key_refused", int(time.time()))
+                        if is_person(agent):
+                            log(s, f"listen: key refused (HTTP {e.status} {code}); stops")
+                            return 0
+                        live["key"] = None
+                        log(s, f"listen: key refused (HTTP {e.status} {code}); parks")
+                        r = _park(agent, s, "dead", _key_digest(key), parent, printer, me, mine)
+                        if r is not None:
+                            return r
+                        fresh_key = True
+                        continue
+                    if e.status == 404:
+                        log(s, f"listen: not found (HTTP 404 {code}); retry in {NOT_FOUND_BACKOFF}s")
+                        pause(NOT_FOUND_BACKOFF)
+                        continue
+                    fail(f"HTTP {e.status} {code}")
                     continue
-                fail(f"HTTP {e.status} {code}")
-                continue
-            except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
-                net_fails += 1
-                if net_fails == HELLO_NETWORK_NOTICE_AFTER and not is_person(agent) and \
-                        isinstance(e, (urllib.error.URLError, socket.timeout, ConnectionError)):
-                    raise_notice("blocked:network_blocked", blocked_text("network_blocked", why=_net_why(e)))
-                fail(f"network {type(e).__name__}")
-                continue
-            if net_fails:
-                net_fails = 0
-                clear_notices(["blocked:network_blocked"])
-            gone = 0
-            if fresh_key and not is_person(agent):
-                key_works(agent)  # the key works: its refused mark and key notices go (once per start or resume)
-                fresh_key = False
-                if hello is not None:
-                    hello.due(key)  # XLI-375 P2: hello on every listener start, and after each park, once it works
-            if items and status_wake is not None:
-                status_wake.set()  # something changed in the workbook: refresh the status copy now
-            try:
-                applied, fresh, arrived = apply_page(agent, cur, items, nxt, more)
-            except OSError as e:
-                fail(f"state not saved ({type(e).__name__})")
-                continue
-            if not applied:
-                pause(random.uniform(0.2, 1.0))  # another process moved the cursor; read again shortly
-                continue
-            if more:
-                if not items:
-                    pause(random.uniform(1.0, 2.0))  # "more" with an empty page: keep a floor
-                continue
-            catching_up = False
-            if fresh and pending_since is None:
-                pending_since = time.time() - (WAKE_GATHER_SECONDS if wait == 0 else 0)
-            elif arrived and pending_since is not None and pending_since > time.time():
-                pending_since = time.time()  # a new arrival while only paused senders wait: judge it now (it may be due)
-            elif not items and wait > 0 and time.time() - t0 < FAST_POLL_SECONDS:
-                pause(random.uniform(1.0, 2.0))  # an empty long poll came back at once: keep a floor between polls
+                except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
+                    net_fails += 1
+                    if net_fails == HELLO_NETWORK_NOTICE_AFTER and not is_person(agent) and \
+                            isinstance(e, (urllib.error.URLError, socket.timeout, ConnectionError)):
+                        raise_notice("blocked:network_blocked", blocked_text("network_blocked", why=_net_why(e)))
+                    fail(f"network {type(e).__name__}")
+                    continue
+                if net_fails:
+                    net_fails = 0
+                    clear_notices(["blocked:network_blocked"])
+                gone = 0
+                if fresh_key and not is_person(agent):
+                    key_works(agent)  # the key works: its refused mark and key notices go (once per start or resume)
+                    fresh_key = False
+                    if hello is not None:
+                        hello.due(key)  # XLI-375 P2: hello on every listener start, and after each park, once it works
+                if items and status_wake is not None:
+                    status_wake.set()  # something changed in the workbook: refresh the status copy now
+                try:
+                    applied, fresh, arrived = apply_page(agent, cur, items, nxt, more)
+                except OSError as e:
+                    fail(f"state not saved ({type(e).__name__})")
+                    continue
+                if not applied:
+                    pause(random.uniform(0.2, 1.0))  # another process moved the cursor; read again shortly
+                    continue
+                if more:
+                    if not items:
+                        pause(random.uniform(1.0, 2.0))  # "more" with an empty page: keep a floor
+                    continue
+                catching_up = False
+                if fresh and pending_since is None:
+                    pending_since = time.time() - (WAKE_GATHER_SECONDS if wait == 0 else 0)
+                elif arrived and pending_since is not None and pending_since > time.time():
+                    pending_since = time.time()  # a new arrival while only paused senders wait: judge it now (it may be due)
+                elif not items and wait > 0 and time.time() - t0 < FAST_POLL_SECONDS:
+                    pause(random.uniform(1.0, 2.0))  # an empty long poll came back at once: keep a floor between polls
+            except Exception as e:  # noqa: BLE001  XLI-374 (11-24): a fault the loop does not know never ends it
+                # An unexpected error (a state file it can't parse, a bug) used to end the listener, and the session
+                # stayed deaf until its next turn. It is logged by type only (never a message, path or key) and the
+                # loop goes on after the backoff; nothing is lost (the cursor and the new ids are on disk).
+                fail(f"unexpected {type(e).__name__}")
     finally:
         live["key"] = None  # the status refresher reads and sends nothing once the listener has ended
         if beat is not None:
