@@ -380,8 +380,10 @@ class Uninstall(Base):
         self.prompt("/datastash:uninstall")
         self.tool("PostToolUse", "ledger_agents_list", {}, lst)
         v, _ = self.prompt("beta")
-        self.assertEqual((v["decision"], v["reason"]), ("block", ds.PICK_REFUSED_LINE.format(
-            why='"beta" matches more than one agent (closest exact names: "beta", "Be ta"); type one in double quotes exactly as the list shows it')))
+        self.assertEqual(v["decision"], "block")  # 1.0.11 final: "Be ta" is an old-style name; "beta" may stand for it
+        self.assertTrue(v["reason"].startswith('Not done: "beta" may stand for your agent "Be ta", which has an old-style name'),
+                        v["reason"])
+        self.assertIn("Nothing was removed.", v["reason"])
         self.assertEqual(ds.fold_name("A1pha"), ds.fold_name("alpha"))
         self.assertIsNone(self.prompt("what was that about?")[0])  # not a pick: an ordinary prompt
 
@@ -491,16 +493,17 @@ class StrictNames(Base):
             self.assertNotIsInstance(picks_of(text, AX_LIST), list, text)
         self.refused(self.picks("alex alex-3"), "alex-3")
 
-    # quoted names that contain spaces
-    def test_a_quoted_name_with_spaces_counts(self):
+    # names that contain spaces (1.0.11 final: an old-style name, never picked by name, quoted or not)
+    def test_a_quoted_name_with_spaces_never_counts(self):
         lst = plain("Be ta", "x", ids=[SP, A])
-        self.assertEqual(sorted(picks_of('"be ta" x', lst)), sorted([SP, A]))
-        self.assertEqual(picks_of("“Be ta”", lst), [SP])  # typographic quotes too
+        for text in ('"be ta" x', "“Be ta”", '"Be ta"'):
+            self.assertIsNone(picks_of(text, lst), text)
         self.assertEqual(picks_of('"x"', lst), [A])
+        self.assertEqual(sorted(picks_of("all", lst)), sorted([SP, A]))
 
     def test_a_name_with_spaces_unquoted_never_counts(self):
         lst = plain("Be ta", "x", ids=[SP, A])
-        self.assertEqual(picks_of("be ta", lst), "none")
+        self.assertIsNone(picks_of("be ta", lst))
         self.assertIsNone(picks_of("be ta x", lst))
         self.assertIsNone(picks_of('"be  ta" "be"', lst))
 
@@ -782,7 +785,7 @@ class ReservedWords(Base):
         want = {
             "a b c": ["a", "b", "c"], "bc": ["bc"], "b c": ["b", "c"], "alpha beta": ["alpha", "beta"],
             "alpha-beta": ["alpha-beta"], "alex alex-2": ["alex", "alex-2"], "alex-2, alex": ["alex", "alex-2"],
-            "alex and alex-2": ["alex", "alex-2"], '"My Agent" a': ["my agent", "a"], "alex alex ALEX": ["alex"],
+            "alex and alex-2": ["alex", "alex-2"], "alex alex ALEX": ["alex"],
             '"alpha" alpha': ["alpha"], "all": "every", "  ALL  ": "every", "all,": "every",
         }
         for text, exp in want.items():
@@ -791,7 +794,7 @@ class ReservedWords(Base):
         refused = ("x all", "all x", "alex all", "all alex", "alpha beta all", "all, alpha", "x,all", "all all",
                    "this x", "a ll", "alex a ll", "alex nobody", 'alex "alex-2', '"my agent', 'my agent"', '"x"y',
                    '"my agent" x"', "alex \u201calex-2\"", "alpha.", "alpha!", "(alpha)", "alpha/beta", "alex 2",
-                   "alex alex2", "a1ex", 'alex ""', "alex, " + "x" * 4000)
+                   "alex alex2", "a1ex", 'alex ""', "alex, " + "x" * 4000, '"My Agent" a', "my agent")
         for text in refused:
             self.assertNotIsInstance(ds.resolve_picks(text, lst, None), list, text)
         for text in ("make alex all public", "make alex, all public", "make alex this private"):
@@ -876,7 +879,7 @@ class PlainNames(Base):
         want = {"\u13aall": "ll", "\u1d00\u029f\u029f": "", "\u1d1bhis": "his", "My Project": "my-project",
                 "  --a__b--  ": "a__b", "Q4  launch--plan": "q4-launch-plan", "caf\u00e9 bot": "caf-bot", "\u0430ll": "ll",
                 "\uff41\uff4c\uff4c": "", "a\u200bll": "a-ll", "web.App_2": "web.app_2", "\u212aey": "ey",
-                "\u0130stanbul": "stanbul", "x" * 50: "x" * 40, "-" * 5: ""}
+                "\u0130stanbul": "stanbul", "x" * 50: "x" * 40, "-" * 5: "", "...": "", "_": ""}
         for raw, plain_ in want.items():
             self.assertEqual(ds.plain_agent_name(raw), plain_, repr(raw))
             self.assertTrue(plain_ == "" or ds.plain_name(plain_), repr(raw))
@@ -965,7 +968,7 @@ class PlainNames(Base):
             for word in ("all", "ALL", "this", "and", '"all"', "vault and web-app"):
                 self.assertIsNone(picks_of(word, lst, OWN), (odd, word))
             why = ds.pick_refused_why("all", ds.norm_list(lst), OWN)
-            self.assertIn("is not plain ASCII", why, repr(odd))
+            self.assertIn("has an old-style name", why, repr(odd))
             self.assertIn("never by id", why)
             self.assertIn("leave it, or switch it off on the agents page", why)
             self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), repr(odd))
@@ -986,8 +989,8 @@ class PlainNames(Base):
             for text in (typed, f'"{typed}"', typed.upper(), f"web-app {typed}"):
                 self.assertIsNone(picks_of(text, lst, OWN), (odd, text))
             why = ds.pick_refused_why(typed, ds.norm_list(lst), OWN)
-            self.assertIn("whose name is not plain ASCII", why, repr(odd))
-            self.assertIn("can't be picked by name", why)
+            self.assertIn("has an old-style name", why, repr(odd))
+            self.assertIn("can't be removed by name", why)
             self.assertEqual(picks_of("web-app", lst, OWN), [OWN], repr(odd))
         lst = plain("web-app", "alpha\u202e", "beta", ids=[OWN, KEPT, X])  # a long odd name can't read as "all"
         self.assertEqual(sorted(picks_of("all", lst, OWN)), sorted([OWN, KEPT, X]))
@@ -1018,6 +1021,165 @@ class PlainNames(Base):
                      "\u13aall", "alpha \u13aall", "make alpha all public", "alpha\u200b", "remove all"):
             self.assertNotIsInstance(ds.resolve_picks(text, lst, None), list, repr(text))
             self.assertNotIsInstance(ds.resolve_picks(text, lst, None, reserved=False), list, repr(text))
+
+
+# 1.0.11 final review CRITICAL: names prod allows today that hold a separator next to a pick word, and other old-style ones
+OLD_WORDLIKE = ("all,", ",all", "all ,", "all and", "and all", "this,", "ALL,", '"all"')
+OLD_PLAIN = ("a b", "x;y", "my agent", "web/app", "alpha!", "(beta)")
+
+
+class OldStyleNames(Base):
+    """1.0.11 final (PM ruling after the final review CRITICAL): a STORED agent name is picked by name only when the whole
+    name matches ^[a-z0-9._-]+$ (ignoring case) and is not a pick word. Any other stored name ("all,", "all and", "this,",
+    "a b", "x;y", a look-alike) is an old-style name, never picked by name: the command is refused with a plain line
+    (it has an old-style name and can't be removed by name; "all" still removes it, unless it may read as a pick word).
+    Typed tokens must match the same rule."""
+    def setUp(self):
+        super().setUp()
+        self.installed()
+
+    def picks(self, args, lst):
+        self.slash("/datastash:uninstall " + args)
+        return self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+
+    def denied(self):
+        return self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def targets(self):
+        return self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]["targets"]
+
+    def test_the_stored_name_is_plain_only_by_the_strict_rule(self):
+        got = ds.norm_list(plain(*(OLD_WORDLIKE + OLD_PLAIN + ("alex", "alex-2", "Web.App_2", "Ꭺll"))))
+        self.assertEqual([a["plain"] for a in got["agents"]],
+                         [False] * (len(OLD_WORDLIKE) + len(OLD_PLAIN)) + [True, True, True, False])
+
+    def test_typing_an_old_name_as_listed_removes_nothing(self):
+        for old in OLD_WORDLIKE + OLD_PLAIN:
+            lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
+            for text in (old, old.upper(), f'"{old}"', f"vault {old}", f"{old} vault", f"  {old}  "):
+                self.assertIsNone(picks_of(text, lst, OWN), (old, text))
+                self.assertIsNone(ds.resolve_picks(text, ds.norm_list(lst), None, reserved=False), (old, text))
+            why = ds.pick_refused_why(old, ds.norm_list(lst), OWN)
+            self.assertIn(f'your agent "{old}" has an old-style name', why, old)
+            self.assertIn("can't be removed by name", why)
+            self.assertIn("never by id", why)
+            self.assertIn("can't be changed by name", ds.pick_refused_why(old, ds.norm_list(lst), None, reserved=False))
+            self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), old)
+
+    def test_the_critical_end_to_end_all_comma_on_the_slash_line_and_after_the_list(self):
+        for old in ("all,", "all and", ",all", "and all", "all ,"):
+            lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
+            out = self.picks(old, lst)
+            self.assertTrue(out["systemMessage"].startswith(f'Not done: your agent "{old}" has an old-style name'), out)
+            self.assertIn("Nothing was removed.", out["systemMessage"])
+            self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.PICK_REFUSED_AI)
+            self.assertTrue(self.denied(), old)
+            self.prompt("/datastash:uninstall")
+            self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+            v, _ = self.prompt(old)
+            self.assertEqual(v["decision"], "block", old)
+            self.assertIn("has an old-style name", v["reason"])
+            self.assertTrue(self.denied(), old)
+
+    def test_this_comma_never_removes_this_sessions_agent(self):
+        lst = plain("web-app", "x", "this,", ids=[OWN, X, KEPT])
+        for text in ("this,", "this", "THIS ,", '"this,"'):
+            self.assertIsNone(picks_of(text, lst, OWN), text)
+        out = self.picks("this,", lst)
+        self.assertIn("Nothing was removed.", out["systemMessage"])
+        self.assertTrue(self.denied())
+
+    def test_an_old_name_that_may_read_as_a_pick_word_refuses_the_words_too(self):
+        for old in OLD_WORDLIKE + ("Ꭺll", "Ꭺll,", "a n d"):
+            lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
+            for word in ("all", "ALL", "this", "and", "vault and web-app", "all,"):
+                self.assertIsNone(picks_of(word, lst, OWN), (old, word))
+            why = ds.pick_refused_why("all", ds.norm_list(lst), OWN)
+            self.assertIn("old-style name", why, old)
+            self.assertIn("leave it, or switch it off on the agents page", why)
+            self.assertNotIn('"all" alone still removes it', why)
+
+    def test_all_alone_still_removes_an_old_name_that_reads_as_no_word(self):
+        """Final LOW 2, said outright: "all" removes it, with every other agent."""
+        for old in OLD_PLAIN + ("alpha‮", "café-long-name"):
+            lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
+            self.assertEqual(sorted(picks_of("all", lst, OWN)), sorted([OWN, X, KEPT]), old)
+            if old.isascii():
+                self.assertIn('"all" alone still removes it, with every other agent', ds.pick_refused_why(old, ds.norm_list(lst), OWN))
+        out = self.picks("all", plain("web-app", "a b", ids=[OWN, KEPT]))
+        self.assertEqual(sorted(self.targets()), sorted([OWN, KEPT]))
+        self.assertIsNotNone(out)
+
+    def test_an_old_name_never_blocks_names_beside_it(self):
+        lst = plain("a", "b", "a b", "x", "y", "x;y", "alpha", "beta", ids=[str(uuid.UUID(int=0x300 + i)) for i in range(8)])
+        ids = {a["name"]: a["id"] for a in ds.norm_list(lst)["agents"]}
+        for text, exp in {"a, b": ["a", "b"], "a": ["a"], "x y": ["x", "y"], "alpha beta": ["alpha", "beta"],
+                          "x, y": ["x", "y"]}.items():
+            self.assertEqual(sorted(picks_of(text, lst)), sorted(ids[n] for n in exp), text)
+        for text in ("a b", "ab", "x;y", '"a b"', "alpha a b"):
+            self.assertIsNone(picks_of(text, lst), text)
+        self.assertNotIsInstance(picks_of("xy", lst), list)
+
+    def test_a_typed_token_must_match_the_strict_rule(self):
+        lst = plain("web-app", "alpha", ids=[OWN, X])
+        for tok in ("alpha!", "(alpha)", "alpha/beta", "x;y", '"my agent"', "alpha?"):
+            self.assertNotIsInstance(picks_of(tok, lst, OWN), list, tok)
+            self.assertIsNone(picks_of(f"alpha {tok}", lst, OWN), tok)
+        self.assertIn("is not a plain name", ds.pick_refused_why("alpha x;y", ds.norm_list(lst), OWN))
+
+    def test_a_stored_look_alike(self):
+        for odd in LOOKALIKES:
+            lst = plain("web-app", "vault", odd, ids=[OWN, X, KEPT])
+            for text in ("all", "this", "and", odd, f'"{odd}"', "vault and web-app"):
+                self.assertIsNone(picks_of(text, lst, OWN), (odd, text))
+            self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), repr(odd))
+
+    def test_the_owners_case_alex_and_alex_2(self):
+        for extra in ((), ("all,",), ("a b", "x;y"), ("this,", "Ꭺll")):
+            lst = plain("web-app", "alex", "alex-2", *extra, ids=[OWN, AX, AX2] + [KEPT, X, Y][:len(extra)])
+            for text, exp in {"alex alex-2": [AX, AX2], "alex-2 alex": [AX, AX2], "alex, alex-2": [AX, AX2],
+                              "alex and alex-2": [AX, AX2], "ALEX  Alex-2": [AX, AX2], "alex": [AX], "alex-2": [AX2],
+                              '"alex"': [AX], '"alex-2"': [AX2]}.items():
+                if extra and "and" in text.split() and any(ds._old_reads_as_word(n) for n in extra):
+                    self.assertIsNone(picks_of(text, lst, OWN), (extra, text))  # "and" is refused while one is listed
+                    continue
+                self.assertEqual(sorted(picks_of(text, lst, OWN)), sorted(exp), (extra, text))
+        lst = plain("web-app", "alex", "alex-2", "all,", ids=[OWN, AX, AX2, KEPT])
+        self.picks("alex alex-2", lst)
+        self.assertEqual(sorted(self.targets()), sorted([AX, AX2]))
+        self.picks("alex", lst)
+        self.assertEqual(self.targets(), [AX])
+        self.picks("alex-2", lst)
+        self.assertEqual(self.targets(), [AX2])
+
+    def test_every_attack_of_every_review_with_old_names_listed(self):
+        lst = ds.norm_list(plain("a", "b", "c", "bc", "alpha", "beta", "alpha-beta", "alex", "alex-2", "all,", "a b",
+                                 "this,", "x;y", "Ꭺll", "all", ids=[str(uuid.UUID(int=0x400 + i)) for i in range(15)]))
+        ids = {a["name"]: a["id"] for a in lst["agents"]}
+        for text, exp in {"a, b, c": ["a", "b", "c"], "bc": ["bc"], "b c": ["b", "c"], "alpha beta": ["alpha", "beta"],
+                          "alpha-beta": ["alpha-beta"], "alpha, beta": ["alpha", "beta"], "alex alex-2": ["alex", "alex-2"],
+                          "alex-2, alex": ["alex", "alex-2"], "alex alex ALEX": ["alex"], '"alpha" alpha': ["alpha"]}.items():
+            self.assertEqual(sorted(ds.resolve_picks(text, lst, None)), sorted(ids[n] for n in exp), text)
+        for text in ("a b c",  # holds the old-style "a b" as listed: refused whole (fail closed)
+                     "all", "this", "and", "all,", ",all", "all and", "this,", "x;y", '"all,"', '"a b"', "a b",
+                     "x all", "all x", "alpha all", "all, alpha", "x,all", "all all", "this x", "alpha and beta", "a ll",
+                     '"all"', "Ꭺll", "alpha Ꭺll", "alpha​", "remove all", "alex nobody", 'alex "alex-2',
+                     "alpha.", "alpha!", "(alpha)", "alpha/beta", "alex 2", "alex alex2", "a1ex", "аlpha",
+                     "alex, " + "x" * 4000, " ".join(["alex"] * 101), "n" * 65):
+            self.assertNotIsInstance(ds.resolve_picks(text, lst, None), list, repr(text[:40]))
+            self.assertNotIsInstance(ds.resolve_picks(text, lst, None, reserved=False), list, repr(text[:40]))
+        for text in ("make alex all public", "make alex, all public", "make alex this private", "make all, public",
+                     "make this, private"):
+            got = ds.VISIBILITY_RE.fullmatch(text)
+            self.assertNotIsInstance(ds.resolve_picks(got.group(1), lst, None, reserved=False), list, text)
+
+    def test_low1_a_folder_named_only_with_dots_or_underscores_is_agent(self):
+        for raw in ("...", ".", "_", "._-", "__"):
+            self.assertEqual(ds.plain_agent_name(raw), "", raw)
+            d = os.path.join(os.path.dirname(self.folder), "f" + str(len(raw)), raw)
+            os.makedirs(d, exist_ok=True)
+            self.assertEqual(ds._folder_name(d), "agent", raw)
+            self.assertTrue(ds.plain_name(ds._free_name(d)), raw)
 
 
 class RealSlashShape(Base):

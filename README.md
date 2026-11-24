@@ -459,7 +459,7 @@ To make one public: say make <name> public.
 
 **Agent names (1.0.11).** One strict parser reads the names after `/datastash:uninstall` (or typed after the list)
 and in `make <names> private` / `make <names> public`. The typed text is split at whitespace, commas and the word "and";
-a name with spaces counts only in double quotes (`"my agent"`). Tokens are never joined into a longer name and never
+a name is never more than one token (double quotes keep a piece as one token, but no name has a space). Tokens are never joined into a longer name and never
 matched by prefix or fuzzy matching: each token must equal exactly one listed name, ignoring case, so with agents
 `alex` and `alex-2`, `alex alex-2` picks those two, and with agents a, b, c and bc, `a b c` picks a, b and c. A token
 that also differs from another listed name only by case, spaces, dashes or look-alike letters is ambiguous. A token
@@ -480,25 +480,34 @@ So "Ꭺll" (a Cherokee A) is agent "ll", "My Project" is "my-project", "ᴀʟʟ"
 "all-2". A name sent for a new agent (the AI's `ledger_agent_register` call, `datastash api POST
 /api/v1/agent/register` and `/api/v1/agent/join/redeem`) that is not plain is refused, unless an agent on this computer
 already has exactly that name (registering it again answers that agent). `datastash link` and `datastash fetch` name an
-agent datastash already has; they refuse a name with any character that is not plain ASCII. datastash itself refuses
-new names that are not plain too (no agent is renamed).
+agent datastash already has; they refuse a name with any character that is not plain ASCII. The plugin's checks do not
+depend on datastash: the datastash server in use today still accepts some names that are not plain (such as "all,",
+"all and" or "a b"), and no agent is renamed.
 
 "all", "this" and "and" are words of these commands, never agent names (compared ignoring case, spaces, dashes, dots,
 underscores and look-alike digits, so "ALL", "a-ll" and "a11" count too). No naming path gives one (see the -2 rule
 above), and the register paths refuse it. Typed names are ASCII only: if a token has any character that is not plain
 ASCII (a look-alike, an accent, a zero-width or other invisible character), the whole command is refused and nothing
-changes. An agent made before these rules keeps its name, and:
+changes. Typed tokens follow the same strict rule as stored names: a token that is not a plain name ("x;y", "alpha!")
+never picks anything. An agent made before these rules keeps its name, and:
 - if its name reads as one of the words ("ALL", "a-ll"), it is never picked by name: typing the word, quoted or not,
   refuses the whole command;
-- if its stored name is not plain ASCII (even when the list shows it without the hidden character), it is never picked
-  by name: a typed name of the same length whose plain letters match (each other letter standing for any one letter;
-  "web" for "ᴡeb", "cafe" for "café") refuses the whole command;
-- while such an agent may read as "all", "this" or "and" (at most 4 letters once invisible ones are dropped, or its
-  plain letters all fit inside one of the words, as "Ꭺll" and "ᴛhis" do), "all", "this" and "and" are refused too,
-  so typing the word as the list shows it never removes every agent or this session's own.
-The refusal says why: agents can't be renamed, and the plugin picks agents only by name, never by id, so such an agent
-is left, or switched off on the agents page. Every other name still works. Two names that differ only by case, a dot,
-a dash or a space are picked one at a time in double quotes, typed character for character as the list shows them.
+- **old-style names (1.0.11 final, PM ruling).** A STORED name is picked by name only when the whole name matches
+  `^[a-z0-9._-]+$` (ignoring case) and is not one of the words. Any other stored name is old-style and is never picked
+  by name: "all,", "all and", "this,", "a b", "x;y", a look-alike ("Ꭺll", "ᴡeb"), a name with a hidden character (even
+  when the list shows it without one). Typing it as the list shows it (quoted or not, with other names or alone)
+  refuses the whole command with a plain line: that agent has an old-style name and can't be removed by name. A typed
+  name of the same length whose plain letters match it ("web" for "ᴡeb", "ab" for "a b") is refused too;
+- "all" typed alone still removes an old-style agent, with every other agent, unless it may read as "all", "this" or
+  "and" (its name or any piece of it split at spaces, commas and "and" reads as one, as "all,", "all and", "this,"
+  do; or, with a character that is not ASCII, it has at most 4 letters once invisible ones are dropped or its plain
+  letters all fit inside one of the words, as "Ꭺll", "ᴛhis", "café" do). While such an agent is listed, "all", "this"
+  and "and" are refused too, so the plugin can't remove every agent then, nor that one: typing the word as the list
+  shows it never removes every agent or this session's own.
+The refusal says which of the two holds: agents can't be renamed, and the plugin picks agents only by name, never by
+id, so such an agent goes with "all", or is left, or switched off on the agents page. Every other name still works.
+Two plain names that differ only by case, a dot or a dash are picked one at a time in double quotes, typed character
+for character as the list shows them.
 A token longer than 64 characters is never a name.
 
 **make <name> private / make <name> public** (plugin 1.0.1). Typed as the whole prompt in an agent's session, with the

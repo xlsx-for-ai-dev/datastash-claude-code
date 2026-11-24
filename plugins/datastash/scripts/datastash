@@ -4879,9 +4879,11 @@ def agent_name_refused(name):
 def plain_agent_name(text, cut=40):
     """text made a plain agent name, the one rule for every naming path (folder, `claude --agent`): every character that
     is not an ASCII letter, digit, "-", "_" or "." becomes "-"; then lowercase; runs of "-" become one; "-" is trimmed
-    from both ends; at most `cut` characters. "" when nothing is left. "Ꭺll" -> "ll", "My Project" -> "my-project"."""
+    from both ends; at most `cut` characters. "" when nothing is left, or no letter or digit is ("...", "_"; 1.0.11
+    final LOW 1: the caller then uses "agent", as 1.0.10 did). "Ꭺll" -> "ll", "My Project" -> "my-project"."""
     v = re.sub(r"[^A-Za-z0-9._-]", "-", str(text or "")).lower()
-    return re.sub(r"-{2,}", "-", v).strip("-")[:cut].strip("-")
+    v = re.sub(r"-{2,}", "-", v).strip("-")[:cut].strip("-")
+    return v if re.search(r"[a-z0-9]", v) else ""
 
 
 def _folder_name(here):
@@ -12106,7 +12108,7 @@ CONNECTOR_SAME_LINE = "Your datastash connector in Claude is unchanged."
 PICK_UNKNOWN_LINE = ("Not done: a name you typed is not on the list, or matches two agents. Nothing was removed. Type the "
                      "names as the list shows them, or all.")
 PICK_REFUSED_LINE = ("Not done: {why}. Nothing was removed. Type the names exactly as the list shows them, separated by "
-                     "commas or spaces (a name with spaces in double quotes), or all alone.")
+                     "commas or spaces, or all alone.")
 REFUSED_LINE = "Not done: datastash refused it. Nothing changed."
 # XLI-390 install fix: every refusal is ONE line that says why, and who refused (the plugin here, or datastash).
 NO_STEP_LINE = ("Not done: no /datastash:install or /datastash:uninstall is open in this session, so the plugin sent "
@@ -12148,7 +12150,7 @@ VIS_NOT_AGENT_AI = (f"{CMD_NOTE}: none of the person's datastash agents has that
 VIS_PICK_LINE = ("Not done: a name you typed matches two of your agents, or is not on your list. Nothing changed. Type "
                  "the name as /datastash:uninstall lists it.")
 VIS_REFUSED_LINE = ("Not done: {why}. Nothing was changed. Type the names exactly as /datastash:uninstall lists them, "
-                    "separated by commas or spaces (a name with spaces in double quotes).")
+                    "separated by commas or spaces.")
 VIS_REFUSED_AI = (f"{CMD_NOTE}: the plugin refused the person's names and changed nothing; it showed them the reason. "
                   "Make no more datastash calls. Say only: \"Nothing was changed.\" Never say an agent is listed, ready, "
                   "picked or about to change, and never say datastash did or did not run a step.")
@@ -12420,7 +12422,7 @@ def norm_list(body):
     for a in body.get("agents") if isinstance(body.get("agents"), list) else []:
         if isinstance(a, dict) and isinstance(a.get("agent_id"), str) and re.fullmatch(GRANT_ID_RE, a["agent_id"].lower()):
             out.append({"id": a["agent_id"].lower(), "name": show_name(a.get("name")), "shut": a.get("visibility") != "public",
-                        "plain": ascii_text(a.get("name"))})  # 1.0.11: the STORED name, before show_name drops anything
+                        "plain": plain_name(a.get("name"))})  # 1.0.11 final: the STORED name matches the strict rule
     return {"list_id": body["list_id"].lower(), "agents": out[:500]}
 
 
@@ -12434,8 +12436,8 @@ _RESERVED = ("all", "this")
 
 def pick_tokens(text, keep_and=False):
     """The typed names as ([(token, quoted)], error | None). Tokens are split at whitespace, commas and the word "and";
-    a name with spaces counts only in double quotes. Tokens are never joined into a longer name. keep_and: a bare "and"
-    is kept as a token too (pick_check tells it from a name)."""
+    a double-quoted piece is one token (1.0.11 final: one with a space is never a plain name). Tokens are never joined
+    into a longer name. keep_and: a bare "and" is kept as a token too (pick_check tells it from a name)."""
     out, err = [], None
     for m in _PICK_TOKEN_RE.finditer(text or ""):
         q, cq, word, stray = m.groups()
@@ -12454,8 +12456,10 @@ _BLANK_LETTERS = "\u115f\u1160\u3164\uffa0\u2800"
 
 
 def _listed_plain(a):
-    """True when a listed agent's stored name is plain ASCII (an older saved list has no "plain": its shown name)."""
-    return a["plain"] if isinstance(a.get("plain"), bool) else ascii_text(a["name"])
+    """True when a listed agent's stored name is a plain name: the whole name matches PLAIN_NAME_RE (a-z, 0-9, "-", "_",
+    ".", ignoring case). Anything else ("all,", "all and", "a b", "x;y", a look-alike) is an old-style name, never
+    picked by name. An older saved list has no "plain": its shown name decides."""
+    return a["plain"] if isinstance(a.get("plain"), bool) else plain_name(a["name"])
 
 
 def _shape(v):
@@ -12488,6 +12492,36 @@ def _reads_as_word(shape):
     return len(shape) <= 4 or any(_subseq(part, w) for w in PICK_WORDS)
 
 
+def _old_reads_as_word(name):
+    """True when an old-style listed name (as shown) may read as a pick word: a name with a character that is not ASCII
+    by its shape (_reads_as_word); a plain-ASCII one ("all,", "all and", "this,", "a n d") when it reads as a pick word
+    itself, or when any token the parser would split it into does (so typing it as listed would be that word)."""
+    if not name.isascii():
+        return _reads_as_word(_shape(name))
+    return pick_word_like(name) is not None or any(pick_word_like(t) for t, _ in pick_tokens(name, keep_and=True)[0])
+
+
+def _old_typed(text, lst):
+    """The listed agents with an old-style name (one with a letter or digit) that the typed text holds as it is shown,
+    ignoring case and runs of spaces, at token edges: "all," typed with "all," listed ("a b" is not held by "alpha
+    beta"). Such a pick is refused whole ("old")."""
+    t = _shown_full(text or "").casefold()
+    return [a for a in lst["agents"] if not _listed_plain(a) and re.search(r"[A-Za-z0-9]", a["name"])
+            and re.search(_old_edge(a["name"]), t)]
+
+
+_PICK_SEP = '\\s,"“”'
+
+
+def _old_edge(name):
+    """The pattern finding a shown name in typed text, casefolded, starting and ending at a separator or the text's edge
+    (an edge that is itself a separator, as in "all,", needs none)."""
+    n = name.casefold()
+    pre = "" if n[:1] in ' ,"“”' else f"(?<![^{_PICK_SEP}])"
+    post = "" if n[-1:] in ' ,"“”' else f"(?![^{_PICK_SEP}])"
+    return pre + re.escape(n) + post
+
+
 def _pick_index(lst):
     """(listed plain names by casefold, how many listed names share each fold, [(pick word, agent)] for every listed
     agent named like a pick word, [(shape, agent, may read as a pick word)] for every listed agent whose stored name is
@@ -12498,8 +12532,7 @@ def _pick_index(lst):
         f = fold_name(a["name"])
         folds[f] = folds.get(f, 0) + 1
         if not _listed_plain(a):
-            sh = _shape(a["name"])
-            odd.append((sh, a, _reads_as_word(sh)))
+            odd.append((_shape(a["name"]), a, _old_reads_as_word(a["name"])))
             continue
         low.setdefault(a["name"].casefold(), []).append(a)
         w = pick_word_like(a["name"])
@@ -12531,6 +12564,8 @@ def _pick_match(tok, quoted, idx):
         if not quoted and tok.casefold() in _RESERVED:
             return "reserved", []
         return "unknown", []
+    if not plain_name(tok):  # 1.0.11 final: a typed name matches the same strict rule as a stored one
+        return "notplain", []
     full = _shown_full(tok)
     if not full or len(full) > 64:  # cycle 2 LOW 1: never a match on the first 64 characters of a longer token
         return "unknown", []
@@ -12550,17 +12585,22 @@ def pick_check(text, lst, own, reserved=True):
     """The one strict parser for every command that takes agent names (uninstall, make <names> private/public).
     (picked ids | "none" | None, the token that failed or None, why). "none" when no token names anything (the prompt is
     something else, and the failing token, if any, is still given); None refuses the whole command, changing nothing:
-    a token that is not plain ASCII ("ascii"), unknown ("unknown") or matching two agents ("two"), a pick word while a
-    listed agent is named like it ("kept") or one whose name is not plain ASCII may read as it ("odd-word"), a token that
-    may stand for such an agent ("odd"), "all"/"this" next to any other token ("mixed") or where they are not names ("reserved", when reserved is
-    False), an unclosed quote ("quote"), more than 100 names ("many")."""
+    typed text holding a listed old-style name as shown ("old": a stored name that is not a plain name, "all,", "a b"),
+    a token that is not plain ASCII ("ascii"), not a plain name ("notplain"), unknown ("unknown") or matching two agents
+    ("two"), a pick word while a listed agent is named like it ("kept") or one with an old-style name may read as it
+    ("odd-word"), a token that may stand for such an agent ("odd"), "all"/"this" next to any other token ("mixed") or
+    where they are not names ("reserved", when reserved is False), an unclosed quote ("quote"), more than 100 names
+    ("many")."""
     toks, err = pick_tokens(text, keep_and=True)
+    old = _old_typed(text, lst)
+    if old:  # 1.0.11 final (PM ruling): an old-style name typed as listed is refused, whatever its tokens read as
+        return None, old[0]["name"], "old"
     idx = _pick_index(lst)
     seen = [(t, q, *_pick_match(t, q, idx)) for t, q in toks]
     seen = [x for x in seen if x[2] != "skip"]
     hits = sum(1 for _, _, k, _ in seen if k in ("one", "two", "kept", "ascii", "odd", "odd-word")
                or (reserved and k == "reserved"))
-    first_bad = next(((t, k) for t, _, k, _ in seen if k in ("unknown", "two")), (None, "unknown"))
+    first_bad = next(((t, k) for t, _, k, _ in seen if k in ("unknown", "two", "notplain")), (None, "unknown"))
     if hits == 0:
         return "none", *first_bad
     if len(seen) > 100:  # cycle 2 LOW 2: after "names nothing", so a long ordinary prompt passes through
@@ -12601,7 +12641,7 @@ def pick_refused_why(text, lst, own, reserved=True):
     if why == "many":
         return "more than 100 names were typed"
     if why == "quote":
-        return "a quote is not closed; put a name with spaces in double quotes"
+        return "a quote is not closed"
     if tok is None:
         return None
     t, names = show_name(tok) + ("..." if len(_shown_full(tok)) > 64 else ""), [a["name"] for a in lst["agents"]]
@@ -12615,15 +12655,38 @@ def pick_refused_why(text, lst, own, reserved=True):
         return (f'"{t}" is a word this command keeps, never a name, and your agent {q(kept)} is named like it, so '
                 "that agent can't be picked by name (agents can't be renamed, and the plugin picks agents only by name, "
                 "never by id): leave it, or switch it off on the agents page")
-    if why in ("odd", "odd-word"):
+    if why in ("odd", "odd-word", "old"):
         odd = _pick_index(lst)[3]
         ts = _shape(_shown_full(tok))
-        who = [a["name"] for sh, a, r in odd if (r if why == "odd-word" else _shape_hit(ts, sh))]
-        word = (f'"{t}" is a word this command keeps, and' if why == "odd-word" else f'"{t}" may stand for')
-        return (f"{word} your agent {q(who[:3])}{' and others' if len(who) > 3 else ''}, whose name is not plain ASCII "
-                f"and may read as it, so \"{t}\" is refused while that agent is on the list. An agent whose name is not "
-                "plain ASCII can't be picked by name (agents can't be renamed, and the plugin picks agents only by "
-                "name, never by id): leave it, or switch it off on the agents page")
+        if why == "old":
+            who = [a["name"] for a in _old_typed(text, lst)]
+        else:
+            who = [a["name"] for sh, a, r in odd if (r if why == "odd-word" else _shape_hit(ts, sh))]
+        names_ = f"{q(who[:3])}{' and others' if len(who) > 3 else ''}"
+        head = {"odd-word": f'"{t}" is a word this command keeps, and your agent {names_} has an old-style name that '
+                            f'may read as it, so "{t}" is refused while that agent is on the list',
+                "odd": f'"{t}" may stand for your agent {names_}, which has an old-style name, so "{t}" is refused while '
+                       "that agent is on the list",
+                "old": f"your agent {names_} has an old-style name"}[why]
+        how = ("removed" if reserved else "changed")
+        if not reserved:
+            tail = "leave it, or switch it off on the agents page"
+        elif why == "odd-word":
+            tail = "leave it, or switch it off on the agents page"
+        elif any(r for _, _, r in odd):  # 1.0.11 final LOW 2: say outright that "all" is refused too
+            word_ = [a["name"] for _, a, r in odd if r]
+            tail = (f'while {q(word_[:3])}{" and others" if len(word_) > 3 else ""} '
+                    f'{"is" if len(word_) == 1 else "are"} listed "all", "this" and "and" are refused too, since '
+                    f'{"it" if len(word_) == 1 else "they"} may read as one of them: leave it, or switch it off on the '
+                    "agents page")
+        else:
+            tail = '"all" alone still removes it, with every other agent; or leave it'
+        return (f"{head}. An agent with an old-style name (not only the letters a-z, digits, \"-\", \"_\" and \".\") "
+                f"can't be {how} by name (agents can't be renamed, and the plugin picks agents only by name, never by "
+                f"id): {tail}")
+    if why == "notplain":
+        return (f'"{t}" is not a plain name: type names with plain letters a-z, digits, "-", "_" and "." only, as the '
+                "list shows them")
     if why == "mixed":
         return f'"{t}" must be typed alone, never with other names'
     if why == "reserved":
