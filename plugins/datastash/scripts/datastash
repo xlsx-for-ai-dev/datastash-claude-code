@@ -12137,6 +12137,12 @@ NO_STEP_LINE = ("Not done: no /datastash:install or /datastash:uninstall is open
                 "nothing. Nothing changed.")
 NO_OWN_AGENT_LINE = ("Not done: this session has no datastash agent key on this computer yet, so the plugin sent nothing. "
                      "Type /datastash:install again. Nothing changed.")
+# 1.0.13 (owner's Mac, 11-24): an uninstall never needs this session to be an agent. The person's typed names are signed
+# by any agent of theirs still set up on this computer (note_signer); only when there is none at all is this said. Never
+# "type /datastash:install": that would make one more agent.
+NO_SIGNER_LINE = ("Not done: none of your datastash agents is set up on this computer, so nothing here can sign your typed "
+                  "names and the plugin sent nothing. Nothing was removed. Type /datastash:uninstall on a computer where "
+                  "one of your agents runs.")
 NOT_TYPED_LINE = ("Not done: the plugin could not find your typed command in this session's transcript, so it sent "
                   "nothing. Type the command again. Nothing changed.")
 USED_LINE = "Not done: that typed command was already used once. Type it again. Nothing changed."
@@ -12918,12 +12924,47 @@ def _post(line=None, ai=None, event="PostToolUse"):
     return dict(out, systemMessage=line) if line else out
 
 
+def note_signer(lst, targets):
+    """1.0.13: the agent that signs an uninstall typed in a session that is no agent of its own (the person's main or SPM
+    session, any folder with no agent): one of the person's agents set up on this computer, with its key and answer key,
+    and on the list datastash just showed (so it is on, and the person's). X2 takes any agent keyed through this same
+    connector as the signer (src/agents/agent-notes.ts checkTypedGrantProof). An agent that is not being removed first
+    (datastash then removes every target at once); else a target, which goes last on its own key, as this session's own
+    agent does. None when there is no such agent here."""
+    on = {a["id"] for a in (lst or {}).get("agents") or [] if isinstance(a, dict) and isinstance(a.get("id"), str)}
+    picked = {t.lower() for t in targets}
+    here = [a for a in all_agents() if not is_person(a) and isinstance(a.get("agent_id"), str)
+            and re.fullmatch(GRANT_ID_RE, a["agent_id"].lower()) and a["agent_id"].lower() in on
+            and read_key(a["slug"]) and read_agent_answer(a["slug"])]
+    here.sort(key=lambda a: (a["agent_id"].lower() in picked, a["slug"]))
+    return here[0] if here else None
+
+
+def _signer_of(inp, rec):
+    """The agent that signed this uninstall (note_input saved its slug), checked again against its local record; else
+    this session's own agent."""
+    s = rec.get("signer")
+    if isinstance(s, dict) and isinstance(s.get("slug"), str) and re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,63}", s["slug"]):
+        c = read_json(conf_path(s["slug"]), None)
+        if isinstance(c, dict) and c.get("name") and str(c.get("agent_id") or "").lower() == str(s.get("agent_id") or "-") \
+                and read_key(s["slug"]):
+            return dict(c, slug=s["slug"])
+        return None
+    return _own(inp)
+
+
 def note_input(inp, rec):
     """PreToolUse of ledger_agents_note: the call's whole input, written by the plugin (kind, list id, target ids and the
-    typed proof), or a deny with its fixed line. Only for the person's own typed command, once, while fresh."""
+    typed proof), or a deny with its fixed line. Only for the person's own typed command, once, while fresh. An uninstall
+    from a session with no agent of its own is signed by another agent of the person's on this computer (note_signer)."""
     targets, lst, own = rec.get("targets"), rec.get("list"), _own(inp)
     if not isinstance(targets, list) or not targets or not isinstance(lst, dict):
         return _deny(NO_STEP_LINE)
+    borrowed = False
+    if own is None and rec.get("kind") == "uninstall":
+        own, borrowed = note_signer(lst, targets), True
+        if own is None:
+            return _deny(NO_SIGNER_LINE)
     if own is None:
         return _deny(NO_OWN_AGENT_LINE)
     used = read_json(_typed_used_path(rec["sid"]), {}).get("ids")
@@ -12936,8 +12977,10 @@ def note_input(inp, rec):
     typed_at = _when(entry.get("timestamp"))
     write_private(_typed_used_path(rec["sid"]), json.dumps({"ids": (used + [rec["pid"]])[-50:]}))
     mine = own["agent_id"].lower()
-    if rec["kind"] == "uninstall" and targets == [mine]:
+    if rec["kind"] == "uninstall" and targets == [mine] and not borrowed:
         return _deny(uninstall_self(own))  # an agent may always end itself, on its own key (no proof needed)
+    if borrowed:  # the note's answer is read with the signer's record (note_result), never this session's
+        save_cmd(rec["sid"], dict(rec, signer={"slug": own["slug"], "agent_id": mine}))
     key = read_agent_answer(own["slug"])
     if key is None or typed_at is None:
         return _deny(NO_ANSWER_KEY_LINE)
@@ -13198,7 +13241,7 @@ def note_result(inp, rec, body):
     if rec["kind"] == "install":
         return "\n".join(list_lines(lst, ON_HEAD) + after_install(inp))
     names = {a["id"]: a["name"] for a in lst["agents"]}
-    own = _own(inp)
+    own = _signer_of(inp, rec)  # 1.0.13: the agent that signed, when this session has none of its own
     mine = own["agent_id"].lower() if own else None
     others = [names[t] for t in targets if t != mine and t in names]
     waiting = _run_waiting(own, body.get("status_path"), others) if own and others else others

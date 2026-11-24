@@ -466,6 +466,11 @@ To make one public: say make <name> public.
 Time per card is on. To turn it off, type: datastash time-per-card off
 ```
 
+**From any session (1.0.13).** `/datastash:uninstall` works in a session that is no agent of its own (your main
+session, or a folder with no agent): the names you type are signed by one of your agents still set up on this computer
+(one you are not removing first; else one you are, which goes last on its own key). Only when none of your agents is
+set up on this computer does the plugin say so and send nothing; it never sends you to `/datastash:install` for that.
+
 **Agent names (1.0.11).** One strict parser reads the names after `/datastash:uninstall` (or typed after the list)
 and in `make <names> private` / `make <names> public`. The typed text is split at whitespace, commas and the word "and";
 a name is never more than one token (double quotes keep a piece as one token, but no name has a space). Tokens are never joined into a longer name and never
@@ -1003,7 +1008,10 @@ An agent can send datastash a capability request, an error report or anything el
   9-line MAC input, and the note call's exact fields, as the server checks them. Install notes are read only from the
   `_meta.datastash_note` of a datastash connector result (the hook's own `tool_response`, or the transcript entry's
   `mcpMeta`, which Claude Code writes after the call and the next hook or the Stop hook reads), once each, and only for
-  this agent's own id. The agent that sends an uninstall goes last, on its own key with the run id. After the last agent
+  this agent's own id. The agent that sends an uninstall goes last, on its own key with the run id. 1.0.13
+  (UninstallNoKey, UninstallNoKeyRealHooks, UninstallNoBox): from a session with no agent key the typed names are signed
+  by another agent on this computer that is on the list (never the model's targets; a model-made prompt is still
+  refused), and with no agent here at all the one line never says /datastash:install. After the last agent
   goes, a small tombstone in the temp folder (a time only; it lapses after an hour, and the next `/datastash:install`
   lifts it) keeps the uninstall turn's own hooks from making `~/.config/datastash` again. The rotated log and the
   workbook's status copy go too; no login is started or pointed at.

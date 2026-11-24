@@ -165,7 +165,7 @@ class Base(unittest.TestCase):
         ds.write_private(ds.conf_path("web-app"), json.dumps(c))
 
 
-def proof_ok(p, kind, targets, pid, typed, own=OWN):
+def proof_ok(p, kind, targets, pid, typed, own=OWN, answer=ANSWER):
     """X2's checkNoteProof, line for line: exactly these 7 fields, and the MAC over its 9-line proofInput."""
     if sorted(p) != ["agent_id", "iat", "mac", "prompt_id", "typed_at", "typed_sha256", "v"] or p["v"] != 1:
         return False
@@ -173,7 +173,7 @@ def proof_ok(p, kind, targets, pid, typed, own=OWN):
         return False
     lines = ["datastash-agents-note/v1", own, LIST_ID.lower(), kind, ",".join(sorted(t.lower() for t in targets)), pid,
              hashlib.sha256(typed.encode()).hexdigest(), str(p["typed_at"]), str(p["iat"])]
-    return hmac.compare_digest(p["mac"], hmac.new(ANSWER.encode(), "\n".join(lines).encode(), hashlib.sha256).hexdigest())
+    return hmac.compare_digest(p["mac"], hmac.new(answer.encode(), "\n".join(lines).encode(), hashlib.sha256).hexdigest())
 
 
 class Install(Base):
@@ -1604,6 +1604,171 @@ class Removed410(Base):
 REAL_NOTE_1 = {"kind": "install", "list_id": "7fe71587-7b74-4a3c-8c0a-750ee057dd41", "targets": [],
                "agent_id": "08514494-d4b4-4cc5-a84e-1433390bd078"}
 REAL_NOTE_2 = {"kind": "install", "agent_id": "c02bb852-9f70-4d18-8149-ee8f167dff25"}
+
+
+KEY_A, ANSWER_A = "ldgr_ag_" + "a" * 40, "a" * 43
+KEY_B, ANSWER_B = "ldgr_ag_" + "b" * 40, "b" * 43
+
+
+def two_agents_elsewhere(t):
+    """alpha and beta set up on this computer, each in its own folder (key and answer key); the test's session folder
+    has no agent."""
+    root = os.path.dirname(t.folder)
+    for name, aid, key, ans in (("alpha", ALPHA, KEY_A, ANSWER_A), ("beta", BETA, KEY_B, ANSWER_B)):
+        os.makedirs(os.path.join(root, name))
+        ds.save_agent(name, aid, key, WB, os.path.join(root, name))  # set up here, in its own folder
+        c = ds.read_json(ds.conf_path(name), {})
+        c["answer_store"] = ds.save_agent_answer(name, ans)
+        ds.write_private(ds.conf_path(name), json.dumps(c))
+    t.assertIsNone(ds._own({"cwd": t.folder, "session_id": "s1"}))  # this session: no agent key of its own
+
+
+class UninstallNoKey(Base):
+    """1.0.13 (found on the owner's computer): /datastash:uninstall typed in a session that is no agent of its own (the
+    person's main or SPM session, a folder with no agent) was refused before anything was sent, with "Type
+    /datastash:install again", which would make one more agent. Now the person's typed names are signed by one of their
+    agents still set up on this computer (its own answer key; the proof bound to the named agent ids), and only when
+    there is none is the fixed line said, which never sends the person to /datastash:install."""
+
+    def setUp(self):
+        super().setUp()
+        two_agents_elsewhere(self)
+
+    def note(self, text, source="typed"):
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        _, pid = self.prompt(text, source=source)
+        return self.tool("PreToolUse", "ledger_agents_note", {"targets": [OWN], "typed_proof": {"v": 1}}), pid
+
+    def test_named_agents_are_removed_with_the_typed_proof_of_an_agent_on_this_computer(self):
+        out, pid = self.note("beta")
+        got = out["hookSpecificOutput"]["updatedInput"]
+        self.assertNotIn("permissionDecision", out["hookSpecificOutput"])
+        self.assertEqual(got["targets"], [BETA])  # the person's names, never the model's targets or proof
+        self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [BETA], pid, "beta", own=ALPHA, answer=ANSWER_A))
+        self.assertEqual(sorted(got), ["kind", "list_id", "targets", "typed_proof"])
+        self.assertNotIn(KEY_A, json.dumps(out))
+        self.assertNotIn(ANSWER_A, json.dumps(out))  # the key never reaches the model
+        status = "/api/v1/agent/uninstall/" + RUN
+        self.answers[status] = (200, {"run_id": RUN, "kind": "uninstall", "total": 1, "confirmed": [], "not_confirmed": ["beta"]})
+        line = self.tool("PostToolUse", "ledger_agents_note", got, {
+            "run_id": RUN, "kind": "uninstall", "targets": 1, "removed": ["beta"], "this_agent_last": False,
+            "status_path": status})["systemMessage"]
+        self.assertIn(("GET", status, KEY_A, None), self.calls)  # read on the signer's key
+        self.assertFalse(any(c[:2] == ("POST", ds.UNINSTALL_SELF_PATH) for c in self.calls))  # the signer stays
+        self.assertEqual(line, 'datastash is off for "beta". Removed: listener, key, settings and local copies. Removed 1 '
+                               'agents. Not yet confirmed: "beta" (they clean up when they next start). Your datastash '
+                               "connector in Claude is unchanged.")
+        self.assertTrue(os.path.exists(ds.key_path("alpha")))
+
+    def test_every_agent_on_this_computer_named_the_signer_goes_last_on_its_own_key(self):
+        out, pid = self.note("alpha, beta")
+        got = out["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(got["targets"], sorted([ALPHA, BETA]))
+        self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [ALPHA, BETA], pid, "alpha, beta", own=ALPHA,
+                                 answer=ANSWER_A))
+        status = "/api/v1/agent/uninstall/" + RUN
+        self.answers[status] = (200, {"run_id": RUN, "kind": "uninstall", "total": 2, "confirmed": [], "not_confirmed": ["alpha", "beta"]})
+        self.answers[ds.UNINSTALL_SELF_PATH] = (200, {"result": "removed", "run_id": RUN})
+        line = self.tool("PostToolUse", "ledger_agents_note", got, {
+            "run_id": RUN, "kind": "uninstall", "targets": 2, "removed": ["beta"], "this_agent_last": True,
+            "status_path": status})["systemMessage"]
+        self.assertIn(("POST", ds.UNINSTALL_SELF_PATH, KEY_A, {"run_id": RUN}), self.calls)  # the signer, last
+        self.assertFalse(os.path.exists(ds.key_path("alpha")))  # and cleaned up here
+        self.assertIn('Removed 2 agents. Not yet confirmed: "beta"', line)
+        self.assertNotIn("/datastash:install", line)
+
+    def test_remove_all_from_a_session_with_no_key(self):
+        self.prompt("/datastash:uninstall all")
+        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        _, pid = self.prompt("remove all 3")
+        got = self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]
+        self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [OWN, ALPHA, BETA], pid, "remove all 3", own=ALPHA,
+                                 answer=ANSWER_A))
+
+    def test_a_model_made_uninstall_is_still_refused(self):
+        out, _ = self.note("beta", source="sdk")  # a headless or model-made prompt: no person origin
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(out["systemMessage"], ds.NOT_PERSON_LINE)
+        self.assertNotIn("updatedInput", out["hookSpecificOutput"])
+        self.assertTrue(os.path.exists(ds.key_path("alpha")) and os.path.exists(ds.key_path("beta")))
+        none = self.tool("PreToolUse", "ledger_agents_note", {"kind": "uninstall", "targets": [BETA]}, sid="s2")
+        self.assertEqual(none["systemMessage"], ds.NO_STEP_LINE)  # no typed command in that session: nothing to sign
+
+    def test_an_agent_not_on_the_list_never_signs(self):
+        lst = dict(LIST, agents=[a for a in LIST["agents"] if a["agent_id"] != ALPHA])
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+        _, pid = self.prompt("web-app")
+        got = self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]
+        self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [OWN], pid, "web-app", own=BETA, answer=ANSWER_B))
+
+    def test_no_agent_on_this_computer_says_what_to_do_and_never_install(self):
+        for s in ("alpha", "beta"):
+            ds._drop(ds.key_path(s))  # a record left here with no key: nothing on this computer can sign
+        out, _ = self.note("beta")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(out["systemMessage"], ds.NO_SIGNER_LINE)
+        self.assertNotIn("/datastash:install", out["systemMessage"])
+        self.assertIn("Type /datastash:uninstall on a computer where one of your agents runs.", out["systemMessage"])
+        self.assertNotIn("/datastash:install", ds.NO_SIGNER_LINE)
+        self.assertFalse(any(c[0] == "POST" for c in self.calls))
+
+
+class UninstallNoKeyRealHooks(Base):
+    """The same key-less uninstall, end to end through the plugin's real hook commands as Claude Code runs them (a
+    separate python3 process per hook, the hook input on stdin, the real slash-command transcript entries): the prompt
+    hook opens the step, the list's PostToolUse shows it, the typed pick is taken, and the note's PreToolUse comes back
+    signed by an agent on this computer. No network: it stops before the note goes out."""
+
+    def run_hook(self, args, inp):
+        env = dict(os.environ, DATASTASH_CONFIG_DIR=ds.CONF, DATASTASH_NO_NETWORK="1")
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        r = subprocess.run([sys.executable, "-I", BIN, *args], input=json.dumps(inp), capture_output=True, text=True,
+                           env=env, timeout=30, cwd=self.folder)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def test_a_keyless_session_uninstall_through_the_real_hooks(self):
+        two_agents_elsewhere(self)
+        with open(os.path.join(FIXTURES, "slash-command-2.1.330-hooks.json")) as f:
+            shape = dict([h for h in json.load(f) if h["prompt"].startswith("/datastash:uninstall")][0], prompt="/datastash:uninstall")
+        sid, tp = "s1", self.transcript("s1")
+        pid = str(uuid.uuid4())
+        v = self.run_hook(["prompt"], dict(shape, session_id=sid, cwd=self.folder, prompt_id=pid, transcript_path=tp))
+        self.assertIn("ledger_agents_list", v["hookSpecificOutput"]["additionalContext"])
+        own, meta = real_entries("datastash:uninstall")
+        with open(tp, "a") as f:
+            c = "<command-message>datastash:uninstall</command-message>\n<command-name>/datastash:uninstall</command-name>"
+            f.write(json.dumps(dict(own, promptId=pid, sessionId=sid, message={"role": "user", "content": c}, timestamp=time.strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()))) + "\n" + json.dumps(dict(meta, promptId=pid, sessionId=sid)) + "\n")
+        tool = {"session_id": sid, "cwd": self.folder, "transcript_path": tp}
+        shown = self.run_hook(["agent-tool"], dict(tool, hook_event_name="PostToolUse", tool_name=TOOL + "ledger_agents_list",
+                                                   tool_input={}, tool_response=[{"type": "text", "text": json.dumps(LIST)}]))
+        self.assertTrue(shown["systemMessage"].startswith("Your datastash agents:"), shown)
+        pid = str(uuid.uuid4())
+        v = self.run_hook(["prompt"], {"session_id": sid, "prompt": "beta", "hook_event_name": "UserPromptSubmit",
+                                       "cwd": self.folder, "prompt_id": pid, "transcript_path": tp})
+        self.assertIn('kind "uninstall"', v["hookSpecificOutput"]["additionalContext"])
+        self.typed(sid, "beta", pid)
+        out = self.run_hook(["agent-tool"], dict(tool, hook_event_name="PreToolUse", tool_name=TOOL + "ledger_agents_note",
+                                                 tool_input={"kind": "uninstall", "targets": [OWN]}))
+        got = out["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(got["targets"], [BETA])
+        self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [BETA], pid, "beta", own=ALPHA, answer=ANSWER_A))
+        self.assertNotIn("/datastash:install", json.dumps(out))
+        for secret in (KEY_A, ANSWER_A, KEY_B, ANSWER_B):
+            self.assertNotIn(secret, json.dumps(out) + json.dumps(shown) + json.dumps(v))
+
+
+class UninstallNoBox(Base):
+    def test_a_computer_with_no_agent_at_all_says_what_to_do(self):
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        self.prompt("beta")
+        out = self.tool("PreToolUse", "ledger_agents_note", {})
+        self.assertEqual(out["systemMessage"], ds.NO_SIGNER_LINE)
+        self.assertNotIn("/datastash:install", out["systemMessage"])
 
 
 class HomeFolderInstall(Base):

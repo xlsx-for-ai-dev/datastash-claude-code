@@ -14,6 +14,9 @@
 #      datastash's own sign-in page (the page a person signs in on). The run stops there (Esc).
 #   5. /datastash:install: the plugin's own prompt hook takes the typed command and picks the agent's name: "agent" in
 #      the home folder (1.0.1: the computer user's name), "web-app" in the repo.
+#   6. /datastash:uninstall in that same session, which has no agent key on this computer (1.0.12 refused it there
+#      with "Type /datastash:install again"): the plugin's prompt hook must take it and open the uninstall step. The
+#      key-less signing that follows is covered offline (test/test_install.py UninstallNoKey, UninstallNoKeyRealHooks).
 # PASS only when every step passes in every folder. Exit 0 PASS, 1 FAIL, 2 can't run here (no tmux, claude, network).
 #
 # NOT covered here (said as NOT RUN at the end of every run): finishing Authenticate's sign-in, and what follows it
@@ -213,6 +216,19 @@ check_install_hook() {  # step 5, the plugin's half: the typed /datastash:instal
     fail "$where step 5: /datastash:install: wanted agent name \"$want\", the plugin has: ${got:-nothing}"
   fi
   tmux send-keys -t "$T" Escape; sleep 1
+  # Step 6 (1.0.13): uninstall from this key-less session reaches the plugin (no agent key here, no install first).
+  type_line "/datastash:uninstall"
+  for ((i = 0; i < 30; i++)); do
+    got="$(command_record "$h" 2>/dev/null)"
+    [[ "$got" == uninstall* ]] && break
+    sleep 1
+  done
+  if [[ "$got" == uninstall* ]] && ! pane | grep -q "Type /datastash:install again. Nothing changed"; then
+    pass "$where step 6: /datastash:uninstall from a session with no agent key reached the plugin"
+  else
+    fail "$where step 6: /datastash:uninstall from a key-less session: the plugin has: ${got:-nothing}"
+  fi
+  tmux send-keys -t "$T" Escape; sleep 1
 }
 
 STARTS=0
@@ -223,7 +239,8 @@ done
 say "NOT RUN (can't be automated here): finishing Authenticate's sign-in (Google only; no selftest door signs a"
 say "  throwaway account in through the connector's OAuth), and so the agent /datastash:install makes, a retry that"
 say "  reuses it (no \"-2\"), the install note accepted, and /datastash:uninstall cleaning up. Also the session runs"
-say "  with no Claude login. Covered offline by test/test_install.py (HomeFolderInstall, FreshHome)."
+say "  with no Claude login. Covered offline by test/test_install.py (HomeFolderInstall, FreshHome, UninstallNoKey,"
+say "  UninstallNoKeyRealHooks: the key-less uninstall signed by an agent on this computer)."
 if ((FAILS == 0)); then say "RESULT: PASS (${TAG:-$MARKETPLACE}; folders: $FOLDERS)"; exit 0; fi
 say "RESULT: FAIL, $FAILS step(s) (${TAG:-$MARKETPLACE}; folders: $FOLDERS)"
 exit 1
