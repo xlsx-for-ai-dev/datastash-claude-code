@@ -163,13 +163,16 @@ The session start gives the agent the rules only for what is on. Clean sessions 
 XLI-396): while either choice is on, the main session (Claude Code's hook input carries `agent_id` only inside a
 subagent) is refused Edit, Write, MultiEdit and NotebookEdit, and any Bash call that is not one short read-only lookup,
 with one fixed line: "Clean sessions is on: hand this to a subagent (Agent tool), then report the result in plain
-words." A read-only lookup is a single command from this list, with no redirect, pipe, `;`, `&&`, `||`, subshell,
-command substitution or background run: `ls`, `cat`, `head`, `tail` (not `-f`), `grep`, `wc`, `git status`, `git log`,
-`git diff`, `git show` (no `--output`, no `--ext-diff`, no `git -C`), `gh pr view` (not `--web`), `curl -s <url>` (a GET
-to stdout: only `-s -S -f -L -I` and their long forms), and the plugin's own `datastash` command (also as
-`printf '%s' '<json>' | datastash status-set -`). With no code in sessions on, `cat`, `head`, `tail`, `grep`,
-`git diff`, `git show` and `git log -p` are refused too. Subagents are never refused, and neither is your datastash main
-session. Nothing is capped and no command text is repeated. Type "no code in sessions", "turn off clean sessions"
+words." A read-only lookup is a single command from this list, made only of plain words and quoted literals: no
+shell metacharacter outside quotes (`;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}`, newline), and no `#`, `$`, backtick,
+backslash or `!` anywhere, nothing but plain ASCII, and a `*` or `?` only where the name it expands to can never be an
+option. The list: `ls`, `cat`, `head`, `tail` (never following), `grep`, `wc`, `git status`, `git log`, `git diff`,
+`git show` (no `git -C` or `-c`), `gh pr view` (not `--web`), `curl -s <url>` (a GET to stdout: only `-s -S -f -L -I`
+and their long forms), and the reads of the plugin's own `datastash` command (`status`, `check`, `read INBOX`,
+`api GET PATH`; never `api POST` or any write). Each command has its own list of options; a long option must be
+spelled out in full (`tail --fol` is refused) and anything off the list is refused, as is a file under `/dev`, `/proc`
+or `/sys`. With no code in sessions on, `cat`, `head`, `tail`, `grep`, `git diff`, `git show` and `git log -p` are
+refused too. Subagents are never refused, and neither is your datastash main session. Nothing is capped and no command text is repeated. Type "no code in sessions", "turn off clean sessions"
 (which turns both off, and with them every refusal), "turn on clean sessions" or "code in sessions"; the plugin saves
 it and the agent confirms in one line.
 
@@ -793,7 +796,7 @@ An agent can send datastash a capability request, an error report or anything el
 - `python3 -I test/test_clean.py`: clean sessions (plugin 0.8.0; enforced in 1.0.2, XLI-396): the two choices and their
   phrases, the session-start rules, and the refusal: the main session's Edit, Write, MultiEdit and NotebookEdit and its
   writing Bash (redirects, pipes, chains, substitutions, background runs, anything off the list) refused with the one
-  line, read-only lookups and the `datastash` command let through, no code in sessions refusing the lookups that show
+  line, read-only lookups and the `datastash` reads let through (bypass tricks such as `ls x#;touch F` tried in a real bash, never running), datastash writes and abbreviated long options refused, no code in sessions refusing the lookups that show
   code, subagents never refused, and "turn off clean sessions" ending it all.
 - `python3 -I test/test_ci_report.py`: `datastash ci-report` (plugin 0.9.11): a canary in a failure's message, text,
   stdout and stderr never sent or printed, only allow-listed fields; a DOCTYPE, billion laughs and an outside entity

@@ -6920,75 +6920,187 @@ def clean_session_text(cur=None):
 # code-writing tools are refused; a Bash call runs only as one short read-only lookup from this allow-list, or the
 # plugin's own datastash command. No code in sessions also refuses the lookups that show file text.
 CLEAN_WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
-CLEAN_LOOKUPS = {"ls": None, "cat": None, "head": None, "tail": None, "grep": None, "wc": None,
-                 "git": ("status", "log", "diff", "show"), "gh": ("pr view",), "curl": None}
+# Each lookup: its allowed subcommands (None: no subcommand) and, per subcommand, the short option letters (digits are
+# always allowed in a short option, for -n5, -A3, -U1), the long options taken bare, and the long options taken as
+# --name=VALUE. A long option must be spelled out in full and be on its list: GNU getopt and git take any unambiguous
+# prefix (tail --fol is --follow), so anything not listed, abbreviations included, is refused.
+_CL_HEAD = ("ncqvz", {"--quiet", "--silent", "--verbose", "--zero-terminated"}, {"--lines", "--bytes"})
+CLEAN_OPTS = {
+    "ls": ("aAlhrRtSd1FpisGgnouUXvQkc", {"--all", "--almost-all", "--human-readable", "--recursive", "--reverse",
+                                          "--directory", "--classify", "--size", "--inode"}, {"--color", "--sort"}),
+    "cat": ("nbAEsTvet", {"--number", "--number-nonblank", "--show-all", "--squeeze-blank", "--show-ends",
+                          "--show-tabs", "--show-nonprinting"}, set()),
+    "head": _CL_HEAD,
+    "tail": _CL_HEAD,  # never -f, -F, --follow (or a prefix of it), --retry, --pid, -s: those never end
+    "wc": ("lwcmL", {"--lines", "--words", "--bytes", "--chars", "--max-line-length"}, set()),
+    "grep": ("rRniIlLvwcHhoqsEFxaABCme", {"--recursive", "--dereference-recursive", "--line-number", "--ignore-case",
+                                          "--files-with-matches", "--files-without-match", "--invert-match",
+                                          "--word-regexp", "--line-regexp", "--count", "--with-filename",
+                                          "--no-filename", "--only-matching", "--quiet", "--silent", "--no-messages",
+                                          "--extended-regexp", "--fixed-strings", "--text"},
+             {"--include", "--exclude", "--exclude-dir", "--max-count", "--after-context", "--before-context",
+              "--context", "--regexp", "--color", "--colour", "--binary-files"}),
+    "git status": ("sbuvz", {"--short", "--branch", "--porcelain", "--untracked-files", "--ignored", "--long",
+                             "--verbose", "--show-stash", "--renames", "--no-renames"},
+                   {"--porcelain", "--untracked-files", "--ignored"}),
+    "git log": ("np", {"--oneline", "--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--graph",
+                       "--decorate", "--all", "--reverse", "--no-merges", "--merges", "--first-parent",
+                       "--abbrev-commit", "--patch", "--follow", "--no-color", "--summary", "--branches", "--tags",
+                       "--remotes", "--date-order", "--topo-order", "--left-right"},
+                {"--format", "--pretty", "--since", "--until", "--after", "--before", "--author", "--committer",
+                 "--grep", "--max-count", "--date", "--decorate", "--skip"}),
+    "git diff": ("Uwb", {"--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--cached",
+                         "--staged", "--no-color", "--ignore-all-space", "--ignore-space-change", "--check",
+                         "--summary", "--merge-base", "--word-diff"}, {"--unified", "--diff-filter", "--stat"}),
+    "git show": ("sU", {"--oneline", "--stat", "--shortstat", "--numstat", "--name-only", "--name-status",
+                        "--no-patch", "--summary", "--abbrev-commit", "--no-color"},
+                 {"--format", "--pretty", "--unified", "--stat"}),
+    "gh pr view": ("cqRt", {"--comments", "--json", "--jq", "--repo", "--template"},
+                   {"--json", "--jq", "--repo", "--template"}),  # never -w/--web: it opens a browser
+}
 CLEAN_SHOWS_CODE = ("cat", "head", "tail", "grep", "git diff", "git show")  # refused too while no code in sessions is on
 CLEAN_CURL_FLAGS = {"-s", "-S", "-f", "-L", "-I", "-sS", "-fsS", "-sSf", "-fsSL", "-sL", "-sSL", "-fs", "-sf", "-fsL",
                     "--silent", "--show-error", "--fail", "--location", "--head"}
-_CLEAN_OPS = set(";&|<>()")
+_CLEAN_DS = r'(?:datastash|(?:python3 )?"\$\{CLAUDE_PLUGIN_ROOT\}/(?:bin|scripts)/datastash")'  # on PATH, or the plugin's
+_CLEAN_DS_PREFIX = re.compile(_CLEAN_DS + r"(?= |$)")
+_CLEAN_BARE = r"[A-Za-z0-9_./:=,@%+~^-]"  # no shell meaning at all: no glob, quote, $, `, \, #, !, ;, &, |, <, >, (, ), {, }
+_CLEAN_WORD = re.compile(r"(?:[*?]|" + _CLEAN_BARE + r"+|'[^']*'|\"(?:" + _CLEAN_BARE + r"| )*\")+")
+_CLEAN_PIECE = re.compile(r"([*?])|" + _CLEAN_BARE + r"+|'([^']*)'|\"([^\"]*)\"")
+_CLEAN_MAIN_STEP = re.compile(r"(?:printf '%s\\n' 'dsmk_[A-Za-z0-9_-]{6,200}' \| DS main --key -|DS main(?: --on| --workbook "
+                              r"[0-9a-fA-F-]{36})?|DS login(?: --check)?)(?: 2>&1)?"
+                              .replace("DS", _CLEAN_DS))
 
 
-def _clean_ds_call(words):
-    """True when the words run this plugin's own datastash command: bare (on PATH), from ${CLAUDE_PLUGIN_ROOT}, or
-    this very script, optionally after python3."""
-    if words[:1] == ["python3"]:
-        words = words[1:]
-    me = os.path.realpath(__file__)
-    return bool(words) and (words[0] in ("datastash", "${CLAUDE_PLUGIN_ROOT}/scripts/datastash",
-                                         "${CLAUDE_PLUGIN_ROOT}/bin/datastash", me)
-                            or os.path.realpath(words[0]) == me)
+def _clean_words(cmd, glob=False):
+    """The words of a command made only of plain words and quoted literals, unquoted; None for anything else. Bash
+    gives every allowed character its literal meaning (single quotes keep everything literal, double quotes here hold
+    no $, `, \\ or "), so the words are exactly what the program gets. With glob, a bare * or ? is let through only
+    where every name it can expand to still starts with the same literal text: a first character other than -, * or ?
+    (so never an option), or "--name=" (the same long option, another value)."""
+    words, pos = [], 0
+    while True:
+        while cmd.startswith(" ", pos):
+            pos += 1  # runs of spaces between words
+        if pos >= len(cmd):
+            return words
+        m = _CLEAN_WORD.match(cmd, pos)
+        if m is None or (m.end() < len(cmd) and cmd[m.end()] != " "):
+            return None
+        part, pos = m.group(0), m.end()
+        pieces = list(_CLEAN_PIECE.finditer(part))
+        text = "".join(m.group(2) if m.group(2) is not None else m.group(3) if m.group(3) is not None
+                       else m.group(0) for m in pieces)
+        if any(m.group(1) for m in pieces):
+            if not glob or not text or text[0] in "*?" or (
+                    text[0] == "-" and not re.match(r"--[A-Za-z0-9-]+=", text.split("*")[0].split("?")[0])):
+                return None
+        words.append(text)
 
 
-def clean_lookup_ok(cmd, no_code=False):
-    """True only for one short read-only lookup: a single command from CLEAN_LOOKUPS (or the plugin's own datastash
-    command) with no redirect, pipe, chain, subshell or command substitution. Anything it can't parse is refused."""
-    if not isinstance(cmd, str) or not cmd.strip() or len(cmd) > 2000 or "\n" in cmd or "\r" in cmd:
-        return False
-    if MAIN_STEP_RE.fullmatch(cmd):
-        return True  # the person's own switch-on steps
-    if "`" in cmd or "$(" in cmd or "<(" in cmd or ">(" in cmd:
-        return False
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        words = list(lex)
-    except ValueError:
-        return False
-    ops = [i for i, w in enumerate(words) if w and set(w) <= _CLEAN_OPS]
-    if len(ops) == 1 and words[ops[0]] == "|" and words[:1] == ["printf"] and 3 <= ops[0] <= 4 \
-            and words[1] in ("%s", "%s\\n") and _clean_ds_call(words[ops[0] + 1:]):
-        return True  # printf '%s' '<json>' | datastash status-set - (the skill's own form)
-    if not words or ops:
-        return False
-    if _clean_ds_call(words):
-        return True  # the plugin's own datastash command, as one call
-    name, args = words[0], words[1:]
-    if name not in CLEAN_LOOKUPS:
-        return False
-    subs = CLEAN_LOOKUPS[name]
-    if subs is not None:
-        sub = next((x for x in subs if words[1:1 + len(x.split())] == x.split()), None)
-        if sub is None:
+def _clean_ds_read(args):
+    """Only the datastash command's read subcommands: status (and its list views), check, read INBOX, help, and
+    api GET PATH (no body). Every write (api POST, status-set, send, reply, link, off, keep, ...) is refused."""
+    if args in ([], ["status"], ["status", "--all"], ["status", "--all", "--install"], ["check"], ["help"]):
+        return True
+    if len(args) == 3 and args[0] == "status" and args[1] in ("--details", "--more") and re.fullmatch(r"\d{1,3}", args[2]):
+        return True
+    if len(args) == 2 and args[0] == "read" and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", args[1]):
+        return True
+    return len(args) == 3 and args[0] == "api" and args[1].upper() == "GET" and args[2].startswith("/")
+
+
+def _clean_opts_ok(spec, args, tail=False):
+    letters, bare, valued = spec
+    prev = None
+    for a in args:
+        if a == "--" or not a.startswith("-") or a == "-":
+            if tail and a.startswith("+") and prev not in ("-n", "-c", "--lines", "--bytes"):
+                return False  # tail +1f is the old form of tail -f
+            prev = a
+            continue
+        if a.startswith("--"):
+            name, eq, _v = a.partition("=")
+            if not (name in valued if eq else name in bare):
+                return False
+        elif not all(c.isdigit() or c in letters for c in a[1:]):
             return False
-        shown = f"{name} {sub}"
-        args = words[1 + len(sub.split()):]
-    else:
-        shown = name
-    if no_code and shown in CLEAN_SHOWS_CODE:
+        prev = a
+    return True
+
+
+def _clean_path_ok(arg, cwd):
+    """A file argument that is a device, /proc or /sys is refused (it can never end, or holds the process's secrets)."""
+    try:
+        p = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(arg)))
+    except (OSError, ValueError):
         return False
-    if any(a.startswith("--output") or a in ("--ext-diff", "--web", "-w") for a in args):
-        return False  # git's --output writes a file, --ext-diff runs a program; gh --web opens a browser
-    short = [a[1:] for a in args if a.startswith("-") and not a.startswith("--")]
-    if name == "tail" and (any("f" in a or "F" in a for a in short) or any(a.startswith(("--follow", "--retry"))
-                                                                            for a in args)):
-        return False  # not short: it never ends
-    if no_code and name == "git" and (any(a.startswith(("--patch", "-p", "-u")) for a in args)):
-        return False  # a log with patches shows code
+    return not re.match(r"/(?:dev|proc|sys)(?:/|$)", p)
+
+
+def clean_lookup_ok(cmd, no_code=False, cwd=None):
+    """True only for one short read-only lookup: a single command from CLEAN_OPTS (or a read of the plugin's own
+    datastash command) made of plain words and quoted literals. Any shell metacharacter outside a quoted literal, any
+    "#", backslash, "$", backtick or "!" anywhere, any non-ASCII or control character, and any option not on that
+    command's list is refused. Anything it can't parse is refused."""
+    try:
+        return _clean_lookup_ok(cmd, no_code, cwd)
+    except Exception:  # noqa: BLE001  can't tell: refused
+        return False
+
+
+def _clean_lookup_ok(cmd, no_code, cwd):
+    if not isinstance(cmd, str) or len(cmd) > 2000 or not re.fullmatch(r"[\x20-\x7e]+", cmd):
+        return False  # ASCII printable only: no newline, tab, control or look-alike character
+    cmd = cmd.strip(" ")
+    if not cmd:
+        return False
+    if _CLEAN_MAIN_STEP.fullmatch(cmd):
+        return True  # the person's own switch-on steps
+    m = _CLEAN_DS_PREFIX.match(cmd)
+    rest = cmd[m.end():] if m else cmd  # the one fixed "${CLAUDE_PLUGIN_ROOT}" spelling is the only $ ever let through
+    if any(c in rest for c in "#`$\\!"):
+        return False
+    if m:
+        words = _clean_words(rest)
+        return words is not None and _clean_ds_read(words)
+    words = _clean_words(cmd)
+    if words is None:
+        words = _clean_words(cmd, glob=True)  # a * or ? only for the file lookups below, never curl, gh or datastash
+        if not words or words[0] not in ("ls", "cat", "head", "tail", "grep", "wc", "git"):
+            return False
+    if not words:
+        return False
+    me = os.path.realpath(__file__)
+    ds = words[1:] if words[0] == "python3" else words
+    if ds and ds[0].startswith("/") and os.path.realpath(ds[0]) == me:
+        return _clean_ds_read(ds[1:])  # this very script by its path
+    name = words[0]
     if name == "curl":
+        args = words[1:]
         urls = [a for a in args if not a.startswith("-")]
+        short = [a[1:] for a in args if a.startswith("-") and not a.startswith("--")]
         return (len(urls) == 1 and re.fullmatch(r"https?://[^\s]+", urls[0]) is not None
                 and all(a in CLEAN_CURL_FLAGS for a in args if a.startswith("-"))
                 and ("--silent" in args or any("s" in a for a in short)))  # -s: a quiet GET to stdout, nothing else
+    if name in ("git", "gh"):
+        sub = next((k for k in CLEAN_OPTS if k.startswith(name + " ") and words[1:len(k.split())] == k.split()[1:]),
+                   None)
+        if sub is None:
+            return False  # also git -C, git -c, git --exec-path, gh --web: only the listed subcommands, first
+        args = words[len(sub.split()):]
+    elif name in CLEAN_OPTS:
+        sub, args = name, words[1:]
+    else:
+        return False
+    if no_code and sub in CLEAN_SHOWS_CODE:
+        return False
+    if no_code and sub == "git log" and any(a == "--patch" or (a.startswith("-") and not a.startswith("--")
+                                                                and "p" in a) for a in args):
+        return False  # a log with patches shows code
+    if not _clean_opts_ok(CLEAN_OPTS[sub], args, tail=sub == "tail"):
+        return False
+    if name in ("cat", "head", "tail", "grep", "wc"):
+        return all(_clean_path_ok(a, cwd) for a in args if not a.startswith("-"))
     return True
 
 
@@ -7009,7 +7121,8 @@ def clean_block(inp):
         return None
     if tool == "Bash":
         ti = inp.get("tool_input")
-        if isinstance(ti, dict) and not ti.get("run_in_background") and clean_lookup_ok(ti.get("command"), cur["no_code"]):
+        if isinstance(ti, dict) and not ti.get("run_in_background") and clean_lookup_ok(ti.get("command"), cur["no_code"],
+                                                                                        cwd=inp.get("cwd")):
             return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                    "permissionDecisionReason": CLEAN_BLOCK}}

@@ -101,15 +101,22 @@ WRITE_TOOLS = {"Edit": {"file_path": "/x/a.py", "old_string": "a", "new_string":
 READ_ONLY = ("ls", "ls -la src", "cat README.md", "head -n 20 a.py", "tail -n 5 log.txt", "grep -rn 'a|b' src",
              "wc -l a.py", "git status", "git log --oneline -5", "git diff HEAD~1", "git show HEAD", "gh pr view 12",
              "curl -s https://example.invalid/health", "curl -fsS https://example.invalid/x",
-             "datastash status --all", "datastash where clean_block",
-             "printf '%s' '{\"doing\": \"x; y\"}' | datastash status-set -", "datastash main")
+             "datastash status --all", "datastash main", "datastash check", "datastash read person",
+             "datastash api GET /api/v1/agent/rows", "datastash api get '/api/v1/agent/inbox?limit=5&x=1'",
+             '"${CLAUDE_PLUGIN_ROOT}/scripts/datastash" status --details 3', "grep -r --include=*.py foo .",
+             "grep -rn --include='*.md' 'a b' .", "git log --format='%h %s' -3", "ls src/*.py", "tail -n +5 log")
 WRITING = ("rm -rf x", "touch a", "ls > out.txt", "cat a >> b", "ls; rm x", "ls && touch a", "ls || touch a",
            "cat a | tee b", "echo hi", "python3 x.py", "npm test", "git commit -m x", "git push", "git checkout x",
            "git diff --output=x", "git -C /x status", "gh pr merge 1", "gh pr view 1 --web", "curl -X POST https://e.x/",
            "curl -s -o f https://e.x/", "curl -s -d a=1 https://e.x/", "curl https://e.x/", "tail -f log",
            "tail -fn 5 log", "ls $(touch x)", "ls `touch x`", "cat <(touch x)", "ls\ntouch x", "ls &", "(ls)",
            "/bin/ls", "FOO=1 ls", "sed -i s/a/b/ f", "find . -delete", "printf '%s' x | sh", "printf '%s' x | tee y",
-           "cat 'unclosed", "", SECRET_CMD)
+           "cat 'unclosed", "", SECRET_CMD,
+           # review 1 (be66261): "#" is no comment to bash inside a word; datastash writes; abbreviated long options
+           "ls x#;touch F", "cat a#|sh", "ls #", "datastash api POST /api/v1/agent/x", "datastash api GET /x '{}'",
+           "datastash status-set -", "printf '%s' '{\"doing\": \"x; y\"}' | datastash status-set -",
+           "datastash send a", "datastash where x", "tail --fol x", "tail --f x", "tail --follow=name x", "tail -F x",
+           "tail +1f x", "tail -1f x", "git status --porcelai", "grep --includ=x y", "git log --outp=F")
 
 
 def denied(out):
@@ -192,6 +199,144 @@ class Enforce(Base):
             self.hook(ds.cmd_agent_tool, bash(cmd="touch a", cwd=self.folder))
         after = sorted(os.listdir(ds.STATE)) if os.path.isdir(ds.STATE) else []
         self.assertEqual([x for x in after if x.startswith("clean")], [x for x in before if x.startswith("clean")])
+
+
+# Review 1 (be66261) HIGH: tricks that make bash run "touch F". Each is refused, and each is also run in a real bash in a
+# throwaway folder only when the check lets it through, so touch can never run; the live ones are run raw once too, to
+# prove they are real attacks (F appears) and that the check, not luck, stops them.
+BYPASS = (
+    ("ls x#;touch F", True), ("cat a#|sh", True), ("ls x #; touch F", False), ("ls;touch F", True),
+    ("ls&&touch F", True), ("ls nope||touch F", True), ("ls|touch F", True), ("ls&touch F", True),
+    ("ls${IFS};touch${IFS}F", True), ("ls 'x';touch F", True), ('ls "x";touch F', True), ('ls "$(touch F)"', True),
+    ("ls `touch F`", True), ("ls x\\\n;touch F", True), ("ls x\n touch F", True), ("ls $'\\x3b'touch F", False),
+    ("ls x\\;touch F", False), ("ls x\u037etouch F", False), ("ls x\uff1btouch F", False), ("ls x\u2028touch F", False),
+    ("ls\u00a0x", False), ("ls x\ttouch F", False), ("ls x\rtouch F", False), ("bash -c 'touch F'", True),
+    ("sh -c 'touch F'", True), ("eval touch F", True), ("env touch F", True), ("xargs -a L touch", True),
+    ("find . -name a -exec touch F \\;", True), ("find . -name a -exec touch F {} +", True),
+    ("git -c alias.x='!touch F' x", True), ("git -c core.fsmonitor='touch F' status", True),
+    ("git log --output=F", True), ("git log --outp=F", True), ("git log '--output=F'", True),
+    ('git log "--output"=F', True), ("git log --out''put=F", True), ("git diff --output=F HEAD", True),
+    ("git show --output=F", True), ("cat a#|sh #", True), ("ls x#|sh", False), ("tail +1f a", False),
+    ("ls --hide=x#;touch F", True), ("grep -r x . --exclude=x#;touch F", True), ("ls x# ;touch F", True),
+    ("ls ~/x#;touch F", True), ("ls x#&touch F", True), ("ls x#\ntouch F", True), ("ls x\x00;touch F", False),
+    ("datastash status#;touch F", True), ("datastash api GET /x#;touch F", True),
+)
+LOCAL_LOOKUPS = ("ls", "ls -la", "cat a", "head -n 1 a", "tail -n 1 a", "tail -n +1 a", "wc -l a", "grep -rn touch .",
+                 "grep -r --include=*.py touch .", "grep -r --include='*' touch .", "git status", "git log --oneline -1",
+                 "git log --format='%h %s' -1", "git diff HEAD", "git show --stat HEAD", "ls ./*", "cat ./a*")
+
+
+class Bypass(Base):
+    def shell_folder(self):
+        import shutil
+        import subprocess
+        from harness import tmpdir
+        d = tmpdir(self, prefix="clean-bypass-")
+        with open(os.path.join(d, "a"), "w") as f:
+            f.write("touch F\n")
+        with open(os.path.join(d, "a#"), "w") as f:
+            f.write("touch F\n")
+        with open(os.path.join(d, "L"), "w") as f:
+            f.write("F\n")
+        env = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@x.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@x.invalid")
+        git = shutil.which("git")
+        if git:
+            for args in (["init", "-q"], ["add", "a", "L"], ["commit", "-qm", "x"]):
+                subprocess.run([git, *args], cwd=d, env=env, capture_output=True, timeout=20)
+        return d, env
+
+    def run_bash(self, d, env, cmd):
+        import subprocess
+        if "\x00" in cmd:
+            return
+        subprocess.run(["bash", "-c", cmd], cwd=d, env=env, capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+
+    def test_no_trick_lets_touch_run(self):
+        d, env = self.shell_folder()
+        f = os.path.join(d, "F")
+        for cmd, _live in BYPASS:
+            for no_code in (False, True):
+                self.assertFalse(ds.clean_lookup_ok(cmd, no_code, cwd=d), repr(cmd))
+            self.assertTrue(denied(self.hook(ds.cmd_agent_tool, bash(cmd=cmd, cwd=d))), repr(cmd))
+            if ds.clean_lookup_ok(cmd, cwd=d):  # never: run only what the check lets through
+                self.run_bash(d, env, cmd)
+            self.assertFalse(os.path.exists(f), repr(cmd))
+
+    def test_the_live_tricks_are_real(self):
+        import shutil
+        if not shutil.which("git"):
+            self.skipTest("no git")
+        d, env = self.shell_folder()
+        f, dead = os.path.join(d, "F"), []
+        for cmd, live in BYPASS:
+            if not live or cmd.startswith("datastash") or "touch" not in cmd and "|sh" not in cmd:
+                continue
+            if os.path.exists(f):
+                os.replace(f, os.path.join(d, "F-old"))
+            self.run_bash(d, env, cmd)
+            if not os.path.exists(f):
+                dead.append(cmd)
+        self.assertEqual(dead, [], "not live attacks in bash")
+
+    def test_allowed_lookups_run_in_bash_and_never_write(self):
+        d, env = self.shell_folder()
+        for cmd in LOCAL_LOOKUPS:
+            self.assertTrue(ds.clean_lookup_ok(cmd, cwd=d), repr(cmd))
+            before = sorted(os.listdir(d))
+            self.run_bash(d, env, cmd)
+            self.assertEqual(sorted(os.listdir(d)), before, repr(cmd))
+            self.assertFalse(os.path.exists(os.path.join(d, "F")), repr(cmd))
+
+    def test_a_planted_file_name_can_never_become_an_option(self):
+        d, env = self.shell_folder()
+        for name in ("--output=F", "-f", "+1f", "--follow"):
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write("x\n")
+        for cmd in ("ls *", "git log *", "tail *", "cat ?f", "ls -*", "tail +*", "git log --*", "ls ./*"):
+            if ds.clean_lookup_ok(cmd, cwd=d):
+                self.run_bash(d, env, cmd)
+            self.assertFalse(os.path.exists(os.path.join(d, "F")), repr(cmd))
+        for cmd in ("ls -*", "tail +*", "git log --*", "tail *f", "ls ?*"):
+            self.assertFalse(ds.clean_lookup_ok(cmd, cwd=d), repr(cmd))
+
+    def test_endless_and_secret_files_are_refused(self):
+        for cmd in ("cat /dev/zero", "head /dev/urandom", "tail -n 1 /proc/self/environ", "grep -r x /proc",
+                    "wc -c /dev/stdin", "cat ../../../../../../../../dev/zero", "tail -f a", "tail --follow a",
+                    "tail --retry a", "tail --pid=1 a", "tail -s 1 a"):
+            self.assertFalse(ds.clean_lookup_ok(cmd, cwd=self.folder), repr(cmd))
+
+    def test_only_listed_long_options_spelled_in_full(self):
+        for cmd in ("tail --fol a", "tail --follo a", "tail --f a", "git log --out=x", "git log --output-directory=x",
+                    "git diff --ext-diff", "git diff --textconv", "git log -c", "gh pr view 1 --we",
+                    "grep --exclude-from=x y", "grep -f x y", "ls --color", "git status --no-renames=x",
+                    "wc --files0-from=x", "git log --no-walk", "git log --exec=x", "cat --number=3 a"):
+            self.assertFalse(ds.clean_lookup_ok(cmd), repr(cmd))
+        for cmd in ("tail --lines=3 a", "git log --stat", "grep --count x a", "ls --all", "git status --porcelain=v2",
+                    "gh pr view 3 --json title,state --jq .title", "wc --lines a"):
+            self.assertTrue(ds.clean_lookup_ok(cmd, cwd=self.folder), repr(cmd))
+
+    def test_datastash_reads_only(self):
+        for cmd in ("datastash status", "datastash status --more 2", "datastash check", "datastash read person",
+                    "datastash api GET /api/v1/agent/rows", "datastash help", "datastash main", "datastash login --check"):
+            self.assertTrue(ds.clean_lookup_ok(cmd), repr(cmd))
+        for cmd in ("datastash api POST /api/v1/agent/rows", "datastash api PUT /x", "datastash api PATCH /x",
+                    "datastash api DELETE /x", "datastash api GET /x -", "datastash api GET /x @f",
+                    "datastash status-set -", "datastash status-send", "datastash send a", "datastash reply 1",
+                    "datastash link a --workbook x", "datastash off a", "datastash keep --on", "datastash fetch a -",
+                    "datastash logout", "datastash ci-report x.xml", "datastash fingerprint a", "datastash where x",
+                    "datastash file a", "datastash status --all --install x", "python3 datastash status",
+                    "./datastash status", "datastash filter x", "datastash self-update", "datastash token --header"):
+            self.assertFalse(ds.clean_lookup_ok(cmd), repr(cmd))
+
+    def test_a_check_that_breaks_refuses(self):
+        saved = ds._clean_lookup_ok
+        ds._clean_lookup_ok = lambda *a: 1 / 0
+        try:
+            self.assertFalse(ds.clean_lookup_ok("ls"))
+            self.assertTrue(denied(self.hook(ds.cmd_agent_tool, bash(cmd="ls", cwd=self.folder))))
+        finally:
+            ds._clean_lookup_ok = saved
 
 
 class Phrases(Base):
