@@ -247,7 +247,7 @@ class NoCallsWhenOff(OffBase):
             hs = (self.tool(name) or {}).get("hookSpecificOutput") or {}
             self.assertEqual(hs.get("permissionDecision"), "deny", name)
         hs = (self.tool("mcp__claude_ai_Other__rows_get") or {}).get("hookSpecificOutput") or {}
-        self.assertNotEqual(hs.get("permissionDecision"), "deny")
+        self.assertNotIn("off in this folder", hs.get("permissionDecisionReason", ""))  # (clean sessions refuses it)
 
     def test_a_ledger_tool_in_an_on_folder_is_not_denied(self):
         hs = (self.tool("mcp__claude_ai_Ledger__ledger_rows_get") or {}).get("hookSpecificOutput") or {}

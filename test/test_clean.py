@@ -4,8 +4,9 @@
   for all the person's agents here): "commands through subagents" (default on) and "no code in sessions" (default off).
 - The session start gives the AI the rules only for what is on.
 - XLI-396 (owner 11-23): a block, not a nudge. While either choice is on, the main session (the hook input has no
-  agent_id; a subagent's has one) is refused Edit, Write, MultiEdit, NotebookEdit and any Bash call that is not one
-  short read-only lookup, with one fixed line. A subagent is never refused. "turn off clean sessions" ends it all.
+  agent_id; a subagent's has one) runs only the listed tools that can't change a file or run code and the datastash
+  connector's read-only tools (deny by default: any other tool, an unknown one or an MCP write, is refused), and every
+  command tool (Bash, Monitor, PowerShell, any "command") only as one short read-only lookup, with one fixed line. A subagent is never refused. "turn off clean sessions" ends it all.
 - The person's typed "no code in sessions", "turn off clean sessions" and "turn on clean sessions" change the choices;
   the agent confirms in one line.
 No network, no key; a throwaway HOME and config folder, enforced by test/harness.py.
@@ -103,8 +104,8 @@ READ_ONLY = ("ls", "ls -la src", "cat README.md", "head -n 20 a.py", "tail -n 5 
              "curl -s https://example.invalid/health", "curl -fsS https://example.invalid/x",
              "datastash status --all", "datastash main", "datastash check", "datastash read person",
              "datastash api GET /api/v1/agent/rows", "datastash api get '/api/v1/agent/inbox?limit=5&x=1'",
-             '"${CLAUDE_PLUGIN_ROOT}/scripts/datastash" status --details 3', "grep -r --include=*.py foo .",
-             "grep -rn --include='*.md' 'a b' .", "git log --format='%h %s' -3", "ls src/*.py", "tail -n +5 log")
+             '"${CLAUDE_PLUGIN_ROOT}/scripts/datastash" status --details 3', "grep -r --include='*.py' foo .",
+             "grep -rn --include='*.md' 'a b' .", "git log --format='%h %s' -3", "ls 'src/*.py'", "tail -n +5 log")
 WRITING = ("rm -rf x", "touch a", "ls > out.txt", "cat a >> b", "ls; rm x", "ls && touch a", "ls || touch a",
            "cat a | tee b", "echo hi", "python3 x.py", "npm test", "git commit -m x", "git push", "git checkout x",
            "git diff --output=x", "git -C /x status", "gh pr merge 1", "gh pr view 1 --web", "curl -X POST https://e.x/",
@@ -222,8 +223,8 @@ BYPASS = (
     ("datastash status#;touch F", True), ("datastash api GET /x#;touch F", True),
 )
 LOCAL_LOOKUPS = ("ls", "ls -la", "cat a", "head -n 1 a", "tail -n 1 a", "tail -n +1 a", "wc -l a", "grep -rn touch .",
-                 "grep -r --include=*.py touch .", "grep -r --include='*' touch .", "git status", "git log --oneline -1",
-                 "git log --format='%h %s' -1", "git diff HEAD", "git show --stat HEAD", "ls ./*", "cat ./a*")
+                 "grep -r --include='*.py' touch .", "grep -r --include='*' touch .", "git status", "git log --oneline -1",
+                 "git log --format='%h %s' -1", "git diff HEAD", "git show --stat HEAD", "ls './*'", "cat 'a'")
 
 
 class Bypass(Base):
@@ -337,6 +338,126 @@ class Bypass(Base):
             self.assertTrue(denied(self.hook(ds.cmd_agent_tool, bash(cmd="ls", cwd=self.folder))))
         finally:
             ds._clean_lookup_ok = saved
+
+
+# Review 2 (0f28b06) HIGH: a deny-list of tools let Monitor (and PowerShell on Windows) run any command. Now deny by
+# default: only the listed tools that can't change a file or run code, the datastash connector's read-only tools, and
+# the one command check for every tool that runs a command.
+DS_MCP = "mcp__plugin_datastash_datastash__"
+ALLOWED_INPUTS = {"Read": {"file_path": "/x/a.py"}, "Grep": {"pattern": "x"}, "Glob": {"pattern": "*.py"},
+                  "Agent": {"prompt": "do it", "description": "x"}, "Task": {"prompt": "do it"},
+                  "SendMessage": {"to": "a", "message": "hi"}, "TaskStop": {"task_id": "t1"},
+                  "ToolSearch": {"query": "select:Monitor"}, "AskUserQuestion": {"questions": []},
+                  "ListAgents": {}, "ReadNotifications": {}, "WebFetch": {"url": "https://example.invalid/", "prompt": "x"},
+                  "WebSearch": {"query": "x"}}
+GLOBS = ("cat /pro?/self/environ", "cat /d?v/zero", "cat /proc/sel?/environ", "ls *", "ls ./*", "cat ./a*",
+         "cat [a]", "cat /[p]roc/self/environ", "ls {a,b}", "cat /{proc,x}/self/environ", "ls a{,}",
+         "grep -r --include=*.py x .", "wc -l a*", "git log -- *", "curl -s 'http://x/[1-3]'",
+         "curl -s 'http://x/{a,b}'", "curl -s http://x/[1-3]")
+
+
+class DenyByDefault(Base):
+    def call(self, tool, ti, **kw):
+        return self.hook(ds.cmd_agent_tool, bash(tool=tool, tool_input=ti, cwd=self.folder, **kw))
+
+    def test_monitor_runs_only_the_one_check(self):
+        for cmd in ("touch /tmp/F", "touch F", "rm -rf x", "while true; do touch F; done", "bash -c 'touch F'", "tail -f a",
+                    "datastash watch; touch F", "datastash watch --person --setup x", "datastash api POST /x",
+                    SECRET_CMD) + tuple(c for c, _ in BYPASS):
+            self.assertTrue(denied(self.call("Monitor", {"command": cmd, "description": "x", "timeout_ms": 1000})),
+                            repr(cmd))
+        self.assertTrue(denied(self.call("Monitor", {"ws": {"url": "wss://example.invalid/"}, "description": "x",
+                                                     "timeout_ms": 1000})))
+        self.assertTrue(denied(self.call("Monitor", {"description": "x", "timeout_ms": 1000})))
+        for cmd in ("datastash watch", "datastash watch --person", '"${CLAUDE_PLUGIN_ROOT}/scripts/datastash" watch',
+                    'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/datastash" watch --person', "datastash status", "ls"):
+            self.assertFalse(denied(self.call("Monitor", {"command": cmd, "description": "x", "timeout_ms": 1000})),
+                             repr(cmd))
+        self.assertTrue(denied(self.call("Bash", {"command": "datastash watch"})))  # a watch never ends: Monitor only
+
+    def test_monitor_touch_never_runs(self):
+        import subprocess
+        from harness import tmpdir
+        d = tmpdir(self, prefix="clean-monitor-")
+        cmd = "touch " + os.path.join(d, "F")
+        inp = bash(tool="Monitor", tool_input={"command": cmd, "description": "x", "timeout_ms": 1000}, cwd=d)
+        if not denied(self.hook(ds.cmd_agent_tool, inp)):  # never: run only what the hook lets through
+            subprocess.run(["bash", "-c", cmd], cwd=d, capture_output=True, timeout=10)
+        self.assertFalse(os.path.exists(os.path.join(d, "F")))
+
+    def test_powershell_is_refused(self):
+        for cmd in ("New-Item F", "Set-Content -Path F -Value x", "ls", "datastash status", "Get-Content a.py"):
+            self.assertTrue(denied(self.call("PowerShell", {"command": cmd})), repr(cmd))
+
+    def test_an_unknown_or_future_tool_is_refused(self):
+        for tool, ti in (("FutureTool", {"path": "/x"}), ("Skill", {"skill": "x"}), ("TodoWrite", {"todos": []}),
+                         ("EnterWorktree", {}), ("Workflow", {"script": "x"}), ("LSP", {}), ("bash", {"command": "ls"}),
+                         ("Read ", {"file_path": "/x"}), ("", {}), (None, {}), ("Shell", {"command": "ls"}),
+                         ("FutureRunner", {"command": "touch F"}), ("Grep", {"pattern": "x", "command": "touch F"})):
+            self.assertTrue(denied(self.call(tool, ti)), repr(tool))
+
+    def test_an_mcp_tool_that_writes_is_refused(self):
+        for tool in (DS_MCP + "ledger_rows_upsert", DS_MCP + "ledger_rows_delete", DS_MCP + "ledger_workbook_delete",
+                     DS_MCP + "ledger_workbook_create", DS_MCP + "ledger_inbox_send", DS_MCP + "ledger_agent_status",
+                     DS_MCP + "ledger_future_tool", DS_MCP + "sync", "mcp__claude_ai_datastash__ledger_rows_upsert",
+                     "mcp__claude_ai_Ledger__ledger_import", "mcp__github__create_pull_request",
+                     "mcp__filesystem__write_file", "mcp__evil__rows_get", "mcp__evil__checkin", "mcp__evil__chat_save",
+                     "mcp__x", "mcp____ledger_help", "mcp__"):
+            self.assertTrue(denied(self.call(tool, {"workbook_id": "w", "rows": []})), tool)
+
+    def test_the_datastash_connectors_read_only_tools_run(self):
+        for name in ds.CLEAN_DS_READ_TOOLS:
+            for server in (DS_MCP, "mcp__claude_ai_datastash__") + (("mcp__claude_ai_Ledger__",) if name[:7] == "ledger_" else ()):
+                self.assertFalse(denied(self.call(server + name, {"workbook_id": "w"})), server + name)
+
+    def test_the_plugins_own_connector_steps_still_run(self):
+        for name in ds.CLEAN_DS_STEP_TOOLS:  # each one checked or written by the plugin itself (not refused here)
+            for server in (DS_MCP, "mcp__claude_ai_datastash__"):
+                self.assertNotEqual((((self.call(server + name, {"name": "x"}) or {}).get("hookSpecificOutput") or {})
+                                     .get("permissionDecisionReason")), BLOCK, server + name)
+
+    def test_globs_and_braces_are_refused(self):
+        for cmd in GLOBS:
+            for no_code in (False, True):
+                self.assertFalse(ds.clean_lookup_ok(cmd, no_code, cwd=self.folder), repr(cmd))
+            self.assertTrue(denied(self.call("Bash", {"command": cmd})), repr(cmd))
+            self.assertTrue(denied(self.call("Monitor", {"command": cmd, "description": "x", "timeout_ms": 1000})),
+                            repr(cmd))
+        for cmd in ("cat '/pro?/self/environ'", "ls '*'", "grep -r --include='*.py' x ."):  # quoted: literal to bash
+            self.assertTrue(ds.clean_lookup_ok(cmd, cwd=self.folder), repr(cmd))
+
+    def test_the_allowed_list_still_runs_in_the_main_session(self):
+        self.assertEqual(set(ALLOWED_INPUTS), set(ds.CLEAN_ALLOWED_TOOLS))
+        for tool, ti in ALLOWED_INPUTS.items():
+            self.assertFalse(denied(self.call(tool, ti)), tool)
+        for cmd in READ_ONLY:
+            self.assertFalse(denied(self.call("Bash", {"command": cmd})), repr(cmd))
+
+    def test_a_subagent_is_unaffected(self):
+        for tool, ti in (("Monitor", {"command": "touch /tmp/F", "description": "x", "timeout_ms": 1000}),
+                         ("PowerShell", {"command": "New-Item F"}), ("FutureTool", {"path": "/x"}),
+                         ("Skill", {"skill": "x"}), (DS_MCP + "ledger_rows_upsert", {"workbook_id": "w"}),
+                         ("mcp__github__create_pull_request", {}), ("Bash", {"command": "cat /pro?/self/environ"}),
+                         ("Bash", {"command": "ls", "run_in_background": True}), ("Write", WRITE_TOOLS["Write"])):
+            self.assertFalse(denied(self.call(tool, ti, agent_id="a1b2c3")), tool)
+
+    def test_clean_sessions_off_refuses_nothing(self):
+        ds.set_clean(commands=False, no_code=False)
+        for tool, ti in (("Monitor", {"command": "touch F", "description": "x", "timeout_ms": 1000}),
+                         ("PowerShell", {"command": "New-Item F"}), ("FutureTool", {})):
+            self.assertFalse(denied(self.call(tool, ti)), tool)
+
+    def test_a_check_that_breaks_fails_closed_in_the_main_session(self):
+        saved = ds.clean_settings
+        ds.clean_settings = lambda: 1 / 0
+        try:
+            self.assertTrue(denied(self.call("Bash", {"command": "ls"})))
+            self.assertTrue(denied(self.call("Monitor", {"command": "datastash watch", "description": "x",
+                                                         "timeout_ms": 1000})))
+            self.assertFalse(denied(self.call("Agent", {"prompt": "do it"})))  # the hand-off still works
+            self.assertFalse(denied(self.call("Bash", {"command": "touch F"}, agent_id="a1b2c3")))
+        finally:
+            ds.clean_settings = saved
 
 
 class Phrases(Base):
