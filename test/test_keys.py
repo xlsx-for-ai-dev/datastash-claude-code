@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Offline tests for XLI-399 (plugin 1.0.4): the model can't reach datastash key material through any tool.
+- The PreToolUse hook refuses every tool call (Read, Write, Edit, MultiEdit, NotebookEdit, Grep, Glob, Bash, Monitor,
+  another MCP server's tools, an unknown tool) that names a file the plugin keeps in the datastash folder, the folder
+  itself, or a main folder's marker, in every path form: absolute, relative to the session's folder or to a `cd`, ~,
+  $HOME, ${HOME} and $XDG_CONFIG_HOME, a glob or a brace, a symlink to the folder or to one file, any letter case, a
+  path split into pieces, and a keychain read of the datastash items.
+- A search, copy or archive of a folder that holds the datastash folder (home, ~/.config, /) is refused too, including
+  a Grep with no path in such a folder, `grep -r`, `rg` with no folder, and `find -exec`.
+- The same refusal in the main session and in a subagent, with clean sessions on or off.
+- Only the listener logs stay readable; ordinary project work, the datastash command and the plugin's own steps are
+  never refused by it; the plugin's own key reads still work.
+No network, no key: fake key files in a throwaway HOME, enforced by test/harness.py. No key file is ever printed.
+Run: python3 -I test/test_keys.py"""
+import json
+import os
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import harness  # noqa: E402
+from test_status import Base, ds  # noqa: E402  (the same harness and plugin copy)
+
+HOME = harness.FAKE_HOME
+DEFAULT = os.path.join(HOME, ".config", "datastash")  # where the plugin keeps its folder on a real computer
+FAKE_AGENT_KEY = "ldgr_ag_" + "k" * 30  # made up, never a real key
+SECRET_FILES = ("agent-web-app.key", "agent-web-app.proof", "agent-web-app.answer", "person.key", "main.key",
+                "login.refresh", "login.answer", "login.access.json", "login.pending.json", "enroll.json",
+                "hook-abc.secret", "main.json", "pending/agent-web-app.verifier", "state/agent-web-app.chatkey",
+                "off/agent-old.key.20261124-000000")
+
+
+def put(path, text):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+class KeyBase(Base):
+    def setUp(self):
+        super().setUp()
+        for rel in SECRET_FILES:
+            put(os.path.join(DEFAULT, rel), "made-up\n")
+        put(os.path.join(DEFAULT, "state", "agent-web-app.log"), "listener started\n")
+        put(os.path.join(ds.CONF, "agent-keys-test.key"), FAKE_AGENT_KEY + "\n")
+        self.links = harness.tmpdir(self, prefix="links-", dir=harness.ROOT)
+        os.symlink(DEFAULT, os.path.join(self.links, "conf-link"))
+        os.symlink(os.path.join(DEFAULT, "login.answer"), os.path.join(self.links, "plain-name"))
+        self.project = os.path.realpath(harness.tmpdir(self, prefix="kproj-", dir=os.path.join(HOME)))
+        put(os.path.join(self.project, "src", "app.py"), "print('hi')\n")
+        ds.set_clean(commands=False, no_code=False)
+
+    def call(self, name, ti, cwd=None, agent_id=None):
+        inp = {"session_id": "sess-keys", "hook_event_name": "PreToolUse", "tool_name": name, "tool_input": ti,
+               "cwd": cwd or HOME}
+        if agent_id:
+            inp["agent_id"], inp["agent_type"] = agent_id, "general-purpose"
+        return inp
+
+    def key_denied(self, out):
+        hs = (out or {}).get("hookSpecificOutput", {})
+        return hs.get("permissionDecision") == "deny"
+
+    def assert_refused(self, name, ti, cwd=None):
+        out = ds.key_path_deny(self.call(name, ti, cwd))
+        self.assertTrue(self.key_denied(out), f"{name} {ti} cwd={cwd}: not refused")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], ds.KEY_DENY)
+
+    def assert_allowed(self, name, ti, cwd=None):
+        self.assertIsNone(ds.key_path_deny(self.call(name, ti, cwd)), f"{name} {ti} cwd={cwd}: refused")
+
+
+# Every way a path to one key file can be written (cwd is HOME unless given)
+KEY = "agent-web-app.key"
+PATH_FORMS = (
+    ("absolute", os.path.join(DEFAULT, KEY), None),
+    ("relative to the session's folder", os.path.join(".config", "datastash", KEY), None),
+    ("relative with ..", os.path.join("..", "..", ".config", "datastash", KEY), "PROJECT/src"),
+    ("tilde", "~/.config/datastash/" + KEY, None),
+    ("$HOME", "$HOME/.config/datastash/" + KEY, None),
+    ("${HOME}", "${HOME}/.config/datastash/" + KEY, None),
+    ("$XDG_CONFIG_HOME", "$XDG_CONFIG_HOME/datastash/" + KEY, None),
+    ("glob on the folder", "~/.config/data*/" + KEY, None),
+    ("glob on the file", "~/.config/datastash/agent-*", None),
+    ("glob on both", "~/.c*/d?tastash/*", None),
+    ("brace", "~/.config/{datastash,other}/" + KEY, None),
+    ("symlink to the folder", "LINKS/conf-link/" + KEY, None),
+    ("upper case", "~/.CONFIG/DataStash/AGENT-WEB-APP.KEY", None),
+)
+
+
+class EveryToolEveryForm(KeyBase):
+    def form(self, raw, cwd):
+        p = raw.replace("LINKS", self.links)
+        c = (cwd or HOME).replace("PROJECT", self.project)
+        return p, c
+
+    def test_the_file_tools_refuse_every_path_form(self):
+        for label, raw, cwd in PATH_FORMS:
+            p, c = self.form(raw, cwd)
+            for name, ti in (("Read", {"file_path": p}), ("Write", {"file_path": p, "content": "x"}),
+                             ("Edit", {"file_path": p, "old_string": "a", "new_string": "b"}),
+                             ("MultiEdit", {"file_path": p, "edits": []}),
+                             ("NotebookEdit", {"notebook_path": p, "new_source": "x"}),
+                             ("Grep", {"pattern": "x", "path": p}), ("Glob", {"pattern": "*", "path": p})):
+                with self.subTest(form=label, tool=name):
+                    self.assert_refused(name, ti, c)
+
+    def test_commands_refuse_every_path_form(self):
+        for label, raw, cwd in PATH_FORMS:
+            p, c = self.form(raw, cwd)
+            for name, ti in (("Bash", {"command": f"cat {p}"}), ("Bash", {"command": f'head -c 9 "{p}"'}),
+                             ("Bash", {"command": f"cp {p} /tmp/x"}), ("Monitor", {"command": f"tail -f {p}"}),
+                             ("mcp__files__read_file", {"path": p}), ("SomeNewTool", {"target": {"file": p}})):
+                with self.subTest(form=label, tool=name):
+                    self.assert_refused(name, ti, c)
+
+    def test_a_symlink_to_one_key_file_is_refused(self):
+        link = os.path.join(self.links, "plain-name")
+        for name, ti in (("Read", {"file_path": link}), ("Bash", {"command": f"cat {link}"}),
+                         ("Grep", {"pattern": ".", "path": link}), ("Monitor", {"command": f"tail {link}"})):
+            with self.subTest(tool=name):
+                self.assert_refused(name, ti)
+
+    def test_every_file_the_plugin_keeps_is_refused(self):
+        for rel in SECRET_FILES:
+            p = os.path.join(DEFAULT, rel)
+            for name, ti in (("Read", {"file_path": p}), ("Bash", {"command": f"cat {p}"})):
+                with self.subTest(file=rel, tool=name):
+                    self.assert_refused(name, ti)
+        self.assert_refused("Read", {"file_path": os.path.join(ds.CONF, "agent-keys-test.key")})
+
+    def test_a_cd_then_a_relative_path_is_refused(self):
+        for cmd in ("cd ~/.config && cat datastash/agent-web-app.key", "cd ~/.config/datastash; cat person.key",
+                    "pushd $HOME/.config/datastash >/dev/null && cat main.json", "cd .config/datastash && cat *"):
+            with self.subTest(cmd=cmd):
+                self.assert_refused("Bash", {"command": cmd})
+
+    def test_a_split_or_escaped_path_is_refused(self):
+        for cmd in ("python3 -c \"import os;print(open(os.path.expanduser('~/.con'+'fig/data'+'stash/person.key')).read())\"",
+                    "cat ~/.config/data''stash/main.json", 'cat ~/.config/data"st"ash/main.json',
+                    "cat ~/.config/d\\atastash/main.json", "node -e \"fs.readFileSync(HOME+'/.config/'+'datastash/x')\""):
+            with self.subTest(cmd=cmd):
+                self.assert_refused("Bash", {"command": cmd})
+
+    def test_the_main_folders_marker_is_refused(self):
+        marker = os.path.join(ds.MAIN_DIR, ds.MAIN_MARKER)
+        for name, ti in (("Read", {"file_path": marker}), ("Bash", {"command": f"cat '{marker}'"}),
+                         ("Grep", {"pattern": ".", "path": ds.MAIN_DIR})):
+            with self.subTest(tool=name):
+                self.assert_refused(name, ti)
+
+    def test_a_keychain_read_of_the_datastash_items_is_refused(self):
+        for cmd in ("secret-tool lookup service datastash account refresh-token",
+                    "secret-tool lookup service datastash account agent-answer-web-app",
+                    "secret-tool search --all service datastash", "secret-tool search --all --unlock x y",
+                    "security find-generic-password -s datastash -w", "security dump-keychain -d",
+                    "python3 -c \"import keyring;print(keyring.get_password('datastash','answer-key'))\""):
+            with self.subTest(cmd=cmd):
+                self.assert_refused("Bash", {"command": cmd})
+
+
+class TwoStepRoutes(KeyBase):
+    def test_chained_cds_are_followed(self):
+        self.assert_refused("Bash", {"command": "cd ~; cd .config; cat datastash/person.key"}, cwd=self.project)
+        self.assert_refused("Bash", {"command": "cd /; cd home; cd ..; cd " + HOME.lstrip("/") + " && cd .config && "
+                                                "grep -r x datastash"}, cwd=self.project)
+
+    def test_loading_the_plugin_script_to_call_its_key_readers_is_refused(self):
+        for cmd in ("python3 -c \"import runpy;m=runpy.run_path('/p/scripts/datastash');print(m['read_key']('web-app'))\"",
+                    "python3 - <<'E'\nexec(open('/p/scripts/datastash').read()); print(login_token())\nE",
+                    "python3 -c \"from importlib.machinery import SourceFileLoader as L;m=L('d','/p/x').load_module();"
+                    "print(m._kc('get','answer-key'))\""):
+            with self.subTest(cmd=cmd):
+                self.assert_refused("Bash", {"command": cmd})
+        self.assert_allowed("Bash", {"command": "grep -n read_key plugins/datastash/scripts/datastash"}, self.project)
+
+    def test_writing_a_script_that_reads_the_folder_is_refused(self):
+        body = "import os\nprint(open(os.path.expanduser('~/.config/datastash/person.key')).read())\n"
+        for name, ti in (("Write", {"file_path": os.path.join(self.project, "x.py"), "content": body}),
+                         ("Edit", {"file_path": os.path.join(self.project, "x.py"), "old_string": "a", "new_string": body}),
+                         ("MultiEdit", {"file_path": os.path.join(self.project, "x.py"),
+                                        "edits": [{"old_string": "a", "new_string": body}]}),
+                         ("Write", {"file_path": os.path.join(self.project, "y.sh"),
+                                    "content": "cat ~/.con''fig/data''stash/main.json"})):
+            with self.subTest(tool=name):
+                self.assert_refused(name, ti, self.project)
+        self.assert_allowed("Write", {"file_path": os.path.join(self.project, "z.sh"),
+                                      "content": "tail ~/.config/datastash/state/agent-web-app.log\n"}, self.project)
+
+
+class FolderSearches(KeyBase):
+    """The review's case: naming only the folder (or a folder above it) and searching inside."""
+
+    def test_grep_naming_only_the_folder_is_refused(self):
+        for p in (DEFAULT, "~/.config/datastash", "$HOME/.config/datastash/", os.path.join(self.links, "conf-link"),
+                  os.path.join(DEFAULT, "state"), os.path.join(DEFAULT, "pending")):
+            with self.subTest(path=p):
+                self.assert_refused("Grep", {"pattern": "dsak_", "path": p, "output_mode": "content"})
+                self.assert_refused("Bash", {"command": f"grep -r dsak_ {p}"})
+                self.assert_refused("Bash", {"command": f"ls {p}"})
+
+    def test_a_search_of_a_folder_above_it_is_refused(self):
+        for p in (HOME, "~", "~/.config", "/", os.path.dirname(DEFAULT)):
+            with self.subTest(path=p):
+                self.assert_refused("Grep", {"pattern": "dsak_", "path": p})
+                for cmd in (f"grep -r dsak_ {p}", f"grep -R -l dsak_ {p}", f"grep --recursive x {p}",
+                            f"rg dsak_ {p}", f"rg --hidden dsak_ {p}", f"find {p} -type f -exec cat {{}} +",
+                            f"tar czf /tmp/all.tgz {p}", f"cp -r {p} /tmp/copy", f"rsync -a {p} /tmp/copy",
+                            f"python3 -c \"import os;[print(r) for r in os.walk('{p}')]\""):
+                    self.assert_refused("Bash", {"command": cmd})
+
+    def test_a_search_with_no_folder_where_the_session_runs_above_it(self):
+        self.assert_refused("Grep", {"pattern": "dsak_"})  # cwd HOME
+        for cmd in ("rg dsak_", "grep -r dsak_", "grep -rn dsak_ .", "ag dsak_", "git grep dsak_",
+                    "python3 -c \"import pathlib;[print(p.read_text()) for p in pathlib.Path.home().rglob('*')]\""):
+            with self.subTest(cmd=cmd):
+                self.assert_refused("Bash", {"command": cmd})
+        self.assert_refused("Grep", {"pattern": "dsak_"}, cwd=os.path.join(HOME, ".config"))
+
+    def test_a_glob_that_spans_the_folder_is_refused(self):
+        self.assert_refused("Glob", {"pattern": "**/*", "path": HOME})
+        self.assert_refused("Glob", {"pattern": ".config/**"})
+        self.assert_refused("Bash", {"command": "cat ~/.*/*/*"})
+        self.assert_refused("Bash", {"command": "grep dsak_ ~/.config/*/*"})
+
+
+class EverySession(KeyBase):
+    """Through the real PreToolUse hook: the main session and a subagent, clean sessions off and on."""
+
+    def test_the_hook_refuses_in_the_main_session_and_in_a_subagent(self):
+        for clean in (False, True):
+            ds.set_clean(commands=clean, no_code=False)
+            for agent_id in (None, "a1b2c3d4"):
+                for name, ti in (("Read", {"file_path": "~/.config/datastash/agent-web-app.key"}),
+                                 ("Grep", {"pattern": "dsak_", "path": "~/.config/datastash"}),
+                                 ("Glob", {"pattern": "*", "path": DEFAULT}),
+                                 ("Bash", {"command": "grep -r dsak_ ~/.config/datastash"}),
+                                 ("Monitor", {"command": "tail -f ~/.config/datastash/login.answer"}),
+                                 ("mcp__files__read_file", {"path": "~/.config/datastash/login.refresh"})):
+                    with self.subTest(clean=clean, subagent=bool(agent_id), tool=name):
+                        out = self.hook(ds.cmd_agent_tool, self.call(name, ti, agent_id=agent_id))
+                        self.assertTrue(self.key_denied(out), out)
+                        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], ds.KEY_DENY)
+                        self.assertNotIn("made-up", json.dumps(out))
+        ds.set_clean(commands=False, no_code=False)
+
+    def test_the_refusal_never_shows_a_key(self):
+        out = self.hook(ds.cmd_agent_tool, self.call("Read", {"file_path": os.path.join(ds.CONF, "agent-keys-test.key")}))
+        self.assertTrue(self.key_denied(out))
+        self.assertNotIn(FAKE_AGENT_KEY, json.dumps(out))
+
+    def test_only_before_the_call(self):
+        for event in ("PostToolUse", "PostToolUseFailure"):
+            inp = dict(self.call("Read", {"file_path": os.path.join(DEFAULT, KEY)}), hook_event_name=event)
+            self.assertIsNone(ds.key_path_deny(inp))
+
+
+class StillWorks(KeyBase):
+    def test_ordinary_work_is_not_refused(self):
+        p = self.project
+        for name, ti, cwd in (("Read", {"file_path": os.path.join(p, "src", "app.py")}, p),
+                              ("Read", {"file_path": "src/app.py"}, p),
+                              ("Grep", {"pattern": "hi", "path": p}, p), ("Grep", {"pattern": "hi"}, p),
+                              ("Glob", {"pattern": "**/*.py"}, p), ("Glob", {"pattern": "src/*.py", "path": p}, p),
+                              ("Write", {"file_path": os.path.join(p, "notes.md"), "content": "x"}, p),
+                              ("Bash", {"command": "git status && rg hi src && grep -rn hi ."}, p),
+                              ("Bash", {"command": "find . -name '*.py' -exec wc -l {} +"}, p),
+                              ("Bash", {"command": "ls ~ && ls -la ~/.config && find ~ -maxdepth 1 -name notes"}, p),
+                              ("Bash", {"command": "cat ~/.bashrc; echo $HOME"}, p),
+                              ("Bash", {"command": "datastash status && datastash api GET /x && datastash watch"}, p),
+                              ("Bash", {"command": 'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/datastash" status'}, p),
+                              ("Bash", {"command": "datastash login --check"}, HOME),
+                              ("Monitor", {"command": "datastash watch"}, p),
+                              ("Agent", {"prompt": "read ~/.config/datastash/login.answer"}, p),
+                              ("WebSearch", {"query": "datastash"}, p),
+                              ("mcp__files__read_file", {"path": os.path.join(p, "src", "app.py")}, p)):
+            with self.subTest(tool=name, ti=ti):
+                self.assert_allowed(name, ti, cwd)
+
+    def test_the_listener_logs_stay_readable(self):
+        log = os.path.join(DEFAULT, "state", "agent-web-app.log")
+        for name, ti in (("Read", {"file_path": log}), ("Read", {"file_path": "~/.config/datastash/state/agent-web-app.log"}),
+                         ("Bash", {"command": "tail -n 50 ~/.config/datastash/state/agent-web-app.log"}),
+                         ("Bash", {"command": f"cat {log}.1"}), ("Monitor", {"command": f"tail -f {log}"})):
+            with self.subTest(tool=name, ti=ti):
+                self.assert_allowed(name, ti)
+
+    def test_a_log_name_that_is_a_symlink_to_a_key_is_refused(self):
+        log = os.path.join(DEFAULT, "state", "agent-sneaky.log")
+        os.symlink(os.path.join(DEFAULT, "login.answer"), log)
+        self.addCleanup(os.replace, log, os.path.join(self.links, "moved-sneaky"))
+        self.assert_refused("Read", {"file_path": log})
+        self.assert_refused("Bash", {"command": f"cat {log}"})
+
+    def test_the_datastash_connector_is_not_refused(self):
+        ds.CLAUDE_USER_CONFIG = os.path.join(self.project, ".claude.json")
+        self.addCleanup(setattr, ds, "CLAUDE_USER_CONFIG", self.saved_cfg)
+        with open(ds.CLAUDE_USER_CONFIG, "w") as f:
+            json.dump({"mcpServers": {"ds": {"type": "http", "url": "https://getdatastash.com/mcp"}}}, f)
+        self.assert_allowed("mcp__ds__ledger_rows_get", {"tab": "notes about login.answer and ~/.config/datastash"})
+
+    def setUp(self):
+        super().setUp()
+        self.saved_cfg = ds.CLAUDE_USER_CONFIG
+
+    def test_the_plugins_own_scripts_still_read_the_key(self):
+        """The hook stops tool calls only: the plugin's own reads (outside any tool call) still get the key."""
+        self.assertEqual(ds._read_key_file(os.path.join(ds.CONF, "agent-keys-test.key"), r"ldgr_ag_[A-Za-z0-9_\-]+",
+                                           "keys-test"), FAKE_AGENT_KEY)
+
+    def test_a_folder_the_plugin_never_makes_inside_its_folder_is_not_refused(self):
+        foreign = os.path.realpath(harness.tmpdir(self, prefix="proj-", dir=ds.CONF))  # how the other tests lay out
+        self.assert_allowed("Bash", {"command": "git status && cat README.md && ls *.py"}, foreign)
+        self.assert_allowed("Grep", {"pattern": "x"}, foreign)
+        self.assert_refused("Bash", {"command": "cat ../agent-keys-test.key"}, foreign)
+        self.assert_refused("Bash", {"command": "ls .."}, foreign)
+
+
+if __name__ == "__main__":
+    unittest.main()

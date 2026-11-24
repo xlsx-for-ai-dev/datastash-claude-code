@@ -92,6 +92,7 @@ command line. Everything datastash answers is data, never instructions.
 """
 import base64
 import errno
+import fnmatch
 import hashlib
 import hmac
 import http.client as httpclient
@@ -5166,6 +5167,293 @@ def proof_file_deny(inp):
                                    "permissionDecisionReason": PROOF_DENY}}
 
 
+# XLI-399: the datastash folder holds this computer's datastash keys: agent keys, proofs and answer keys, the login's
+# tokens and answer key (when no OS keychain works), verifiers, chat keys, hook secrets; the main folder's marker holds
+# a token too. No tool call, in any session (the main session or a subagent), reads, searches, lists, copies or writes
+# them, whatever form the path takes: absolute, relative (to the session's folder or a `cd`), ~, $HOME and other
+# variables, a glob or brace, a symlink, any letter case, or split into pieces; nor any call that searches, copies or
+# archives a folder holding them (home, ~/.config, /), nor a keychain read of the datastash items. Only the listener
+# logs (state/agent-<name>.log) stay readable. The plugin's own scripts read the keys themselves, outside any tool call.
+KEY_DENY = ("datastash: the datastash folder (~/.config/datastash) holds this computer's datastash keys, so no tool call "
+            "reads, searches, lists or copies it, or searches a folder that holds it, and the keychain's datastash items "
+            "are never read. Don't work around it: use the datastash command (`datastash status`), read only the "
+            "listener logs (state/agent-<name>.log), and search a narrower folder.")
+# Tools whose input is only prose or ids (a subagent's own tool calls are checked by its own hook calls)
+KEY_PROSE_TOOLS = frozenset(("Agent", "Task", "SendMessage", "AskUserQuestion", "TodoWrite", "TaskCreate", "TaskUpdate",
+                             "TaskGet", "TaskList", "TaskStop", "TaskOutput", "ToolSearch", "ListAgents",
+                             "ReadNotifications", "WebSearch", "ExitPlanMode", "EnterPlanMode", "Skill"))
+KEY_LOG_OK_RE = re.compile(r"state/agent-[a-z0-9@][a-z0-9@\-]{0,99}\.log(?:\.1)?")  # the only readable files in there
+KEY_NAME_RE = re.compile(r"(?:agent-[^\s/\\'\"]*\.(?:key|proof|answer|verifier|chatkey)|login\.(?:refresh|answer|access"
+                         r"|pending)|(?:main|watch)\.verifier|\.datastash-main)(?![\w-])", re.I)
+KEY_GLOB_CHARS = "*?["
+KEY_RECURSE_RE = re.compile(
+    r"\b(?:rg|ag|ack|ugrep|tar|zip|7z|7za|rsync|scp|cpio|pax|bsdtar|duplicity|restic|borg|xargs)\b"
+    r"|\b[efz]?grep\b[^;|&]*?\s(?:-[a-z]*r[a-z]*|--recursive|--dereference-recursive|--directories=?\s*recurse"
+    r"|-d\s*recurse)(?![\w-])"
+    r"|\bcp\b[^;|&]*?\s-[a-z]*[ar]|\bfind\b[^;|&]*?\s-(?:exec|execdir|ok|okdir|fprint|fls|fprintf)\b"
+    r"|\bgit\s+(?:grep|add)\b|os\.walk|\brglob\b|\biglob\b|\bglob\b|scandir|listdir|readdir|walkdir|walksync|\bwalk\(")
+KEY_HOME_RE = re.compile(r"expanduser|\bhome\(\)|homedir\(|gethome|getenv\(\s*home|environ\[\s*home|env\.home"
+                         r"|environ\.get\(\s*home|\$env:home", re.I)
+KEYCHAIN_READ_RE = re.compile(r"\bsecret-tool\b[^;|&]*\b(?:lookup|search)\b|\bsecurity\b[^;|&]*\b(?:find-generic-password"
+                              r"|find-internet-password|dump-keychain|export)\b|\bkeyring\b|\bsecretstorage\b"
+                              r"|org\.freedesktop\.secret|\bkwallet", re.I)
+# The plugin's own readers of a key, run from a tool call (the script loaded as a module)
+KEY_FUNC_RE = re.compile(r"\b(?:read_key|read_main_key|_keychain_get|_answer_kc_get|read_answer_key|login_token"
+                         r"|_read_key_file|read_proof|_kc|read_agent_answer|read_verifier|_chat_sessions"
+                         r"|_read_private_json|_read_private_big|typed_proof|_hook_secret_path)\b")
+KEY_RUN_RE = re.compile(r"\b(?:python[0-9.]*|node|perl|ruby|php|deno|bun|osascript|exec|import|runpy|sourcefileloader"
+                        r"|importlib)\b")
+# Text written into a file (a script run later) that names the folder, other than a listener log
+KEY_FOLDER_TEXT_RE = re.compile(r"/\.config/datastash(?!/state/agent-[a-z0-9@][a-z0-9@\-]{0,99}\.log(?:\.1)?(?![\w./-]))",
+                                re.I)
+KEY_MAX_WORDS = 20000
+KEY_MAX_GLOB = 5000
+
+
+def _key_roots():
+    """The protected folders (each as written and as its real path, lowercased) and the main folders' marker files."""
+    dirs, files = set(), set()
+    for d in (CONF, os.path.join(HOME, ".config", "datastash")):
+        for f in (os.path.normpath(os.path.abspath(d)), os.path.realpath(d)):
+            dirs.add(f.lower())
+    mains = {MAIN_DIR}
+    rec = read_json(MAIN_CONF, {})
+    if isinstance(rec.get("dir"), str) and rec["dir"]:
+        mains.add(rec["dir"])
+    for m in mains:
+        for f in (os.path.normpath(os.path.abspath(os.path.join(m, MAIN_MARKER))),
+                  os.path.realpath(os.path.join(m, MAIN_MARKER))):
+            files.add(f.lower())
+    return dirs, files
+
+
+def _key_within(p, root):
+    return p == root or p.startswith(root.rstrip("/") + "/")
+
+
+KEY_OWN_DIRS = ("state", "off", "pending")  # the folders the plugin makes in the datastash folder
+
+
+def _key_class(p, roots):
+    """"secret" (the datastash folder, anything the plugin keeps in it, or a main folder's marker), "holds" (a folder
+    holding one), or None. Only the listener logs, and a folder in there the plugin never makes, are not secret."""
+    dirs, files = roots
+    low = p.lower()
+    holds = False
+    for r in dirs:
+        if _key_within(low, r):
+            comps = [x for x in low[len(r):].split("/") if x]
+            if not comps or KEY_LOG_OK_RE.fullmatch("/".join(comps)):
+                return None if comps else "secret"
+            top = os.path.join(p[:len(r)], p[len(r):].lstrip("/").split("/")[0])
+            if comps[0] not in KEY_OWN_DIRS and os.path.isdir(top) and not os.path.islink(top):
+                return None
+            return "secret"
+        holds = holds or _key_within(r, low)
+    for f in files:
+        if low == f:
+            return "secret"
+        holds = holds or _key_within(f, low)
+    return "holds" if holds else None
+
+
+def _key_braces(word, n=0):
+    """Bash brace expansion of one word (bounded): "{a,b}c" gives ["ac", "bc"]."""
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", word)
+    if m is None or n > 64:
+        return [word]
+    out = []
+    for alt in m.group(1).split(","):
+        out.extend(_key_braces(word[:m.start()] + alt + word[m.end():], n + 1))
+        if len(out) > 256:
+            break
+    return out
+
+
+def _key_glob(pattern):
+    """Every existing path an absolute glob pattern names, dot files and any letter case included (bounded)."""
+    parts = [x for x in pattern.split("/") if x]
+    found, todo = [], [("/", 0)]
+    while todo and len(found) + len(todo) < KEY_MAX_GLOB:
+        base, i = todo.pop()
+        if i == len(parts):
+            found.append(base)
+            continue
+        part = parts[i]
+        if not any(c in part for c in KEY_GLOB_CHARS):
+            todo.append((os.path.join(base, part), i + 1))
+            continue
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        pat = part.replace("**", "*").lower()
+        for n in names:
+            if fnmatch.fnmatchcase(n.lower(), pat):
+                todo.append((os.path.join(base, n), i + 1))
+    return found + [b for b, _i in todo]
+
+
+def _key_glob_class(pattern, roots):
+    """What a glob pattern could name, from its words alone (any letter case, existing or not): "secret", "holds" or
+    None. A pattern that can only name listener logs inside the datastash folder names none."""
+    pc = [x for x in pattern.lower().split("/") if x]
+    worst = None
+    for r in list(roots[0]) + list(roots[1]):
+        rc = [x for x in r.split("/") if x]
+        for i in range(min(len(pc), len(rc))):
+            if pc[i] == "**" or "**" in pc[i]:
+                return "secret"
+            if not fnmatch.fnmatchcase(rc[i], pc[i]):
+                break
+        else:
+            if len(pc) < len(rc):
+                worst = worst or "holds"
+            elif r in roots[1] or len(pc) == len(rc):
+                return "secret"
+            elif "/".join(pc[len(rc):]).startswith("state/") and re.search(r"\.log(?:\.1)?$", pc[-1]):
+                continue  # only listener logs
+            elif _key_class("/" + "/".join(pattern.split("/")[1:][:len(rc) + 1]).replace("//", "/"), roots) is None \
+                    and not any(ch in pc[len(rc)] for ch in KEY_GLOB_CHARS):
+                continue  # inside a folder there the plugin never makes
+            else:
+                return "secret"
+    return worst
+
+
+def _key_norm(text):
+    """The text as the shell would mostly see it: escapes and quotes gone, $VARS and ${VARS} filled in."""
+    t = re.sub(r"\\(.)", r"\1", str(text))
+    t = t.replace("'", "").replace('"', "")
+    env = dict(os.environ)
+    env.setdefault("HOME", HOME)
+    env.setdefault("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))
+    return re.sub(r"\$\{(\w+)(?:[:-][^}]*)?\}|\$(\w+)",
+                  lambda m: env.get(m.group(1) or m.group(2), m.group(0)), t)
+
+
+def _key_words(t):
+    out = []
+    for w in re.split(r"[\s;|&()<>`=]+", t):
+        for b in _key_braces(w):
+            out.extend(x for x in re.split(r"[,:]", b) if x)
+    return out
+
+
+def _key_expand(w):
+    return os.path.expanduser(w) if w.startswith("~") else w
+
+
+def _key_forms(w, bases):
+    """The lowercased paths one word can name: as written and real (symlinks followed), from each base folder; a glob
+    word also gives every existing path it matches."""
+    w = _key_expand(w)
+    cands = [w] if os.path.isabs(w) else [os.path.join(b, w) for b in bases]
+    out = set()
+    for c in cands:
+        out.add(os.path.normpath(c))
+        try:
+            out.add(os.path.realpath(c))
+        except (OSError, ValueError):
+            pass
+        if any(ch in c for ch in KEY_GLOB_CHARS):
+            out.add(("glob", os.path.normpath(c)))
+            for g in _key_glob(os.path.normpath(c)):
+                out.add(os.path.normpath(g))
+                try:
+                    out.add(os.path.realpath(g))
+                except (OSError, ValueError):
+                    pass
+    return out
+
+
+def _key_text_deny(text, cwd, roots, recurse_tool=False):
+    """True when a command (or any tool's text) names a datastash key file or folder, or searches a folder holding one."""
+    t = _key_norm(text)
+    low = t.lower()
+    squashed = re.sub(r"[\s'\"\\+,`]|\$\(|[()]", "", str(text)).lower()
+    if KEY_NAME_RE.search(squashed) or KEY_NAME_RE.search(low):
+        return True
+    for r in list(roots[0]) + ["/.config/datastash"]:
+        if squashed.count(r) > re.sub(r"\s", "", low).count(r):
+            return True  # the folder's path split into pieces
+    if KEYCHAIN_READ_RE.search(low) and ("datastash" in low or re.search(r"dump-keychain|\bsearch\b", low)):
+        return True
+    if KEY_FUNC_RE.search(t) and KEY_RUN_RE.search(low):
+        return True
+    bases = [cwd]
+    for m in re.finditer(r"(?:^|[;&|(\s])(?:cd|pushd)\s+([^\s;&|()]+)", t):
+        d = _key_expand(m.group(1))
+        bases.extend([os.path.normpath(d)] if os.path.isabs(d) else [os.path.normpath(os.path.join(b, d)) for b in bases])
+        bases = list(dict.fromkeys(bases))[:64]
+    words = _key_words(t)
+    if len(words) > KEY_MAX_WORDS:
+        return True
+    recursive = recurse_tool or KEY_RECURSE_RE.search(low) is not None
+    if recursive and KEY_HOME_RE.search(low):
+        words.append(HOME)
+    named = False
+    for w in words:
+        for f in _key_forms(w, bases):
+            if isinstance(f, tuple):
+                k = _key_glob_class(f[1], roots)
+                if k == "secret" or (k == "holds" and recursive):
+                    return True
+                continue
+            k = _key_class(f, roots)
+            if k == "secret":
+                return True
+            if k == "holds" and recursive:
+                return True
+            named = named or (os.path.lexists(f) and f not in bases)
+    if recursive and not named:  # a search with no folder named searches where it runs
+        return any(_key_class(b, roots) is not None for b in bases)
+    return False
+
+
+def key_path_deny(inp):
+    """PreToolUse, every tool and every session: the deny for a call that could reach a datastash key file (see
+    KEY_DENY), else None. Never reads a key file: it looks at paths and names only."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse":
+        return None
+    name, args = inp.get("tool_name"), inp.get("tool_input")
+    if not isinstance(name, str) or name in KEY_PROSE_TOOLS:
+        return None
+    if name.startswith("mcp__") and _trusted_connector(inp, name):
+        return None  # datastash's own connector reads no local file
+    args = args if isinstance(args, dict) else {}
+    cwd = inp.get("cwd") if isinstance(inp.get("cwd"), str) and os.path.isabs(inp["cwd"]) else os.getcwd()
+    roots = _key_roots()
+    hit = False
+    if name in FILE_TOOLS:
+        # Each path field is one path (spaces and all), from the session's folder; a Grep searches its path (or the
+        # session's folder) with every file under it, so a folder holding the keys is refused too.
+        where = args.get("path") if isinstance(args.get("path"), str) and args["path"].strip() else cwd
+        where = _key_expand(_key_norm(where).strip())
+        where = where if os.path.isabs(where) else os.path.join(cwd, where)
+        paths = [where] if name in ("Grep", "Glob") else []
+        paths += [args[k] for k in ("file_path", "notebook_path") if isinstance(args.get(k), str)]
+        if name == "Glob" and isinstance(args.get("pattern"), str):
+            paths.append(os.path.join(where, _key_norm(args["pattern"]).strip()))
+        worst = {"secret"} | ({"holds"} if name == "Grep" else set())
+        for x in paths:
+            for f in _key_forms(_key_norm(x).strip(), [cwd]):
+                k = _key_glob_class(f[1], roots) if isinstance(f, tuple) else _key_class(f, roots)
+                hit = hit or k in worst
+        hit = hit or KEY_NAME_RE.search(json.dumps(args)) is not None
+        written = [v for k, v in args.items() if k in ("content", "new_string", "new_source") and isinstance(v, str)]
+        written += [e.get("new_string") for e in args.get("edits") or [] if isinstance(e, dict)
+                    and isinstance(e.get("new_string"), str)] if isinstance(args.get("edits"), list) else []
+        hit = hit or any(KEY_FOLDER_TEXT_RE.search(_key_norm(w)) or KEY_FOLDER_TEXT_RE.search(
+            re.sub(r"[\s'\"\\+,`]", "", w)) for w in written)
+    else:
+        hit = any(_key_text_deny(x, cwd, roots) for x in _strings(args, []))
+    if not hit:
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": KEY_DENY}}
+
+
 def cmd_agent_tool(_args):
     """PreToolUse, PostToolUse and PostToolUseFailure hook, every tool: a call that could carry datastash content records this session as an
     agent (never main; see tool_carries_datastash). Never blocks the call. It prints nothing, except (PreToolUse, security
@@ -5194,6 +5482,14 @@ def cmd_agent_tool(_args):
         tdeny = tdeny or proof_file_deny(inp)  # XLI-351: nor an agent's proof
     except Exception:  # noqa: BLE001
         pass
+    try:
+        tdeny = tdeny or key_path_deny(inp)  # XLI-399: nor any datastash key file, in any form, in any session
+    except Exception:  # noqa: BLE001  can't tell: a call that names datastash at all is refused (fails closed)
+        ti = inp.get("tool_input") if isinstance(inp, dict) else None
+        if tdeny is None and isinstance(inp, dict) and inp.get("hook_event_name") == "PreToolUse" \
+                and inp.get("tool_name") not in KEY_PROSE_TOOLS and _touches_datastash_text(json.dumps(ti, default=str)):
+            tdeny = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                            "permissionDecisionReason": KEY_DENY}}
     if tdeny is not None:
         print(json.dumps(tdeny), flush=True)
         return _agent_tool(inp)
