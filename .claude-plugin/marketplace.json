@@ -11,8 +11,8 @@
         "source": "git-subdir",
         "url": "https://github.com/xlsx-for-ai-dev/datastash-claude-code.git",
         "path": "plugins/datastash",
-        "ref": "v1.0.12",
-        "sha": "1d8b71324f46df1f2d54cd43e57fe76699ac8a3b"
+        "ref": "v1.0.13",
+        "sha": "ac0dc25ce0c4a8abc0530b62f8708a10115f49b4"
       },
       "description": "datastash agent workbooks for Claude Code: register an agent, keep its key in a private file, work in the agent workbook, and wake on inbox messages."
     }
