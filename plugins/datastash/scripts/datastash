@@ -12140,9 +12140,8 @@ NO_OWN_AGENT_LINE = ("Not done: this session has no datastash agent key on this 
 # 1.0.13 (owner's Mac, 11-24): an uninstall never needs this session to be an agent. The person's typed names are signed
 # by any agent of theirs still set up on this computer (note_signer); only when there is none at all is this said. Never
 # "type /datastash:install": that would make one more agent.
-NO_SIGNER_LINE = ("Not done: none of your datastash agents is set up on this computer, so nothing here can sign your typed "
-                  "names and the plugin sent nothing. Nothing was removed. Type /datastash:uninstall on a computer where "
-                  "one of your agents runs.")
+NO_SIGNER_LINE = ("Datastash isn't installed on this agent. Nothing was removed. Type /datastash:uninstall on a computer "
+                  "where one of your agents runs.")
 NOT_TYPED_LINE = ("Not done: the plugin could not find your typed command in this session's transcript, so it sent "
                   "nothing. Type the command again. Nothing changed.")
 USED_LINE = "Not done: that typed command was already used once. Type it again. Nothing changed."

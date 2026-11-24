@@ -1709,6 +1709,7 @@ class UninstallNoKey(Base):
         out, _ = self.note("beta")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(out["systemMessage"], ds.NO_SIGNER_LINE)
+        self.assertTrue(out["systemMessage"].startswith("Datastash isn't installed on this agent."))
         self.assertNotIn("/datastash:install", out["systemMessage"])
         self.assertIn("Type /datastash:uninstall on a computer where one of your agents runs.", out["systemMessage"])
         self.assertNotIn("/datastash:install", ds.NO_SIGNER_LINE)
