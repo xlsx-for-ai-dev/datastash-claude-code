@@ -381,7 +381,7 @@ class Uninstall(Base):
         self.tool("PostToolUse", "ledger_agents_list", {}, lst)
         v, _ = self.prompt("beta")
         self.assertEqual((v["decision"], v["reason"]), ("block", ds.PICK_REFUSED_LINE.format(
-            why='"beta" matches more than one agent (closest on the list: "beta", "Be ta")')))
+            why='"beta" matches more than one agent (closest exact names: "beta", "Be ta")')))
         self.assertEqual(ds.fold_name("A1pha"), ds.fold_name("alpha"))
         self.assertIsNone(self.prompt("what was that about?")[0])  # not a pick: an ordinary prompt
 
@@ -395,75 +395,202 @@ class Uninstall(Base):
         self.assertIn(("POST", ds.UNINSTALL_SELF_PATH, KEY, {}), self.calls)
 
 
-RS, RS2, RS3 = (str(uuid.UUID(int=i)) for i in (0x51, 0x52, 0x53))
-RS_LIST = dict(LIST, agents=LIST["agents"] + [{"agent_id": RS, "name": "robertsenoff", "visibility": "public"},
-                                              {"agent_id": RS2, "name": "robertsenoff-2", "visibility": "public"}])
+AX, AX2, AX3 = (str(uuid.UUID(int=i)) for i in (0x51, 0x52, 0x53))
+AX_LIST = dict(LIST, agents=LIST["agents"] + [{"agent_id": AX, "name": "alex", "visibility": "public"},
+                                              {"agent_id": AX2, "name": "alex-2", "visibility": "public"}])
+A, B, C, BC, SP = (str(uuid.UUID(int=i)) for i in (0x61, 0x62, 0x63, 0x64, 0x65))
 
 
-class HyphenatedNames(Base):
-    """1.0.11: "/datastash:uninstall robertsenoff robertsenoff-2" (names split by a space, one a prefix of the other with
-    a dash) picks exactly those two; a refusal names the piece that failed and says nothing was removed."""
+def plain(*names, ids=None):
+    """A list with these names only (ids in order, made up)."""
+    ids = ids or [str(uuid.UUID(int=0x70 + i)) for i in range(len(names))]
+    return {"list_id": LIST_ID, "expires_in_seconds": 600,
+            "agents": [{"agent_id": i, "name": n, "visibility": "public"} for i, n in zip(ids, names)]}
+
+
+ABC_LIST = plain("a", "b", "c", "bc", ids=[A, B, C, BC])
+
+
+def picks_of(text, lst, own=None, reserved=True):
+    return ds.resolve_picks(text, ds.norm_list(lst), own, reserved)
+
+
+class StrictNames(Base):
+    """1.0.11 review 1: ONE strict parser for every command that takes agent names. Tokens split at whitespace, commas and
+    "and"; a name with spaces only in double quotes; never joined, never a prefix or a fuzzy match; each token equals
+    exactly one listed name ignoring case; "all" only alone; any unknown or ambiguous token refuses the whole command."""
     def setUp(self):
         super().setUp()
         self.installed()
 
-    def picks(self, args, lst=RS_LIST):
-        v, pid = self.slash("/datastash:uninstall " + args)
-        return self.tool("PostToolUse", "ledger_agents_list", {}, lst), pid
+    def picks(self, args, lst=AX_LIST):
+        self.slash("/datastash:uninstall " + args)
+        return self.tool("PostToolUse", "ledger_agents_list", {}, lst)
 
     def targets(self):
         return self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]["targets"]
 
-    def test_the_pair_split_by_a_space_is_removed_together(self):
-        out, _ = self.picks("robertsenoff robertsenoff-2")
-        self.assertNotIn("systemMessage", out)
-        self.assertEqual(sorted(self.targets()), sorted([RS, RS2]))
-
-    def test_the_pair_split_by_a_comma_is_removed_together(self):
-        self.picks("robertsenoff-2, robertsenoff")
-        self.assertEqual(sorted(self.targets()), sorted([RS, RS2]))
-
-    def test_robertsenoff_alone_is_only_that_agent(self):
-        self.picks("robertsenoff")
-        self.assertEqual(self.targets(), [RS])
-
-    def test_robertsenoff_2_alone_is_only_that_agent(self):
-        self.picks("robertsenoff-2")
-        self.assertEqual(self.targets(), [RS2])
-
-    def test_the_pair_typed_after_the_list(self):
-        self.prompt("/datastash:uninstall")
-        self.tool("PostToolUse", "ledger_agents_list", {}, RS_LIST)
-        v, _ = self.prompt("robertsenoff robertsenoff-2")
-        self.assertIsNone(v.get("decision"))
-        self.assertEqual(sorted(self.targets()), sorted([RS, RS2]))
-
-    def test_a_truly_ambiguous_name_is_still_refused_and_says_which(self):
-        lst = dict(RS_LIST, agents=RS_LIST["agents"] + [{"agent_id": RS3, "name": "robert-senoff", "visibility": "public"}])
-        out, _ = self.picks("robertsenoff-2 robertsenoff", lst)
-        self.assertEqual(out["systemMessage"], 'Not done: "robertsenoff" matches more than one agent (closest on the list: '
-                         '"robertsenoff", "robert-senoff"). Nothing was removed. Type the names exactly as the list shows '
-                         'them, separated by commas or spaces, or all.')
+    def refused(self, out, word):
+        self.assertTrue(out["systemMessage"].startswith(f'Not done: "{word}"'), out["systemMessage"])
+        self.assertIn("Nothing was removed.", out["systemMessage"])
         self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.PICK_REFUSED_AI)
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_a_refusal_names_the_unknown_piece_and_its_closest_names_and_never_implies_success(self):
-        out, _ = self.picks("robertsenoff robertsenof-3")
-        line, ai = out["systemMessage"], out["hookSpecificOutput"]["additionalContext"]
-        self.assertTrue(line.startswith('Not done: "robertsenof-3" is not on the list (closest on the list: "robertsenoff-2"'))
-        self.assertIn("Nothing was removed.", line)
-        self.assertIn('Say only: "Nothing was removed."', ai)
-        self.assertIn("Never say an agent is listed, ready", ai)
-        self.assertIn("never say datastash did or did not run a step", ai)
+    # reviewer CRITICAL 1: tokens are never joined into a longer name
+    def test_a_b_c_with_bc_listed_removes_exactly_a_b_c(self):
+        self.picks("a b c", ABC_LIST)
+        self.assertEqual(sorted(self.targets()), sorted([A, B, C]))
+        self.assertNotIn(BC, picks_of("a b c", ABC_LIST))
+
+    def test_b_c_never_becomes_bc_and_bc_never_becomes_b_c(self):
+        self.assertEqual(sorted(picks_of("b c", ABC_LIST)), sorted([B, C]))
+        self.assertEqual(picks_of("bc", ABC_LIST), [BC])
+
+    def test_alpha_beta_never_becomes_alpha_beta(self):
+        lst = plain("alpha", "beta", "alpha-beta", ids=[A, B, C])
+        self.assertEqual(sorted(picks_of("alpha beta", lst)), sorted([A, B]))
+        self.assertEqual(picks_of("alpha-beta", lst), [C])
+
+    # reviewer HIGH 1: "all" only as the single token
+    def test_x_all_is_refused_and_removes_nothing(self):
+        for text in ("alex all", "all alex", "alex, all", "alex and all", "all all", "alex alex-2 all"):
+            self.assertIsNone(picks_of(text, AX_LIST), text)
+        self.refused(self.picks("alex all"), "all")
+
+    def test_all_typed_after_the_list_next_to_a_name_is_refused(self):
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, AX_LIST)
+        v, _ = self.prompt("alex all")
+        self.assertEqual(v["decision"], "block")
+        self.assertTrue(v["reason"].startswith('Not done: "all" must be typed alone'))
+        self.assertIn("Nothing was removed.", v["reason"])
+
+    def test_all_alone_is_every_agent_and_this_alone_is_this_agent(self):
+        self.assertEqual(sorted(picks_of("all", AX_LIST)), sorted([OWN, ALPHA, BETA, AX, AX2]))
+        self.assertEqual(sorted(picks_of("  ALL  ", AX_LIST)), sorted([OWN, ALPHA, BETA, AX, AX2]))
+        self.assertEqual(picks_of("this", AX_LIST, OWN), [OWN])
+        self.assertIsNone(picks_of("this alex", AX_LIST, OWN))
+        self.assertNotIsInstance(picks_of("a ll", AX_LIST), list)  # reviewer LOW 2: never folded into "all"
+        self.assertIsNone(picks_of("alex a ll", AX_LIST))
+
+    # hyphenated pairs
+    def test_hyphenated_pair_by_space_comma_and(self):
+        for text in ("alex alex-2", "alex-2 alex", "alex,alex-2", "alex-2 and alex", "alex ,  alex-2\n"):
+            self.assertEqual(sorted(picks_of(text, AX_LIST)), sorted([AX, AX2]), text)
+        self.picks("alex alex-2")
+        self.assertEqual(sorted(self.targets()), sorted([AX, AX2]))
+
+    def test_each_hyphenated_name_alone_is_only_that_agent(self):
+        self.assertEqual(picks_of("alex", AX_LIST), [AX])
+        self.assertEqual(picks_of("alex-2", AX_LIST), [AX2])
+        self.assertIsNone(picks_of("alex 2", AX_LIST))  # "2" is no name: never joined to alex-2
+        self.assertIsNone(picks_of("alex alex2", AX_LIST))  # no folding of the dash
+
+    def test_never_a_prefix_or_fuzzy_match(self):
+        for text in ("ale", "alex-", "alex-3", "alexx", "a1ex", "web", "webapp"):
+            self.assertNotIsInstance(picks_of(text, AX_LIST), list, text)
+        self.refused(self.picks("alex alex-3"), "alex-3")
+
+    # quoted names that contain spaces
+    def test_a_quoted_name_with_spaces_counts(self):
+        lst = plain("Be ta", "x", ids=[SP, A])
+        self.assertEqual(sorted(picks_of('"be ta" x', lst)), sorted([SP, A]))
+        self.assertEqual(picks_of("“Be ta”", lst), [SP])  # typographic quotes too
+        self.assertEqual(picks_of('"x"', lst), [A])
+
+    def test_a_name_with_spaces_unquoted_never_counts(self):
+        lst = plain("Be ta", "x", ids=[SP, A])
+        self.assertEqual(picks_of("be ta", lst), "none")
+        self.assertIsNone(picks_of("be ta x", lst))
+        self.assertIsNone(picks_of('"be  ta" "be"', lst))
+
+    def test_an_unclosed_quote_refuses_the_whole_command(self):
+        out = self.picks('alex "alex-2')
+        self.assertTrue(out["systemMessage"].startswith("Not done: a quote is not closed"))
+        self.assertIn("Nothing was removed.", out["systemMessage"])
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_a_refused_typed_pick_after_the_list_names_the_piece(self):
+    # case differences
+    def test_case_differences_match_and_case_twins_are_refused(self):
+        self.assertEqual(sorted(picks_of("ALEX Alex-2", AX_LIST)), sorted([AX, AX2]))
+        twins = plain("Alex", "alex", ids=[A, B])
+        self.assertIsNone(picks_of("alex", twins))
+        self.refused(self.picks("ALEX", twins), "ALEX")
+
+    def test_look_alike_twins_are_refused(self):
+        lst = plain("beta", "Be-ta", ids=[A, B])
+        self.assertIsNone(picks_of("beta", lst))
+        self.assertIsNone(picks_of("Be-ta", lst))
+
+    # duplicate tokens
+    def test_duplicate_tokens_pick_the_agent_once(self):
+        self.assertEqual(picks_of("alex alex ALEX, alex", AX_LIST), [AX])
+        self.picks("alex-2 alex alex-2")
+        self.assertEqual(sorted(self.targets()), sorted([AX, AX2]))
+
+    # an empty input
+    def test_an_empty_input_picks_nothing(self):
+        for text in ("", "   ", ",,", "and", " , and \n"):
+            self.assertEqual(picks_of(text, AX_LIST), "none", repr(text))
+
+    def test_an_empty_quoted_name_is_refused(self):
+        self.assertIsNone(picks_of('alex ""', AX_LIST))
+
+    # any unknown token refuses the whole command
+    def test_one_unknown_token_refuses_all_of_it_and_names_it(self):
+        out = self.picks("alex alex-2 nobody")
+        self.assertTrue(out["systemMessage"].startswith('Not done: "nobody" is not on the list'))
+        self.refused(out, "nobody")
+
+    def test_a_single_unknown_name_on_the_slash_line_names_it(self):  # reviewer LOW 1
+        out = self.picks("alexis")
+        self.assertTrue(out["systemMessage"].startswith('Not done: "alexis" is not on the list (closest exact names: "alex"'))
+        self.refused(out, "alexis")
+
+    def test_refusal_line_names_closest_exact_names(self):
+        lst = ds.norm_list(dict(AX_LIST, agents=AX_LIST["agents"] + [{"agent_id": AX3, "name": "al-ex", "visibility": "public"}]))
+        self.assertEqual(ds.pick_refused_line("alex-2 alex", lst, None), ds.PICK_REFUSED_LINE.format(
+            why='"alex" matches more than one agent (closest exact names: "alex", "al-ex")'))
+
+    def test_a_refused_typed_pick_after_the_list_names_the_token(self):
         self.prompt("/datastash:uninstall")
-        self.tool("PostToolUse", "ledger_agents_list", {}, RS_LIST)
-        v, _ = self.prompt("robertsenoff, nobody-here")
+        self.tool("PostToolUse", "ledger_agents_list", {}, AX_LIST)
+        v, _ = self.prompt("alex, nobody-here")
         self.assertEqual(v["decision"], "block")
         self.assertTrue(v["reason"].startswith('Not done: "nobody-here" is not on the list'))
         self.assertIn("Nothing was removed.", v["reason"])
+
+    # reviewer HIGH 2: public/private share the parser and never take "all"
+    def test_make_alpha_all_public_changes_nothing(self):
+        self.prompt("make alpha all public")
+        out = self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        self.assertTrue(out["systemMessage"].startswith('Not done: "all" is not a name here'), out.get("systemMessage"))
+        self.assertIn("Nothing was changed.", out["systemMessage"])
+        self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.VIS_REFUSED_AI)
+        self.assertIn('Say only: "Nothing was changed."', ds.VIS_REFUSED_AI)
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_visibility_names_are_strict_too(self):
+        lst = ds.norm_list(AX_LIST)
+        self.assertEqual(ds.resolve_picks("alex alex-2", lst, None, reserved=False), sorted([AX, AX2], key=[AX, AX2].index))
+        for text in ("alex all", "all alex", "this alex", "alex nobody", "ale"):
+            self.assertNotIsInstance(ds.resolve_picks(text, lst, None, reserved=False), list, text)
+        self.assertEqual(ds.resolve_picks("all", lst, None, reserved=False), "none")
+        self.assertEqual(ds.resolve_picks("this function", lst, None, reserved=False), "none")
+
+    def test_make_alex_nobody_public_names_the_token(self):
+        self.prompt("make alex nobody public")
+        out = self.tool("PostToolUse", "ledger_agents_list", {}, AX_LIST)
+        self.assertTrue(out["systemMessage"].startswith('Not done: "nobody" is not on the list'))
+        self.assertIn("Nothing was changed.", out["systemMessage"])
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_no_real_handle_in_code_readme_or_tests(self):
+        bad = "robert" + "senoff"
+        root = os.path.join(HERE, "..")
+        for rel in ("plugins/datastash/scripts/datastash", "README.md", "test/test_install.py"):
+            with open(os.path.join(root, rel), encoding="utf-8") as f:
+                self.assertNotIn(bad, f.read().casefold(), rel)
 
 
 class RealSlashShape(Base):

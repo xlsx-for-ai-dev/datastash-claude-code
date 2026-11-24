@@ -457,14 +457,19 @@ To make one private: say make <name> private.
 To make one public: say make <name> public.
 ```
 
-**Uninstall names (1.0.11).** Names after `/datastash:uninstall` (or typed after the list) are split at commas, new
-lines, " and ", and at spaces when the whole piece is no listed name (the longest run of words that is one name first),
-so `robertsenoff robertsenoff-2` picks those two. Names match whole (case, spaces, dashes and look-alike letters folded),
-never by prefix; a name that folds onto two agents is still refused. A refusal names the piece that failed and the listed
-names closest to it, says nothing was removed, and tells the AI to say only that.
+**Agent names (1.0.11).** One strict parser reads the names after `/datastash:uninstall` (or typed after the list)
+and in `make <names> private` / `make <names> public`. The typed text is split at whitespace, commas and the word "and";
+a name with spaces counts only in double quotes (`"my agent"`). Tokens are never joined into a longer name and never
+matched by prefix or fuzzy matching: each token must equal exactly one listed name, ignoring case, so with agents
+`alex` and `alex-2`, `alex alex-2` picks those two, and with agents a, b, c and bc, `a b c` picks a, b and c. A token
+that also differs from another listed name only by case, spaces, dashes or look-alike letters is ambiguous. A token
+typed twice picks its agent once. "all" works only when it is the single token (and is never a name in make ...
+private/public). If any token is unknown or ambiguous, or "all" is typed next to another token, the whole command is
+refused and nothing changes: the refusal names the failing token and its closest exact names, and the AI is told to say
+only "Nothing was removed." (or "Nothing was changed.").
 
 **make <name> private / make <name> public** (plugin 1.0.1). Typed as the whole prompt in an agent's session, with the
-name as the list shows it (several names separated by commas; "all" and "this" are not names here, so "make this
+name as the list shows it (several names separated by commas or spaces; "all" and "this" are not names here, so "make this
 private" stays an ordinary prompt). The AI calls `ledger_agents_list`; if no agent has that name, nothing is sent and the
 prompt is treated as an ordinary one. Otherwise the plugin itself writes the `ledger_agents_note` call (kind `private`
 or `public`, the list id, the agent id from that list and a typed proof signed with this agent's answer key, the same
@@ -926,8 +931,8 @@ An agent can send datastash a capability request, an error report or anything el
   server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
 - `python3 -I test/test_install.py`: `/datastash:install` and `/datastash:uninstall` (plugin 1.0.0; the home-folder
   install with the owner's real 1.0.1 note inputs, the reused session agent and the one-line refusals in 1.0.2; in 1.0.11
-  names split by spaces, as in "/datastash:uninstall robertsenoff robertsenoff-2", and a refusal that names the piece that
-  failed with its closest listed names and tells the AI to say only "Nothing was removed."). The slash commands
+  one strict name parser, as in "/datastash:uninstall alex alex-2": tokens never joined, "all" only alone, any unknown
+  or ambiguous token refuses the whole command with a line that names it and its closest exact names). The slash commands
   pass the typed check only in the entry shape Claude Code 2.1.330 really writes for a typed plugin command
   (`test/fixtures/slash-command-2.1.330.jsonl` and `-hooks.json`, copied from a real interactive session and only renamed
   and given placeholder ids): the message tag, then the name, the args only when there are some; origin human, no

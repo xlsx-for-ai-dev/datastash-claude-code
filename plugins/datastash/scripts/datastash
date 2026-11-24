@@ -12023,7 +12023,7 @@ CONNECTOR_SAME_LINE = "Your datastash connector in Claude is unchanged."
 PICK_UNKNOWN_LINE = ("Not done: a name you typed is not on the list, or matches two agents. Nothing was removed. Type the "
                      "names as the list shows them, or all.")
 PICK_REFUSED_LINE = ("Not done: {why}. Nothing was removed. Type the names exactly as the list shows them, separated by "
-                     "commas or spaces, or all.")
+                     "commas or spaces (a name with spaces in double quotes), or all alone.")
 REFUSED_LINE = "Not done: datastash refused it. Nothing changed."
 # XLI-390 install fix: every refusal is ONE line that says why, and who refused (the plugin here, or datastash).
 NO_STEP_LINE = ("Not done: no /datastash:install or /datastash:uninstall is open in this session, so the plugin sent "
@@ -12064,6 +12064,11 @@ VIS_NOT_AGENT_AI = (f"{CMD_NOTE}: none of the person's datastash agents has that
                     "ordinary way.")
 VIS_PICK_LINE = ("Not done: a name you typed matches two of your agents, or is not on your list. Nothing changed. Type "
                  "the name as /datastash:uninstall lists it.")
+VIS_REFUSED_LINE = ("Not done: {why}. Nothing was changed. Type the names exactly as /datastash:uninstall lists them, "
+                    "separated by commas or spaces (a name with spaces in double quotes).")
+VIS_REFUSED_AI = (f"{CMD_NOTE}: the plugin refused the person's names and changed nothing; it showed them the reason. "
+                  "Make no more datastash calls. Say only: \"Nothing was changed.\" Never say an agent is listed, ready, "
+                  "picked or about to change, and never say datastash did or did not run a step.")
 VIS_BRAKED_LINE = "Not done: too many changes just now. Wait a few minutes, then try again."
 NOTE_INSTALL_AI = (f"{CMD_NOTE}: the person installed datastash for all their agents. Call the datastash connector's "
                    'ledger_agent_key now with name "{name}", agent_id "{agent_id}" and only_if_no_key true. ' + _SAY)
@@ -12334,83 +12339,113 @@ def list_lines(lst, head):
     return [head] + [f"- {a['name']} ({'private' if a['shut'] else 'public'})" for a in lst["agents"]]
 
 
-def _pick_one(p, lst, folds, own):
-    """(fold, ids) for one typed piece: the reserved words "all" and "this" first, else the listed names it folds to."""
-    w = re.sub(r"\s+", "", p.casefold())
-    f = w if w in ("all", "this") else fold_name(p)
-    ids = [a["id"] for a in lst["agents"]] if f == "all" else ([own] if own else []) if f == "this" else folds.get(f, [])
-    return f, ids
+_PICK_TOKEN_RE = re.compile(r'"([^"]*)"|“([^”"]*)”|([^\s,"“”]+)|(["“”])')
+_RESERVED = ("all", "this")
 
 
-def _pick_segments(p, lst, folds, own):
-    """A piece with spaces that is no listed name as a whole ("robertsenoff robertsenoff-2"): split at the spaces, the
-    longest run of words that is one listed name first. A list of (piece, fold, ids); a word that starts no name is
-    kept as its own piece (unknown), so a refusal names that word."""
-    words, out, i = p.split(), [], 0
-    while i < len(words):
-        for j in range(len(words), i, -1):
-            seg = " ".join(words[i:j])
-            f, ids = _pick_one(seg, lst, folds, own)
-            if f in ("all", "this") or f in folds:
-                out.append((seg, f, ids))
-                i = j
-                break
+def pick_tokens(text):
+    """The typed names as ([(token, quoted)], error | None). Tokens are split at whitespace, commas and the word "and";
+    a name with spaces counts only in double quotes. Tokens are never joined into a longer name."""
+    out, err = [], None
+    for m in _PICK_TOKEN_RE.finditer(text or ""):
+        q, cq, word, stray = m.groups()
+        if stray is not None:
+            err = err or "quote"
+        elif word is not None:
+            if word.casefold() != "and":
+                out.append((word, False))
         else:
-            out.append((words[i], *_pick_one(words[i], lst, folds, own)))
-            i += 1
-    return out
+            out.append((q if q is not None else cq, True))
+    return out, err
 
 
-def pick_check(text, lst, own):
-    """(picked ids | "none" | None, the first piece that failed or None, why: "unknown" | "two" | "many" | None).
-    "none" when no piece names anything (the prompt is something else); None when a piece is unknown or matches two
-    agents. Names are split at commas, new lines, " and ", and at spaces when the whole piece is no listed name."""
-    pieces = [p.strip() for p in re.split(r"[,\n]+|\s+and\s+", text.strip()) if p.strip()][:101]
-    if len(pieces) > 100:
+def _pick_match(tok, quoted, lst):
+    """("reserved" | "one" | "two" | "unknown", ids) for one token: equal to exactly one listed name, ignoring case, and
+    no other listed name that differs from it only by case, spaces, dashes or look-alike letters."""
+    if not quoted and tok.casefold() in _RESERVED:
+        return "reserved", []
+    t = show_name(tok).casefold() if tok.strip() else ""
+    same = [a for a in lst["agents"] if a["name"].casefold() == t]
+    if not same:
+        return "unknown", []
+    near = [a for a in lst["agents"] if fold_name(a["name"]) == fold_name(tok)]
+    return ("one", [same[0]["id"]]) if len(same) == 1 and len(near) <= 1 else ("two", [])
+
+
+def pick_check(text, lst, own, reserved=True):
+    """The one strict parser for every command that takes agent names (uninstall, make <names> private/public).
+    (picked ids | "none" | None, the token that failed or None, why). "none" when no token names anything (the prompt is
+    something else, and the failing token, if any, is still given); None refuses the whole command, changing nothing:
+    a token unknown ("unknown") or matching two agents ("two"), "all"/"this" next to any other token ("mixed") or where
+    they are not names ("reserved", when reserved is False), an unclosed quote ("quote"), more than 100 names ("many")."""
+    toks, err = pick_tokens(text)
+    if len(toks) > 100:
         return None, None, "many"
-    folds = {}
-    for a in lst["agents"]:
-        folds.setdefault(fold_name(a["name"]), []).append(a["id"])
-    picked, hits, failed = [], 0, None
-    for p in pieces:
-        f, ids = _pick_one(p, lst, folds, own)
-        segs = [(p, f, ids)]
-        if f not in ("all", "this") and f not in folds and len(p.split()) > 1:
-            split = _pick_segments(p, lst, folds, own)
-            segs = split if any(f in ("all", "this") or f in folds for _, f, _ in split) else segs
-        for seg, f, ids in segs:
-            hits += f in ("all", "this") or f in folds
-            why = "unknown" if not ids else "two" if f not in ("all", "this") and len(ids) != 1 else None
-            if why and failed is None:
-                failed = (seg, why)
-            picked += [i for i in ids if i not in picked]
+    seen = [(t, q, *_pick_match(t, q, lst)) for t, q in toks]
+    hits = sum(1 for _, _, k, _ in seen if k in ("one", "two") or (reserved and k == "reserved"))
+    first_bad = next(((t, k) for t, _, k, _ in seen if k in ("unknown", "two")), (None, "unknown"))
     if hits == 0:
-        return "none", None, None
-    if failed or not picked:
-        return None, *(failed or (None, "unknown"))
+        return "none", *first_bad
+    if err:
+        return None, '"', "quote"
+    res = [t for t, _, k, _ in seen if k == "reserved"]
+    if res:
+        if not reserved:
+            return None, res[0], "reserved"
+        if len(seen) > 1:
+            return None, res[0], "mixed"
+        if res[0].casefold() == "all":
+            return ([a["id"] for a in lst["agents"]] or None), (None if lst["agents"] else res[0]), \
+                (None if lst["agents"] else "unknown")
+        return ([own], None, None) if own else (None, res[0], "unknown")
+    if first_bad[0] is not None:
+        return None, *first_bad
+    picked = []
+    for _, _, _, ids in seen:
+        picked += [i for i in ids if i not in picked]
     return picked, None, None
 
 
-def resolve_picks(text, lst, own):
-    """The agent ids the person's typed names pick ("all", "this", names as listed); "none" when no piece names anything
-    (the prompt is something else); None when a piece is unknown or matches two agents."""
-    return pick_check(text, lst, own)[0]
+def resolve_picks(text, lst, own, reserved=True):
+    """The agent ids the person's typed names pick; "none" when no token names anything (the prompt is something
+    else); None when the whole command is refused (pick_check)."""
+    return pick_check(text, lst, own, reserved)[0]
+
+
+def pick_refused_why(text, lst, own, reserved=True):
+    """Why a pick was refused, naming the failing token and the listed names closest to it, or None."""
+    _, tok, why = pick_check(text, lst, own, reserved)
+    if why == "many":
+        return "more than 100 names were typed"
+    if why == "quote":
+        return "a quote is not closed; put a name with spaces in double quotes"
+    if tok is None:
+        return None
+    t, names = show_name(tok), [a["name"] for a in lst["agents"]]
+    if why == "mixed":
+        return f'"{t}" must be typed alone, never with other names'
+    if why == "reserved":
+        return f'"{t}" is not a name here; type the names exactly as the list shows them'
+    if why == "two":
+        close = [n for n in names if fold_name(n) == fold_name(tok)]
+        head = f'"{t}" matches more than one agent'
+    else:
+        low = {n.casefold(): n for n in names}
+        close = [low[c] for c in difflib.get_close_matches(t.casefold(), list(low), n=3, cutoff=0.5)]
+        head = f'"{t}" is not on the list'
+    return head + (f" (closest exact names: {', '.join(chr(34) + n + chr(34) for n in close)})" if close else "")
 
 
 def pick_refused_line(text, lst, own):
-    """The one line for a refused pick: which name failed, and the listed names closest to it. Nothing was removed."""
-    _, piece, why = pick_check(text, lst, own)
-    if piece is None:
-        return PICK_UNKNOWN_LINE
-    names = [a["name"] for a in lst["agents"]]
-    if why == "two":
-        close = [n for n in names if fold_name(n) == fold_name(piece)]
-        head = f'"{show_name(piece)}" matches more than one agent'
-    else:
-        close = difflib.get_close_matches(show_name(piece), names, n=3, cutoff=0.5)
-        head = f'"{show_name(piece)}" is not on the list'
-    near = f" (closest on the list: {', '.join(chr(34) + n + chr(34) for n in close)})" if close else ""
-    return PICK_REFUSED_LINE.format(why=head + near)
+    """The one line for a refused uninstall pick: which name failed, and the listed names closest to it."""
+    why = pick_refused_why(text, lst, own)
+    return PICK_REFUSED_LINE.format(why=why) if why else PICK_UNKNOWN_LINE
+
+
+def vis_refused_line(text, lst):
+    """The one line for a refused make <names> private/public: which name failed. Nothing was changed."""
+    why = pick_refused_why(text, lst, None, reserved=False)
+    return VIS_REFUSED_LINE.format(why=why) if why else VIS_PICK_LINE
 
 
 def _cmd_path(sid):
@@ -12464,8 +12499,8 @@ def command_prompt(inp):
         return None, UNINSTALL_LIST_AI, False
     v = VISIBILITY_RE.fullmatch(prompt)
     if v and _own(inp) is not None:
-        pieces = [p for p in re.split(r"[,\n]+|\s+and\s+", v.group(1)) if p.strip()]
-        if pieces and not any(re.sub(r"\s+", "", p.casefold()) in ("all", "this") for p in pieces):
+        toks, _ = pick_tokens(v.group(1))  # "make this private" alone stays an ordinary prompt; mixed is refused later
+        if toks and not (len(toks) == 1 and not toks[0][1] and toks[0][0].casefold() in _RESERVED):
             kind = v.group(2).lower()
             save_cmd(sid, dict(base, kind=kind, picks=v.group(1)))
             return None, VIS_AI.format(kind=kind), False
@@ -12755,10 +12790,11 @@ def command_tool(inp):
                 _drop(_cmd_path(sid))
             return _post(server_refused(body))
         if rec["kind"] in VIS_KINDS:  # X6: the typed name, bound to an agent id from this list
-            got = resolve_picks(rec.get("picks") or "", lst, None)
+            got = resolve_picks(rec.get("picks") or "", lst, None, reserved=False)
             if not isinstance(got, list):
                 _drop(_cmd_path(sid))
-                return _post(None, VIS_NOT_AGENT_AI) if got == "none" else _post(VIS_PICK_LINE)
+                return _post(None, VIS_NOT_AGENT_AI) if got == "none" else \
+                    _post(vis_refused_line(rec.get("picks") or "", lst), VIS_REFUSED_AI)
             save_cmd(sid, dict(rec, list=lst, targets=got))
             return _post(None, VIS_NOTE_AI.format(kind=rec["kind"]))
         own = _own(inp)
