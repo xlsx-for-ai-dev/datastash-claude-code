@@ -37,10 +37,11 @@ MODEL = "claude-opus-5-5"
 class Fake:
     """Keyed tabs with inc/min/max, idempotency keys, filter (eq, ne, blank, order, rows_matched), delete."""
 
-    KEYS = {"Burn": "key", "Cards cost": "card", "Prices": "model"}
+    KEYS = {"Burn": "key", "Cards cost": "card", "Time per card": "card", "Prices": "model"}
 
     def __init__(self):
         self.tabs, self.seen_idem, self.calls, self.fail_next, self.cols = {}, {}, [], [], {}
+        self.card_tab = None  # the card_tab ledger_feeds_setup answers (x-live #487); None: not in the answer
         self.lock = threading.RLock()
 
     def apply(self, tab, row):
@@ -87,7 +88,10 @@ class Fake:
                     return f
             tab = args.get("tab")
             if name == "ledger_feeds_setup":
-                return False, {"feeds": [{"service": "burn", "ok": True, "tabs": []}]}
+                feed = {"service": "burn", "ok": True, "tabs": []}
+                if self.card_tab is not None:
+                    feed["card_tab"] = self.card_tab
+                return False, {"feeds": [feed]}
             if name == "ledger_rows_upsert":
                 idem = args.get("idempotency_key")
                 if idem and idem in self.seen_idem:
@@ -185,6 +189,8 @@ class Base(unittest.TestCase):
             if n.startswith("tpc-"):
                 os.unlink(os.path.join(ds.STATE, n))
         os.environ.pop("DATASTASH_CARD", None)
+        if os.path.exists(ds.TPC_PATH):  # no saved card_tab from another test (any order)
+            os.unlink(ds.TPC_PATH)
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -747,6 +753,28 @@ class OptIn(Base):
         self.assertIn("time per card is off", out)
         self.hook("SessionEnd")
         self.assertEqual(len(self.spawned), 3)
+
+    def test_the_saved_card_tab_names_the_per_card_tab(self):
+        """1.0.7: `on` saves the card_tab ledger_feeds_setup answered, per workbook; sends and folds use it. With none
+        saved (an `on` before 1.0.7, or an answer without it) it is "Cards cost", which x-live maps for a newer workbook."""
+        self.assertEqual(ds._tpc_card_tab(WB), "Cards cost")
+        self.fake.card_tab = "bad\ntab"
+        self.assertEqual(self.say("on")[0], 0)
+        self.assertEqual(ds._tpc_card_tab(WB), "Cards cost")  # a bad answer is never saved
+        self.fake.card_tab = "Time per card"
+        self.assertEqual(self.say("on")[0], 0)
+        self.assertEqual(ds._tpc_card_tab(WB), "Time per card")
+        self.assertEqual(ds._tpc_card_tab(WB.upper()), "Time per card")
+        self.assertEqual(ds._tpc_card_tab("1" + WB[1:]), "Cards cost")  # another workbook keeps the default
+        self.assertTrue(ds.tpc_is_on(self.folder))
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(5, [("Edit", {"file_path": "/a"})])
+        self.assertEqual(self.run_once()["cards"], 1)
+        tabs = {a["tab"] for n, a in self.fake.calls if n == "ledger_rows_upsert"}
+        self.assertEqual(tabs, {"Burn", "Time per card"})
+        self.assertIn("XLI-378", self.fake.tabs["Time per card"])
+        self.assertNotIn("Cards cost", self.fake.tabs)
 
     def test_on_without_the_tabs_changes_nothing(self):
         self.fake.fail_next = [(True, {"code": "refused", "message": "Tab Burn is there with another key"})]

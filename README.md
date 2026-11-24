@@ -325,6 +325,9 @@ time-per-card off` stops it, and `datastash time-per-card` says which it is.
   minutes; the rest of a minute is carried to the session's next send and rounded at its end.
 - **The card.** A subagent's description ("Build XLI-12"), else `DATASTASH_CARD`, else the git branch (`xli-12-login`);
   else "no card". Card ids are letters, a dash and digits only.
+- **The per-card tab** (plugin 1.0.7). `on` saves the per-card tab name the set-up answers (`card_tab`: "Time per
+  card" in a workbook set up since then, "Cards cost" in an older one) and every send and fold writes there; with none
+  saved it is "Cards cost", which datastash maps to "Time per card" in a newer workbook.
 - **Never twice.** Each send carries an idempotency key from where it was read, each part is marked taken once datastash
   took it, and the read position moves only after that; a send that was cut short goes again with the same rows and
   keys, only its parts not yet taken. A send that failed at a session end is finished at the next session start or send
@@ -913,7 +916,7 @@ An agent can send datastash a capability request, an error report or anything el
   answers and outputs never sent or printed, only allow-listed fields; JSONL, promptfoo and Inspect read; runs folded with
   whole-number incs; `--vs` copying prev_passed (read before the write) and none for a new case; exit 0 with one line for
   every problem.
-- `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5): off until `on` (which sets up the tabs), the
+- `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5; 1.0.7 the saved `card_tab`): off until `on` (which sets up the tabs), the
   hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's
   tokens counted once; active minutes only (no question, permission prompt, compaction or pause time; whole minutes
   sent, the rest carried); minutes without the person's typing time and with side-by-side calls counted once; wakes and
