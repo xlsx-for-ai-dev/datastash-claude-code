@@ -293,16 +293,23 @@ time-per-card off` stops it, and `datastash time-per-card` says which it is.
   (all its calls). Monitor, a wake-up, `sleep` or `datastash watch`: wakes. A read (Read, Grep, Glob, a web read, a
   read-only shell command, an outside-tool lookup): orienting, or lookups when the session already read that target. The
   rest (delegating, messages, other commands): planning. A model turn's tokens go to its first tool call's activity.
-- **Minutes.** A model turn from its input to its end, and a tool from its call to its result (calls side by side counted
-  once). The time before the person types is never counted, nor a subagent's run in its parent's time.
+- **Minutes.** Active time only: a model turn from its input (or its model request) to its last entry, and a tool from
+  its call to its result (side by side counted once); a wait on the person (AskUserQuestion, plan approval, a permission
+  prompt they answered), the time before they type, a compaction's old time and a wait over 10 minutes before a model
+  turn's first entry (a pause or a resume) are left out, as is a subagent's run in its parent's time. Burn takes whole
+  minutes; the rest of a minute is carried to the session's next send and rounded at its end.
 - **The card.** A subagent's description ("Build XLI-12"), else `DATASTASH_CARD`, else the git branch (`xli-12-login`);
   else "no card". Card ids are letters, a dash and digits only.
-- **Never twice.** Each send carries an idempotency key from where it was read, and the read position moves only after
-  datastash took the rows; a send that was cut short goes again with the same rows and keys.
+- **Never twice.** Each send carries an idempotency key from where it was read, each part is marked taken once datastash
+  took it, and the read position moves only after that; a send that was cut short goes again with the same rows and
+  keys, only its parts not yet taken. A send that failed at a session end is finished at the next session start or send
+  in any session of that agent's workbook.
 - **Past 10,000 Burn rows** (the size the card totals read whole), finished cards are folded, oldest first, never a card
   in the send: their Burn sums go into the card's `folded_*` cells and their Burn rows are removed, so each card's
-  totals read the same. A fold cut short is finished first the next time. The totals and shares are always the
-  engine's formula columns.
+  totals read the same. Only a Cards cost tab with the `folded_*` columns is folded (an older one just keeps adding, so
+  no total drops). A card is folded once: a card whose `folded_*` cells are set is never written again, so a fold cut
+  short and finished later (even a day later) never counts twice; a Burn row that took more since keeps that part. The
+  totals and shares are always the engine's formula columns.
 
 ## Lookups kept ready (plugin 0.6.0)
 
@@ -869,11 +876,13 @@ An agent can send datastash a capability request, an error report or anything el
   Test runs rows removed; exit 0 with one line for every problem, a bad wait or retry setting and a server that does not answer.
 - `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5): off until `on` (which sets up the tabs), the
   hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's
-  tokens counted once; minutes without the person's typing time and with side-by-side calls counted once; wakes and
+  tokens counted once; active minutes only (no question, permission prompt, compaction or pause time; whole minutes
+  sent, the rest carried); minutes without the person's typing time and with side-by-side calls counted once; wakes and
   retries; review subagents; a canary in prompts, commands, paths and results never sent; only new lines sent, a
   half-written line left for later, a cut-short send sent again without counting twice, files outside Claude Code's
   projects folder never read; the fold past the limit (oldest first, never this send's card, sums into `folded_*`, rows
-  removed, a cut-short fold finished once).
+  removed, a cut-short fold finished once, also a day later; never on an older Cards cost tab); a failed session-end
+  send finished by the next session once, its taken parts never again.
 - `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
   for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
   without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the

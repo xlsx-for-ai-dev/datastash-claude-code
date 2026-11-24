@@ -40,7 +40,7 @@ class Fake:
     KEYS = {"Burn": "key", "Cards cost": "card", "Prices": "model"}
 
     def __init__(self):
-        self.tabs, self.seen_idem, self.calls, self.fail_next = {}, {}, [], []
+        self.tabs, self.seen_idem, self.calls, self.fail_next, self.cols = {}, {}, [], [], {}
         self.lock = threading.RLock()
 
     def apply(self, tab, row):
@@ -92,6 +92,10 @@ class Fake:
                 idem = args.get("idempotency_key")
                 if idem and idem in self.seen_idem:
                     return False, self.seen_idem[idem]
+                for r in args["rows"]:  # as datastash (src/rows/ops.ts): {"inc": n} takes a whole number only
+                    for f, v in r.items():
+                        if isinstance(v, dict) and list(v) == ["inc"] and (not isinstance(v["inc"], int) or isinstance(v["inc"], bool)):
+                            return True, {"code": "bad_op", "message": f"{f}: inc takes a whole number"}
                 for r in args["rows"]:
                     self.apply(tab, r)
                 out = {"saved": len(args["rows"])}
@@ -101,6 +105,8 @@ class Fake:
             if name == "ledger_rows_filter":
                 if tab not in self.tabs:
                     return True, {"code": "not_found", "message": "no such tab"}
+                if tab in self.cols and not set(args.get("columns") or []) <= self.cols[tab]:
+                    return True, {"code": "bad_column", "message": "no such column"}
                 rows = [dict(c) for c in self.tabs[tab].values() if self.match(c, args.get("where"))]
                 for o in reversed(args.get("order") or []):
                     rows.sort(key=lambda c: str(c.get(o["column"]) or ""), reverse=o.get("dir") == "desc")
@@ -192,6 +198,14 @@ class Base(unittest.TestCase):
     def burn(self):
         return self.fake.tabs.get("Burn", {})
 
+    def mins(self, path=None, by=1):
+        """The reader's own minutes (to the second) for a whole transcript, by activity (or by=None: by row)."""
+        rd, _ = ds.tpc_read(path or self.main, {})
+        out = {}
+        for k, r in rd.rows.items():
+            out[k[by] if by is not None else k] = out.get(k[by] if by is not None else k, 0) + r["minutes"]
+        return out
+
     def cards(self):
         return self.fake.tabs.get("Cards cost", {})
 
@@ -248,11 +262,12 @@ class Reader(Base):
         self.assertEqual(r["burn"], 5)
         rows = {k.split(" / ")[2]: v for k, v in self.burn().items()}
         self.assertEqual(set(rows), {"orienting", "lookups", "coding", "testing", "planning"}, rows)
+        m = self.mins()
         # turn 1 (orienting): from the prompt at 0 to the turn's end at 12, then the read 12 -> 15
-        self.assertAlmostEqual(rows["orienting"]["minutes"], 15 / 60, places=3)
+        self.assertAlmostEqual(m["orienting"], 15 / 60, places=3)
         # turn 2 from the result at 15 to its end at 25, its repeat read 25 -> 28; the edit's result at 30 adds 2 s only
-        self.assertAlmostEqual(rows["lookups"]["minutes"], 13 / 60, places=3)
-        self.assertAlmostEqual(rows["coding"]["minutes"], 2 / 60, places=3)
+        self.assertAlmostEqual(m["lookups"], 13 / 60, places=3)
+        self.assertAlmostEqual(m["coding"], 2 / 60, places=3)
         self.assertEqual(rows["orienting"]["tokens_in"], 10)
         self.assertEqual(rows["orienting"]["cache_read"], 300)
         self.assertEqual(rows["orienting"]["calls"], 1)
@@ -263,10 +278,12 @@ class Reader(Base):
         self.assertEqual(coding["calls"], 1)
         self.assertEqual(coding.get("tokens_in"), 0)
         # the text-only turn is planning; the person's 6 minutes are nowhere
-        self.assertAlmostEqual(rows["planning"]["minutes"], 10 / 60, places=3)
-        self.assertAlmostEqual(rows["testing"]["minutes"], (10 + 60) / 60, places=3)
-        total = sum(v["minutes"] for v in self.burn().values())
-        self.assertLess(total, 120 / 60)
+        self.assertAlmostEqual(m["planning"], 10 / 60, places=3)
+        self.assertAlmostEqual(m["testing"], (10 + 60) / 60, places=3)
+        self.assertLess(sum(m.values()), 120 / 60)
+        # datastash adds whole minutes only: this send carries 1 whole minute of testing, the rest waits locally
+        self.assertEqual(rows["testing"]["minutes"], 1)
+        self.assertTrue(all(isinstance(v["minutes"], int) for v in self.burn().values()))
         self.assertEqual({v["card"] for v in self.burn().values()}, {"XLI-378"})
         self.assertNotIn(CANARY, self.fake.sent_text())
         self.assertNotIn("/src/", self.fake.sent_text())
@@ -286,8 +303,9 @@ class Reader(Base):
         self.assertEqual(land["retries"], 1)
         self.assertEqual(land["calls"], 3)
         # turns 1 s + 1 s, tools 1 s + 10 s (two calls side by side count their 10 s once)
-        self.assertAlmostEqual(land["minutes"], 13 / 60, places=3)
-        self.assertAlmostEqual(self.burn()[f"XLI-378 / - / wakes / {MODEL}"]["minutes"], 5 / 60, places=3)
+        m = self.mins()
+        self.assertAlmostEqual(m["landing"], 13 / 60, places=3)
+        self.assertAlmostEqual(m["wakes"], 5 / 60, places=3)
         self.assertEqual(self.cards()["XLI-378"]["wakes"], 1)
         self.assertEqual(self.cards()["XLI-378"]["retries"], 1)
 
@@ -319,6 +337,118 @@ class Reader(Base):
         self.assertEqual(self.cards()["XLI-77"]["subagents"], 1)  # a subagent is counted once
         for k, v in self.burn().items():
             self.assertRegex(v["card"], r"^(?:[A-Z]{2,10}-\d+|no card)$")
+
+
+class ActiveTime(Base):
+    """Minutes count active time only: waits on the person and pauses are left out (PM ruling on review M1)."""
+
+    def test_a_question_to_the_person_is_never_timed(self):
+        log = Log(self.main)
+        log.prompt(0)
+        a = log.turn(10, [("AskUserQuestion", {"questions": [{"question": f"which {CANARY}?"}]})])
+        log.result(1500, a[0])  # the person answered 25 minutes later
+        log.turn(1505, [], text="thanks")
+        m = self.mins()
+        self.assertAlmostEqual(sum(m.values()), (10 + 5) / 60, places=3)
+
+    def test_a_permission_prompt_the_person_answered_is_never_timed(self):
+        log = Log(self.main)
+        log.prompt(0)
+        a = log.turn(2, [("Bash", {"command": "make"})])
+        log.put({"type": "user", "timestamp": ts(900), "permissionDecision": {"decision": "accept", "source": "user_temporary"},
+                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": a[0], "content": "x"}]}})
+        b = log.turn(902, [("Bash", {"command": "make"})])
+        log.put({"type": "user", "timestamp": ts(932), "permissionDecision": {"decision": "accept", "source": "config",
+                                                                               "reasonType": "rule"},
+                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": b[0], "content": "x"}]}})
+        log.turn(933, [], text="built")
+        # 2 s, the first make's 15 minutes left out, 2 s, the second make's 30 s, 1 s
+        self.assertAlmostEqual(sum(self.mins().values()), (2 + 2 + 30 + 1) / 60, places=3)
+
+    def test_a_compaction_and_a_resume_never_count_the_pause(self):
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(10, [], text="done")
+        # the session sat 8 minutes; then a compaction writes its summary with the old prompt's time, a model request
+        # starts (after a resume) and the reply comes 4 s later: 4 s, not 8 minutes
+        log.put({"type": "user", "timestamp": ts(0), "isCompactSummary": True, "isVisibleInTranscriptOnly": True,
+                 "message": {"role": "user", "content": f"summary {CANARY}"}})
+        log.put({"type": "api-request", "timestamp": ts(500)})
+        log.turn(504, [], text="resumed")
+        # and a reply 20 minutes after its last input with no request line (an older Claude Code): a pause, left out
+        log.turn(1704, [], text="later", mid="msg_late")
+        self.assertAlmostEqual(sum(self.mins().values()), (10 + 4) / 60, places=3)
+
+    def test_whole_minutes_are_sent_and_the_rest_carried_to_the_session_end(self):
+        log = Log(self.main)
+        log.prompt(0)
+        a = log.turn(1, [("Edit", {"file_path": "/a"})])
+        log.result(40, a[0])  # 40 s of coding
+        self.run_once()
+        key = f"XLI-378 / - / coding / {MODEL}"
+        self.assertEqual(self.burn()[key]["minutes"], 0)
+        b = log.turn(41, [("Edit", {"file_path": "/a"})])
+        log.result(81, b[0])  # 40 s more: 80 s in all
+        self.run_once()
+        self.assertEqual(self.burn()[key]["minutes"], 1)
+        c = log.turn(82, [("Edit", {"file_path": "/a"})])
+        log.result(102, c[0])  # 20 s more: 1 min 40 s in all, rounded at the end
+        self.run_once(ended=True)
+        self.assertEqual(self.burn()[key]["minutes"], 2)
+        ups = [a for n, a in self.fake.calls if n == "ledger_rows_upsert" and a["tab"] == "Burn"]
+        self.assertTrue(all(isinstance(r["minutes"]["inc"], int) for a in ups for r in a["rows"]))
+
+
+class Retry(Base):
+    SID2 = "7c1d2e3f-0a1b-4c2d-8e3f-a4b5c6d7e8f9"
+
+    def other(self):
+        return Log(os.path.join(self.proj, self.SID2 + ".jsonl"))
+
+    def test_a_failed_session_end_send_goes_at_the_next_session_once(self):
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(5, [("Edit", {"file_path": "/a"})])
+        self.fake.fail_next = [(True, {"code": "refused", "message": "down"})]
+        with self.assertRaises(ds.CiProblem):
+            self.run_once(ended=True)
+        self.assertEqual(self.burn(), {})
+        nxt = self.other()  # the next session starts: nothing of its own yet
+        r = ds.tpc_run(self.SID2, nxt.path, False, KEY, WB)
+        self.assertEqual(r["retried"], 1)
+        self.assertEqual(self.burn()[f"XLI-378 / - / coding / {MODEL}"]["calls"], 1)
+        self.assertEqual(self.cards()["XLI-378"]["sessions"], 1)
+        self.assertNotIn("pending", ds.read_json(ds._tpc_state_path(SID), {}))
+        n = len(self.fake.calls)
+        nxt.prompt(10)
+        nxt.turn(12, [("Edit", {"file_path": "/b"})])
+        self.assertEqual(ds.tpc_run(self.SID2, nxt.path, True, KEY, WB)["retried"], 0)
+        self.assertEqual(self.burn()[f"XLI-378 / - / coding / {MODEL}"]["calls"], 2)
+        self.assertEqual(self.cards()["XLI-378"]["sessions"], 2)
+        self.assertEqual(len([c for c in self.fake.calls[n:] if c[0] == "ledger_rows_upsert"]), 2)
+
+    def test_a_part_taken_is_never_sent_again_even_past_the_idempotency_window(self):
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(5, [("Edit", {"file_path": "/a"})])
+        self.fake.fail_next = [None, (True, {"code": "refused", "message": "down"})]  # Burn lands, Cards cost does not
+        with self.assertRaises(ds.CiProblem):
+            self.run_once(ended=True)
+        self.fake.seen_idem.clear()  # a day later: datastash no longer knows the keys
+        ds.tpc_run(self.SID2, self.other().path, False, KEY, WB)
+        self.assertEqual(self.burn()[f"XLI-378 / - / coding / {MODEL}"]["calls"], 1)
+        self.assertEqual(self.cards()["XLI-378"]["sessions"], 1)
+
+    def test_another_workbooks_pending_send_is_left_alone(self):
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(5, [("Edit", {"file_path": "/a"})])
+        self.fake.fail_next = [(True, {"code": "refused", "message": "down"})]
+        with self.assertRaises(ds.CiProblem):
+            self.run_once(ended=True)
+        other_wb = "1b6a3f9e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+        self.assertEqual(ds.tpc_run(self.SID2, self.other().path, False, KEY, other_wb)["retried"], 0)
+        self.assertIn("pending", ds.read_json(ds._tpc_state_path(SID), {}))
 
 
 class Sending(Base):
@@ -435,10 +565,10 @@ class Fold(Base):
         self.assertEqual(r["folded"], ["OLD-1"])
         old1 = self.cards()["OLD-1"]
         # the seeded rows (tokens from the engine's column; a can't-calculate est_cost left out) plus the reported row
-        # (no tokens column in this fake: its four counts, 10 + 20 + 300 + 40)
+        # (no tokens column in this fake: its four counts, 10 + 20 + 300 + 40); its 5 s are still in this session's carry
         self.assertEqual((old1["folded_calls"], old1["folded_tokens"], old1["folded_progress_tokens"], old1["folded_est_cost"]),
                          (3, 100 + 50 + 370, 100 + 370, 0.5))
-        self.assertAlmostEqual(old1["folded_minutes"], 3 + 2 + 5 / 60, places=3)
+        self.assertAlmostEqual(old1["folded_minutes"], 3 + 2, places=3)
         self.assertFalse([k for k in self.burn() if k.startswith("OLD-1 /")])
 
     def test_under_the_limit_nothing_folds(self):
@@ -475,6 +605,87 @@ class Fold(Base):
         self.assertEqual(self.cards()["OLD-0"]["folded_tokens"], 10)  # not twice
         self.assertNotIn("OLD-0 / - / coding / seed-model", self.burn())
         self.assertFalse(os.path.exists(self.journal))
+
+
+class FoldSafety(Base):
+    def setUp(self):
+        super().setUp()
+        self.old_at = ds.TPC_FOLD_AT
+        ds.TPC_FOLD_AT = 4
+        self.journal = os.path.join(ds.STATE, f"tpc-fold-{WB}.json")
+
+    def tearDown(self):
+        ds.TPC_FOLD_AT = self.old_at
+        super().tearDown()
+
+    def seed(self, n):
+        for i in range(n):
+            card = f"OLD-{i}"
+            self.fake.apply("Burn", {"key": f"{card} / - / coding / m", "card": card, "activity": "coding", "model": "m",
+                                     "minutes": 1, "calls": 1, "tokens_in": 10})
+            self.fake.apply("Cards cost", {"card": card, "last_seen": f"2026-11-0{i + 1}T00:00:00.000Z"})
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(5, [("Edit", {"file_path": "/a"})])
+        return log
+
+    def test_an_older_cards_cost_tab_without_folded_columns_is_never_folded(self):
+        self.fake.cols["Cards cost"] = {"card", "last_seen", "first_seen", "sessions", "subagents", "wakes", "retries"}
+        log = self.seed(4)
+        r = self.run_once()
+        self.assertEqual(r["folded"], [])
+        self.assertIsNone(r["fold_problem"])
+        self.assertEqual(len([k for k in self.burn() if k.startswith("OLD-")]), 4)  # every row kept: totals never drop
+        self.assertFalse([n for n, a in self.fake.calls if n == "ledger_rows_delete"])
+        self.assertFalse([a for n, a in self.fake.calls if n == "ledger_rows_upsert" and any(
+            k.startswith("folded_") for r in a["rows"] for k in r)])
+        log.turn(9, [("Edit", {"file_path": "/a"})])
+        self.run_once()  # and it keeps appending
+        self.assertEqual(self.burn()[f"XLI-378 / - / coding / {MODEL}"]["calls"], 2)
+
+    def cut_short(self):
+        log = self.seed(4)
+        orig = self.fake.mcp_tool
+
+        def flaky(key, name, args, timeout=60):
+            if name == "ledger_rows_delete" and not getattr(flaky, "done", False):
+                flaky.done = True
+                return True, {"code": "refused", "message": "down"}
+            return orig(key, name, args, timeout)
+        ds.mcp_tool = flaky
+        self.assertTrue(self.run_once()["fold_problem"])
+        self.assertTrue(os.path.exists(self.journal))
+        self.assertEqual(self.cards()["OLD-0"]["folded_tokens"], 10)
+        return log
+
+    def test_a_fold_replayed_after_a_day_never_counts_twice(self):
+        log = self.cut_short()
+        self.fake.seen_idem.clear()  # past the idempotency window
+        log.turn(9, [("Edit", {"file_path": "/a"})])
+        self.run_once()
+        self.assertEqual((self.cards()["OLD-0"]["folded_tokens"], self.cards()["OLD-0"]["folded_calls"]), (10, 1))
+        self.assertNotIn("OLD-0 / - / coding / m", self.burn())
+        self.assertFalse(os.path.exists(self.journal))
+
+    def test_a_row_that_took_more_before_the_replay_keeps_only_the_new_part(self):
+        log = self.cut_short()
+        self.fake.apply("Burn", {"key": "OLD-0 / - / coding / m", "calls": {"inc": 2}, "minutes": {"inc": 3}})
+        log.turn(9, [("Edit", {"file_path": "/a"})])
+        self.run_once()
+        row = self.burn()["OLD-0 / - / coding / m"]
+        self.assertEqual((row["calls"], row["minutes"], row["tokens_in"]), (2, 3, 0))
+        self.assertEqual(self.cards()["OLD-0"]["folded_calls"], 1)
+
+    def test_a_card_already_folded_is_never_written_again(self):
+        log = self.seed(4)
+        self.fake.apply("Cards cost", {"card": "OLD-0", "folded_tokens": 10})  # folded before, its rows still listed
+        ds.write_private(self.journal, json.dumps({"row": {"card": "OLD-0", "folded_tokens": 10, "folded_calls": 1},
+                                                   "keys": ["OLD-0 / - / coding / m"], "idem": "tpc-fold-x"}))
+        self.run_once()
+        self.assertFalse([a for n, a in self.fake.calls if n == "ledger_rows_upsert" and a["tab"] == "Cards cost"
+                          and a.get("idempotency_key") == "tpc-fold-x"])
+        self.assertEqual(self.cards()["OLD-0"]["folded_tokens"], 10)
+        self.assertNotIn("OLD-0 / - / coding / m", self.burn())
 
 
 class OptIn(Base):
@@ -528,12 +739,14 @@ class OptIn(Base):
         self.assertEqual([a for n, a in self.fake.calls if n == "ledger_feeds_setup"], [{"workbook_id": WB, "services": ["burn"]}])
         self.assertEqual(self.hook("SubagentStop"), 0)
         self.assertEqual(self.hook("SessionEnd"), 0)
+        self.assertEqual(self.hook("SessionStart"), 0)  # a session start finishes what earlier sessions left pending
         self.assertEqual([a[0][-5:] for a in self.spawned], [["run", "web-app", SID, self.main, "0"],
-                                                            ["run", "web-app", SID, self.main, "1"]])
+                                                            ["run", "web-app", SID, self.main, "1"],
+                                                            ["run", "web-app", SID, self.main, "0"]])
         rc, out = self.say("off")
         self.assertIn("time per card is off", out)
         self.hook("SessionEnd")
-        self.assertEqual(len(self.spawned), 2)
+        self.assertEqual(len(self.spawned), 3)
 
     def test_on_without_the_tabs_changes_nothing(self):
         self.fake.fail_next = [(True, {"code": "refused", "message": "Tab Burn is there with another key"})]
@@ -550,6 +763,9 @@ class OptIn(Base):
         sub = [h for g in hooks["hooks"]["SubagentStop"] for h in g["hooks"]]
         self.assertEqual([h["args"][1:] for h in sub], [["time-per-card", "hook"]])
         self.assertTrue(all(h["timeout"] <= 10 and not h.get("async") for h in sub))
+        start = [h for g in hooks["hooks"]["SessionStart"] for h in g["hooks"] if h["args"][1:] == ["time-per-card", "hook"]]
+        self.assertEqual(len(start), 1)
+        self.assertTrue(start[0]["timeout"] <= 10 and not start[0].get("async"))
         self.assertIn("XLI-378 E: time per card", hooks["description"])
 
 

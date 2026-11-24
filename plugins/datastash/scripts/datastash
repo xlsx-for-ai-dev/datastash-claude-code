@@ -13031,8 +13031,9 @@ class CiClient:
                 raise CiProblem(f"{what}: still slowed down after {int(CI_WAIT_SECONDS)} s; this report was not finished")
             self.sleep(wait)
 
-    def tool(self, name, args, what, missing_ok=False):
-        """One MCP tool call. A read of a tab that is not there yet (missing_ok) answers None; a write never does."""
+    def tool(self, name, args, what, missing_ok=False, soft=False):
+        """One MCP tool call. A read of a tab that is not there yet (missing_ok) answers None; a write never does. A soft
+        read answers None for any refusal (busy and brake answers are still waited out)."""
         def once(timeout):
             is_err, body = mcp_tool(self.key, name, args, timeout=timeout)
             if is_err:
@@ -13040,7 +13041,7 @@ class CiClient:
                 ra = body.get("retry_after_seconds")
                 if isinstance(ra, (int, float)) and ra > 0 or code in ("busy", "rate_limited", "agent_slowed_down"):
                     raise _CiWait(ra if isinstance(ra, (int, float)) else 3)
-                if code == "not_found" and missing_ok:
+                if (code == "not_found" and missing_ok) or soft:
                     return None
                 raise CiProblem(f"{what}: {ci_clean(body.get('message') or code or 'refused', 200)}")
             return body
@@ -13330,14 +13331,19 @@ def cmd_ci_report(args):
 # shell command, an outside-tool lookup) of a target this session already read = lookups, else orienting; a shell command
 # that writes a file (sed -i, a redirect, a script that writes) = coding; the rest (delegating, messages, other commands)
 # = planning. A model turn's tokens go to its first tool call's activity (a turn with no tool call after a wake:
-# wakes; else planning). Minutes: a model turn from its input to its end, and a tool from its call to its result (wall
-# time, overlaps counted once); the time before the person types is never counted, nor a subagent's run in its parent.
+# wakes; else planning). Minutes are active time only: a model turn from its input (or its model request) to its last
+# entry, and a tool from its call to its result (wall time, overlaps counted once); never the time before the person
+# types, a tool waiting on the person (AskUserQuestion, ExitPlanMode, a permission prompt the person answered), a wait
+# over 10 minutes before a model turn's first entry (a pause or a resume), nor a subagent's run in its parent. Burn takes
+# whole minutes ({"inc": n} is whole numbers only); the rest of a minute is carried to the session's next send.
 # The card: a subagent's description, else DATASTASH_CARD, else the git branch (an id like XLI-12), else "no card".
 #
-# Each send has an idempotency key from where it was read, so a retry never counts twice; the read offsets move only
-# after datastash took the rows. Then, past TPC_FOLD_AT Burn rows (the range-sheet limit of the card totals; an existing
+# Each send has an idempotency key from where it was read, so a retry never counts twice; each part is marked taken and
+# the read offsets move only after datastash took the rows; a send left pending (a failed session-end send) is finished
+# by the next session start or send of any session of that workbook. Then, past TPC_FOLD_AT Burn rows (the range-sheet limit of the card totals; an existing
 # ruling, not a cap), finished cards (oldest last_seen first, never a card in this report) are folded: their Burn rows'
-# sums are added to the card's folded_* cells and those rows are deleted, so each card reads the same totals. The fold
+# sums are written to the card's folded_* cells (once per card; only on a Cards cost tab that has them) and those rows
+# are deleted, so each card reads the same totals. The fold
 # only moves counts already sent; every total, share and price a person reads is the engine's formula column.
 # Never fails or slows a session: the hook starts a background run and returns at once.
 TPC_USAGE = "usage: datastash time-per-card [on | off]   (time per card for this folder's agent; off by default)"
@@ -13356,6 +13362,14 @@ TPC_EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 TPC_READ_TOOLS = {"Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "ToolSearch", "NotebookRead"}
 TPC_WAKE_TOOLS = {"Monitor", "ScheduleWakeup", "TaskOutput"}
 TPC_AGENT_TOOLS = {"Agent", "Task"}
+# Active minutes only (PM ruling on review M1): a tool that waits on the person is never timed, nor a tool whose result
+# says the person answered its permission prompt (permissionDecision.source "user_..."). A wait before a model turn's
+# first entry longer than Claude Code's own model-request timeout (10 minutes) is a pause (a suspended, closed or resumed
+# session), not work: it is left out. A measurement rule, not a data limit.
+TPC_PERSON_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+TPC_PAUSE_SECONDS = 600.0
+TPC_FOLDED = ("folded_minutes", "folded_calls", "folded_tokens", "folded_progress_tokens", "folded_est_cost")
+TPC_BURN_COUNTS = ("minutes", "calls", "tokens_in", "tokens_out", "cache_read", "cache_write", "retries")
 TPC_TEST_RE = re.compile(
     r"(?:^|[\s/])(?:pytest|py\.test|vitest|jest|mocha|rspec|phpunit|tox|nox|xpm-vitest|unittest|go\s+test|cargo\s+test|"
     r"dotnet\s+test|deno\s+test|bun\s+test|playwright\s+test|mvn\s+(?:\S+\s+)*test|gradlew?\s+(?:\S+\s+)*test|"
@@ -13466,8 +13480,15 @@ class TpcReader:
         if secs > 0:
             self.row(card, activity, model, ts)["minutes"] += secs / 60.0
 
+    def mark(self, ts):
+        """The latest input or model request so far; it never moves back (a compaction rewrites old times)."""
+        if ts is not None:
+            self.st["mark"] = ts if self.st.get("mark") is None else max(self.st["mark"], ts)
+
     def finish_turn(self):
-        """The turn being read is complete (or the read ends): its tokens and its time from its input to its end."""
+        """The turn being read is complete (or the read ends): its tokens and its active time, from its input (or its
+        model request) to its last entry. A wait before its first entry longer than TPC_PAUSE_SECONDS is a pause, left
+        out."""
         t = self.st.pop("turn", None)
         if not t:
             return
@@ -13475,10 +13496,13 @@ class TpcReader:
         r = self.row(t["card"], activity, t["model"], t.get("end"))
         for col, v in (t.get("usage") or {}).items():
             r[col] += v
-        if t.get("start") is not None and t.get("end") is not None:
-            self.minutes(t["card"], activity, t["model"], t["end"] - t["start"], t["end"])
-        if t.get("end") is not None:
-            self.st["mark"] = t["end"]
+        start, first, end = t.get("start"), t.get("first"), t.get("end")
+        if first is not None and end is not None:
+            secs = max(0.0, end - first)
+            if start is not None and 0 <= first - start <= TPC_PAUSE_SECONDS:
+                secs += first - start
+            self.minutes(t["card"], activity, t["model"], secs, end)
+        self.mark(end)
 
     def entry(self, e):
         if not isinstance(e, dict):
@@ -13487,8 +13511,12 @@ class TpcReader:
         if e.get("type") == "assistant":
             self.assistant(e, ts)
         elif e.get("type") == "user":
+            if e.get("isCompactSummary") or e.get("isVisibleInTranscriptOnly"):
+                return  # a compaction's summary carries an old prompt's time: not an input
             self.finish_turn()
             self.user(e, ts)
+        elif e.get("type") == "api-request":
+            self.mark(ts)  # a model request starts here (after a resume too): the turn's time starts at it at the latest
 
     def user(self, e, ts):
         st = self.st
@@ -13496,13 +13524,15 @@ class TpcReader:
         content = msg.get("content")
         results = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_result"] if isinstance(content, list) else []
         if results:
+            pd = e.get("permissionDecision") if isinstance(e.get("permissionDecision"), dict) else {}
+            asked = str(pd.get("source") or "").startswith("user") or str(e.get("toolDenialKind") or "").startswith("user")
             for c in results:
                 call = st.setdefault("open", {}).pop(str(c.get("tool_use_id")), None)
                 if call is None:
                     continue
                 if c.get("is_error") is True:
                     st["error"] = call["sig"]
-                if ts is not None and call["timed"]:
+                if ts is not None and call["timed"] and not asked:  # the person answered its prompt: not timed
                     since = max(call["ts"], st.get("until") or 0)
                     self.minutes(call["card"], call["activity"], call["model"], ts - since, ts)
                     st["until"] = max(st.get("until") or 0, ts)
@@ -13512,8 +13542,7 @@ class TpcReader:
             st["wake"] = origin.get("kind") == "task-notification"
             if st["wake"]:
                 self.card_row(self.card_of(e), ts)["wakes"] += 1
-        if ts is not None:
-            st["mark"] = ts
+        self.mark(ts)
 
     def assistant(self, e, ts):
         st = self.st
@@ -13534,12 +13563,13 @@ class TpcReader:
                                                   ("cache_write", "cache_creation_input_tokens"))
                          if isinstance(u.get(k), int) and not isinstance(u.get(k), bool) and u[k] > 0}
                 t = st["turn"] = {"id": mid, "card": card, "model": model, "usage": usage, "start": st.get("mark"),
-                                  "end": ts, "wake": st.get("wake"), "activity": None}
+                                  "first": ts, "end": ts, "wake": st.get("wake"), "activity": None}
                 st["done"] = (st["done"] + [mid])[-50:]
         else:
             t = st["turn"]
             if ts is not None:
-                t["end"] = ts
+                t["end"] = ts if t.get("end") is None else max(t["end"], ts)
+                t["first"] = ts if t.get("first") is None else t["first"]
         blocks = msg.get("content") if isinstance(msg.get("content"), list) else []
         for b in blocks:
             if not isinstance(b, dict) or b.get("type") != "tool_use":
@@ -13555,7 +13585,8 @@ class TpcReader:
                 self.card_row(card, ts)["retries"] += 1
             st["error"] = None
             st.setdefault("open", {})[str(b.get("id"))] = {"ts": ts or 0, "card": card, "activity": activity, "model": model,
-                                                           "sig": sig, "timed": ts is not None and name not in TPC_AGENT_TOOLS}
+                                                           "sig": sig, "timed": ts is not None and name not in TPC_AGENT_TOOLS
+                                                           and name not in TPC_PERSON_TOOLS}
             if t is not None and t["activity"] is None:
                 t["activity"] = activity
 
@@ -13624,26 +13655,24 @@ def tpc_files(transcript, sid):
     return out
 
 
-def tpc_rows(readers, ended, main_card, now):
-    """The Burn and Cards cost rows for one send: Burn one row per (card, activity, model), Cards cost one per card."""
-    burn, cards = [], {}
+def tpc_rows(readers, ended, main_card, now, carry=None):
+    """The Burn and Cards cost rows for one send: Burn one row per (card, activity, model), Cards cost one per card, and
+    the minutes carried to the next send. datastash's {"inc": n} adds whole numbers only, so Burn gets the whole minutes
+    and the part of a minute left over is kept here for the next send of this session ({key: [card, activity, model,
+    minutes]}); the session's last send (ended) rounds what is left to the nearest minute."""
+    cards, merged = {}, {}
+    carry = {k: v for k, v in (carry or {}).items() if isinstance(v, list) and len(v) == 4}
 
     def card(c):
         return cards.setdefault(c, {"card": c})
     for rd, new_sub in readers:
         for (c, activity, model), r in sorted(rd.rows.items()):
-            row = {"key": f"{c} / {TPC_STEP} / {activity} / {model}", "card": c, "step": TPC_STEP, "activity": activity,
-                   "model": model, "minutes": {"inc": round(r["minutes"], 3)}, "calls": {"inc": r["calls"]},
-                   "tokens_in": {"inc": r["tokens_in"]}, "tokens_out": {"inc": r["tokens_out"]},
-                   "cache_read": {"inc": r["cache_read"]}, "cache_write": {"inc": r["cache_write"]},
-                   "retries": {"inc": r["retries"]}}
+            m = merged.setdefault((c, activity, model), {k: 0 for k in TPC_BURN_COUNTS})
+            for k in TPC_BURN_COUNTS:
+                m[k] += r.get(k) or 0
             if r.get("first") is not None:
-                row["first_seen"], row["last_seen"] = {"min": _tpc_iso(r["first"])}, {"max": _tpc_iso(r["last"])}
-            burn.append(row)
-            cr = card(c)
-            if r.get("first") is not None:
-                cr["first_seen"] = {"min": min(_tpc_iso(r["first"]), (cr.get("first_seen") or {}).get("min") or "9")}
-                cr["last_seen"] = {"max": max(_tpc_iso(r["last"]), (cr.get("last_seen") or {}).get("max") or "")}
+                m["first"] = r["first"] if m.get("first") is None else min(m["first"], r["first"])
+                m["last"] = r["last"] if m.get("last") is None else max(m["last"], r["last"])
         for c, x in rd.cards.items():
             cr = card(c)
             for col in ("wakes", "retries"):
@@ -13652,77 +13681,150 @@ def tpc_rows(readers, ended, main_card, now):
         if new_sub:
             cr = card(new_sub)
             cr["subagents"] = {"inc": (cr.get("subagents") or {}).get("inc", 0) + 1}
+    if ended:  # the rest carried from earlier sends of this session goes out now
+        for k, (c, activity, model, _) in carry.items():
+            merged.setdefault((c, activity, model), {x: 0 for x in TPC_BURN_COUNTS})
+    burn, left = [], {}
+    for (c, activity, model), r in sorted(merged.items()):
+        key = f"{c} / {TPC_STEP} / {activity} / {model}"
+        total = r["minutes"] + float((carry.get(key) or [0, 0, 0, 0])[3] or 0)
+        whole = int(math.floor(total + (0.5 if ended else 1e-9)))
+        if not ended and total - whole > 1e-9:
+            left[key] = [c, activity, model, round(total - whole, 6)]
+        counts = {k: int(r[k]) for k in TPC_BURN_COUNTS if k != "minutes"}
+        if whole <= 0 and not any(counts.values()):
+            continue  # only part of a minute so far: it waits in the carry
+        row = {"key": key, "card": c, "step": TPC_STEP, "activity": activity, "model": model, "minutes": {"inc": whole},
+               **{k: {"inc": v} for k, v in counts.items()}}
+        if r.get("first") is not None:
+            row["first_seen"], row["last_seen"] = {"min": _tpc_iso(r["first"])}, {"max": _tpc_iso(r["last"])}
+            cr = card(c)
+            cr["first_seen"] = {"min": min(_tpc_iso(r["first"]), (cr.get("first_seen") or {}).get("min") or "9")}
+            cr["last_seen"] = {"max": max(_tpc_iso(r["last"]), (cr.get("last_seen") or {}).get("max") or "")}
+        burn.append(row)
+    for key, v in carry.items():  # a key with no new lines this time keeps its carry
+        if not ended and key not in left and (v[0], v[1], v[2]) not in merged:
+            left[key] = v
     if ended:
         cr = card(main_card or "no card")
         cr["sessions"] = {"inc": 1}
         cr.setdefault("last_seen", {"max": _tpc_iso(now)})
-    return burn, [cards[c] for c in sorted(cards)]
+    return burn, [cards[c] for c in sorted(cards)], left
 
 
 def _tpc_state_path(sid):
     return os.path.join(STATE, f"tpc-{sid}.json")
 
 
+def _tpc_fold_ready(client):
+    """True only when Cards cost has every folded_* column (x-live #486). An older Cards cost tab is never folded: its
+    Burn rows stay and are only added to, so no total can drop."""
+    body = client.tool("ledger_rows_filter", {"workbook_id": client.wb, "tab": TPC_CARDS, "where": {"ne": ["card", ""]},
+                                              "columns": ["card", *TPC_FOLDED], "limit": 1}, "checking Cards cost", soft=True)
+    return body is not None
+
+
 def tpc_fold(client, keep, journal_path):
     """Past TPC_FOLD_AT Burn rows, fold finished cards (oldest last_seen first, never one in `keep`, only ones not folded
-    before) until Burn is back at the limit. A card's fold: its Burn rows' sums added to its folded_* cells (one upsert,
-    its idempotency key from those rows), then those rows deleted. A fold cut short is finished first on the next run (the
-    journal), so nothing counts twice. Returns the cards folded."""
-    j = read_json(journal_path, None)
-    if isinstance(j, dict) and isinstance(j.get("row"), dict) and isinstance(j.get("keys"), list):
-        _tpc_fold_apply(client, j)
-        _drop(journal_path)
-    body = client.tool("ledger_rows_filter", {"workbook_id": client.wb, "tab": TPC_BURN, "where": {"ne": ["key", ""]},
-                                              "limit": 1}, "counting Burn", missing_ok=True)
-    n = int(_ci_num((body or {}).get("rows_matched")))
-    folded = []
-    if n <= TPC_FOLD_AT:
+    before) until Burn is back at the limit, and only on a Cards cost tab with the folded_* columns. A card's fold: its
+    Burn rows' sums written to its folded_* cells (plain values: a card is folded once, so a replay writes the same
+    numbers, and a card whose folded_* cells are already set is never written again), then those rows deleted. A fold cut
+    short is finished first on the next run (the journal), however late, so nothing counts twice. One fold per workbook
+    at a time (a lock beside the journal). Returns the cards folded."""
+    lock = open(journal_path + ".lock", "a")
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return []  # another send is folding this workbook now
+        ready = None
+        j = read_json(journal_path, None)
+        if isinstance(j, dict) and isinstance(j.get("row"), dict) and isinstance(j.get("keys"), list):
+            ready = _tpc_fold_ready(client)
+            if not ready:
+                return []
+            _tpc_fold_apply(client, j, journal_path)
+            _drop(journal_path)
+        body = client.tool("ledger_rows_filter", {"workbook_id": client.wb, "tab": TPC_BURN, "where": {"ne": ["key", ""]},
+                                                  "limit": 1}, "counting Burn", missing_ok=True)
+        n = int(_ci_num((body or {}).get("rows_matched")))
+        folded = []
+        if n <= TPC_FOLD_AT or not (ready if ready is not None else _tpc_fold_ready(client)):
+            return folded
+        oldest = client.filter(TPC_CARDS, {"blank": ["folded_tokens"]}, order=[{"column": "last_seen", "dir": "asc"}], pages=1)
+        for c in oldest:
+            card = c.get("card")
+            if not isinstance(card, str) or not card or card in keep:
+                continue
+            rows = [r for r in client.filter(TPC_BURN, {"eq": ["card", card]}) if isinstance(r.get("key"), str)]
+            if not rows:
+                continue
+            tot = {k: 0.0 for k in TPC_FOLDED}
+            for r in rows:
+                toks = r.get("tokens")
+                toks = toks if isinstance(toks, (int, float)) and not isinstance(toks, bool) else sum(
+                    _ci_num(r.get(k)) for k in ("tokens_in", "tokens_out", "cache_read", "cache_write"))
+                tot["folded_minutes"] += _ci_num(r.get("minutes"))
+                tot["folded_calls"] += _ci_num(r.get("calls"))
+                tot["folded_tokens"] += toks
+                if r.get("activity") in TPC_PROGRESS:
+                    tot["folded_progress_tokens"] += toks
+                cost = r.get("est_cost")
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                    tot["folded_est_cost"] += cost  # the engine's value at fold time (no Prices row yet: none)
+            keys = sorted(r["key"] for r in rows)
+            snap = {r["key"]: {k: _ci_num(r.get(k)) for k in TPC_BURN_COUNTS} for r in rows}
+            row = {"card": card, **{k: round(v, 6) for k, v in tot.items()}}
+            j = {"row": row, "keys": keys, "snap": snap, "done": [],
+                 "idem": "tpc-fold-" + _tpc_hash(card, *keys, json.dumps(row, sort_keys=True))}
+            write_private(journal_path, json.dumps(j))
+            _tpc_fold_apply(client, j, journal_path)
+            _drop(journal_path)
+            folded.append(card)
+            n -= len(keys)
+            if n <= TPC_FOLD_AT:
+                break
         return folded
-    oldest = client.filter(TPC_CARDS, {"blank": ["folded_tokens"]}, order=[{"column": "last_seen", "dir": "asc"}], pages=1)
-    for c in oldest:
-        card = c.get("card")
-        if not isinstance(card, str) or not card or card in keep:
-            continue
-        rows = [r for r in client.filter(TPC_BURN, {"eq": ["card", card]}) if isinstance(r.get("key"), str)]
-        if not rows:
-            continue
-        tot = {"folded_minutes": 0.0, "folded_calls": 0.0, "folded_tokens": 0.0, "folded_progress_tokens": 0.0,
-               "folded_est_cost": 0.0}
-        for r in rows:
-            toks = r.get("tokens")
-            toks = toks if isinstance(toks, (int, float)) and not isinstance(toks, bool) else sum(
-                _ci_num(r.get(k)) for k in ("tokens_in", "tokens_out", "cache_read", "cache_write"))
-            tot["folded_minutes"] += _ci_num(r.get("minutes"))
-            tot["folded_calls"] += _ci_num(r.get("calls"))
-            tot["folded_tokens"] += toks
-            if r.get("activity") in TPC_PROGRESS:
-                tot["folded_progress_tokens"] += toks
-            cost = r.get("est_cost")
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-                tot["folded_est_cost"] += cost  # the engine's value at fold time (no Prices row yet: none)
-        keys = sorted(r["key"] for r in rows)
-        row = {"card": card, **{k: {"inc": round(v, 6)} for k, v in tot.items()}}
-        j = {"row": row, "keys": keys, "idem": "tpc-fold-" + _tpc_hash(card, *keys, json.dumps(row, sort_keys=True))}
-        write_private(journal_path, json.dumps(j))
-        _tpc_fold_apply(client, j)
-        _drop(journal_path)
-        folded.append(card)
-        n -= len(keys)
-        if n <= TPC_FOLD_AT:
-            break
-    return folded
+    finally:
+        lock.close()
 
 
-def _tpc_fold_apply(client, j):
-    client.tool("ledger_rows_upsert", {"workbook_id": client.wb, "tab": TPC_CARDS, "rows": [j["row"]], "key": "card",
-                                       "idempotency_key": j["idem"]}, "folding a card")
-    for i in range(0, len(j["keys"]), CI_PAGE):
-        client.tool("ledger_rows_delete", {"workbook_id": client.wb, "tab": TPC_BURN, "keys": j["keys"][i:i + CI_PAGE]},
+def _tpc_fold_apply(client, j, journal_path):
+    """One card's fold, from its journal: the folded_* cells (only when none is set yet), then each Burn row deleted if it
+    still holds what was folded; a row that took more since (another session) gives back only what was folded."""
+    card = j["row"]["card"]
+    now = client.filter(TPC_CARDS, {"eq": ["card", card]}, pages=1)
+    if not any(r.get(k) not in (None, "") for r in now for k in TPC_FOLDED):
+        client.tool("ledger_rows_upsert", {"workbook_id": client.wb, "tab": TPC_CARDS, "rows": [j["row"]], "key": "card",
+                                           "idempotency_key": j["idem"]}, "folding a card")
+    done = j.setdefault("done", [])
+    snaps = j.get("snap") if isinstance(j.get("snap"), dict) else {}
+    have = {r["key"]: r for r in client.filter(TPC_BURN, {"eq": ["card", card]}) if isinstance(r.get("key"), str)}
+    gone, back = [], []
+    for k in j["keys"]:
+        if k in done or k not in have:
+            continue
+        snap = snaps.get(k)
+        if not isinstance(snap, dict) or all(abs(_ci_num(have[k].get(c)) - _ci_num(v)) < 1e-9 for c, v in snap.items()):
+            gone.append(k)
+        else:
+            back.append({"key": k, **{c: {"inc": -int(round(_ci_num(v)))} for c, v in snap.items() if int(round(_ci_num(v)))}})
+    for i in range(0, len(gone), CI_PAGE):
+        client.tool("ledger_rows_delete", {"workbook_id": client.wb, "tab": TPC_BURN, "keys": gone[i:i + CI_PAGE]},
                     "folding a card")
+        done += gone[i:i + CI_PAGE]
+        write_private(journal_path, json.dumps(j))
+    for i in range(0, len(back), CI_PAGE):
+        client.tool("ledger_rows_upsert", {"workbook_id": client.wb, "tab": TPC_BURN, "rows": back[i:i + CI_PAGE], "key": "key",
+                                           "idempotency_key": f"{j['idem']}-back-{i // CI_PAGE}"}, "folding a card")
+        done += [r["key"] for r in back[i:i + CI_PAGE]]
+        write_private(journal_path, json.dumps(j))
 
 
 def tpc_run(sid, transcript, ended, key, wb, now=None):
-    """One send for this session: read what is new, send it, then fold if Burn is past the limit. Returns a summary."""
+    """One send for this session: first any send of this workbook left pending (this session's, then other sessions'),
+    then read what is new, send it, then fold if Burn is past the limit. Returns a summary."""
     now = time.time() if now is None else now
     path = _tpc_state_path(sid)
     lock = open(path + ".lock", "a")
@@ -13739,17 +13841,19 @@ def tpc_run(sid, transcript, ended, key, wb, now=None):
         state = read_json(path, {})
         files = state.setdefault("files", {})
         client = CiClient(key, wb, time.time() + TPC_WAIT_SECONDS)
-        pend = state.get("pending")
-        if isinstance(pend, dict):  # a send that did not finish: the same rows and keys again, then its offsets
-            _tpc_send(client, pend)
-            state["files"] = files = pend["files"]
-            state.pop("pending", None)
+
+        def save():
             write_private(path, json.dumps(state))
+        pend = state.get("pending")
+        if isinstance(pend, dict):  # a send that did not finish: its parts not yet taken, same rows and keys, then its offsets
+            _tpc_finish_pending(client, state, pend, save)
+            files = state["files"]
+        retried = tpc_retry_pending(client, wb, sid)
         new_files = json.loads(json.dumps(files))
         readers, main_card, sent = [], state.get("main_card"), {"burn": 0, "cards": 0}
         todo = tpc_files(transcript, sid)
         if not todo:  # no transcript of this user inside Claude Code's projects folder: nothing is read or sent
-            return dict(sent, folded=[], fold_problem=None)
+            return dict(sent, folded=[], fold_problem=None, retried=retried)
         for p, hint, review in todo:
             fst = new_files.setdefault(p, {"offset": 0})
             start = int(fst.get("offset") or 0)
@@ -13763,36 +13867,91 @@ def tpc_run(sid, transcript, ended, key, wb, now=None):
                 main_card = max(rd.rows.items(), key=lambda kv: kv[1].get("last") or 0)[0][0]
             readers.append((rd, new_sub))
             fst["read_from"] = start
-        burn, cards = tpc_rows(readers, ended, main_card, now)
+        burn, cards, carry = tpc_rows(readers, ended, main_card, now, state.get("carry"))
         tag = "tpc-" + _tpc_hash(sid, json.dumps(sorted((p, f.get("read_from"), f.get("offset")) for p, f in new_files.items())),
                                  bool(ended))
-        pend = {"tag": tag, "burn": burn, "cards": cards, "files": new_files}
+        pend = {"tag": tag, "wb": wb, "burn": burn, "cards": cards, "files": new_files, "carry": carry, "done": []}
         if burn or cards:
             state["pending"] = pend
-            write_private(path, json.dumps(state))
-            _tpc_send(client, pend)
+            save()
+            _tpc_send(client, pend, save)
             sent = {"burn": len(burn), "cards": len(cards)}
         state.pop("pending", None)
-        state["files"], state["main_card"] = new_files, main_card
-        write_private(path, json.dumps(state))
+        state["files"], state["main_card"], state["carry"] = new_files, main_card, carry
+        save()
         folded, fold_problem = [], None
         if burn:
             try:
                 folded = tpc_fold(client, {c["card"] for c in cards}, os.path.join(STATE, f"tpc-fold-{wb}.json"))
             except CiProblem as e:  # the rows are sent; the fold is tried again at the next send
                 fold_problem = str(e)
-        return dict(sent, folded=folded, fold_problem=fold_problem)
+        return dict(sent, folded=folded, fold_problem=fold_problem, retried=retried)
     finally:
         lock.close()
 
 
-def _tpc_send(client, pend):
-    if pend.get("burn"):
-        client.upsert(TPC_BURN, pend["burn"], pend["tag"] + "-b")
-    for i in range(0, len(pend.get("cards") or []), CI_PAGE):
-        client.tool("ledger_rows_upsert", {"workbook_id": client.wb, "tab": TPC_CARDS, "rows": pend["cards"][i:i + CI_PAGE],
-                                           "key": "card", "idempotency_key": f"{pend['tag']}-c-{i // CI_PAGE}"},
-                    f"writing {TPC_CARDS}")
+def _tpc_finish_pending(client, state, pend, save):
+    """Send what is left of a pending send, then move its offsets and carry into the state and drop it."""
+    _tpc_send(client, pend, save)
+    state["files"] = pend.get("files") if isinstance(pend.get("files"), dict) else state.get("files") or {}
+    if isinstance(pend.get("carry"), dict):
+        state["carry"] = pend["carry"]
+    state.pop("pending", None)
+    save()
+
+
+def tpc_retry_pending(client, wb, own_sid):
+    """Other sessions' sends to this workbook left pending (a session-end send that failed has no later hook of its own):
+    each is finished under that session's own lock, skipped while that session's run holds it. Parts already taken are
+    never sent again. A problem stops the retries for now (the next send tries again). Returns how many were finished."""
+    n = 0
+    try:
+        names = sorted(os.listdir(STATE))
+    except OSError:
+        return 0
+    for name in names:
+        m = re.fullmatch(r"tpc-(" + SID_RE + r")\.json", name)
+        if not m or m.group(1) == own_sid or m.group(1).startswith("fold-"):
+            continue
+        path = os.path.join(STATE, name)
+        p = read_json(path, {}).get("pending")
+        if not isinstance(p, dict) or p.get("wb") != wb:
+            continue
+        lock = open(path + ".lock", "a")
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue
+            st = read_json(path, {})  # again, under its lock
+            p = st.get("pending")
+            if not isinstance(p, dict) or p.get("wb") != wb:
+                continue
+            try:
+                _tpc_finish_pending(client, st, p, lambda st=st, path=path: write_private(path, json.dumps(st)))
+            except CiProblem:
+                break
+            n += 1
+        finally:
+            lock.close()
+    return n
+
+
+def _tpc_send(client, pend, save):
+    """The pending send's parts not taken yet, in order. Each part is marked done (and saved) once datastash took it, so
+    a retry, however late (past the idempotency window too), never sends a part twice."""
+    done = pend.setdefault("done", [])
+    parts = [(f"b-{i // CI_PAGE}", TPC_BURN, "key", pend["burn"][i:i + CI_PAGE]) for i in range(0, len(pend.get("burn") or []), CI_PAGE)]
+    parts += [(f"c-{i // CI_PAGE}", TPC_CARDS, "card", pend["cards"][i:i + CI_PAGE])
+              for i in range(0, len(pend.get("cards") or []), CI_PAGE)]
+    for pid, tab, keycol, rows in parts:
+        if pid in done:
+            continue
+        client.tool("ledger_rows_upsert", {"workbook_id": client.wb, "tab": tab, "rows": rows, "key": keycol,
+                                           "idempotency_key": f"{pend['tag']}-{pid}"}, f"writing {tab}")
+        done.append(pid)
+        save()
 
 
 def _tpc_settings():
@@ -13850,7 +14009,8 @@ def cmd_time_per_card(args):
 
 
 def _tpc_hook():
-    """SubagentStop and SessionEnd: when this folder is on, start the background send and return at once."""
+    """SessionStart, SubagentStop and SessionEnd: when this folder is on, start the background send and return at once
+    (at a session start it finishes any send an earlier session left pending, e.g. a failed session-end send)."""
     inp = hook_input()
     try:
         folder = project_of(inp)
@@ -13881,6 +14041,7 @@ def _tpc_bg(args):
         ensure_dirs()
         r = tpc_run(sid, tp, ended == "1", key, agent["workbook_id"].lower())
         line = f"time per card: sent {r['burn']} Burn and {r['cards']} Cards cost rows" + \
+               (f"; finished {r['retried']} earlier sends" if r.get("retried") else "") + \
                (f"; folded {len(r['folded'])} finished cards" if r["folded"] else "") + \
                (f"; fold not done: {ci_clean(r['fold_problem'], 200)}" if r["fold_problem"] else "")
     except CiProblem as e:
