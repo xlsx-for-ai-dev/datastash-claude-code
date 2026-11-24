@@ -13606,6 +13606,12 @@ XT_EVAL_ITEMS = 100  # formulas per xlsx_eval call on a handle (the engine's own
 XT_FORMULA_CHARS = 4096  # the engine's longest formula
 XT_CELL_RE = re.compile(r"\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})")
 XT_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+XT_MIN_WAIT = 1.0  # 1.0.9: the shortest pause before trying a 429 or busy answer again (pacing, not a cap): Retry-After 0
+# would otherwise retry at once, over and over, until the deadline
+# 1.0.9: what xlsx-test says when XFA_API_KEY is not set (exit 2). The command is the engine's own device sign-in.
+XT_NO_ENGINE_KEY = ("datastash xlsx-test: did not run: no engine key. You need a free xlsx-for-ai engine key. To get one, "
+                    "run: npx xlsx-for-ai login (it shows a link and a code; about a minute). Then set XFA_API_KEY to "
+                    "that key. The free plan covers test runs.")
 
 
 def xt_engine(path, body, engine_key, deadline, what):
@@ -13640,6 +13646,8 @@ def xt_engine(path, body, engine_key, deadline, what):
                     wait = float((e.headers or {}).get("Retry-After") or err.get("retry_after_seconds") or 5)
                 except (TypeError, ValueError):
                     wait = 5.0
+                if not wait >= XT_MIN_WAIT:  # 0, negative or NaN: a short pause all the same
+                    wait = XT_MIN_WAIT
             elif e.code >= 500 and tries < CI_RETRIES:
                 tries += 1
                 wait = CI_RETRY_SECONDS * tries
@@ -13901,14 +13909,19 @@ def cmd_xlsx_test(args):
     if any(a in ("-h", "--help") for a in args):
         print(XT_USAGE)
         return 0
+    engine_key = os.environ.get("XFA_API_KEY", "").strip()
+    if not engine_key:
+        # 1.0.9: no engine key, no test. Checked first: nothing is read, uploaded or sent (to the engine or to datastash)
+        # and nothing else is tried in its place.
+        print(XT_NO_ENGINE_KEY)
+        return 2
     try:
+        if re.search(r"[\s\x00-\x1f]", engine_key):
+            raise CiProblem("XFA_API_KEY has a space or control character in it; set it to your engine key alone")
         o = _xt_args(args)
         key = os.environ.get("DATASTASH_AGENT_KEY", "").strip()
         if not re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key):
             raise CiProblem("set DATASTASH_AGENT_KEY (a CI secret) to the agent's key (ldgr_ag_...)")
-        engine_key = os.environ.get("XFA_API_KEY", "").strip()
-        if not engine_key or re.search(r"[\s\x00-\x1f]", engine_key):
-            raise CiProblem("set XFA_API_KEY (a CI secret) to your engine key (from POST https://api.xlsx-for-ai.dev/api/v1/clients)")
         s = xlsx_test(o["path"], o["set"], key, o["wb"], engine_key, sha=o["sha"], branch=o["branch"], run_url=o["run_url"],
                       record=o["record"], cells=o["cells"], tolerance=o["tolerance"])
     except CiProblem as e:

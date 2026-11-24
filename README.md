@@ -322,6 +322,9 @@ datastash xlsx-test out/invoice.xlsx --set invoice --sha "$GITHUB_SHA" --branch 
 - **Exit codes.** 0 every cell passed and no stale saved value; 1 a value moved, could not be checked or is stale (one
   line per cell); 2 the test could not run (a missing key, no file, the engine unreachable). A datastash write that fails
   after the engine answered is one line and keeps the exit code. Agent key and workbook as for ci-report.
+- **No engine key (1.0.9).** Without `XFA_API_KEY` it sends nothing anywhere and tries nothing else. It says how to get
+  a free engine key (`npx xlsx-for-ai login`: a link and a code, about a minute; the free plan covers test runs) and
+  exits 2. A brake answered with `Retry-After: 0` is still paced: at least 1 second before the next try.
 
 ## Time per card (plugin 1.0.5)
 
@@ -944,7 +947,8 @@ An agent can send datastash a capability request, an error report or anything el
   sent to datastash; a chunked upload under one handle; one engine formula per cell (number with tolerance, text with
   EXACT and doubled quotes, a date, a quoted sheet name), engine TRUE/FALSE copied, anything else "not known"; stale
   saved values fail; calls of at most 100 formulas; --record (error cells skipped, a row's tolerance kept); exit 0, 1 and
-  2 with one line per problem.
+  2 with one line per problem; 1.0.9: no engine key prints the sign-in line and exits 2 with nothing sent; Retry-After 0
+  still pauses 1 second.
 - `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5; 1.0.7 the saved `card_tab`): off until `on` (which sets up the tabs), the
   hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's
   tokens counted once; active minutes only (no question, permission prompt, compaction or pause time; whole minutes

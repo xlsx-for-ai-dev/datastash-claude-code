@@ -8,6 +8,8 @@
 - The engine's stale_cached_value findings fail the run; formulas go in calls of at most 100.
 - --record copies the engine's values as expected (an error cell is skipped; a row's own tolerance is kept).
 - Exit 0 all passed, 1 a value moved / not known / stale, 2 the test could not run; one line per problem, no traceback.
+- 1.0.9: no XFA_API_KEY says how to get a free engine key and exits 2 before anything is read or sent (no fallback);
+  a 429 with Retry-After 0 still pauses XT_MIN_WAIT before the next try.
 No network, no key; the fake datastash of test_ci_report, under test/harness.py.
 Run: python3 -I test/test_xlsx_test.py"""
 import json
@@ -23,6 +25,8 @@ sys.path.insert(0, HERE)
 from test_status import ds, BIN, TMP  # noqa: E402  (the same harness and plugin copy)
 from test_ci_report import FakeDatastash, KEY, WB  # noqa: E402
 import harness  # noqa: E402
+
+REAL_XT_ENGINE = ds.xt_engine  # setUp swaps in the fake engine; the pacing tests drive the real one
 
 ENGINE_KEY = "xfa_enginekeyenginekey"
 CANARY = b"XLSX_FILE_CANARY_7e2a"
@@ -236,6 +240,113 @@ class XlsxTest(unittest.TestCase):
         h = self.run_cli("--help")
         self.assertEqual(h.returncode, 0)
         self.assertIn("usage: datastash xlsx-test", h.stdout)
+
+    def test_no_engine_key_says_how_to_get_one_and_sends_nothing(self):
+        want = ("datastash xlsx-test: did not run: no engine key. You need a free xlsx-for-ai engine key. To get one, run: "
+                "npx xlsx-for-ai login (it shows a link and a code; about a minute). Then set XFA_API_KEY to that key. "
+                "The free plan covers test runs.")
+        self.assertEqual(ds.XT_NO_ENGINE_KEY, want)
+        for args in ([self.xlsx, "--set", "invoice"], [self.xlsx, "--set", "invoice", "--record"], []):
+            for engine in ("", "   "):
+                r = self.run_cli(*args, engine=engine)
+                self.assertEqual(r.returncode, 2, (args, r.stdout, r.stderr))
+                self.assertEqual(r.stdout, want + "\n")
+                self.assertEqual(r.stderr, "")
+        # In process with the fakes: neither the engine nor datastash is called, and the file is not opened.
+        old_env = {k: os.environ.get(k) for k in ("DATASTASH_AGENT_KEY", "XFA_API_KEY", "DATASTASH_WORKBOOK_ID")}
+        os.environ.update(DATASTASH_AGENT_KEY=KEY, DATASTASH_WORKBOOK_ID=WB)
+        os.environ.pop("XFA_API_KEY", None)
+
+        def restore():
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+        self.expect("B7", "number", "1234.5")
+        calls_before = len(self.fake.calls)
+        opened = []
+        real_open = open
+        import builtins
+        builtins.open = lambda f, *a, **k: (opened.append(f), real_open(f, *a, **k))[1]
+        self.addCleanup(setattr, builtins, "open", real_open)
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = ds.cmd_xlsx_test([self.xlsx, "--set", "invoice", "--sha", SHA])
+        builtins.open = real_open
+        self.assertEqual(code, 2)
+        self.assertEqual(buf.getvalue(), want + "\n")
+        self.assertEqual(self.engine.calls, [])
+        self.assertEqual(len(self.fake.calls), calls_before)
+        self.assertNotIn(self.xlsx, opened)
+
+    def test_a_key_with_a_space_is_refused_without_echoing_it(self):
+        r = self.run_cli(self.xlsx, "--set", "invoice", engine="xfa_bad key")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("XFA_API_KEY has a space or control character", r.stdout)
+        self.assertNotIn("xfa_bad", r.stdout + r.stderr)
+
+    def _drive_real_engine(self, answers):
+        """REAL_XT_ENGINE against a fake opener: each answer is (status, headers, body) or a dict (a 200 body). The
+        pauses it asks for, and the calls made."""
+        import email.message
+        import io
+        import urllib.error
+        seen, waits = [], []
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class Opener:
+            def open(self, req, timeout=None):
+                seen.append(req.full_url)
+                a = answers.pop(0)
+                if isinstance(a, dict):
+                    return Resp(json.dumps(a).encode())
+                status, headers, body = a
+                h = email.message.Message()
+                for k, v in headers.items():
+                    h[k] = v
+                raise urllib.error.HTTPError(req.full_url, status, "x", h, io.BytesIO(json.dumps(body).encode()))
+        old = ds._opener
+        ds._opener = Opener()
+        self.addCleanup(setattr, ds, "_opener", old)
+        ds.CiClient.sleep = staticmethod(waits.append)
+        env = {k: os.environ.get(k) for k in ("DATASTASH_NO_NETWORK", "XFA_API_BASE")}
+        os.environ.pop("DATASTASH_NO_NETWORK", None)
+        os.environ["XFA_API_BASE"] = "https://engine.invalid"
+
+        def restore():
+            for k, v in env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+        out = REAL_XT_ENGINE("api/v1/tools/xlsx_check", {"cache_handle": "h"}, ENGINE_KEY, ds.time.time() + 600, "checking")
+        return out, waits, seen
+
+    def test_retry_after_zero_still_pauses(self):
+        busy = {"error": {"code": "rate_limited"}}
+        out, waits, seen = self._drive_real_engine([(429, {"Retry-After": "0"}, busy), (429, {"Retry-After": "-3"}, busy),
+                                                    (429, {}, {"error": {"code": "busy", "retry_after_seconds": 0.2}}),
+                                                    (429, {"Retry-After": "nan"}, busy), {"ok": True}])
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(waits, [ds.XT_MIN_WAIT] * 4)
+        self.assertEqual(ds.XT_MIN_WAIT, 1.0)
+
+    def test_retry_after_above_the_floor_is_kept(self):
+        out, waits, _ = self._drive_real_engine([(429, {"Retry-After": "7"}, {}), (429, {}, {}), {"ok": 1}])
+        self.assertEqual(out, {"ok": 1})
+        self.assertEqual(waits, [7.0, 5.0])
 
     def test_cmd_prints_each_moved_cell_and_exits_1(self):
         self.expect("B7", "number", "1")
