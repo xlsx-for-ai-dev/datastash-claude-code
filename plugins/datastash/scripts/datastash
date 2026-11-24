@@ -3236,7 +3236,6 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
                 t0 = time.time()
                 try:
                     items, nxt, more = fetch_page(agent, key, cur, wait)
-                    backoff = BACKOFF_START
                 except ApiError as e:
                     code = _code(e)
                     if e.status == 410 and code == "agent_removed" and not is_person(agent):
@@ -3298,6 +3297,9 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
                 except OSError as e:
                     fail(f"state not saved ({type(e).__name__})")
                     continue
+                # A full good pass (fetched and applied): only now does the backoff start over. A fault after a good
+                # fetch (a state file that won't parse, say) keeps growing it instead of polling every few seconds.
+                backoff = BACKOFF_START
                 if not applied:
                     pause(random.uniform(0.2, 1.0))  # another process moved the cursor; read again shortly
                     continue
@@ -11810,6 +11812,8 @@ AGENT_FILES = (
     "{st}/agent-{s}.log.1",
     "{p}/agent-{s}.verifier", "{st}/status-sent-{s}.json", "{st}/status-written-{s}", "{st}/status-out-{s}.json",
     "{st}/status-snap-{s}.json", "{st}/status-reminded-{s}", "{st}/agent-{s}.chatkey")
+# Plus each session's standby lock for the agent (XLI-374): {st}/agent-{s}.standby-<16 hex>.listener.lock (standby_path).
+AGENT_STANDBY_RE = r"agent-{s}\.standby-[0-9a-f]{{16}}\.listener\.lock"
 AGENT_KEYCHAIN = ("agent-answer-{s}",)
 BOX_FILES = ("{m}/" + MAIN_MARKER,)  # outside the config folder: only the main folder's marker
 BOX_KEYCHAIN = (KEYCHAIN_ACCOUNT, ANSWER_KEY_ACCOUNT)  # the older login's refresh token and answer key
@@ -11888,6 +11892,18 @@ def session_agent(inp):
         and read_key(a["slug"]) else None
 
 
+def _drop_standby_locks(s):
+    """Uninstall: every session's standby lock for agent `s` (only names of the fixed standby_path form)."""
+    try:
+        names = os.listdir(STATE)
+    except OSError:
+        return
+    pat = AGENT_STANDBY_RE.format(s=re.escape(s))
+    for f in names:
+        if re.fullmatch(pat, f):
+            _drop(os.path.join(STATE, f))
+
+
 def _drop_session_agents(s):
     """Uninstall: every state/session-agent-<sid>.json that names agent `s` (fixed file names; the slug read from each)."""
     try:
@@ -11960,6 +11976,7 @@ def remove_agent_here(s):
     clear_notices(notice_causes({"slug": s}))
     for t in AGENT_FILES:
         _drop(_fill(t, s))
+    _drop_standby_locks(s)
     _drop_session_agents(s)
     left = [a for a in all_agents() if not is_person(a)]
     wb = c.get("workbook_id")

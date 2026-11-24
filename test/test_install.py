@@ -532,6 +532,21 @@ class Cleanup(Base):
         self.assertEqual(self.kc, {})
         self.assertFalse(ds.remove_agent_here("../x"))  # never a path from outside the table
 
+    def test_each_session_s_standby_lock_goes_with_its_agent(self):
+        """XLI-374: the standby lock (one per session, its name from the session id) is on the cleanup list too."""
+        ds.save_agent("other", str(uuid.UUID(int=5)), KEY, WB, self.folder + "-2")
+        self.installed()
+        mine = [ds.standby_path("web-app", sid) for sid in ("s1", "s2")]
+        theirs = ds.standby_path("other", "s1")
+        stray = os.path.join(ds.STATE, "agent-web-app.standby-notours.listener.lock")
+        for p in mine + [theirs, stray]:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            ds.write_private(p, "x\n")
+        self.assertFalse(ds.remove_agent_here("web-app"))
+        self.assertEqual([p for p in mine if os.path.exists(p)], [])
+        self.assertTrue(os.path.exists(theirs))  # another agent's standby stays
+        self.assertTrue(os.path.exists(stray))  # only names of the fixed standby form
+
     def test_the_answer_key_goes_to_the_keychain_when_there_is_one(self):
         self.kc_works = True
         self.installed()

@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import time
+import types
 import unittest
 from contextlib import redirect_stderr
 
@@ -236,6 +237,47 @@ class Heals(WakeBase):
         self.assertEqual(len(n), 2)
         self.assertIn("unexpected RuntimeError", self.log_text())
         self.assertNotIn("a fault the loop does not know", self.log_text())  # by type only
+
+    def test_a_fault_after_a_good_fetch_keeps_growing_the_backoff(self):
+        """The backoff starts over only after a full good pass, not after a single good fetch: a client whose state
+        keeps failing after each fetch waits longer each time instead of polling every few seconds."""
+        self.saved.setdefault("apply_page", ds.apply_page)
+        polls = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            polls.append(wait)
+            if len(polls) > 4:
+                raise Stop()
+            return [], "c1", False
+        ds.fetch_page = fetch
+        ds.apply_page = lambda *a, **k: (_ for _ in ()).throw(KeyError("corrupt state"))
+        ds.random = types.SimpleNamespace(uniform=lambda a, b: 1.0, random=lambda: 0.5)
+        waits = []
+        ds._sleep = lambda sec, parent: waits.append(sec)
+        with self.assertRaises(Stop):
+            self.listen()
+        self.assertEqual(waits, [ds.BACKOFF_START * 2 ** i for i in range(4)])  # 5, 10, 20, 40: never back to 5
+
+    def test_a_full_good_pass_starts_the_backoff_over(self):
+        self.saved.setdefault("apply_page", ds.apply_page)
+        n = []
+
+        def fetch(agent, key, cursor, wait, timeout=None):
+            n.append(1)
+            if len(n) in (1, 2, 4):
+                raise RuntimeError("a fault the loop does not know")
+            if len(n) > 4:
+                raise Stop()
+            return [], "c1", False
+        ds.fetch_page = fetch
+        ds.apply_page = lambda *a, **k: (True, 0, 0)
+        ds.random = types.SimpleNamespace(uniform=lambda a, b: 1.0, random=lambda: 0.5)
+        waits = []
+        ds._sleep = lambda sec, parent: waits.append(sec)
+        with self.assertRaises(Stop):
+            self.listen()
+        backoffs = [w for w in waits if w >= ds.BACKOFF_START]
+        self.assertEqual(backoffs, [ds.BACKOFF_START, ds.BACKOFF_START * 2, ds.BACKOFF_START])
 
     def test_an_unexpected_error_at_start_starts_over(self):
         n = []
