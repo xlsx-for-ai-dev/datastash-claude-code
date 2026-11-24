@@ -5369,8 +5369,11 @@ def _key_forms(w, bases):
     return out
 
 
-def _key_text_deny(text, cwd, roots, recurse_tool=False):
-    """True when a command (or any tool's text) names a datastash key file or folder, or searches a folder holding one."""
+def _key_text_deny(text, cwd, roots, recurse_tool=False, ancestors=True):
+    """True when a command (or any tool's text) names a datastash key file or folder, or searches a folder holding one.
+    With ancestors False (Bash and Monitor) only a literal name of the folder or a key file counts: a search of a folder
+    above it, or of where the command runs, is not refused (a shell can get past a text check anyway, so that check
+    only refused normal repo work after a `cd`)."""
     t = _key_norm(text)
     low = t.lower()
     squashed = re.sub(r"[\s'\"\\+,`]|\$\(|[()]", "", str(text)).lower()
@@ -5391,7 +5394,7 @@ def _key_text_deny(text, cwd, roots, recurse_tool=False):
     words = _key_words(t)
     if len(words) > KEY_MAX_WORDS:
         return True
-    recursive = recurse_tool or KEY_RECURSE_RE.search(low) is not None
+    recursive = ancestors and (recurse_tool or KEY_RECURSE_RE.search(low) is not None)
     if recursive and KEY_HOME_RE.search(low):
         words.append(HOME)
     named = False
@@ -5449,7 +5452,8 @@ def key_path_deny(inp):
         hit = hit or any(KEY_FOLDER_TEXT_RE.search(_key_norm(w)) or KEY_FOLDER_TEXT_RE.search(
             re.sub(r"[\s'\"\\+,`]", "", w)) for w in written)
     else:
-        hit = any(_key_text_deny(x, cwd, roots) for x in _strings(args, []))
+        ancestors = name not in ("Bash", "Monitor")  # those two: a literal name only (see _key_text_deny)
+        hit = any(_key_text_deny(x, cwd, roots, ancestors=ancestors) for x in _strings(args, []))
     if not hit:
         return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",

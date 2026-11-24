@@ -479,12 +479,16 @@ XLI-399): the PreToolUse hook refuses, in every session (the main session and ev
 off), any tool call (Read, Write, Edit, Grep, Glob, Bash, Monitor, another MCP server's tools, an unknown tool) that
 names the folder or anything in it, the main folder's `.datastash-main`, or a keychain read of the `datastash` items,
 whatever form the path takes: absolute, relative to the session's folder or a `cd`, `~`, `$HOME` or
-`$XDG_CONFIG_HOME`, a glob or brace, a symlink, any letter case, or a path split into quoted pieces. A search, copy or
-archive of a folder holding it (home, `~/.config`, `/`: a Grep there, `grep -r`, `rg`, `find -exec`, `tar`, `cp -r`,
-`os.walk`) is refused too; search a narrower folder. So is a command that loads the plugin's script to call its key readers, and a
-Write or Edit whose text names the folder (a script to run later). Only the listener logs (`state/agent-<name>.log`) stay readable.
+`$XDG_CONFIG_HOME`, a glob or brace, a symlink, any letter case, or a path split into quoted pieces. In the file tools
+(Read, Grep, Glob and the rest), a search of a folder holding it (home, `~/.config`, `/`, or a Grep with no path
+there) is refused too; give a narrower path. Bash and Monitor are refused only when the command's text names the
+folder or a key file (in any of the forms above); a search of a folder above it in Bash (`grep -r`, `rg`, `find -exec`,
+`xargs`, `tar`, `cp -r`, `os.walk`) is not refused, so normal repo work after a `cd` is never blocked. A command that
+loads the plugin's script to call its key readers is refused too, and so is a Write or Edit whose text names the
+folder (a script to run later). Only the listener logs (`state/agent-<name>.log`) stay readable.
 The plugin's own scripts read the keys themselves, outside any tool call. The refusal looks at the call's text, so a
-program that builds the path at run time can still get past it: it is a guard for the model, not a wall against a
+command that searches a folder above it, or builds the path at run time (shell variables, `base64 -d`, `git -C` or
+`env -C`, an `ln -s` made in the same call), can still get past it: it is a guard for the model, not a wall against a
 process running as you (see "What a process in your terminal can reach"). Where a system keychain works (macOS
 Keychain, libsecret's `secret-tool` on Linux), the login's refresh token, its answer key and each agent's answer key
 are kept there and not in a file at all.
@@ -816,8 +820,9 @@ An agent can send datastash a capability request, an error report or anything el
   MultiEdit, NotebookEdit, Grep, Glob, Bash, Monitor, another MCP server, an unknown tool) and every path form
   (absolute, relative, `..`, `cd`, `~`, `$HOME`, `${HOME}`, `$XDG_CONFIG_HOME`, globs, braces, symlinks to the folder and
   to one file, upper case, quoted or escaped pieces), every file the plugin keeps, the main folder's marker, keychain
-  reads, the folder named alone and folders above it searched (a Grep with no path, `grep -r`, `rg`, `find -exec`,
-  `tar`, `cp -r`, `os.walk`, `rglob`), chained `cd`s, the plugin's script loaded to call its key readers, a file written
+  reads, the folder named alone, folders above it searched in the file tools (a Grep or Glob there or with no path)
+  but not in Bash or Monitor (repo work after a `cd` from a home-folder session: git add/commit, `grep -rn`,
+  `find -exec`, `xargs`, `tar`), chained `cd`s, the plugin's script loaded to call its key readers, a file written
   with a script that reads the folder, in the main session and a subagent with clean sessions off and on, never showing
   a key; ordinary project work, the listener logs, the datastash command and connector, and the plugin's own key reads
   still work.

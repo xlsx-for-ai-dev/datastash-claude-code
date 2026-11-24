@@ -5,8 +5,10 @@
   itself, or a main folder's marker, in every path form: absolute, relative to the session's folder or to a `cd`, ~,
   $HOME, ${HOME} and $XDG_CONFIG_HOME, a glob or a brace, a symlink to the folder or to one file, any letter case, a
   path split into pieces, and a keychain read of the datastash items.
-- A search, copy or archive of a folder that holds the datastash folder (home, ~/.config, /) is refused too, including
-  a Grep with no path in such a folder, `grep -r`, `rg` with no folder, and `find -exec`.
+- In the file tools (Read, Grep, Glob and the rest), a search of a folder that holds the datastash folder (home,
+  ~/.config, /) is refused too, including a Grep with no path in such a folder. Bash and Monitor are refused only
+  when their text names the folder or a key file in a literal form: normal repo work after a `cd` from a session
+  started in the home folder (git add/commit, grep -rn, find -exec, xargs, tar) is never refused.
 - The same refusal in the main session and in a subagent, with clean sessions on or off.
 - Only the listener logs stay readable; ordinary project work, the datastash command and the plugin's own steps are
   never refused by it; the plugin's own key reads still work.
@@ -202,7 +204,8 @@ class FolderSearches(KeyBase):
                 self.assert_refused("Bash", {"command": f"grep -r dsak_ {p}"})
                 self.assert_refused("Bash", {"command": f"ls {p}"})
 
-    def test_a_search_of_a_folder_above_it_is_refused(self):
+    def test_a_search_of_a_folder_above_it_is_refused_in_the_file_tools_only(self):
+        """PM ruling (review 1.0.4): Bash and Monitor have no folder-above check, only a literal-name check."""
         for p in (HOME, "~", "~/.config", "/", os.path.dirname(DEFAULT)):
             with self.subTest(path=p):
                 self.assert_refused("Grep", {"pattern": "dsak_", "path": p})
@@ -210,21 +213,54 @@ class FolderSearches(KeyBase):
                             f"rg dsak_ {p}", f"rg --hidden dsak_ {p}", f"find {p} -type f -exec cat {{}} +",
                             f"tar czf /tmp/all.tgz {p}", f"cp -r {p} /tmp/copy", f"rsync -a {p} /tmp/copy",
                             f"python3 -c \"import os;[print(r) for r in os.walk('{p}')]\""):
-                    self.assert_refused("Bash", {"command": cmd})
+                    self.assert_allowed("Bash", {"command": cmd})
+                self.assert_allowed("Monitor", {"command": f"grep -r dsak_ {p}"})
 
     def test_a_search_with_no_folder_where_the_session_runs_above_it(self):
         self.assert_refused("Grep", {"pattern": "dsak_"})  # cwd HOME
+        self.assert_refused("Grep", {"pattern": "dsak_"}, cwd=os.path.join(HOME, ".config"))
         for cmd in ("rg dsak_", "grep -r dsak_", "grep -rn dsak_ .", "ag dsak_", "git grep dsak_",
                     "python3 -c \"import pathlib;[print(p.read_text()) for p in pathlib.Path.home().rglob('*')]\""):
             with self.subTest(cmd=cmd):
-                self.assert_refused("Bash", {"command": cmd})
-        self.assert_refused("Grep", {"pattern": "dsak_"}, cwd=os.path.join(HOME, ".config"))
+                self.assert_allowed("Bash", {"command": cmd})  # no literal name: the accepted Bash limit
 
     def test_a_glob_that_spans_the_folder_is_refused(self):
         self.assert_refused("Glob", {"pattern": "**/*", "path": HOME})
         self.assert_refused("Glob", {"pattern": ".config/**"})
         self.assert_refused("Bash", {"command": "cat ~/.*/*/*"})
         self.assert_refused("Bash", {"command": "grep dsak_ ~/.config/*/*"})
+
+
+class RepoWorkFromHome(KeyBase):
+    """Review 1.0.4 HIGH: a session (or subagent) started in the home folder that cds into a repo is not refused."""
+
+    def test_the_reviewers_examples_are_allowed(self):
+        rel = "~/" + os.path.relpath(self.project, HOME)
+        for repo in (rel, self.project):
+            for cmd in (f'cd {repo} && git add -A && git commit -m "fix the parser"',
+                        f"cd {repo} && git add -A",
+                        f"cd {repo} && grep -rn foo .", f"cd {repo} && grep -rn foo",
+                        f"cd {repo} && find . -name '*.py' -exec wc -l {{}} +",
+                        f"cd {repo} && ls | xargs wc -l", f"cd {repo} && tar czf /tmp/a.tgz .",
+                        f"cd {repo} && python3 -c \"import os;[print(r) for r in os.walk('.')]\"",
+                        f"git -C {repo} add -A"):
+                for name in ("Bash", "Monitor"):
+                    with self.subTest(cmd=cmd, tool=name):
+                        self.assert_allowed(name, {"command": cmd}, HOME)
+
+    def test_literal_key_paths_in_bash_are_still_refused(self):
+        rel = "~/" + os.path.relpath(self.project, HOME)
+        up = os.path.relpath(DEFAULT, os.path.join(self.project, "src"))  # ../../.config/datastash
+        for cmd in (f"cd {rel} && cat ~/.config/datastash/{KEY}", f"cd {rel} && cat $HOME/.config/datastash/person.key",
+                    f"cd {rel} && cat ${{HOME}}/.config/datastash/login.refresh",
+                    f"cd {rel} && cat {DEFAULT}/main.json", f"cd {rel}/src && cat {up}/{KEY}",
+                    f"cd {rel} && cat ../.config/datastash/{KEY}", f"cd {rel} && cat ~/.CONFIG/DataStash/Person.KEY",
+                    f"cd {rel} && grep -rn foo ~/.config/datastash", f"cd {rel} && tar czf /tmp/a.tgz ~/.config/datastash",
+                    f"cd {rel} && ls ~/.config/datastash | xargs cat", f"cd {rel} && git add -A && cat agent-web-app.key",
+                    "cd ~/.config/datastash && grep -rn foo ."):
+            for name in ("Bash", "Monitor"):
+                with self.subTest(cmd=cmd, tool=name):
+                    self.assert_refused(name, {"command": cmd}, HOME)
 
 
 class EverySession(KeyBase):
