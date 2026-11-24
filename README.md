@@ -474,7 +474,20 @@ signing the computer in (`datastash login`), and "datastash main". Detailed how-
 
 ## What is stored where
 
-All in `~/.config/datastash/` (folder mode 700, files mode 600):
+All in `~/.config/datastash/` (folder mode 700, files mode 600). The model never reads this folder (plugin 1.0.4,
+XLI-399): the PreToolUse hook refuses, in every session (the main session and every subagent, clean sessions on or
+off), any tool call (Read, Write, Edit, Grep, Glob, Bash, Monitor, another MCP server's tools, an unknown tool) that
+names the folder or anything in it, the main folder's `.datastash-main`, or a keychain read of the `datastash` items,
+whatever form the path takes: absolute, relative to the session's folder or a `cd`, `~`, `$HOME` or
+`$XDG_CONFIG_HOME`, a glob or brace, a symlink, any letter case, or a path split into quoted pieces. A search, copy or
+archive of a folder holding it (home, `~/.config`, `/`: a Grep there, `grep -r`, `rg`, `find -exec`, `tar`, `cp -r`,
+`os.walk`) is refused too; search a narrower folder. So is a command that loads the plugin's script to call its key readers, and a
+Write or Edit whose text names the folder (a script to run later). Only the listener logs (`state/agent-<name>.log`) stay readable.
+The plugin's own scripts read the keys themselves, outside any tool call. The refusal looks at the call's text, so a
+program that builds the path at run time can still get past it: it is a guard for the model, not a wall against a
+process running as you (see "What a process in your terminal can reach"). Where a system keychain works (macOS
+Keychain, libsecret's `secret-tool` on Linux), the login's refresh token, its answer key and each agent's answer key
+are kept there and not in a file at all.
 
 | File | Holds |
 |---|---|
@@ -799,6 +812,15 @@ An agent can send datastash a capability request, an error report or anything el
   is said again by the listener. X6: "make <name> private" / "make <name> public" signed over the list's agent id like uninstall,
   the server's fixed line shown only over names on the list, model-typed text refused, unknown names left as ordinary
   prompts, and the after-install lines.
+- `python3 -I test/test_keys.py`: the key folder refusal (plugin 1.0.4, XLI-399): every tool (Read, Write, Edit,
+  MultiEdit, NotebookEdit, Grep, Glob, Bash, Monitor, another MCP server, an unknown tool) and every path form
+  (absolute, relative, `..`, `cd`, `~`, `$HOME`, `${HOME}`, `$XDG_CONFIG_HOME`, globs, braces, symlinks to the folder and
+  to one file, upper case, quoted or escaped pieces), every file the plugin keeps, the main folder's marker, keychain
+  reads, the folder named alone and folders above it searched (a Grep with no path, `grep -r`, `rg`, `find -exec`,
+  `tar`, `cp -r`, `os.walk`, `rglob`), chained `cd`s, the plugin's script loaded to call its key readers, a file written
+  with a script that reads the folder, in the main session and a subagent with clean sessions off and on, never showing
+  a key; ordinary project work, the listener logs, the datastash command and connector, and the plugin's own key reads
+  still work.
 - `python3 -I test/test_clean.py`: clean sessions (plugin 0.8.0; enforced in 1.0.3, XLI-396): the two choices and their
   phrases, the session-start rules, and the refusal: deny by default (Monitor, PowerShell, an unknown tool and an MCP
   write refused; the allowed tools and the datastash connector's reads still run; a glob or brace refused), the main
