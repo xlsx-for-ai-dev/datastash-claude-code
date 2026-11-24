@@ -12107,6 +12107,17 @@ UNCONFIRMED_LINE = "Not yet confirmed: {names} (they clean up when they next sta
 CONNECTOR_SAME_LINE = "Your datastash connector in Claude is unchanged."
 PICK_UNKNOWN_LINE = ("Not done: a name you typed is not on the list, or matches two agents. Nothing was removed. Type the "
                      "names as the list shows them, or all.")
+# 1.0.11 stored-name HIGH (PM ruling): "all" alone lists every agent and goes ahead only on the person's typed
+# "remove all N" (N = the count shown); an old-style name is never picked by name, and this is its way out.
+ALL_HEAD = "This removes all {n} of your datastash agent{s}:"
+ALL_CONFIRM_TEXT = "remove all {n}"
+ALL_CONFIRM_LINE = 'To go ahead, type exactly: remove all {n}. Anything else removes nothing.'
+ALL_NOT_CONFIRMED_LINE = "Not done: that was not the confirm text. Nothing was removed."
+OLD_STYLE_LINE = "That agent has an old-style name. To remove it, use /datastash:uninstall all and confirm."
+ALL_CONFIRM_AI = (f"{CMD_NOTE}: the plugin showed the person every agent \"all\" would remove and asked them to type "
+                  "the confirm text. Make no more datastash calls; say nothing more; wait for their answer.")
+PICK_OLD_LINE = "Not done: {why}. Nothing was removed. " + OLD_STYLE_LINE
+VIS_OLD_LINE = "Not done: {why}. Nothing was changed. " + OLD_STYLE_LINE
 PICK_REFUSED_LINE = ("Not done: {why}. Nothing was removed. Type the names exactly as the list shows them, separated by "
                      "commas or spaces, or all alone.")
 REFUSED_LINE = "Not done: datastash refused it. Nothing changed."
@@ -12484,21 +12495,25 @@ def _subseq(part, word):
     return all(ch in it for ch in part)
 
 
-def _reads_as_word(shape):
-    """True when a name that is not plain ASCII may read as a pick word: at most 4 letters long once invisible ones are
-    dropped (one odd letter can look like two: "aǁ"), or its ASCII letters all fit, in order, inside "all", "this" or
-    "and" ("Ꭺll", "ᴛhis", "ᴀʟʟ" and a name with no ASCII letter at all)."""
+def _reads_as_words(shape):
+    """The pick words a name that is not plain ASCII may read as: every word when it is at most 4 letters long once
+    invisible ones are dropped (one odd letter can look like two: "aǁ"), else each of "all", "this", "and" its ASCII
+    letters all fit inside, in order ("Ꭺll", "ᴛhis", "ᴀʟʟ"; a name with no ASCII letter at all fits every word)."""
     part = "".join(ch for ch in shape if ch is not None)
-    return len(shape) <= 4 or any(_subseq(part, w) for w in PICK_WORDS)
+    return set(PICK_WORDS) if len(shape) <= 4 else {w for w in PICK_WORDS if _subseq(part, w)}
 
 
-def _old_reads_as_word(name):
-    """True when an old-style listed name (as shown) may read as a pick word: a name with a character that is not ASCII
-    by its shape (_reads_as_word); a plain-ASCII one ("all,", "all and", "this,", "a n d") when it reads as a pick word
-    itself, or when any token the parser would split it into does (so typing it as listed would be that word)."""
+def _old_words(name):
+    """The pick words an old-style listed name (as shown) may read as: for a name with a character that is not ASCII,
+    by its shape (_reads_as_words); for a plain-ASCII one ("all,", "all and", "this,", "a n d", "this?") the word it
+    reads as itself, as each token the parser would split it into, or with every character but a-z and 0-9 dropped
+    (1.0.11 stored-name LOW 1: "all!", "(all)", "t,his"). "all" is in the set, but it never blocks: "all" alone always
+    asks the person to confirm the whole list (see pick_check)."""
     if not name.isascii():
-        return _reads_as_word(_shape(name))
-    return pick_word_like(name) is not None or any(pick_word_like(t) for t, _ in pick_tokens(name, keep_and=True)[0])
+        return _reads_as_words(_shape(name))
+    got = {pick_word_like(name), pick_word_like(re.sub(r"[^a-z0-9]", "", name.casefold()))}
+    got |= {pick_word_like(t) for t, _ in pick_tokens(name, keep_and=True)[0]}
+    return got - {None}
 
 
 def _old_typed(text, lst):
@@ -12526,13 +12541,13 @@ def _pick_index(lst):
     """(listed plain names by casefold, how many listed names share each fold, [(pick word, agent)] for every listed
     agent named like a pick word, [(shape, agent, may read as a pick word)] for every listed agent whose stored name is
     not plain ASCII): built once per pick. An agent whose name is not plain ASCII is never picked by name, and while one
-    that may read as a pick word is listed ("Ꭺll", "ᴛhis", _reads_as_word) the pick words are refused too."""
+    that may read as "this" or "and" is listed ("ᴛhis", "this,", "a n d", _old_words) that word is refused too."""
     low, folds, kept, odd = {}, {}, [], []
     for a in lst["agents"]:
         f = fold_name(a["name"])
         folds[f] = folds.get(f, 0) + 1
         if not _listed_plain(a):
-            odd.append((_shape(a["name"]), a, _old_reads_as_word(a["name"])))
+            odd.append((_shape(a["name"]), a, _old_words(a["name"])))
             continue
         low.setdefault(a["name"].casefold(), []).append(a)
         w = pick_word_like(a["name"])
@@ -12547,8 +12562,8 @@ def _pick_match(tok, quoted, idx):
     itself unquoted ("reserved"; a bare "and" is a separator, "skip"), else "unknown". Otherwise the token must equal
     exactly one listed name, ignoring case, with no other listed name that differs from it only by case, spaces,
     dashes or look-alike letters; in double quotes, a name typed character for character as exactly one listed name
-    picks it even then. 1.0.11 final: a token that is not plain ASCII is "ascii" (refused); a pick word while an agent
-    whose name is not plain ASCII and may read as one is listed is "odd-word"; a token that may stand for the name of an
+    picks it even then. 1.0.11 final: a token that is not plain ASCII is "ascii" (refused); "this" or "and" while an
+    agent with an old-style name that may read as that word is listed is "odd-word"; a token that may stand for the name of an
     agent whose name is not plain ASCII is "odd" (same length, each odd letter standing for any one letter)."""
     low, folds, kept, odd = idx
     if not ascii_text(tok):
@@ -12557,7 +12572,9 @@ def _pick_match(tok, quoted, idx):
     if w is not None:
         if any(k == w for k, _ in kept):
             return "kept", []
-        if any(r for _, _, r in odd):  # even a bare "and": a separator only while no listed name may read as it
+        # 1.0.11 stored-name HIGH (PM ruling): "this" and a bare "and" are refused only while an old-style listed
+        # name may read as that very word; "all" is never blocked by one (alone it asks to confirm the whole list)
+        if w != "all" and any(w in r for _, _, r in odd):
             return "odd-word", []
         if not quoted and tok.casefold() == "and":
             return "skip", []
@@ -12590,8 +12607,12 @@ def pick_check(text, lst, own, reserved=True):
     ("two"), a pick word while a listed agent is named like it ("kept") or one with an old-style name may read as it
     ("odd-word"), a token that may stand for such an agent ("odd"), "all"/"this" next to any other token ("mixed") or
     where they are not names ("reserved", when reserved is False), an unclosed quote ("quote"), more than 100 names
-    ("many")."""
+    ("many"). 1.0.11 stored-name HIGH (PM ruling): "all" typed alone (uninstall only) is never refused and never
+    removes anything by itself: it is "confirm" (with every listed agent; why "all"), and the plugin asks the person to
+    type "remove all N" (all_confirm_lines)."""
     toks, err = pick_tokens(text, keep_and=True)
+    if reserved and not err and len(toks) == 1 and not toks[0][1] and toks[0][0].casefold() == "all":
+        return ("confirm", None, "all") if lst["agents"] else (None, toks[0][0], "unknown")
     old = _old_typed(text, lst)
     if old:  # 1.0.11 final (PM ruling): an old-style name typed as listed is refused, whatever its tokens read as
         return None, old[0]["name"], "old"
@@ -12617,9 +12638,6 @@ def pick_check(text, lst, own, reserved=True):
             return None, res[0], "reserved"
         if len(seen) > 1:
             return None, res[0], "mixed"
-        if res[0].casefold() == "all":
-            return ([a["id"] for a in lst["agents"]] or None), (None if lst["agents"] else res[0]), \
-                (None if lst["agents"] else "unknown")
         return ([own], None, None) if own else (None, res[0], "unknown")
     if first_bad[0] is not None:
         return None, *first_bad
@@ -12631,8 +12649,32 @@ def pick_check(text, lst, own, reserved=True):
 
 def resolve_picks(text, lst, own, reserved=True):
     """The agent ids the person's typed names pick; "none" when no token names anything (the prompt is something
-    else); None when the whole command is refused (pick_check)."""
+    else); "confirm" for "all" alone (nothing is picked until the person types "remove all N"); None when the whole
+    command is refused (pick_check)."""
     return pick_check(text, lst, own, reserved)[0]
+
+
+def all_confirm(lst):
+    """The confirm step "all" opens: every listed agent's id and their count, bound to this list."""
+    return {"n": len(lst["agents"]), "ids": [a["id"] for a in lst["agents"]], "list_id": lst["list_id"]}
+
+
+def all_confirm_lines(lst):
+    """The person's lines for "all": every listed agent by its shown name (old-style names too), then the one reply that
+    goes ahead."""
+    n = len(lst["agents"])
+    return "\n".join(list_lines(lst, ALL_HEAD.format(n=n, s="" if n == 1 else "s")) + [ALL_CONFIRM_LINE.format(n=n)])
+
+
+def all_confirmed(prompt, rec):
+    """True when the person's reply is exactly "remove all N" for the confirm step open in rec, and the step still
+    matches its list (same list id, the same agents, the count shown). Case and runs of spaces are ignored."""
+    c, lst = rec.get("confirm"), rec.get("list")
+    if not isinstance(c, dict) or not isinstance(lst, dict) or not isinstance(prompt, str):
+        return False
+    ids = [a["id"] for a in lst["agents"]]
+    return (c.get("list_id") == lst["list_id"] and c.get("ids") == ids and c.get("n") == len(ids) and len(ids) > 0
+            and " ".join(prompt.split()).casefold() == ALL_CONFIRM_TEXT.format(n=len(ids)))
 
 
 def pick_refused_why(text, lst, own, reserved=True):
@@ -12653,37 +12695,21 @@ def pick_refused_why(text, lst, own, reserved=True):
         w = pick_word_like(tok)
         kept = [a["name"] for k, a in _pick_index(lst)[2] if k == w]
         return (f'"{t}" is a word this command keeps, never a name, and your agent {q(kept)} is named like it, so '
-                "that agent can't be picked by name (agents can't be renamed, and the plugin picks agents only by name, "
-                "never by id): leave it, or switch it off on the agents page")
+                "that agent can't be picked by name")
     if why in ("odd", "odd-word", "old"):
         odd = _pick_index(lst)[3]
-        ts = _shape(_shown_full(tok))
+        ts, w = _shape(_shown_full(tok)), pick_word_like(tok)
         if why == "old":
             who = [a["name"] for a in _old_typed(text, lst)]
         else:
-            who = [a["name"] for sh, a, r in odd if (r if why == "odd-word" else _shape_hit(ts, sh))]
+            who = [a["name"] for sh, a, r in odd if (w in r if why == "odd-word" else _shape_hit(ts, sh))]
         names_ = f"{q(who[:3])}{' and others' if len(who) > 3 else ''}"
         head = {"odd-word": f'"{t}" is a word this command keeps, and your agent {names_} has an old-style name that '
                             f'may read as it, so "{t}" is refused while that agent is on the list',
                 "odd": f'"{t}" may stand for your agent {names_}, which has an old-style name, so "{t}" is refused while '
                        "that agent is on the list",
-                "old": f"your agent {names_} has an old-style name"}[why]
-        how = ("removed" if reserved else "changed")
-        if not reserved:
-            tail = "leave it, or switch it off on the agents page"
-        elif why == "odd-word":
-            tail = "leave it, or switch it off on the agents page"
-        elif any(r for _, _, r in odd):  # 1.0.11 final LOW 2: say outright that "all" is refused too
-            word_ = [a["name"] for _, a, r in odd if r]
-            tail = (f'while {q(word_[:3])}{" and others" if len(word_) > 3 else ""} '
-                    f'{"is" if len(word_) == 1 else "are"} listed "all", "this" and "and" are refused too, since '
-                    f'{"it" if len(word_) == 1 else "they"} may read as one of them: leave it, or switch it off on the '
-                    "agents page")
-        else:
-            tail = '"all" alone still removes it, with every other agent; or leave it'
-        return (f"{head}. An agent with an old-style name (not only the letters a-z, digits, \"-\", \"_\" and \".\") "
-                f"can't be {how} by name (agents can't be renamed, and the plugin picks agents only by name, never by "
-                f"id): {tail}")
+                "old": f"your agent {names_} can't be picked by name"}[why]
+        return head
     if why == "notplain":
         return (f'"{t}" is not a plain name: type names with plain letters a-z, digits, "-", "_" and "." only, as the '
                 "list shows them")
@@ -12702,15 +12728,25 @@ def pick_refused_why(text, lst, own, reserved=True):
     return head + (f" (closest exact names: {', '.join(chr(34) + n + chr(34) for n in close)})" if close else "")
 
 
+def _way_out(text, lst, own, reserved):
+    """True when the refusal is about an agent that can't be picked by name (an old-style name, or one named like a
+    pick word): its line ends with OLD_STYLE_LINE, the one way out (1.0.11 stored-name HIGH; no web page)."""
+    return pick_check(text, lst, own, reserved)[2] in ("old", "odd", "odd-word", "kept")
+
+
 def pick_refused_line(text, lst, own):
     """The one line for a refused uninstall pick: which name failed, and the listed names closest to it."""
     why = pick_refused_why(text, lst, own)
+    if why and _way_out(text, lst, own, True):
+        return PICK_OLD_LINE.format(why=why)
     return PICK_REFUSED_LINE.format(why=why) if why else PICK_UNKNOWN_LINE
 
 
 def vis_refused_line(text, lst):
     """The one line for a refused make <names> private/public: which name failed. Nothing was changed."""
     why = pick_refused_why(text, lst, None, reserved=False)
+    if why and _way_out(text, lst, None, False):
+        return VIS_OLD_LINE.format(why=why)
     return VIS_REFUSED_LINE.format(why=why) if why else VIS_PICK_LINE
 
 
@@ -12771,6 +12807,14 @@ def command_prompt(inp):
             save_cmd(sid, dict(base, kind=kind, picks=v.group(1)))
             return None, VIS_AI.format(kind=kind), False
     rec = load_cmd(sid)
+    if rec and rec.get("kind") == "uninstall" and rec.get("confirm") is not None:
+        # 1.0.11 stored-name HIGH: the step "all" opened. Only "remove all N" goes ahead (signed later as the person's
+        # own typed prompt, like any pick); any other reply closes the step and removes nothing. No name parsing here.
+        if not all_confirmed(prompt, rec):
+            _drop(_cmd_path(sid))
+            return ALL_NOT_CONFIRMED_LINE, None, True
+        save_cmd(sid, dict(rec, **base, targets=list(rec["confirm"]["ids"]), confirm=None))
+        return None, UNINSTALL_NOTE_AI.format(list=""), False
     if not rec or rec.get("kind") != "uninstall" or rec.get("picks") or not isinstance(rec.get("list"), dict):
         return None
     own = _own(inp)
@@ -12778,6 +12822,9 @@ def command_prompt(inp):
     if got == "none":
         _drop(_cmd_path(sid))
         return None
+    if got == "confirm":  # "all" alone: show every agent, remove nothing yet
+        save_cmd(sid, dict(rec, at=time.time(), confirm=all_confirm(rec["list"])))
+        return all_confirm_lines(rec["list"]), None, True
     if got is None:
         return pick_refused_line(prompt, rec["list"], own["agent_id"].lower() if own else None), None, True
     save_cmd(sid, dict(rec, **base, targets=got))
@@ -13078,6 +13125,9 @@ def command_tool(inp):
                              "The plugin showed the person the list. Make no more datastash calls; say nothing more.")
         elif rec.get("picks"):
             got = resolve_picks(rec["picks"], lst, mine)
+            if got == "confirm":  # 1.0.11 stored-name HIGH: "/datastash:uninstall all" asks to confirm first
+                save_cmd(sid, dict(rec, picks="", confirm=all_confirm(lst)))
+                return _post(all_confirm_lines(lst), ALL_CONFIRM_AI)
             if not isinstance(got, list):
                 _drop(_cmd_path(sid))
                 return _post(pick_refused_line(rec["picks"], lst, mine), PICK_REFUSED_AI)

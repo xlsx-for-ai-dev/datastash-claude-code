@@ -463,7 +463,8 @@ a name is never more than one token (double quotes keep a piece as one token, bu
 matched by prefix or fuzzy matching: each token must equal exactly one listed name, ignoring case, so with agents
 `alex` and `alex-2`, `alex alex-2` picks those two, and with agents a, b, c and bc, `a b c` picks a, b and c. A token
 that also differs from another listed name only by case, spaces, dashes or look-alike letters is ambiguous. A token
-typed twice picks its agent once. "all" works only when it is the single token (and is never a name in make ...
+typed twice picks its agent once. "all" works only when it is the single token, and then only after the person
+confirms it with `remove all N` (see below; it is never a name in make ...
 private/public). If any token is unknown or ambiguous, or "all" is typed next to another token, the whole command is
 refused and nothing changes: the refusal names the failing token and its closest exact names, and the AI is told to say
 only "Nothing was removed." (or "Nothing was changed.").
@@ -496,16 +497,24 @@ never picks anything. An agent made before these rules keeps its name, and:
   `^[a-z0-9._-]+$` (ignoring case) and is not one of the words. Any other stored name is old-style and is never picked
   by name: "all,", "all and", "this,", "a b", "x;y", a look-alike ("Ꭺll", "ᴡeb"), a name with a hidden character (even
   when the list shows it without one). Typing it as the list shows it (quoted or not, with other names or alone)
-  refuses the whole command with a plain line: that agent has an old-style name and can't be removed by name. A typed
+  refuses the whole command with a plain line: that agent has an old-style name and the way to remove it. A typed
   name of the same length whose plain letters match it ("web" for "ᴡeb", "ab" for "a b") is refused too;
-- "all" typed alone still removes an old-style agent, with every other agent, unless it may read as "all", "this" or
-  "and" (its name or any piece of it split at spaces, commas and "and" reads as one, as "all,", "all and", "this,"
-  do; or, with a character that is not ASCII, it has at most 4 letters once invisible ones are dropped or its plain
-  letters all fit inside one of the words, as "Ꭺll", "ᴛhis", "café" do). While such an agent is listed, "all", "this"
-  and "and" are refused too, so the plugin can't remove every agent then, nor that one: typing the word as the list
-  shows it never removes every agent or this session's own.
-The refusal says which of the two holds: agents can't be renamed, and the plugin picks agents only by name, never by
-id, so such an agent goes with "all", or is left, or switched off on the agents page. Every other name still works.
+- **"all" (1.0.11 stored-name fix, PM ruling).** "all" typed alone never removes anything by itself and is never
+  refused: the plugin lists every agent by its shown name (old-style names too) and asks the person to type exactly
+  `remove all N`, where N is the count shown. Only that reply (case and runs of spaces ignored), typed by the person
+  and signed with the same typed proof as any pick, removes them; it is bound to the list shown (the same list id and
+  agents), used once, and expires with the list. Any other reply (a wrong count, "yes", a name) removes nothing, says
+  "Nothing was removed." and closes the step. The same holds for `/datastash:uninstall all`. In `make ... private` /
+  `make ... public`, "all" is never a name (a bare "all" leaves the prompt an ordinary one);
+- "this" and "and" are refused only while an old-style agent is listed whose name may read as that very word (its
+  name, any piece of it split at spaces, commas and "and", or the name with every character but a-z and 0-9 dropped,
+  as "this,", "this?", "t,his" or "a n d"; with a character that is not ASCII, a name of at most 4 letters once
+  invisible ones are dropped, or whose plain letters all fit inside the word, as "Ꭺll" or "ᴛhis"). So "alex and alex-2"
+  works while "all," is listed, and "this" never removes this session's own agent while "this," is listed.
+The refusal for an old-style name, or one named like a word, says: "That agent has an old-style name. To remove it,
+use /datastash:uninstall all and confirm." (agents can't be renamed, and the plugin picks agents only by name, never
+by id).
+Every other name still works.
 Two plain names that differ only by case, a dot or a dash are picked one at a time in double quotes, typed character
 for character as the list shows them.
 A token longer than 64 characters is never a name.
@@ -973,7 +982,8 @@ An agent can send datastash a capability request, an error report or anything el
   server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
 - `python3 -I test/test_install.py`: `/datastash:install` and `/datastash:uninstall` (plugin 1.0.0; the home-folder
   install with the owner's real 1.0.1 note inputs, the reused session agent and the one-line refusals in 1.0.2; in 1.0.11
-  one strict name parser, as in "/datastash:uninstall alex alex-2": tokens never joined, "all" only alone, any unknown
+  one strict name parser, as in "/datastash:uninstall alex alex-2": tokens never joined, "all" only alone and only
+  after the person's typed "remove all N" (wrong count, model-made reply and a list fetched again remove nothing), any unknown
   or ambiguous token refuses the whole command with a line that names it and its closest exact names). The slash commands
   pass the typed check only in the entry shape Claude Code 2.1.330 really writes for a typed plugin command
   (`test/fixtures/slash-command-2.1.330.jsonl` and `-hooks.json`, copied from a real interactive session and only renamed

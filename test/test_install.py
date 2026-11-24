@@ -347,12 +347,19 @@ class Uninstall(Base):
         self.assertEqual(again["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_all_in_one_go_removes_this_agent_last_and_says_who_is_unconfirmed(self):
-        v, pid = self.slash("/datastash:uninstall all")  # the real slash-command entry, with args
+        v, _ = self.slash("/datastash:uninstall all")  # the real slash-command entry, with args
         self.assertIsNone(v.get("decision"))
-        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        shown = self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        self.assertEqual(shown["systemMessage"], "This removes all 3 of your datastash agents:\n- web-app (public)\n"
+                         "- alpha (private)\n- beta (public)\n" + ds.ALL_CONFIRM_LINE.format(n=3))
+        self.assertEqual(shown["hookSpecificOutput"]["additionalContext"], ds.ALL_CONFIRM_AI)
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"],
+                         "deny")  # "all" alone removes nothing yet
+        v, pid = self.prompt("remove all 3")
+        self.assertIn('kind "uninstall"', v["hookSpecificOutput"]["additionalContext"])
         got = self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]
         self.assertEqual(got["targets"], sorted([OWN, ALPHA, BETA]))
-        self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [OWN, ALPHA, BETA], pid, "/datastash:uninstall all"))
+        self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [OWN, ALPHA, BETA], pid, "remove all 3"))
         status = "/api/v1/agent/uninstall/" + RUN
         self.answers[status] = (200, {"run_id": RUN, "kind": "uninstall", "total": 3, "confirmed": ["beta"],
                                       "not_confirmed": ["alpha", "web-app"]})
@@ -370,7 +377,7 @@ class Uninstall(Base):
 
     def test_model_typed_text_is_refused(self):
         self.show_list()
-        self.prompt("all", source="sdk")  # a headless or model-made prompt: no person origin
+        self.prompt("alpha", source="sdk")  # a headless or model-made prompt: no person origin
         out = self.tool("PreToolUse", "ledger_agents_note", {})
         self.assertEqual(out["systemMessage"], ds.NOT_PERSON_LINE)
         self.assertTrue(os.path.exists(ds.key_path("web-app")))
@@ -468,8 +475,9 @@ class StrictNames(Base):
         self.assertIn("Nothing was removed.", v["reason"])
 
     def test_all_alone_is_every_agent_and_this_alone_is_this_agent(self):
-        self.assertEqual(sorted(picks_of("all", AX_LIST)), sorted([OWN, ALPHA, BETA, AX, AX2]))
-        self.assertEqual(sorted(picks_of("  ALL  ", AX_LIST)), sorted([OWN, ALPHA, BETA, AX, AX2]))
+        self.assertEqual(picks_of("all", AX_LIST), "confirm")  # stored-name HIGH: "all" alone asks to confirm first
+        self.assertEqual(picks_of("  ALL  ", AX_LIST), "confirm")
+        self.assertEqual(sorted(ds.all_confirm(ds.norm_list(AX_LIST))["ids"]), sorted([OWN, ALPHA, BETA, AX, AX2]))
         self.assertEqual(picks_of("this", AX_LIST, OWN), [OWN])
         self.assertIsNone(picks_of("this alex", AX_LIST, OWN))
         self.assertNotIsInstance(picks_of("a ll", AX_LIST), list)  # reviewer LOW 2: never folded into "all"
@@ -499,7 +507,7 @@ class StrictNames(Base):
         for text in ('"be ta" x', "“Be ta”", '"Be ta"'):
             self.assertIsNone(picks_of(text, lst), text)
         self.assertEqual(picks_of('"x"', lst), [A])
-        self.assertEqual(sorted(picks_of("all", lst)), sorted([SP, A]))
+        self.assertEqual(picks_of("all", lst), "confirm")
 
     def test_a_name_with_spaces_unquoted_never_counts(self):
         lst = plain("Be ta", "x", ids=[SP, A])
@@ -628,9 +636,10 @@ class ReservedWords(Base):
         self.assertIn(f'"{word}" is a word this command keeps, never a name, and your agent "{name}" is named like it',
                       line)
         self.assertTrue(line.startswith(("Not done: ", '"')), line)
-        self.assertIn("agents can't be renamed", line)  # 1.0.11 redesign LOW 1: no step that does not exist
-        self.assertIn("leave it, or switch it off on the agents page", line)
-        self.assertIn("never by id", line)
+        self.assertIn("so that agent can't be picked by name", line)
+        self.assertNotIn("agents page", line)  # stored-name HIGH: the agents page is gone (410)
+        if line.startswith("Not done: "):
+            self.assertTrue(line.endswith(ds.OLD_STYLE_LINE), line)
 
     def mkdir(self, name):
         d = os.path.join(os.path.dirname(self.folder), name)
@@ -702,18 +711,23 @@ class ReservedWords(Base):
 
     # 3. an agent that already has such a name
     def test_cycle2_high_typing_all_with_an_agent_named_all_removes_nothing(self):
+        """Stored-name HIGH: "all" alone never blocks; it lists every agent (the one named "all" too) and removes
+        nothing until the person types "remove all 4"."""
         lst = plain("web-app", "alpha", "beta", "all", ids=[OWN, ALPHA, BETA, KEPT])
         out = self.picks("all", lst)
-        self.kept_refusal(out["systemMessage"], "all", "all")
-        self.assertIn("Nothing was removed.", out["systemMessage"])
-        self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.PICK_REFUSED_AI)
+        self.assertEqual(out["systemMessage"], ds.all_confirm_lines(ds.norm_list(lst)))
+        self.assertIn("- all (public)", out["systemMessage"])
         self.assertTrue(self.denied())
         self.prompt("/datastash:uninstall")
         self.tool("PostToolUse", "ledger_agents_list", {}, lst)
         v, _ = self.prompt("all")
         self.assertEqual(v["decision"], "block")
-        self.kept_refusal(v["reason"], "all", "all")
+        self.assertEqual(v["reason"], ds.all_confirm_lines(ds.norm_list(lst)))
         self.assertTrue(self.denied())
+        self.prompt("remove all 4")
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]["targets"],
+                         sorted([OWN, ALPHA, BETA, KEPT]))
+        self.assertTrue(ds.pick_refused_line('"all"', ds.norm_list(lst), OWN).endswith(ds.OLD_STYLE_LINE))
 
     def test_cycle2_high_typing_this_with_an_agent_named_this_removes_nothing(self):
         lst = with_kept("this", "x")
@@ -726,6 +740,9 @@ class ReservedWords(Base):
             lst = with_kept(word)
             for text in (word, f'"{word}"', word.upper(), f"“{word}”", f"web-app {word}", f"{word}, web-app",
                          f'"{word}" web-app', word[0] + "-" + word[1:]):
+                if text.casefold() == "all":  # stored-name HIGH: "all" alone asks to confirm, never picks by name
+                    self.assertEqual(picks_of(text, lst, OWN), "confirm")
+                    continue
                 self.assertIsNone(picks_of(text, lst, OWN), (word, text))
                 self.assertTrue(ds.pick_refused_why(text, ds.norm_list(lst), OWN).startswith('"'), (word, text))
 
@@ -739,10 +756,10 @@ class ReservedWords(Base):
         for name in ("ALL", "A-ll", "ａｌｌ", "\u0430ll", "a11", "Th1s", "a n d"):
             lst = with_kept(name, "x")
             word = ds.pick_word_like(name)
-            self.assertIsNone(picks_of(word, lst, OWN), name)
+            self.assertEqual(picks_of(word, lst, OWN), "confirm" if word == "all" else None, name)
             self.assertIsNone(picks_of(f'"{name}"', lst, OWN), name)
             if " " not in name:  # unquoted, a name with spaces is several tokens, none of them a name
-                self.assertIsNone(picks_of(name, lst, OWN), name)
+                self.assertEqual(picks_of(name, lst, OWN), "confirm" if name.casefold() == "all" else None, name)
 
     def test_other_names_still_work_beside_a_kept_name(self):
         lst = with_kept("all", "x", "y")
@@ -754,7 +771,8 @@ class ReservedWords(Base):
 
     def test_a_different_word_is_not_ambiguous(self):
         lst = with_kept("this", "x")
-        self.assertEqual(sorted(picks_of("all", lst)), sorted([KEPT, OWN, X]))
+        self.assertEqual(picks_of("all", lst), "confirm")
+        self.assertEqual(sorted(ds.all_confirm(ds.norm_list(lst))["ids"]), sorted([KEPT, OWN, X]))
         lst = with_kept("all", "x")
         self.assertEqual(picks_of("this", lst, OWN), [OWN])
 
@@ -790,7 +808,11 @@ class ReservedWords(Base):
         }
         for text, exp in want.items():
             got = ds.resolve_picks(text, lst, None)
-            self.assertEqual(sorted(got), every if exp == "every" else sorted(ids[n] for n in exp), text)
+            if exp == "every":  # stored-name HIGH: "all" alone asks to confirm every agent first
+                self.assertEqual(got, "confirm", text)
+                self.assertEqual(sorted(ds.all_confirm(lst)["ids"]), every)
+                continue
+            self.assertEqual(sorted(got), sorted(ids[n] for n in exp), text)
         refused = ("x all", "all x", "alex all", "all alex", "alpha beta all", "all, alpha", "x,all", "all all",
                    "this x", "a ll", "alex a ll", "alex nobody", 'alex "alex-2', '"my agent', 'my agent"', '"x"y',
                    '"my agent" x"', "alex \u201calex-2\"", "alpha.", "alpha!", "(alpha)", "alpha/beta", "alex 2",
@@ -965,21 +987,29 @@ class PlainNames(Base):
     def test_redesign_high_typing_all_or_this_beside_a_look_alike_agent_removes_nothing(self):
         for odd in LOOKALIKES:
             lst = plain("web-app", "vault", odd, ids=[OWN, X, KEPT])
-            for word in ("all", "ALL", "this", "and", '"all"', "vault and web-app"):
-                self.assertIsNone(picks_of(word, lst, OWN), (odd, word))
-            why = ds.pick_refused_why("all", ds.norm_list(lst), OWN)
-            self.assertIn("has an old-style name", why, repr(odd))
-            self.assertIn("never by id", why)
-            self.assertIn("leave it, or switch it off on the agents page", why)
+            words = ds._old_words(ds.show_name(odd))  # what the name as listed may read as
+            for word in ("this", "and"):  # refused only while the listed name may read as that very word
+                if word in words:
+                    self.assertIsNone(picks_of(word, lst, OWN), (odd, word))
+                    line = ds.pick_refused_line(word, ds.norm_list(lst), OWN)
+                    self.assertIn("old-style name", line, repr(odd))
+                    self.assertTrue(line.endswith(ds.OLD_STYLE_LINE), line)
+                    self.assertNotIn("agents page", line)
+            self.assertNotIsInstance(picks_of('"all"', lst, OWN), list, repr(odd))
+            self.assertEqual(picks_of("vault and web-app", lst, OWN), None if "and" in words else [X, OWN], repr(odd))
+            self.assertEqual(picks_of("this", lst, OWN), None if "this" in words else [OWN], repr(odd))
+            for word in ("all", "ALL"):  # stored-name HIGH: "all" alone never blocks; it asks to confirm
+                self.assertEqual(picks_of(word, lst, OWN), "confirm", (odd, word))
             self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), repr(odd))
             out = self.picks("all", lst)
-            self.assertIn("Nothing was removed.", out["systemMessage"])
+            self.assertEqual(out["systemMessage"], ds.all_confirm_lines(ds.norm_list(lst)), repr(odd))
             self.assertTrue(self.denied())
-            self.prompt("/datastash:uninstall")
-            self.tool("PostToolUse", "ledger_agents_list", {}, lst)
-            v, _ = self.prompt("this")
-            self.assertEqual(v["decision"], "block", repr(odd))
-            self.assertTrue(self.denied())
+            if "this" in words:
+                self.prompt("/datastash:uninstall")
+                self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+                v, _ = self.prompt("this")
+                self.assertEqual(v["decision"], "block", repr(odd))
+                self.assertTrue(self.denied())
 
     def test_an_agent_whose_name_is_not_plain_ascii_is_never_picked_by_name(self):
         for odd, typed in (("alpha\u202e", "alpha"), ("caf\u00e9", "cafe"), ("\u0430lpha", "alpha"),
@@ -988,12 +1018,12 @@ class PlainNames(Base):
             lst = plain("web-app", odd, ids=[OWN, KEPT])
             for text in (typed, f'"{typed}"', typed.upper(), f"web-app {typed}"):
                 self.assertIsNone(picks_of(text, lst, OWN), (odd, text))
-            why = ds.pick_refused_why(typed, ds.norm_list(lst), OWN)
-            self.assertIn("has an old-style name", why, repr(odd))
-            self.assertIn("can't be removed by name", why)
+            line = ds.pick_refused_line(typed, ds.norm_list(lst), OWN)
+            self.assertIn("has an old-style name", line, repr(odd))
+            self.assertTrue(line.endswith(ds.OLD_STYLE_LINE), line)
             self.assertEqual(picks_of("web-app", lst, OWN), [OWN], repr(odd))
-        lst = plain("web-app", "alpha\u202e", "beta", ids=[OWN, KEPT, X])  # a long odd name can't read as "all"
-        self.assertEqual(sorted(picks_of("all", lst, OWN)), sorted([OWN, KEPT, X]))
+        lst = plain("web-app", "alpha\u202e", "beta", ids=[OWN, KEPT, X])
+        self.assertEqual(picks_of("all", lst, OWN), "confirm")
         lst = plain("web-app", "\u1d00\u029f\u029f", "vault", ids=[OWN, KEPT, X])  # "???": any 3 letters may be it
         self.assertIsNone(picks_of("web", plain("web", "\u1d00\u029f\u029f", ids=[OWN, KEPT]), OWN))
         self.assertEqual(picks_of("vault", lst, OWN), [X])
@@ -1057,28 +1087,38 @@ class OldStyleNames(Base):
         for old in OLD_WORDLIKE + OLD_PLAIN:
             lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
             for text in (old, old.upper(), f'"{old}"', f"vault {old}", f"{old} vault", f"  {old}  "):
-                self.assertIsNone(picks_of(text, lst, OWN), (old, text))
+                got = picks_of(text, lst, OWN)
+                # "all," typed alone is "all" alone: it never picks; it asks to confirm the whole list (stored-name HIGH)
+                alone = [(t.casefold(), q) for t, q in ds.pick_tokens(text, keep_and=True)[0]] == [("all", False)]
+                self.assertEqual(got, "confirm" if alone else None, (old, text))
                 self.assertIsNone(ds.resolve_picks(text, ds.norm_list(lst), None, reserved=False), (old, text))
-            why = ds.pick_refused_why(old, ds.norm_list(lst), OWN)
-            self.assertIn(f'your agent "{old}" has an old-style name', why, old)
-            self.assertIn("can't be removed by name", why)
-            self.assertIn("never by id", why)
-            self.assertIn("can't be changed by name", ds.pick_refused_why(old, ds.norm_list(lst), None, reserved=False))
+            line = ds.pick_refused_line(f"vault {old}", ds.norm_list(lst), OWN)
+            self.assertEqual(line, f'Not done: your agent "{old}" can\'t be picked by name. Nothing was removed. '
+                             + ds.OLD_STYLE_LINE, old)
+            self.assertEqual(ds.OLD_STYLE_LINE, "That agent has an old-style name. To remove it, use "
+                             "/datastash:uninstall all and confirm.")
+            self.assertTrue(ds.vis_refused_line(f"vault {old}", ds.norm_list(lst)).endswith(
+                "Nothing was changed. " + ds.OLD_STYLE_LINE))
             self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), old)
 
     def test_the_critical_end_to_end_all_comma_on_the_slash_line_and_after_the_list(self):
         for old in ("all,", "all and", ",all", "and all", "all ,"):
             lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
+            alone = ds.pick_tokens(old, keep_and=True)[0] == [("all", False)]  # "all,", ",all", "all ,": read as "all" alone
             out = self.picks(old, lst)
-            self.assertTrue(out["systemMessage"].startswith(f'Not done: your agent "{old}" has an old-style name'), out)
-            self.assertIn("Nothing was removed.", out["systemMessage"])
-            self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.PICK_REFUSED_AI)
+            if alone:  # stored-name HIGH: the confirm step, which lists the old-style name too; nothing removed yet
+                self.assertEqual(out["systemMessage"], ds.all_confirm_lines(ds.norm_list(lst)), old)
+                self.assertIn(f"- {old} (public)", out["systemMessage"])
+            else:
+                self.assertEqual(out["systemMessage"], f'Not done: your agent "{old}" can\'t be picked by name. Nothing '
+                                 "was removed. " + ds.OLD_STYLE_LINE, old)
+                self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.PICK_REFUSED_AI)
             self.assertTrue(self.denied(), old)
             self.prompt("/datastash:uninstall")
             self.tool("PostToolUse", "ledger_agents_list", {}, lst)
             v, _ = self.prompt(old)
             self.assertEqual(v["decision"], "block", old)
-            self.assertIn("has an old-style name", v["reason"])
+            self.assertIn("This removes all 3" if alone else ds.OLD_STYLE_LINE, v["reason"])
             self.assertTrue(self.denied(), old)
 
     def test_this_comma_never_removes_this_sessions_agent(self):
@@ -1090,25 +1130,35 @@ class OldStyleNames(Base):
         self.assertTrue(self.denied())
 
     def test_an_old_name_that_may_read_as_a_pick_word_refuses_the_words_too(self):
-        for old in OLD_WORDLIKE + ("Ꭺll", "Ꭺll,", "a n d"):
+        """Stored-name HIGH: "all" is never refused for an old-style name (alone it asks to confirm); "this" and "and"
+        are refused only while an old-style name may read as that very word (LOW 3: "all," no longer blocks "and")."""
+        for old in OLD_WORDLIKE + ("Ꭺll", "Ꭺll,", "a n d", "this?", "t,his", "(and)"):
             lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
-            for word in ("all", "ALL", "this", "and", "vault and web-app", "all,"):
-                self.assertIsNone(picks_of(word, lst, OWN), (old, word))
-            why = ds.pick_refused_why("all", ds.norm_list(lst), OWN)
-            self.assertIn("old-style name", why, old)
-            self.assertIn("leave it, or switch it off on the agents page", why)
-            self.assertNotIn('"all" alone still removes it', why)
+            words = ds._old_words(old)
+            for word in ("all", "ALL", "all,"):
+                self.assertEqual(picks_of(word, lst, OWN), "confirm", (old, word))
+            self.assertEqual(picks_of("this", lst, OWN), None if "this" in words else [OWN], old)
+            self.assertEqual(picks_of("vault and web-app", lst, OWN), None if "and" in words else [X, OWN], old)
+            for word in ("this", "and"):
+                if word in words:
+                    line = ds.pick_refused_line(word, ds.norm_list(lst), OWN)
+                    self.assertIn("old-style name", line, old)
+                    self.assertTrue(line.endswith(ds.OLD_STYLE_LINE), line)
+        self.assertEqual(ds._old_words("all,"), {"all"})
+        self.assertEqual(ds._old_words("this,"), {"this"})
+        self.assertEqual(ds._old_words("all and"), {"all", "and"})
 
     def test_all_alone_still_removes_an_old_name_that_reads_as_no_word(self):
-        """Final LOW 2, said outright: "all" removes it, with every other agent."""
+        """Stored-name HIGH: "all" alone asks to confirm every agent, old-style ones too, and the refusal says so."""
         for old in OLD_PLAIN + ("alpha‮", "café-long-name"):
             lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
-            self.assertEqual(sorted(picks_of("all", lst, OWN)), sorted([OWN, X, KEPT]), old)
+            self.assertEqual(picks_of("all", lst, OWN), "confirm", old)
             if old.isascii():
-                self.assertIn('"all" alone still removes it, with every other agent', ds.pick_refused_why(old, ds.norm_list(lst), OWN))
+                self.assertTrue(ds.pick_refused_line(old, ds.norm_list(lst), OWN).endswith(ds.OLD_STYLE_LINE), old)
         out = self.picks("all", plain("web-app", "a b", ids=[OWN, KEPT]))
+        self.assertIn("- a b (public)", out["systemMessage"])
+        self.prompt("remove all 2")
         self.assertEqual(sorted(self.targets()), sorted([OWN, KEPT]))
-        self.assertIsNotNone(out)
 
     def test_an_old_name_never_blocks_names_beside_it(self):
         lst = plain("a", "b", "a b", "x", "y", "x;y", "alpha", "beta", ids=[str(uuid.UUID(int=0x300 + i)) for i in range(8)])
@@ -1130,8 +1180,16 @@ class OldStyleNames(Base):
     def test_a_stored_look_alike(self):
         for odd in LOOKALIKES:
             lst = plain("web-app", "vault", odd, ids=[OWN, X, KEPT])
-            for text in ("all", "this", "and", odd, f'"{odd}"', "vault and web-app"):
-                self.assertIsNone(picks_of(text, lst, OWN), (odd, text))
+            self.assertEqual(picks_of("all", lst, OWN), "confirm", repr(odd))
+            words = ds._old_words(ds.show_name(odd))
+            for text in ("this", "and", odd, f'"{odd}"', "vault and web-app"):
+                w = "this" if text == "this" else "and" if "and" in text.split() else None
+                if w is not None and w not in words:  # stored-name HIGH: only the word the listed name may read as
+                    self.assertNotIn(KEPT, picks_of(text, lst, OWN) or [], (odd, text))
+                    continue
+                if text.strip('"').casefold() == "all" and not text.startswith('"'):
+                    continue
+                self.assertNotIsInstance(picks_of(text, lst, OWN), list, (odd, text))
             self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), repr(odd))
 
     def test_the_owners_case_alex_and_alex_2(self):
@@ -1140,7 +1198,7 @@ class OldStyleNames(Base):
             for text, exp in {"alex alex-2": [AX, AX2], "alex-2 alex": [AX, AX2], "alex, alex-2": [AX, AX2],
                               "alex and alex-2": [AX, AX2], "ALEX  Alex-2": [AX, AX2], "alex": [AX], "alex-2": [AX2],
                               '"alex"': [AX], '"alex-2"': [AX2]}.items():
-                if extra and "and" in text.split() and any(ds._old_reads_as_word(n) for n in extra):
+                if extra and "and" in text.split() and any("and" in ds._old_words(n) for n in extra):
                     self.assertIsNone(picks_of(text, lst, OWN), (extra, text))  # "and" is refused while one is listed
                     continue
                 self.assertEqual(sorted(picks_of(text, lst, OWN)), sorted(exp), (extra, text))
@@ -1182,6 +1240,137 @@ class OldStyleNames(Base):
             self.assertTrue(ds.plain_name(ds._free_name(d)), raw)
 
 
+class AllConfirm(Base):
+    """1.0.11 stored-name HIGH (PM ruling): "all" alone never blocks. It lists every agent by its shown name, old-style
+    names too, and asks the person to type exactly "remove all N" (N = the count shown). Only that reply, typed by the
+    person (the same typed proof as any pick), removes them; any other reply removes nothing and closes the step."""
+    OLD_LIST = plain("web-app", "alex", "alex-2", "all,", "a b", "\u13aall", "all and", "x;y",
+                     ids=[OWN, AX, AX2] + [str(uuid.UUID(int=0x500 + i)) for i in range(5)])
+
+    def setUp(self):
+        super().setUp()
+        self.installed()
+
+    def open_step(self, lst=LIST, slash=False):
+        if slash:
+            self.slash("/datastash:uninstall all")
+            return self.tool("PostToolUse", "ledger_agents_list", {}, lst)["systemMessage"]
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+        v, _ = self.prompt("all")
+        self.assertEqual(v["decision"], "block")  # the reply goes to the person only, never to the model
+        return v["reason"]
+
+    def note(self):
+        return self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]
+
+    def test_the_exact_count_removes_every_agent_with_the_persons_typed_proof(self):
+        for slash in (False, True):
+            shown = self.open_step(slash=slash)
+            self.assertEqual(shown, "This removes all 3 of your datastash agents:\n- web-app (public)\n- alpha (private)\n"
+                             "- beta (public)\nTo go ahead, type exactly: remove all 3. Anything else removes nothing.")
+            self.assertEqual(self.note()["permissionDecision"], "deny")  # nothing is picked before the confirm
+            v, pid = self.prompt("remove all 3")
+            self.assertIn('kind "uninstall"', v["hookSpecificOutput"]["additionalContext"])
+            got = self.note()["updatedInput"]
+            self.assertEqual(got["targets"], sorted([OWN, ALPHA, BETA]))
+            self.assertTrue(proof_ok(got["typed_proof"], "uninstall", [OWN, ALPHA, BETA], pid, "remove all 3"))
+            self.assertEqual(self.note()["permissionDecision"], "deny")  # one use
+        self.open_step()
+        self.prompt("  Remove  ALL 3 ")  # case and runs of spaces do not matter; the count does
+        self.assertEqual(self.note()["updatedInput"]["targets"], sorted([OWN, ALPHA, BETA]))
+
+    def test_a_wrong_count_or_any_other_reply_removes_nothing(self):
+        for reply in ("remove all 2", "remove all 4", "remove all", "remove all three", "yes", "all", "remove all 3 now",
+                      "remove all 03", "alpha", "remove all 3.", "\"remove all 3\"", "remove all ３", "this"):
+            self.open_step()
+            v, _ = self.prompt(reply)
+            self.assertEqual(v["decision"], "block", reply)
+            self.assertEqual(v["reason"], ds.ALL_NOT_CONFIRMED_LINE, reply)
+            self.assertIn("Nothing was removed.", v["reason"])
+            self.assertEqual(self.note()["permissionDecision"], "deny", reply)
+            self.assertIsNone(self.prompt("remove all 3")[0], reply)  # the step is closed: an ordinary prompt now
+            self.assertEqual(self.note()["permissionDecision"], "deny", reply)
+        self.assertTrue(os.path.exists(ds.key_path("web-app")))
+
+    def test_a_confirm_not_typed_by_the_person_is_refused(self):
+        self.open_step()
+        self.prompt("remove all 3", source="sdk")  # a headless or model-made prompt: no person origin
+        out = self.tool("PreToolUse", "ledger_agents_note", {})
+        self.assertEqual(out["systemMessage"], ds.NOT_PERSON_LINE)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.open_step()
+        self.prompt("remove all 3", entry="remove all 2")  # the transcript does not hold the person's exact reply
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["systemMessage"], ds.NOT_TYPED_LINE)
+        self.open_step()  # the model calling the note itself while the step is open
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {"targets": [OWN, ALPHA, BETA]})["systemMessage"],
+                         ds.NO_STEP_LINE)
+        self.assertTrue(os.path.exists(ds.key_path("web-app")))
+
+    def test_the_confirm_is_bound_to_the_list_shown(self):
+        self.open_step()
+        other = dict(LIST, list_id=str(uuid.UUID(int=0xA2)))
+        self.tool("PostToolUse", "ledger_agents_list", {}, other)  # a list fetched again while the step is open
+        v, _ = self.prompt("remove all 3")
+        self.assertEqual(v["reason"], ds.ALL_NOT_CONFIRMED_LINE)
+        self.open_step()
+        self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:2]))
+        self.assertEqual(self.prompt("remove all 2")[0]["reason"], ds.ALL_NOT_CONFIRMED_LINE)
+        self.assertEqual(self.note()["permissionDecision"], "deny")
+
+    def test_old_style_names_are_listed_and_removed_by_the_confirmed_all(self):
+        lst = ds.norm_list(self.OLD_LIST)
+        for slash in (False, True):
+            shown = self.open_step(self.OLD_LIST, slash=slash)
+            self.assertTrue(shown.startswith("This removes all 8 of your datastash agents:"), shown)
+            for a in lst["agents"]:
+                self.assertIn(f"\n- {a['name']} (public)", shown)
+            self.assertNotIn("agents page", shown)
+            self.prompt("remove all 8")
+            self.assertEqual(self.note()["updatedInput"]["targets"], sorted(a["id"] for a in lst["agents"]))
+        for old in ("all,", "all and", "x;y", "a b"):  # by name they stay refused, with the one way out
+            line = ds.pick_refused_line(f"alex {old}", lst, OWN)
+            self.assertTrue(line.endswith(ds.OLD_STYLE_LINE), line)
+            self.assertNotIn("agents page", line)
+            self.assertNotIn("/agents", line.replace("/datastash:uninstall", ""))
+
+    def test_alex_and_alex_2_together_and_alone_beside_old_style_names(self):
+        for text, want in (("alex alex-2", [AX, AX2]), ("alex and alex-2", [AX, AX2]), ("alex, alex-2", [AX, AX2]),
+                           ("alex", [AX]), ("alex-2", [AX2])):
+            self.slash("/datastash:uninstall " + text)
+            self.tool("PostToolUse", "ledger_agents_list", {}, plain("web-app", "alex", "alex-2", "all,", "a b",
+                                                                     ids=[OWN, AX, AX2, KEPT, X]))
+            self.assertEqual(sorted(self.note()["updatedInput"]["targets"]), sorted(want), text)
+            self.prompt("/datastash:uninstall")
+            self.tool("PostToolUse", "ledger_agents_list", {}, plain("web-app", "alex", "alex-2", "all,",
+                                                                     ids=[OWN, AX, AX2, KEPT]))
+            self.prompt(text)
+            self.assertEqual(sorted(self.note()["updatedInput"]["targets"]), sorted(want), text)
+
+    def test_low1_punctuation_beside_a_word_reads_as_the_word(self):
+        for name, word in (("all!", "all"), ("all;", "all"), ("(all)", "all"), ("al'l", "all"), ("a,ll", "all"),
+                           ("this?", "this"), ("t,his", "this"), ("(and)", "and")):
+            self.assertIn(word, ds._old_words(name), name)
+        lst = plain("web-app", "x", "this?", ids=[OWN, X, KEPT])
+        self.assertIsNone(picks_of("this", lst, OWN))  # never this session's own while "this?" is listed
+        self.assertEqual(picks_of("all", lst, OWN), "confirm")
+        self.assertEqual(picks_of("x and web-app", lst, OWN), [X, OWN])  # LOW 3: "and" stays a separator
+
+    def test_all_in_make_private_or_public(self):
+        lst = plain("web-app", "alex", "alex-2", "all,", "\u13aall", ids=[OWN, AX, AX2, KEPT, X])
+        self.assertIsNone(self.prompt("make all public")[0])  # "all" alone is never a name here: an ordinary prompt
+        self.prompt("make alex and alex-2 private")
+        out = self.tool("PostToolUse", "ledger_agents_list", {}, plain("web-app", "alex", "alex-2", "all,",
+                                                                       ids=[OWN, AX, AX2, KEPT]))
+        self.assertEqual(sorted(self.note()["updatedInput"]["targets"]), sorted([AX, AX2]))
+        self.assertIsNotNone(out)
+        self.prompt("make alex all, public")
+        out = self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+        self.assertIn("Nothing was changed.", out["systemMessage"])
+        self.assertNotIn("agents page", out["systemMessage"])
+        self.assertEqual(self.note()["permissionDecision"], "deny")
+
+
 class RealSlashShape(Base):
     """Review 1 HIGH 1: the real Claude Code 2.1.330 entry of a typed slash command passes; nothing else like it does."""
 
@@ -1190,7 +1379,7 @@ class RealSlashShape(Base):
         self.installed()
 
     def note_after(self, **change):
-        self.slash("/datastash:uninstall all", **change)
+        self.slash("/datastash:uninstall alpha beta web-app", **change)
         self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
         return self.tool("PreToolUse", "ledger_agents_note", {})
 
@@ -1224,9 +1413,9 @@ class RealSlashShape(Base):
 
     def test_the_older_tag_order_and_a_name_that_differs_are_refused(self):
         for content in ("<command-name>/datastash:uninstall</command-name>\n<command-message>datastash:uninstall"
-                        "</command-message>\n<command-args>all</command-args>",
+                        "</command-message>\n<command-args>alpha beta web-app</command-args>",
                         "<command-message>datastash:install</command-message>\n<command-name>/datastash:uninstall"
-                        "</command-name>\n<command-args>all</command-args>"):
+                        "</command-name>\n<command-args>alpha beta web-app</command-args>"):
             out = self.note_after(message={"role": "user", "content": content})
             self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny")
 
