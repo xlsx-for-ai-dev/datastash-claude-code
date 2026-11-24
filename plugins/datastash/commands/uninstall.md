@@ -3,4 +3,4 @@ description: Remove datastash from one or many of your agents (shows the list, t
 disable-model-invocation: true
 argument-hint: "[all | names]"
 ---
-Do only what this turn's datastash note (install and uninstall; the plugin's own steps) says, and nothing else. If there is no such note, say only: "datastash did not answer. Type /datastash:uninstall again."
+Do only what this turn's datastash note (install and uninstall; the plugin's own steps) says, and nothing else. If there is no such note, say only: "datastash did not answer. Type /datastash:uninstall again." If the plugin shows a line that starts "Not done", say only "Nothing was removed." Never say an agent is listed, ready or about to be removed: only the plugin's own line says what was removed.
