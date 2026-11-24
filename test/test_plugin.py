@@ -111,7 +111,7 @@ class Base(unittest.TestCase):
                                                     "announce_ids", "WAKE_IDLE_MAX_SECONDS", "_claude_chain",
                                                     "signed_in", "imported_connector_hint", "http", "_spawn_poller",
                                                     "_open_browser", "_login_recorded", "_spawn_starter",
-                                                    "login_present", "fcntl")}
+                                                    "login_present", "fcntl", "_standby")}
         # Offline: no test ever reaches datastash, starts a background poll or opens a browser unless it fakes them.
         ds.http = _offline_http
         ds._spawn_poller = lambda: True
@@ -838,6 +838,7 @@ class MainFolderIdentity(Base):
             seen = []
             orig = ds._take_listener_lock
             ds._take_listener_lock = lambda s, sid: (seen.append(s) or None)
+            ds._standby = lambda *a: None  # these tests end at the lock (XLI-374 11-24: no standby wait)
             try:
                 os.environ.pop("CLAUDE_PROJECT_DIR", None)
                 ds.cmd_listen([])
@@ -994,6 +995,7 @@ class MainAnySession(MainBase):
         seen = []
         orig = ds._take_listener_lock
         ds._take_listener_lock = lambda s, sid: (seen.append(s) or None)
+        ds._standby = lambda *a: None  # these tests end at the lock (XLI-374 11-24: no standby wait)
         try:
             ds.cmd_listen([])
         finally:
@@ -1338,6 +1340,7 @@ class CleanSessionOnly(MainBase):
             ds.hook_input = lambda: {"session_id": sid, "cwd": self.folder}
             orig = ds._take_listener_lock
             ds._take_listener_lock = lambda s, i: None
+            ds._standby = lambda *a: None  # these tests end at the lock (XLI-374 11-24: no standby wait)
             try:
                 ds.cmd_listen([])
             finally:
@@ -3487,7 +3490,7 @@ class Net:
         return [c for c in self.calls if any(r in " ".join(c) for r in KEY_ROUTES)]
 
 
-class Parked(Exception):
+class Parked(BaseException):  # ends a test from a park check (never caught as a listener fault)
     pass
 
 
@@ -3548,7 +3551,7 @@ class Xli374(Base):
         with open(os.path.join(HERE, "..", "plugins", "datastash", "hooks", "hooks.json")) as f:
             hooks = json.load(f)["hooks"]
         listens = [h for ev in hooks.values() for g in ev for h in g["hooks"] if h.get("args", [])[-1:] == ["listen"]]
-        self.assertEqual(len(listens), 2)
+        self.assertEqual(len(listens), 3)  # SessionStart, Stop and (XLI-374 11-24) the idle notice
         for h in listens:
             self.assertEqual(h["timeout"], 2000000)
             self.assertTrue(h["async"] and h["asyncRewake"])
