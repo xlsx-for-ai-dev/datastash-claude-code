@@ -888,6 +888,210 @@ class OptIn(Base):
         self.assertFalse(on)
         self.assertEqual(ds.tpc_choice(self.folder), "off")
 
+    # --- plugin 1.0.12 review: fail closed. A settings file that is there but can't be read cleanly means off for every
+    # folder this run: no default, no rewrite, one plain log line. The default only adds new folder entries.
+    def raw(self):
+        with open(ds.TPC_PATH, "rb") as f:
+            return f.read()
+
+    def put(self, data):
+        with open(ds.TPC_PATH, "wb") as f:
+            f.write(data)
+
+    def log_lines(self):
+        try:
+            with open(ds.log_path("web-app")) as f:
+                return [ln for ln in f if "time-per-card.json" in ln]
+        except FileNotFoundError:
+            return []
+
+    def bad_files(self):
+        other = os.path.join(TMP, "other-folder")
+        off = {self.folder: {"on": False, "at": 1}, other: {"on": False, "at": 2}}
+        good = json.dumps({"projects": off}).encode()
+        return {
+            "corrupt JSON (truncated)": good[: len(good) - 7],
+            "corrupt JSON (not UTF-8)": b"\xff\xfe" + good,
+            "an empty file": b"",
+            "a blank file": b"  \n",
+            "wrong shape: a list": json.dumps([off]).encode(),
+            "wrong shape: projects is a list": json.dumps({"projects": [self.folder]}).encode(),
+            "wrong shape: no projects": json.dumps({"card_tabs": {}}).encode(),
+            'wrong shape: "on" is "false"': json.dumps({"projects": {**off, self.folder: {"on": "false"}}}).encode(),
+            'wrong shape: "on" is 0': json.dumps({"projects": {**off, self.folder: {"on": 0}}}).encode(),
+            "wrong shape: an entry is a list": json.dumps({"projects": {**off, self.folder: [False]}}).encode(),
+            "wrong shape: card_tabs is a list": json.dumps({"projects": off, "card_tabs": ["x"]}).encode(),
+        }
+
+    def assert_fail_closed(self, name, data):
+        """Every way in leaves every folder off, sends and sets up nothing, logs the plain line and never rewrites."""
+        self.fake.calls.clear()
+        self.spawned.clear()
+        removed = set(ds._REMOVED_HERE)
+        ds._REMOVED_HERE.discard("web-app")  # an uninstall test run earlier in this process (any order) silences its log
+        self.addCleanup(lambda: ds._REMOVED_HERE.update(removed))
+        ds.ensure_dirs()
+        with open(ds.log_path("web-app"), "w"):
+            pass  # start from an empty log (the shared log may rotate at LOG_MAX_BYTES in any test order)
+        self.assertEqual(ds.tpc_choice(self.folder), "off", name)
+        self.assertEqual(ds.tpc_choice(os.path.join(TMP, "never-chose")), "off", name)
+        self.assertFalse(ds.tpc_is_on(self.folder), name)
+        self.assertFalse(ds.tpc_default_due(self.folder), name)
+        for event in ("SessionStart", "SubagentStop", "SessionEnd"):
+            self.assertEqual(self.hook(event), 0, name)
+        inp = {"session_id": SID, "transcript_path": self.main, "cwd": self.folder}
+        ds.tpc_install_kick(inp)
+        self.assertNotIn(ds.TPC_ON_LINE, ds.after_install(inp), name)
+        self.assertEqual(self.in_folder(lambda: ds.cmd_time_per_card(["setup", "web-app"])), 0, name)
+        self.assertEqual(self.in_folder(lambda: ds.cmd_time_per_card(["run", "web-app", SID, self.main, "1"])), 0, name)
+        on, why = ds.tpc_default_on(self.folder, {"workbook_id": WB}, KEY)
+        self.assertFalse(on, name)
+        self.assertIn("left off", why, name)
+        for typed in ("on", "off"):
+            rc, out = self.say(typed)
+            self.assertEqual(rc, 1, name)
+            self.assertIn("nothing changed", out, name)
+        rc, out = self.say()
+        self.assertIn("left off for every folder", out, name)
+        self.assertEqual(self.spawned, [], name)
+        self.assertEqual(self.fake.calls, [], name)  # no set-up, no send
+        self.assertEqual(self.raw(), data, name)  # never rewritten: a saved off in it survives
+        lines = self.log_lines()
+        self.assertEqual(len(lines), 5, name)  # one line per run: three hooks, the set-up and the send
+        self.assertTrue(all("was left off" in ln and "was not changed" in ln for ln in lines), name)
+
+    def test_a_corrupt_or_odd_settings_file_fails_closed(self):
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(5, [("Edit", {"file_path": "/a"})])
+        for name, data in self.bad_files().items():
+            self.put(data)
+            self.assert_fail_closed(name, data)
+
+    def test_a_read_error_fails_closed(self):
+        data = json.dumps({"projects": {self.folder: {"on": False, "at": 1}}}).encode()
+        self.put(data)
+        real = open
+
+        def refuse(path, *a, **k):
+            if path == ds.TPC_PATH:
+                raise PermissionError(13, "Permission denied")
+            return real(path, *a, **k)
+        ds.open = refuse
+        try:
+            self.assert_fail_closed("a read error", data)
+            self.assertIn("can't be read (PermissionError)", self.log_lines()[-1])
+        finally:
+            del ds.open
+        self.assertEqual(ds.tpc_choice(self.folder), "off")  # readable again: the saved off is there
+
+    def test_a_missing_file_still_means_never_chose(self):
+        self.assertFalse(os.path.exists(ds.TPC_PATH))
+        self.assertIsNone(ds.tpc_choice(self.folder))
+        self.assertTrue(ds.tpc_default_due(self.folder))
+        self.assertIsNone(ds.tpc_unreadable_line())
+
+    def test_the_default_only_adds_new_entries(self):
+        other = os.path.join(TMP, "other-folder")
+        before = {"projects": {other: {"on": False, "at": 2}, "/x/kept": {"on": True, "at": 3, "by": "default"}},
+                  "card_tabs": {WB: "Cards cost"}, "default_tried": {"/x/tried": 7}}
+        ds.write_private(ds.TPC_PATH, json.dumps(before))
+        self.fake.card_tab = "Time per card"
+        on, _why = ds.tpc_default_on(self.folder, {"workbook_id": WB}, KEY)
+        self.assertTrue(on)
+        after = self.settings()
+        self.assertEqual(after["projects"][self.folder]["by"], "default")
+        del after["projects"][self.folder]
+        self.assertEqual(after, before)  # every earlier entry exactly as it was, the saved off too
+        self.fake.calls.clear()
+        on, _why = ds.tpc_default_on("/x/kept", {"workbook_id": WB}, KEY)  # an entry there is never rewritten
+        self.assertTrue(on)
+        self.assertEqual(self.settings()["projects"]["/x/kept"], {"on": True, "at": 3, "by": "default"})
+        self.assertEqual(self.fake.calls, [])
+
+    def test_concurrent_writers_lose_nothing(self):
+        import time
+        other = os.path.join(TMP, "other-folder")
+        ds.write_private(ds.TPC_PATH, json.dumps({"projects": {other: {"on": False, "at": 2}}}))
+        real = ds._tpc_update
+
+        def slow(fn):
+            def wrapped(s):
+                time.sleep(0.02)  # widen the read-change-write window
+                return fn(s)
+            return real(wrapped)
+        ds._tpc_update = slow
+        stop, torn = threading.Event(), []
+
+        def reader():  # a reader with no lock (another plugin version) never sees half a file
+            while not stop.is_set():
+                try:
+                    with open(ds.TPC_PATH, "rb") as f:
+                        json.loads(f.read())
+                except ValueError:
+                    torn.append(1)
+        t = threading.Thread(target=reader)
+        kids = []
+        try:
+            for i in range(8):  # fork before the reader thread starts (fork in a threaded process can deadlock)
+                pid = os.fork()
+                if pid == 0:
+                    code = 1
+                    try:
+                        code = 0 if ds.tpc_default_on(os.path.join(TMP, f"w{i}"), {"workbook_id": WB}, KEY)[0] else 1
+                    finally:
+                        os._exit(code)
+                kids.append(pid)
+            t.start()
+            with redirect_stdout(io.StringIO()):
+                ds._tpc_update(lambda s: s["projects"].__setitem__(self.folder, {"on": False, "at": 9}))
+            codes = [os.waitpid(pid, 0)[1] for pid in kids]
+        finally:
+            stop.set()
+            if t.is_alive():
+                t.join()
+            ds._tpc_update = real
+        self.assertEqual(codes, [0] * 8)
+        self.assertEqual(torn, [])
+        got = self.settings()["projects"]
+        self.assertEqual({k for k in got if k.startswith(os.path.join(TMP, "w"))},
+                         {os.path.realpath(os.path.join(TMP, f"w{i}")) for i in range(8)})
+        self.assertEqual(got[other], {"on": False, "at": 2})
+        self.assertEqual(got[self.folder], {"on": False, "at": 9})
+
+    def test_a_crash_mid_write_keeps_the_file(self):
+        other = os.path.join(TMP, "other-folder")
+        ds.write_private(ds.TPC_PATH, json.dumps({"projects": {other: {"on": False, "at": 2}}}))
+        data = self.raw()
+        pid = os.fork()
+        if pid == 0:  # the process dies after writing the temp file, before the rename
+            try:
+                ds.os.fsync = lambda fd: os._exit(9)
+                ds.tpc_default_on(self.folder, {"workbook_id": WB}, KEY)
+            finally:
+                os._exit(3)
+        self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 9)
+        self.assertEqual(self.raw(), data)
+        left = os.path.join(os.path.dirname(ds.TPC_PATH), f".{os.path.basename(ds.TPC_PATH)}.{pid}.tmp")
+        self.assertTrue(os.path.exists(left))  # the half-written temp file is never read
+        self.assertEqual(ds.tpc_choice(other), "off")
+        real = ds.os.replace
+
+        def boom(a, b):
+            raise OSError("disk gone")
+        ds.os.replace = boom  # a write that fails at the rename, in this process
+        try:
+            with self.assertRaises(OSError):
+                ds.tpc_default_on(self.folder, {"workbook_id": WB}, KEY)
+        finally:
+            ds.os.replace = real
+        self.assertEqual(self.raw(), data)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(ds.TPC_PATH),
+                                                     f".{os.path.basename(ds.TPC_PATH)}.{os.getpid()}.tmp")))
+        self.assertTrue(ds.tpc_default_on(self.folder, {"workbook_id": WB}, KEY)[0])  # the next write works
+        self.assertEqual(self.settings()["projects"][other], {"on": False, "at": 2})
+        os.unlink(left)
+
     def test_the_hooks_are_wired_beside_the_others(self):
         with open(os.path.join(HERE, "..", "plugins", "datastash", "hooks", "hooks.json")) as f:
             hooks = json.load(f)

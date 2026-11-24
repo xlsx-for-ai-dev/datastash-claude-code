@@ -15315,17 +15315,63 @@ def _tpc_send(client, pend, save):
         save()
 
 
+class TpcUnreadable(Exception):
+    """time-per-card.json is there but can't be read, parsed, or has an unexpected shape: every folder counts as chose off
+    for this run, no default is applied and nothing rewrites the file (fail closed, plugin 1.0.12 review)."""
+
+
+_TPC_UNREADABLE = []  # why the latest read of the file failed in this run, for the one log line
+
+
+def _tpc_read():
+    """(settings, None) from a file read cleanly (a missing file reads as empty: nobody chose), else (None, why)."""
+    try:
+        with open(TPC_PATH, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {"projects": {}}, None
+    except OSError as e:
+        return None, f"can't be read ({type(e).__name__})"
+    try:
+        s = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None, "is not valid JSON" if raw.strip() else "is empty"
+    if not isinstance(s, dict) or not isinstance(s.get("projects"), dict):
+        return None, "has an unexpected shape"
+    if any(not isinstance(v, dict) or not isinstance(v.get("on"), bool) for v in s["projects"].values()):
+        return None, "has an unexpected shape"
+    if any(k in s and not isinstance(s[k], dict) for k in ("card_tabs", "default_tried")):
+        return None, "has an unexpected shape"
+    return s, None
+
+
 def _tpc_settings():
-    s = read_json(TPC_PATH, {})
-    return s if isinstance(s.get("projects"), dict) else {"projects": {}}
+    """The settings read cleanly, or a view where nothing is set (callers that decide on or off use tpc_choice)."""
+    s, why = _tpc_read()
+    _TPC_UNREADABLE[:] = [] if why is None else [why]  # the latest read decides
+    if why is not None:
+        return {"projects": {}, "unreadable": why}
+    return s
+
+
+def tpc_unreadable_line():
+    """The one plain log line for a run that found the settings file unreadable, or None."""
+    if not _TPC_UNREADABLE:
+        return None
+    return (f"time per card: the settings file time-per-card.json {_TPC_UNREADABLE[0]}, so time per card was left off "
+            f"for every folder in this run and the file was not changed")
 
 
 def tpc_choice(folder):
-    """This folder's own choice: "on", "off", or None when nobody chose here (plugin 1.0.12: on by default)."""
-    got = _tpc_settings()["projects"].get(os.path.realpath(folder))
-    if not isinstance(got, dict) or not isinstance(got.get("on"), bool):
+    """This folder's own choice: "on", "off", or None when nobody chose here (plugin 1.0.12: on by default). An unreadable
+    or odd settings file means "off" for every folder (fail closed)."""
+    s = _tpc_settings()
+    if "unreadable" in s:
+        return "off"
+    got = s["projects"].get(os.path.realpath(folder))
+    if got is None:
         return None
-    return "on" if got["on"] else "off"
+    return "on" if got["on"] is True else "off"
 
 
 def tpc_is_on(folder):
@@ -15334,13 +15380,17 @@ def tpc_is_on(folder):
 
 
 def _tpc_update(fn):
-    """Read, change and write the settings under one lock, so a typed choice and a default never overwrite each other."""
+    """Read, change and write the settings under one lock, so a typed choice and a default never overwrite each other.
+    The write is atomic (a temp file, then a rename), so a crash or a reader never sees half a file. A file that can't be
+    read cleanly is never rewritten: TpcUnreadable."""
     ensure_dirs()
     lock = open(TPC_PATH + ".lock", "a")
     try:
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)
         s = _tpc_settings()
+        if "unreadable" in s:
+            raise TpcUnreadable(s["unreadable"])
         out = fn(s)
         write_private(TPC_PATH, json.dumps(s))
         return out
@@ -15383,25 +15433,31 @@ def tpc_default_on(folder, agent, key):
     """The default for a folder that never chose: set the tabs up as `on` does, then save it as on (by default). A
     choice typed meanwhile wins. (True, None) when it is on now, else (False, why not)."""
     folder = os.path.realpath(folder)
-    if tpc_choice(folder) is not None:
-        return tpc_choice(folder) == "on", None
+    choice = tpc_choice(folder)
+    if _TPC_UNREADABLE:
+        return False, tpc_unreadable_line()
+    if choice is not None:
+        return choice == "on", None
     feed, why = _tpc_setup(agent, key)
 
     def save(s):
-        tried = s.get("default_tried") if isinstance(s.get("default_tried"), dict) else {}
-        if isinstance((s["projects"].get(folder) or {}).get("on"), bool):
+        # The default only adds a new folder entry; it never rewrites or drops one that is there.
+        if folder in s["projects"]:
             return s["projects"][folder]["on"] is True  # the person chose meanwhile: theirs stands
         if feed is None:
+            tried = s.get("default_tried", {})
             tried[folder] = int(time.time())
             s["default_tried"] = tried
             return False
-        tried.pop(folder, None)
-        s["default_tried"] = tried
         s["projects"][folder] = {"on": True, "at": int(time.time()), "by": "default"}
-        _tpc_save_tab(s, agent, feed)
+        if str(agent["workbook_id"]).lower() not in s.get("card_tabs", {}):
+            _tpc_save_tab(s, agent, feed)
         return True
 
-    on = _tpc_update(save)
+    try:
+        on = _tpc_update(save)
+    except TpcUnreadable:
+        return False, tpc_unreadable_line()
     return on, (None if on else why or "the folder chose off")
 
 
@@ -15432,6 +15488,10 @@ def cmd_time_per_card(args):
         print(TPC_USAGE)
         return 0 if sub in ("-h", "--help") else 1
     folder = os.path.realpath(project_of({}))
+    if "unreadable" in _tpc_settings():
+        print(f"time per card: the settings file {TPC_PATH} {_TPC_UNREADABLE[0]}, so time per card is left off for every "
+              f"folder and nothing changed. Fix or move that file, then choose again. {TPC_USAGE}")
+        return 0 if sub == "" else 1
     if sub == "":
         how = {"on": "on", "off": "off"}.get(tpc_choice(folder), "on (by default)")
         print(f"time per card is {how} for this folder. {TPC_USAGE}")
@@ -15452,7 +15512,12 @@ def cmd_time_per_card(args):
         if sub == "on":
             _tpc_save_tab(s, agent, feed)
 
-    _tpc_update(save)
+    try:
+        _tpc_update(save)
+    except TpcUnreadable as e:
+        print(f"time per card: the settings file {TPC_PATH} {e}, so time per card is left off for every folder and "
+              f"nothing changed. Fix or move that file, then choose again.")
+        return 1
     if sub == "on":
         print(f'time per card is on for this folder: at each subagent stop and session end, minutes, tool calls and token '
               f'counts per card, activity and model go to "{disp(agent["name"])}"\'s workbook (tab Burn, and one total row '
@@ -15471,7 +15536,13 @@ def _tpc_hook():
     try:
         folder = project_of(inp)
         sid, tp = inp.get("session_id"), inp.get("transcript_path")
-        if not tpc_is_on(folder) or not isinstance(sid, str) or not re.fullmatch(SID_RE, sid) or not isinstance(tp, str):
+        on = tpc_is_on(folder)
+        if _TPC_UNREADABLE:  # fail closed: off for every folder this run, one plain line in the agent's log
+            agent = _own_agent(inp)
+            if agent is not None:
+                log(agent["slug"], tpc_unreadable_line())
+            return 0
+        if not on or not isinstance(sid, str) or not re.fullmatch(SID_RE, sid) or not isinstance(tp, str):
             return 0
         agent = _own_agent(inp)
         if agent is None or not read_key(agent["slug"]):
@@ -15497,8 +15568,15 @@ def _tpc_bg(args):
         if not agent or not key or not CI_WB_RE.fullmatch(str(agent.get("workbook_id") or "")):
             return 0
         ensure_dirs()
-        if tpc_choice(os.getcwd()) is None:  # never chose: on by default once the tabs are set up (plugin 1.0.12)
+        choice = tpc_choice(os.getcwd())
+        if _TPC_UNREADABLE:
+            raise TpcUnreadable(tpc_unreadable_line())
+        if choice == "off":
+            raise CiProblem("this folder chose off")
+        if choice is None:  # never chose: on by default once the tabs are set up (plugin 1.0.12)
             on, why = tpc_default_on(os.getcwd(), agent, key)
+            if not on and _TPC_UNREADABLE:
+                raise TpcUnreadable(why)
             if not on:
                 raise CiProblem(f"time per card is not set up yet: {why}")
         r = tpc_run(sid, tp, ended == "1", key, agent["workbook_id"].lower())
@@ -15506,6 +15584,8 @@ def _tpc_bg(args):
                (f"; finished {r['retried']} earlier sends" if r.get("retried") else "") + \
                (f"; folded {len(r['folded'])} finished cards" if r["folded"] else "") + \
                (f"; fold not done: {ci_clean(r['fold_problem'], 200)}" if r["fold_problem"] else "")
+    except TpcUnreadable:
+        line = tpc_unreadable_line()
     except CiProblem as e:
         line = f"time per card: not sent: {ci_clean(e, 300)}"
     except Exception as e:  # noqa: BLE001
@@ -15529,7 +15609,8 @@ def _tpc_bg_setup(args):
         if not agent or not key or not CI_WB_RE.fullmatch(str(agent.get("workbook_id") or "")):
             return 0
         on, why = tpc_default_on(os.getcwd(), agent, key)
-        line = "time per card: on by default; tabs set up" if on else f"time per card: not set up: {ci_clean(why, 300)}"
+        line = "time per card: on by default; tabs set up" if on else \
+            (tpc_unreadable_line() or f"time per card: not set up: {ci_clean(why, 300)}")
     except Exception as e:  # noqa: BLE001
         line = f"time per card: not set up: unexpected {type(e).__name__}"
     try:
