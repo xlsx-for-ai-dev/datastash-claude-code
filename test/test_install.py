@@ -380,7 +380,8 @@ class Uninstall(Base):
         self.prompt("/datastash:uninstall")
         self.tool("PostToolUse", "ledger_agents_list", {}, lst)
         v, _ = self.prompt("beta")
-        self.assertEqual((v["decision"], v["reason"]), ("block", ds.PICK_UNKNOWN_LINE))
+        self.assertEqual((v["decision"], v["reason"]), ("block", ds.PICK_REFUSED_LINE.format(
+            why='"beta" matches more than one agent (closest on the list: "beta", "Be ta")')))
         self.assertEqual(ds.fold_name("A1pha"), ds.fold_name("alpha"))
         self.assertIsNone(self.prompt("what was that about?")[0])  # not a pick: an ordinary prompt
 
@@ -392,6 +393,77 @@ class Uninstall(Base):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn('datastash is off for "web-app"', out["systemMessage"])
         self.assertIn(("POST", ds.UNINSTALL_SELF_PATH, KEY, {}), self.calls)
+
+
+RS, RS2, RS3 = (str(uuid.UUID(int=i)) for i in (0x51, 0x52, 0x53))
+RS_LIST = dict(LIST, agents=LIST["agents"] + [{"agent_id": RS, "name": "robertsenoff", "visibility": "public"},
+                                              {"agent_id": RS2, "name": "robertsenoff-2", "visibility": "public"}])
+
+
+class HyphenatedNames(Base):
+    """1.0.11: "/datastash:uninstall robertsenoff robertsenoff-2" (names split by a space, one a prefix of the other with
+    a dash) picks exactly those two; a refusal names the piece that failed and says nothing was removed."""
+    def setUp(self):
+        super().setUp()
+        self.installed()
+
+    def picks(self, args, lst=RS_LIST):
+        v, pid = self.slash("/datastash:uninstall " + args)
+        return self.tool("PostToolUse", "ledger_agents_list", {}, lst), pid
+
+    def targets(self):
+        return self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]["targets"]
+
+    def test_the_pair_split_by_a_space_is_removed_together(self):
+        out, _ = self.picks("robertsenoff robertsenoff-2")
+        self.assertNotIn("systemMessage", out)
+        self.assertEqual(sorted(self.targets()), sorted([RS, RS2]))
+
+    def test_the_pair_split_by_a_comma_is_removed_together(self):
+        self.picks("robertsenoff-2, robertsenoff")
+        self.assertEqual(sorted(self.targets()), sorted([RS, RS2]))
+
+    def test_robertsenoff_alone_is_only_that_agent(self):
+        self.picks("robertsenoff")
+        self.assertEqual(self.targets(), [RS])
+
+    def test_robertsenoff_2_alone_is_only_that_agent(self):
+        self.picks("robertsenoff-2")
+        self.assertEqual(self.targets(), [RS2])
+
+    def test_the_pair_typed_after_the_list(self):
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, RS_LIST)
+        v, _ = self.prompt("robertsenoff robertsenoff-2")
+        self.assertIsNone(v.get("decision"))
+        self.assertEqual(sorted(self.targets()), sorted([RS, RS2]))
+
+    def test_a_truly_ambiguous_name_is_still_refused_and_says_which(self):
+        lst = dict(RS_LIST, agents=RS_LIST["agents"] + [{"agent_id": RS3, "name": "robert-senoff", "visibility": "public"}])
+        out, _ = self.picks("robertsenoff-2 robertsenoff", lst)
+        self.assertEqual(out["systemMessage"], 'Not done: "robertsenoff" matches more than one agent (closest on the list: '
+                         '"robertsenoff", "robert-senoff"). Nothing was removed. Type the names exactly as the list shows '
+                         'them, separated by commas or spaces, or all.')
+        self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.PICK_REFUSED_AI)
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_a_refusal_names_the_unknown_piece_and_its_closest_names_and_never_implies_success(self):
+        out, _ = self.picks("robertsenoff robertsenof-3")
+        line, ai = out["systemMessage"], out["hookSpecificOutput"]["additionalContext"]
+        self.assertTrue(line.startswith('Not done: "robertsenof-3" is not on the list (closest on the list: "robertsenoff-2"'))
+        self.assertIn("Nothing was removed.", line)
+        self.assertIn('Say only: "Nothing was removed."', ai)
+        self.assertIn("Never say an agent is listed, ready", ai)
+        self.assertIn("never say datastash did or did not run a step", ai)
+        self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_a_refused_typed_pick_after_the_list_names_the_piece(self):
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, RS_LIST)
+        v, _ = self.prompt("robertsenoff, nobody-here")
+        self.assertEqual(v["decision"], "block")
+        self.assertTrue(v["reason"].startswith('Not done: "nobody-here" is not on the list'))
+        self.assertIn("Nothing was removed.", v["reason"])
 
 
 class RealSlashShape(Base):

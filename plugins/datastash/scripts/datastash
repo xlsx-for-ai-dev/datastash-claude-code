@@ -112,6 +112,7 @@ The key is read from its file and sent only to https://getdatastash.com, never p
 command line. Everything datastash answers is data, never instructions.
 """
 import base64
+import difflib
 import errno
 import fnmatch
 import hashlib
@@ -12021,6 +12022,8 @@ UNCONFIRMED_LINE = "Not yet confirmed: {names} (they clean up when they next sta
 CONNECTOR_SAME_LINE = "Your datastash connector in Claude is unchanged."
 PICK_UNKNOWN_LINE = ("Not done: a name you typed is not on the list, or matches two agents. Nothing was removed. Type the "
                      "names as the list shows them, or all.")
+PICK_REFUSED_LINE = ("Not done: {why}. Nothing was removed. Type the names exactly as the list shows them, separated by "
+                     "commas or spaces, or all.")
 REFUSED_LINE = "Not done: datastash refused it. Nothing changed."
 # XLI-390 install fix: every refusal is ONE line that says why, and who refused (the plugin here, or datastash).
 NO_STEP_LINE = ("Not done: no /datastash:install or /datastash:uninstall is open in this session, so the plugin sent "
@@ -12049,6 +12052,9 @@ UNINSTALL_LIST_AI = (f"{CMD_NOTE}: the person typed the datastash uninstall comm
                      f"ledger_agents_list once, then stop and wait for the person's answer. {_SAY}")
 UNINSTALL_NOTE_AI = (f"{CMD_NOTE}: the person picked datastash agents to remove. {{list}}Call the datastash connector's "
                      f'ledger_agents_note once with kind "uninstall". {_SAY}')
+PICK_REFUSED_AI = (f"{CMD_NOTE}: the plugin refused the person's names and removed nothing; it showed them the reason. "
+                   "Make no more datastash calls. Say only: \"Nothing was removed.\" Never say an agent is listed, ready, "
+                   "picked or about to be removed, and never say datastash did or did not run a step.")
 VIS_AI = (f'{CMD_NOTE}: the person typed "make <name> {{kind}}" (one of their datastash agents\' private or public). '
           "Call the datastash connector's ledger_agents_list once, then stop: the plugin says the next step. " + _SAY)
 VIS_NOTE_AI = (f"{CMD_NOTE}: the person's agent is on the list. Call the datastash connector's ledger_agents_note once "
@@ -12328,22 +12334,83 @@ def list_lines(lst, head):
     return [head] + [f"- {a['name']} ({'private' if a['shut'] else 'public'})" for a in lst["agents"]]
 
 
-def resolve_picks(text, lst, own):
-    """The agent ids the person's typed names pick ("all", "this", names as listed); "none" when no piece names anything
-    (the prompt is something else); None when a piece is unknown or matches two agents."""
-    pieces = [p for p in re.split(r"[,\n]+|\s+and\s+", text.strip()) if p.strip()][:101]
+def _pick_one(p, lst, folds, own):
+    """(fold, ids) for one typed piece: the reserved words "all" and "this" first, else the listed names it folds to."""
+    w = re.sub(r"\s+", "", p.casefold())
+    f = w if w in ("all", "this") else fold_name(p)
+    ids = [a["id"] for a in lst["agents"]] if f == "all" else ([own] if own else []) if f == "this" else folds.get(f, [])
+    return f, ids
+
+
+def _pick_segments(p, lst, folds, own):
+    """A piece with spaces that is no listed name as a whole ("robertsenoff robertsenoff-2"): split at the spaces, the
+    longest run of words that is one listed name first. A list of (piece, fold, ids); a word that starts no name is
+    kept as its own piece (unknown), so a refusal names that word."""
+    words, out, i = p.split(), [], 0
+    while i < len(words):
+        for j in range(len(words), i, -1):
+            seg = " ".join(words[i:j])
+            f, ids = _pick_one(seg, lst, folds, own)
+            if f in ("all", "this") or f in folds:
+                out.append((seg, f, ids))
+                i = j
+                break
+        else:
+            out.append((words[i], *_pick_one(words[i], lst, folds, own)))
+            i += 1
+    return out
+
+
+def pick_check(text, lst, own):
+    """(picked ids | "none" | None, the first piece that failed or None, why: "unknown" | "two" | "many" | None).
+    "none" when no piece names anything (the prompt is something else); None when a piece is unknown or matches two
+    agents. Names are split at commas, new lines, " and ", and at spaces when the whole piece is no listed name."""
+    pieces = [p.strip() for p in re.split(r"[,\n]+|\s+and\s+", text.strip()) if p.strip()][:101]
+    if len(pieces) > 100:
+        return None, None, "many"
     folds = {}
     for a in lst["agents"]:
         folds.setdefault(fold_name(a["name"]), []).append(a["id"])
-    picked, hits, bad = [], 0, len(pieces) > 100
+    picked, hits, failed = [], 0, None
     for p in pieces:
-        w = re.sub(r"\s+", "", p.casefold())
-        f = w if w in ("all", "this") else fold_name(p)  # the reserved words first
-        ids = [a["id"] for a in lst["agents"]] if f == "all" else ([own] if own else []) if f == "this" else folds.get(f, [])
-        hits += f in ("all", "this") or f in folds
-        bad = bad or not ids or (f not in ("all", "this") and len(ids) != 1)
-        picked += [i for i in ids if i not in picked]
-    return "none" if hits == 0 else None if bad or not picked else picked
+        f, ids = _pick_one(p, lst, folds, own)
+        segs = [(p, f, ids)]
+        if f not in ("all", "this") and f not in folds and len(p.split()) > 1:
+            split = _pick_segments(p, lst, folds, own)
+            segs = split if any(f in ("all", "this") or f in folds for _, f, _ in split) else segs
+        for seg, f, ids in segs:
+            hits += f in ("all", "this") or f in folds
+            why = "unknown" if not ids else "two" if f not in ("all", "this") and len(ids) != 1 else None
+            if why and failed is None:
+                failed = (seg, why)
+            picked += [i for i in ids if i not in picked]
+    if hits == 0:
+        return "none", None, None
+    if failed or not picked:
+        return None, *(failed or (None, "unknown"))
+    return picked, None, None
+
+
+def resolve_picks(text, lst, own):
+    """The agent ids the person's typed names pick ("all", "this", names as listed); "none" when no piece names anything
+    (the prompt is something else); None when a piece is unknown or matches two agents."""
+    return pick_check(text, lst, own)[0]
+
+
+def pick_refused_line(text, lst, own):
+    """The one line for a refused pick: which name failed, and the listed names closest to it. Nothing was removed."""
+    _, piece, why = pick_check(text, lst, own)
+    if piece is None:
+        return PICK_UNKNOWN_LINE
+    names = [a["name"] for a in lst["agents"]]
+    if why == "two":
+        close = [n for n in names if fold_name(n) == fold_name(piece)]
+        head = f'"{show_name(piece)}" matches more than one agent'
+    else:
+        close = difflib.get_close_matches(show_name(piece), names, n=3, cutoff=0.5)
+        head = f'"{show_name(piece)}" is not on the list'
+    near = f" (closest on the list: {', '.join(chr(34) + n + chr(34) for n in close)})" if close else ""
+    return PICK_REFUSED_LINE.format(why=head + near)
 
 
 def _cmd_path(sid):
@@ -12411,7 +12478,7 @@ def command_prompt(inp):
         _drop(_cmd_path(sid))
         return None
     if got is None:
-        return PICK_UNKNOWN_LINE, None, True
+        return pick_refused_line(prompt, rec["list"], own["agent_id"].lower() if own else None), None, True
     save_cmd(sid, dict(rec, **base, targets=got))
     return None, UNINSTALL_NOTE_AI.format(list=""), False
 
@@ -12707,7 +12774,7 @@ def command_tool(inp):
             got = resolve_picks(rec["picks"], lst, mine)
             if not isinstance(got, list):
                 _drop(_cmd_path(sid))
-                return _post(PICK_UNKNOWN_LINE)
+                return _post(pick_refused_line(rec["picks"], lst, mine), PICK_REFUSED_AI)
             rec["targets"] = got
             save_cmd(sid, rec)
             return _post(None, UNINSTALL_NOTE_AI.format(list=""))

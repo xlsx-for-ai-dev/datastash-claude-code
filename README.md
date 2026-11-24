@@ -457,6 +457,12 @@ To make one private: say make <name> private.
 To make one public: say make <name> public.
 ```
 
+**Uninstall names (1.0.11).** Names after `/datastash:uninstall` (or typed after the list) are split at commas, new
+lines, " and ", and at spaces when the whole piece is no listed name (the longest run of words that is one name first),
+so `robertsenoff robertsenoff-2` picks those two. Names match whole (case, spaces, dashes and look-alike letters folded),
+never by prefix; a name that folds onto two agents is still refused. A refusal names the piece that failed and the listed
+names closest to it, says nothing was removed, and tells the AI to say only that.
+
 **make <name> private / make <name> public** (plugin 1.0.1). Typed as the whole prompt in an agent's session, with the
 name as the list shows it (several names separated by commas; "all" and "this" are not names here, so "make this
 private" stays an ordinary prompt). The AI calls `ledger_agents_list`; if no agent has that name, nothing is sent and the
@@ -919,7 +925,9 @@ An agent can send datastash a capability request, an error report or anything el
   this session's own agent, the AI's own agent_proof always replaced or dropped, never on register or key, never to a
   server that is not datastash's, never in a log, and the proof files denied to Bash and file tools.
 - `python3 -I test/test_install.py`: `/datastash:install` and `/datastash:uninstall` (plugin 1.0.0; the home-folder
-  install with the owner's real 1.0.1 note inputs, the reused session agent and the one-line refusals in 1.0.2). The slash commands
+  install with the owner's real 1.0.1 note inputs, the reused session agent and the one-line refusals in 1.0.2; in 1.0.11
+  names split by spaces, as in "/datastash:uninstall robertsenoff robertsenoff-2", and a refusal that names the piece that
+  failed with its closest listed names and tells the AI to say only "Nothing was removed."). The slash commands
   pass the typed check only in the entry shape Claude Code 2.1.330 really writes for a typed plugin command
   (`test/fixtures/slash-command-2.1.330.jsonl` and `-hooks.json`, copied from a real interactive session and only renamed
   and given placeholder ids): the message tag, then the name, the args only when there are some; origin human, no
