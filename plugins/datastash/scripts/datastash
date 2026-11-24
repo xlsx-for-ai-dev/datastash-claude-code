@@ -54,6 +54,9 @@ Subcommands (run `datastash help`):
                             Code transcripts here and sends minutes, tool calls and token counts per card, activity and
                             model; only counts, model names, activity labels and card ids, never prompt, code or command
                             text. Past 10,000 Burn rows it folds finished cards into their Cards cost row
+  heartbeat [STEP [--tab T] [--column C] | off]  XLI-392 N2: while this folder's agent uses tools, touch STEP's row
+                            (tab T, default "Card steps"; column C, default last_seen) at most once a minute, in the
+                            background; a touch never adds a row. DATASTASH_STEP / DATASTASH_STEP_TAB name it too
   off NAME                  turn NAME's folders off on this computer (no datastash calls from them), switch it off on
                             datastash with its own key, and move its key file to ~/.config/datastash/off/
   watch                     print one line each time new messages arrive (for a Monitor loop)
@@ -5669,6 +5672,7 @@ def login_approval_note(inp):
 
 def _agent_tool(inp):
     hook_heartbeat("tool", inp, throttle=TOOL_HEARTBEAT_EVERY)
+    step_touch_hook(inp)  # XLI-392 N2: the step heartbeat (background, at most once a minute; never adds a row)
     try:
         tsid = inp.get("session_id") if isinstance(inp, dict) else None
         turn_used_tool(tsid if isinstance(tsid, str) and re.fullmatch(SID_RE, tsid) else None, inp)
@@ -14056,6 +14060,152 @@ def _tpc_bg(args):
     return 0
 
 
+# --- XLI-392 N2: the step heartbeat (EPM 11-23: a heartbeat with no model). While a session of this folder's agent uses
+# tools, the PostToolUse hook touches the agent's step row: POST /api/v1/agent/rows/touch (x-live #484) sets the row's
+# last_seen (or the named column) to now on the row with that key, and only there; datastash never adds a row for a
+# touch (no such row: 404, nothing written), and the plugin sends nothing else. At most once per STEP_TOUCH_SECONDS per
+# folder and step, from a detached background run, so a tool call is never slowed. The step is named by
+# `datastash heartbeat STEP [--tab TAB] [--column COLUMN]` in the folder (or DATASTASH_STEP / DATASTASH_STEP_TAB in the
+# session's environment); `datastash heartbeat off` stops it. Never in the person's main session, an off or a private
+# folder. With N1 (a deadline on a row) this makes "quiet for N minutes" mean no tool use for N minutes.
+STEP_TOUCH_PATH = "/api/v1/agent/rows/touch"
+STEP_CONF = os.path.join(CONF, "heartbeat.json")  # {"projects": {folder: {"key", "tab", "column", "at"}}}
+STEP_TOUCH_SECONDS = 60.0
+STEP_TAB_DEFAULT = "Card steps"
+STEP_USAGE = ("usage: datastash heartbeat [STEP [--tab TAB] [--column COLUMN] | off]   (touch STEP's row in TAB, default "
+              f'"{STEP_TAB_DEFAULT}", column last_seen, while this folder\'s agent uses tools)')
+STEP_NAME_RE = re.compile(r"[^\x00-\x1f\x7f]{1,200}")
+
+
+def _step_settings():
+    s = read_json(STEP_CONF, {})
+    return s if isinstance(s.get("projects"), dict) else {"projects": {}}
+
+
+def step_for(folder):
+    """{"key", "tab", "column"} for this folder's heartbeat, or None. DATASTASH_STEP (and DATASTASH_STEP_TAB) win."""
+    env = os.environ.get("DATASTASH_STEP", "").strip()
+    if env:
+        st = {"key": env, "tab": os.environ.get("DATASTASH_STEP_TAB", "").strip() or STEP_TAB_DEFAULT, "column": "last_seen"}
+    else:
+        st = _step_settings()["projects"].get(os.path.realpath(folder))
+    if not isinstance(st, dict) or not all(isinstance(st.get(k), str) and STEP_NAME_RE.fullmatch(st[k])
+                                           for k in ("key", "tab", "column")):
+        return None
+    return {k: st[k] for k in ("key", "tab", "column")}
+
+
+def step_touch_hook(inp):
+    """PostToolUse (from _agent_tool): when this folder's agent has a step, start a touch at most every
+    STEP_TOUCH_SECONDS. Never raises, never prints."""
+    try:
+        if not isinstance(inp, dict) or inp.get("hook_event_name") != "PostToolUse":
+            return
+        folder = project_of(inp)
+        st = step_for(folder)
+        if st is None or off_here(inp) or private_here(inp):
+            return
+        agent = _own_agent(inp)
+        if agent is None or not read_key(agent["slug"]):
+            return
+        stamp = os.path.join(STATE, "step-touch-" + _tpc_hash(agent["slug"], st["tab"], st["key"], st["column"]) + ".json")
+        try:
+            if time.time() - os.stat(stamp).st_mtime < STEP_TOUCH_SECONDS:
+                return
+        except OSError:
+            pass
+        ensure_dirs()
+        last = read_json(stamp, {}).get("last")
+        write_private(stamp, json.dumps({"at": int(time.time()), "last": last}))  # first, so a burst starts one touch
+        spawn_detached([sys.executable, os.path.realpath(__file__), "heartbeat", "run", agent["slug"], stamp],
+                       os.path.realpath(folder))
+    except Exception:  # noqa: BLE001 a hook never fails a session
+        pass
+
+
+def step_touch(key, wb, st):
+    """One touch: "ok", "no row" (404: nothing was added), or a short problem word. Only the touch route is called."""
+    try:
+        api_json("POST", STEP_TOUCH_PATH, key, body={"workbook_id": wb, "tab": st["tab"], "key": st["key"],
+                                                     "column": st["column"]}, timeout=20)
+        return "ok"
+    except ApiError as e:
+        return "no row" if e.status == 404 else f"HTTP {e.status}"
+    except (OSError, ValueError, httpclient.HTTPException):
+        return "unreachable"
+
+
+def _step_bg(args):
+    """The background touch: one log line only when the outcome changed (a new problem, or ok again)."""
+    if len(args) != 2 or not re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,63}", args[0]) \
+            or os.path.dirname(os.path.realpath(args[1])) != os.path.realpath(STATE) \
+            or not re.fullmatch(r"step-touch-[0-9a-f]{16}\.json", os.path.basename(args[1])):
+        return 1
+    s, stamp = args
+    try:
+        agent = read_json(conf_path(s), None)
+        key = read_key(s)
+        folder = os.getcwd()
+        st = step_for(folder)
+        if not agent or not key or st is None or not CI_WB_RE.fullmatch(str(agent.get("workbook_id") or "")):
+            return 0
+        out = step_touch(key, agent["workbook_id"].lower(), st)
+        rec = read_json(stamp, {})
+        if rec.get("last") != out:
+            write_private(stamp, json.dumps({"at": int(time.time()), "last": out}))
+            line = "heartbeat: touching the step row again" if out == "ok" else (
+                f"heartbeat: no row {disp(st['key'])} in {disp(st['tab'])}; nothing added (add the step row first)"
+                if out == "no row" else f"heartbeat: not touched ({out})")
+            with open(log_path(s), "a") as f:
+                f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def cmd_heartbeat(args):
+    """`datastash heartbeat [STEP [--tab TAB] [--column COLUMN] | off]`: this folder's step heartbeat."""
+    if args and args[0] == "run":
+        return _step_bg(args[1:])
+    if args and args[0] in ("-h", "--help"):
+        print(STEP_USAGE)
+        return 0
+    folder = os.path.realpath(project_of({}))
+    if not args:
+        st = step_for(folder)
+        print(f'heartbeat is on for this folder: step "{disp(st["key"])}" in tab "{disp(st["tab"])}", column '
+              f'{disp(st["column"])}' if st else f"heartbeat is off for this folder. {STEP_USAGE}")
+        return 0
+    s = _step_settings()
+    if args == ["off"]:
+        s["projects"].pop(folder, None)
+        ensure_dirs()
+        write_private(STEP_CONF, json.dumps(s))
+        print("heartbeat is off for this folder: no step row is touched")
+        return 0
+    step, tab, column, rest = args[0], STEP_TAB_DEFAULT, "last_seen", args[1:]
+    while rest:
+        if rest[0] in ("--tab", "--column") and len(rest) > 1:
+            tab, column = (rest[1], column) if rest[0] == "--tab" else (tab, rest[1])
+            rest = rest[2:]
+        else:
+            print(STEP_USAGE)
+            return 1
+    if not all(STEP_NAME_RE.fullmatch(x) and x.strip() for x in (step, tab, column)) or step.startswith("-"):
+        print(STEP_USAGE)
+        return 1
+    if _own_agent({}) is None:
+        print("heartbeat: this folder has no datastash agent; nothing changed")
+        return 1
+    s["projects"][folder] = {"key": step, "tab": tab, "column": column, "at": int(time.time())}
+    ensure_dirs()
+    write_private(STEP_CONF, json.dumps(s))
+    print(f'heartbeat is on for this folder: while this agent uses tools, the row "{disp(step)}" in tab "{disp(tab)}" '
+          f'gets {disp(column)} set to now, at most once a minute; a touch never adds a row (add the step row first). '
+          f'To stop: datastash heartbeat off')
+    return 0
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     args = sys.argv[2:]
@@ -14068,7 +14218,7 @@ def main():
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report,
-             "time-per-card": cmd_time_per_card}
+             "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

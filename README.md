@@ -311,6 +311,16 @@ time-per-card off` stops it, and `datastash time-per-card` says which it is.
   short and finished later (even a day later) never counts twice; a Burn row that took more since keeps that part. The
   totals and shares are always the engine's formula columns.
 
+## Step heartbeat (plugin 1.0.5, XLI-392 N2)
+
+`datastash heartbeat STEP [--tab TAB] [--column COLUMN]`, run in a project folder by its agent, names the agent's
+current step row (tab default "Card steps", column default `last_seen`; `DATASTASH_STEP` and `DATASTASH_STEP_TAB` in
+the session's environment name it too). While a session of that agent uses tools, the plugin touches that row at most
+once a minute, in the background with no model involved: `POST /api/v1/agent/rows/touch` sets the column to now on
+the row with that key only. A touch never adds a row; with no such row datastash answers 404, the agent's log says so
+once, and nothing else is sent. Never in the person's main session or an off or private folder. `datastash heartbeat
+off` stops it. With a deadline on the row, "quiet for N minutes" then means no tool use for N minutes.
+
 ## Lookups kept ready (plugin 0.6.0)
 
 Agents repeat slow lookups: where a PR stands, how CI went, the state of a card. The plugin counts them on this computer
@@ -883,6 +893,9 @@ An agent can send datastash a capability request, an error report or anything el
   projects folder never read; the fold past the limit (oldest first, never this send's card, sums into `folded_*`, rows
   removed, a cut-short fold finished once, also a day later; never on an older Cards cost tab); a failed session-end
   send finished by the next session once, its taken parts never again.
+- `python3 -I test/test_step_heartbeat.py`: the step heartbeat (XLI-392 N2): off until a step is named (or
+  `DATASTASH_STEP`), only on PostToolUse of the folder's own agent, at most once a minute; only the touch route is
+  called, never an add; a 404 logged once.
 - `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
   for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
   without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the
