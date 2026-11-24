@@ -247,7 +247,7 @@ class NoCallsWhenOff(OffBase):
             hs = (self.tool(name) or {}).get("hookSpecificOutput") or {}
             self.assertEqual(hs.get("permissionDecision"), "deny", name)
         hs = (self.tool("mcp__claude_ai_Other__rows_get") or {}).get("hookSpecificOutput") or {}
-        self.assertNotEqual(hs.get("permissionDecision"), "deny")
+        self.assertNotIn("off in this folder", hs.get("permissionDecisionReason", ""))  # (clean sessions refuses it)
 
     def test_a_ledger_tool_in_an_on_folder_is_not_denied(self):
         hs = (self.tool("mcp__claude_ai_Ledger__ledger_rows_get") or {}).get("hookSpecificOutput") or {}
@@ -565,6 +565,7 @@ class TokenHelperDeny(OffBase):
                 self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], ds.TOKEN_DENY)
 
     def test_other_datastash_commands_and_other_tools_are_not_denied(self):
+        ds.set_clean(commands=False)  # XLI-396: this checks the token deny only, not the clean sessions refusal
         for name, ti in (("Bash", {"command": "datastash status"}), ("Bash", {"command": "datastash login --check"}),
                          ("Bash", {"command": "git log --oneline -3"}), ("Bash", {"command": "echo token"}),
                          ("Read", {"file_path": "/x/README.md"})):

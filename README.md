@@ -70,7 +70,7 @@ Requires `python3` (3.8 or later, standard library only) and Claude Code with pl
 
    When it asks where to install, pick "for you". (Or in your shell: `claude plugin marketplace add
    xlsx-for-ai-dev/datastash-claude-code`, then `claude plugin install datastash@datastash`.)
-3. **Restart Claude Code.**
+3. **Type `/exit`, then start `claude` again.**
 4. **Connect once.** Type `/mcp`, pick datastash, choose Authenticate, and sign in. This is needed only once.
 5. **Make this session an agent.** Type `/datastash:install`. If it says "Type /mcp, pick datastash, choose
    Authenticate, then run /datastash:install again.", do that one step and type `/datastash:install` again.
@@ -97,12 +97,11 @@ In Claude chat on claude.ai, the desktop app and Cowork, nothing changes: the da
 usual **Connect** button. The plugin needs no shell or keychain there.
 
 **Updating from 0.1.x.** An install that signed in through `/mcp` Authenticate keeps that sign-in working. The plugin
-decides this from its own files only: if an earlier datastash version left any state on this computer, it is an
-updated install and keeps the connector's own sign-in; with no datastash state at all it is a fresh install, which
-signs in with `/mcp` Authenticate. It never opens, reads or checks Claude Code's own sign-in file or keychain entries. An updated
-install's session start shows the same device link and code, worded as "datastash has a new sign-in for this
-computer"; once you approve one, the new sign-in takes over for good. Thirty days after the first run of 0.2.0 it
-takes over anyway, with one line a week before. `datastash doctor` shows the mode, since when, and what the connector gets on this host.
+decides this from its own files only and never opens, reads or checks Claude Code's own sign-in file or keychain
+entries. Since 1.0.0 no session start shows a sign-in link or code and the plugin starts no sign-in by itself: a
+computer that already has a datastash login from an earlier version (`datastash login`) keeps using it, and anything
+else signs in with `/mcp` Authenticate (step 4). If `/mcp` shows datastash as not connected after an update, choose
+Authenticate there once. `datastash doctor` shows the mode, since when, and what the connector gets on this host.
 
 About `datastash login`:
 
@@ -159,11 +158,29 @@ Two choices of your own, each on or off by itself, for all your agents on this c
   back in plain words, so your session stays readable and its context stays small.
 - **No code in sessions** (off from the start): code reading, writing and code blocks stay in subagents too.
 
-The session start gives the agent the rules only for what is on. While commands through subagents is on, a Bash call by
-the main session (Claude Code's hook input carries `agent_id` only inside a subagent) gets one line, "Clean sessions: hand
-this to a subagent.", at most once every 5 minutes per session. It is a nudge, never a block, and the command itself is
-never read. Type "no code in sessions", "turn off clean sessions", "turn on clean sessions" or "code in sessions"; the
-plugin saves it and the agent confirms in one line.
+The session start gives the agent the rules only for what is on. Clean sessions enforces subagents (plugin 1.0.3,
+XLI-396): while either choice is on, the main session (Claude Code's hook input carries `agent_id` only inside a
+subagent) runs only tools that can't change a file or run code, and every other tool is refused with one fixed line:
+"Clean sessions is on: hand this to a subagent (Agent tool), then report the result in plain words." It is deny by
+default: the main session runs Read, Grep, Glob, Agent (Task), SendMessage, TaskStop, ListAgents, ReadNotifications,
+ToolSearch, AskUserQuestion, WebFetch and WebSearch, and the datastash connector's read-only tools, plus the
+connector steps the plugin checks or writes itself (an agent's sign-up and key, the "datastash main" step, the
+install, uninstall and private/public notes, and the chat save). Edit, Write, PowerShell, a skill, every other
+datastash write, any other MCP tool, and any tool it doesn't know (a future one too) are refused. Every tool that runs a command (Bash, Monitor, or any tool input with a `command`) goes through one check:
+one short read-only lookup (never in the background), and under a Monitor also `datastash watch`. A read-only lookup
+is a single command from this list, made only of plain words and quoted literals: no shell metacharacter outside
+quotes (`;`, `&`, `|`, `<`, `>`, `(`, `)`, newline), no glob or brace (`*`, `?`, `[`, `]`, `{`, `}`) outside quotes,
+and no `#`, `$`, backtick, backslash or `!` anywhere, nothing but plain ASCII. The list: `ls`, `cat`, `head`, `tail`
+(never following), `grep`, `wc`, `git status`, `git log`, `git diff`, `git show` (no `git -C` or `-c`), `gh pr view`
+(not `--web`), `curl -s <url>` (a GET to stdout: only `-s -S -f -L -I` and their long forms, no `[ ]` or `{ }` in the
+URL), and the reads of the plugin's own `datastash` command (`status`, `check`, `read INBOX`, `api GET PATH`; never
+`api POST` or any write). Each command has its own list of options; a long option must be spelled out in full
+(`tail --fol` is refused) and anything off the list is refused, as is a file under `/dev`, `/proc` or `/sys`. If the
+check itself fails, the main session's call is refused (only the tools above still run). With no code in sessions on,
+`cat`, `head`, `tail`, `grep`, `git diff`, `git show` and `git log -p` are
+refused too. Subagents are never refused, and neither is your datastash main session. Nothing is capped and no command text is repeated. Type "no code in sessions", "turn off clean sessions"
+(which turns both off, and with them every refusal), "turn on clean sessions" or "code in sessions"; the plugin saves
+it and the agent confirms in one line.
 
 ## Project map (plugin 0.7.0)
 
@@ -782,6 +799,12 @@ An agent can send datastash a capability request, an error report or anything el
   is said again by the listener. X6: "make <name> private" / "make <name> public" signed over the list's agent id like uninstall,
   the server's fixed line shown only over names on the list, model-typed text refused, unknown names left as ordinary
   prompts, and the after-install lines.
+- `python3 -I test/test_clean.py`: clean sessions (plugin 0.8.0; enforced in 1.0.3, XLI-396): the two choices and their
+  phrases, the session-start rules, and the refusal: deny by default (Monitor, PowerShell, an unknown tool and an MCP
+  write refused; the allowed tools and the datastash connector's reads still run; a glob or brace refused), the main
+  session's Edit, Write, MultiEdit and NotebookEdit and its writing Bash (redirects, pipes, chains, substitutions, background runs, anything off the list) refused with the one
+  line, read-only lookups and the `datastash` reads let through (bypass tricks such as `ls x#;touch F` tried in a real bash, never running), datastash writes and abbreviated long options refused, no code in sessions refusing the lookups that show
+  code, subagents never refused, and "turn off clean sessions" ending it all.
 - `python3 -I test/test_ci_report.py`: `datastash ci-report` (plugin 0.9.11): a canary in a failure's message, text,
   stdout and stderr never sent or printed, only allow-listed fields; a DOCTYPE, billion laughs and an outside entity
   refused; rows folded; flaky in either order (also across legs that ran different tests), at once (counted once), in a
@@ -796,6 +819,11 @@ An agent can send datastash a capability request, an error report or anything el
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key
   on the machine: the person types "datastash main" there, the session turns into the main, and it wakes as the person.
+- `test/e2e-install.sh` (live, needs tmux and claude) types the Install steps above into a real interactive Claude
+  Code on an empty HOME, in the home folder and in a fresh repo folder: marketplace add, install "for you", restart,
+  `/mcp` datastash must offer Authenticate and its link must open datastash's sign-in page, and `/datastash:install`
+  must reach the plugin with the right agent name. `E2E_TAG=v1.0.1 test/e2e-install.sh` runs it on an older release
+  (1.0.1 fails it). Finishing the sign-in and the steps after it are not run there (see the script header).
 - `test/wake-test.sh` proves the idle wake on this box with the test account (needs tmux; see the script header).
   `BURST=5 test/wake-test.sh` sends 5 messages within seconds instead and passes when the session wakes once or
   twice and handles all 5.

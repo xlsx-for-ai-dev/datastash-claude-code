@@ -5198,6 +5198,14 @@ def cmd_agent_tool(_args):
         print(json.dumps(tdeny), flush=True)
         return _agent_tool(inp)
     try:
+        cdeny = clean_block(inp)  # XLI-396: clean sessions enforces subagents (the main session's writes are refused)
+    except Exception:  # noqa: BLE001  review 2: can't tell in the main session's PreToolUse: refused (fails closed)
+        cdeny = CLEAN_DENY if (isinstance(inp, dict) and inp.get("hook_event_name") == "PreToolUse"
+                               and not inp.get("agent_id") and inp.get("tool_name") not in CLEAN_ALLOWED_TOOLS) else None
+    if cdeny is not None:
+        print(json.dumps(cdeny), flush=True)
+        return 0  # the call never runs, so it carries nothing to record
+    try:
         cmd_out = command_tool(inp)  # XLI-390 P1: install and uninstall calls, collect, install notes
     except (Exception, SystemExit):  # fail closed: a note call goes out only with the plugin's own input
         is_note = str(inp.get("tool_name") or "").endswith("__ledger_agents_note")
@@ -5259,14 +5267,6 @@ def cmd_agent_tool(_args):
         out = out or {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
         hs = out["hookSpecificOutput"]
         hs["additionalContext"] = (hs.get("additionalContext", "") + " " + hint).strip()
-    try:
-        nudge = clean_nudge(inp)  # XLI-386: the main session's Bash call, while commands through subagents is on
-    except Exception:
-        nudge = None
-    if nudge:
-        out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
-        hs = out["hookSpecificOutput"]
-        hs["additionalContext"] = (hs.get("additionalContext", "") + " " + nudge).strip()
     if proofed is not None:  # XLI-351: the proof rewrite goes out with any sign-in line (PreToolUse only)
         out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
         out["hookSpecificOutput"]["updatedInput"] = proofed
@@ -6996,10 +6996,10 @@ def install_update_lines():
 # a personal thing"; each is chosen by itself). Kept in the per-person settings file beside the keep answer.
 CLEAN_DEFAULTS = {"commands": True, "no_code": False}  # commands through subagents: on; no code in sessions: off
 CLEAN_NOTE = "datastash note (clean sessions; the person's own choices)"
-CLEAN_NUDGE = "Clean sessions: hand this to a subagent."
-CLEAN_NUDGE_EVERY = 300  # seconds: at most one nudge per session in this time
-CLEAN_COMMANDS_RULE = ("Commands through subagents is on: hand shell commands to a subagent instead of running them in "
-                       "this session, and ask it to report back in plain words only (what changed, the result, any "
+CLEAN_BLOCK = "Clean sessions is on: hand this to a subagent (Agent tool), then report the result in plain words."
+CLEAN_COMMANDS_RULE = ("Commands through subagents is on: this session doesn't edit files or run shell commands itself (the "
+                       "plugin refuses them here; only a short read-only lookup runs). Hand the work to a subagent "
+                       "(Agent tool), and ask it to report back in plain words only (what changed, the result, any "
                        "blocker), with no commands or output.")
 CLEAN_NO_CODE_RULE = ("No code in sessions is on: code reading and writing go to a subagent too, and this session shows "
                       "no code and no code blocks; the subagent reports in plain words.")
@@ -7042,31 +7042,268 @@ def clean_session_text(cur=None):
             "choice; never comment on it.")
 
 
-def _clean_nudge_path(sid):
-    return os.path.join(STATE, f"clean-nudge-{sid}.json")
+# XLI-396 (owner 11-23: clean sessions ENFORCES subagents; a block, not a nudge). Deny by default (review 2: a deny-list
+# of named tools let Monitor and PowerShell through): the main session (no agent_id) runs only the tools on
+# CLEAN_ALLOWED_TOOLS, which can't change a file or run code, and the read-only tools of the datastash connector. Every
+# other tool is refused, an unknown or future one included, and so is any MCP tool that writes (but the connector steps
+# the plugin checks or writes itself, CLEAN_DS_STEP_TOOLS). Every tool that runs a
+# command (Bash, Monitor, PowerShell, or any tool input with a "command") goes through the one check, clean_command_ok:
+# one short read-only lookup from the allow-list below, or a read of the plugin's own datastash command (Monitor also
+# `datastash watch`). No code in sessions also refuses the lookups that show file text.
+CLEAN_ALLOWED_TOOLS = frozenset((
+    "Read", "Grep", "Glob",  # read files only
+    "Agent", "Task",  # hand the work to a subagent (Task is the older name of Agent)
+    "SendMessage", "TaskStop", "ListAgents", "ReadNotifications",  # talk to, stop and list agents and their notices
+    "ToolSearch", "AskUserQuestion",  # load a tool's schema; ask the person
+    "WebFetch", "WebSearch",  # read the web
+    # 1.0.3 review MEDIUM: harmless tools a person's normal use needs. Enter plan mode (only narrows the session); the
+    # to-do and task lists (Claude Code's own list state, at a path it fixes; no path, file or command from the model);
+    # read a background task's output; list MCP resources. Left out on purpose: ExitPlanMode (saves the model's plan
+    # text to a plan file and changes the permission mode), Skill (a skill's !`command` lines run a shell command when
+    # it loads, outside this hook) and ReadMcpResourceTool (saves a binary resource to a file on disk, from any server).
+    "EnterPlanMode", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput",
+    "ListMcpResourcesTool",
+))
+CLEAN_COMMAND_TOOLS = ("Bash", "Monitor")  # the shell tools the check below understands (PowerShell is another shell)
+# The datastash connector's read-only tools (readOnlyHint true in datastash's own tool list).
+CLEAN_DS_READ_TOOLS = frozenset((
+    "ledger_help", "ledger_workbook_list", "ledger_workbook_open", "ledger_rows_get", "ledger_rows_filter",
+    "ledger_rows_aggregate", "ledger_rows_since", "ledger_report", "ledger_changes", "ledger_export",
+    "ledger_job_status", "ledger_agent_list", "ledger_agents_list", "ledger_inbox_read", "ledger_inbox_sent",
+    "ledger_timer_list", "ledger_watch_list", "ledger_account_link", "checkin",
+))
+# The datastash connector's own steps, which the plugin checks or writes itself: an agent's sign-up and its key (the
+# pickup binding; the key never reaches the model), the "datastash main" step (ledger_person_watch), the install,
+# uninstall and private/public notes (command_tool writes the whole input or refuses it) and the chat save (with the
+# chat_key the plugin holds). None edits a file or runs code. Every other datastash write is refused.
+CLEAN_DS_STEP_TOOLS = frozenset(("ledger_agent_register", "ledger_agent_key", "ledger_person_watch",
+                                 "ledger_agents_note", "chat_save"))
+# Each lookup: its allowed subcommands (None: no subcommand) and, per subcommand, the short option letters (digits are
+# always allowed in a short option, for -n5, -A3, -U1), the long options taken bare, and the long options taken as
+# --name=VALUE. A long option must be spelled out in full and be on its list: GNU getopt and git take any unambiguous
+# prefix (tail --fol is --follow), so anything not listed, abbreviations included, is refused.
+_CL_HEAD = ("ncqvz", {"--quiet", "--silent", "--verbose", "--zero-terminated"}, {"--lines", "--bytes"})
+CLEAN_OPTS = {
+    "ls": ("aAlhrRtSd1FpisGgnouUXvQkc", {"--all", "--almost-all", "--human-readable", "--recursive", "--reverse",
+                                          "--directory", "--classify", "--size", "--inode"}, {"--color", "--sort"}),
+    "cat": ("nbAEsTvet", {"--number", "--number-nonblank", "--show-all", "--squeeze-blank", "--show-ends",
+                          "--show-tabs", "--show-nonprinting"}, set()),
+    "head": _CL_HEAD,
+    "tail": _CL_HEAD,  # never -f, -F, --follow (or a prefix of it), --retry, --pid, -s: those never end
+    "wc": ("lwcmL", {"--lines", "--words", "--bytes", "--chars", "--max-line-length"}, set()),
+    "grep": ("rRniIlLvwcHhoqsEFxaABCme", {"--recursive", "--dereference-recursive", "--line-number", "--ignore-case",
+                                          "--files-with-matches", "--files-without-match", "--invert-match",
+                                          "--word-regexp", "--line-regexp", "--count", "--with-filename",
+                                          "--no-filename", "--only-matching", "--quiet", "--silent", "--no-messages",
+                                          "--extended-regexp", "--fixed-strings", "--text"},
+             {"--include", "--exclude", "--exclude-dir", "--max-count", "--after-context", "--before-context",
+              "--context", "--regexp", "--color", "--colour", "--binary-files"}),
+    "git status": ("sbuvz", {"--short", "--branch", "--porcelain", "--untracked-files", "--ignored", "--long",
+                             "--verbose", "--show-stash", "--renames", "--no-renames"},
+                   {"--porcelain", "--untracked-files", "--ignored"}),
+    "git log": ("np", {"--oneline", "--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--graph",
+                       "--decorate", "--all", "--reverse", "--no-merges", "--merges", "--first-parent",
+                       "--abbrev-commit", "--patch", "--follow", "--no-color", "--summary", "--branches", "--tags",
+                       "--remotes", "--date-order", "--topo-order", "--left-right"},
+                {"--format", "--pretty", "--since", "--until", "--after", "--before", "--author", "--committer",
+                 "--grep", "--max-count", "--date", "--decorate", "--skip"}),
+    "git diff": ("Uwb", {"--stat", "--shortstat", "--numstat", "--name-only", "--name-status", "--cached",
+                         "--staged", "--no-color", "--ignore-all-space", "--ignore-space-change", "--check",
+                         "--summary", "--merge-base", "--word-diff"}, {"--unified", "--diff-filter", "--stat"}),
+    "git show": ("sU", {"--oneline", "--stat", "--shortstat", "--numstat", "--name-only", "--name-status",
+                        "--no-patch", "--summary", "--abbrev-commit", "--no-color"},
+                 {"--format", "--pretty", "--unified", "--stat"}),
+    "gh pr view": ("cqRt", {"--comments", "--json", "--jq", "--repo", "--template"},
+                   {"--json", "--jq", "--repo", "--template"}),  # never -w/--web: it opens a browser
+}
+CLEAN_SHOWS_CODE = ("cat", "head", "tail", "grep", "git diff", "git show")  # refused too while no code in sessions is on
+CLEAN_CURL_FLAGS = {"-s", "-S", "-f", "-L", "-I", "-sS", "-fsS", "-sSf", "-fsSL", "-sL", "-sSL", "-fs", "-sf", "-fsL",
+                    "--silent", "--show-error", "--fail", "--location", "--head"}
+_CLEAN_DS = r'(?:datastash|(?:python3 )?"\$\{CLAUDE_PLUGIN_ROOT\}/(?:bin|scripts)/datastash")'  # on PATH, or the plugin's
+_CLEAN_DS_PREFIX = re.compile(_CLEAN_DS + r"(?= |$)")
+_CLEAN_BARE = r"[A-Za-z0-9_./:=,@%+~^-]"  # no shell meaning at all: no glob (* ? [ ]), brace ({ }), quote, $, `, \, #,
+# !, ;, &, |, <, > or ( ): review 2, a glob is expanded after the check (cat /pro?/self/environ), so none is let through
+_CLEAN_WORD = re.compile(r"(?:" + _CLEAN_BARE + r"+|'[^']*'|\"(?:" + _CLEAN_BARE + r"| )*\")+")
+_CLEAN_PIECE = re.compile(_CLEAN_BARE + r"+|'([^']*)'|\"([^\"]*)\"")
+_CLEAN_MAIN_STEP = re.compile(r"(?:printf '%s\\n' 'dsmk_[A-Za-z0-9_-]{6,200}' \| DS main --key -|DS main(?: --on| --workbook "
+                              r"[0-9a-fA-F-]{36})?|DS login(?: --check)?)(?: 2>&1)?"
+                              .replace("DS", _CLEAN_DS))
 
 
-def clean_nudge(inp):
-    """PreToolUse Bash in the main session (Claude Code's hook input carries agent_id only inside a subagent) while
-    commands through subagents is on: the one nudge line, at most once per CLEAN_NUDGE_EVERY per session; else None.
-    Never a block, and the command itself is never read. The person's datastash main session is never nudged."""
-    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse" or inp.get("tool_name") != "Bash":
-        return None
-    if inp.get("agent_id"):
+def _clean_words(cmd):
+    """The words of a command made only of plain words and quoted literals, unquoted; None for anything else. Bash
+    gives every allowed character its literal meaning (single quotes keep everything literal, double quotes here hold
+    no $, `, \\ or "; no unquoted glob or brace), so the words are exactly what the program gets."""
+    words, pos = [], 0
+    while True:
+        while cmd.startswith(" ", pos):
+            pos += 1  # runs of spaces between words
+        if pos >= len(cmd):
+            return words
+        m = _CLEAN_WORD.match(cmd, pos)
+        if m is None or (m.end() < len(cmd) and cmd[m.end()] != " "):
+            return None
+        part, pos = m.group(0), m.end()
+        words.append("".join(m.group(1) if m.group(1) is not None else m.group(2) if m.group(2) is not None
+                             else m.group(0) for m in _CLEAN_PIECE.finditer(part)))
+
+
+def _clean_ds_read(args):
+    """Only the datastash command's read subcommands: status (and its list views), check, read INBOX, help, and
+    api GET PATH (no body). Every write (api POST, status-set, send, reply, link, off, keep, ...) is refused."""
+    if args in ([], ["status"], ["status", "--all"], ["status", "--all", "--install"], ["check"], ["help"]):
+        return True
+    if len(args) == 3 and args[0] == "status" and args[1] in ("--details", "--more") and re.fullmatch(r"\d{1,3}", args[2]):
+        return True
+    if len(args) == 2 and args[0] == "read" and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", args[1]):
+        return True
+    return len(args) == 3 and args[0] == "api" and args[1].upper() == "GET" and args[2].startswith("/")
+
+
+def _clean_opts_ok(spec, args, tail=False):
+    letters, bare, valued = spec
+    prev = None
+    for a in args:
+        if a == "--" or not a.startswith("-") or a == "-":
+            if tail and a.startswith("+") and prev not in ("-n", "-c", "--lines", "--bytes"):
+                return False  # tail +1f is the old form of tail -f
+            prev = a
+            continue
+        if a.startswith("--"):
+            name, eq, _v = a.partition("=")
+            if not (name in valued if eq else name in bare):
+                return False
+        elif not all(c.isdigit() or c in letters for c in a[1:]):
+            return False
+        prev = a
+    return True
+
+
+def _clean_path_ok(arg, cwd):
+    """A file argument that is a device, /proc or /sys is refused (it can never end, or holds the process's secrets)."""
+    try:
+        p = os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(arg)))
+    except (OSError, ValueError):
+        return False
+    return not re.match(r"/(?:dev|proc|sys)(?:/|$)", p)
+
+
+def clean_lookup_ok(cmd, no_code=False, cwd=None, watch=False):
+    """True only for one short read-only lookup: a single command from CLEAN_OPTS (or a read of the plugin's own
+    datastash command) made of plain words and quoted literals. Any shell metacharacter outside a quoted literal, any
+    "#", backslash, "$", backtick or "!" anywhere, any non-ASCII or control character, and any option not on that
+    command's list is refused. With watch (a Monitor), `datastash watch` and `datastash watch --person` too: the
+    main session's watchers. Anything it can't parse is refused."""
+    try:
+        return _clean_lookup_ok(cmd, no_code, cwd, watch)
+    except Exception:  # noqa: BLE001  can't tell: refused
+        return False
+
+
+def _clean_lookup_ok(cmd, no_code, cwd, watch=False):
+    if not isinstance(cmd, str) or len(cmd) > 2000 or not re.fullmatch(r"[\x20-\x7e]+", cmd):
+        return False  # ASCII printable only: no newline, tab, control or look-alike character
+    cmd = cmd.strip(" ")
+    if not cmd:
+        return False
+    if _CLEAN_MAIN_STEP.fullmatch(cmd):
+        return True  # the person's own switch-on steps
+    m = _CLEAN_DS_PREFIX.match(cmd)
+    rest = cmd[m.end():] if m else cmd  # the one fixed "${CLAUDE_PLUGIN_ROOT}" spelling is the only $ ever let through
+    if any(c in rest for c in "#`$\\!"):
+        return False
+    if m:
+        words = _clean_words(rest)
+        return words is not None and (_clean_ds_read(words) or watch and words in (["watch"], ["watch", "--person"]))
+    words = _clean_words(cmd)
+    if not words:
+        return False
+    me = os.path.realpath(__file__)
+    ds = words[1:] if words[0] == "python3" else words
+    if ds and ds[0].startswith("/") and os.path.realpath(ds[0]) == me:
+        return _clean_ds_read(ds[1:]) or watch and ds[1:] in (["watch"], ["watch", "--person"])  # this script by path
+    name = words[0]
+    if name == "curl":
+        args = words[1:]
+        urls = [a for a in args if not a.startswith("-")]
+        short = [a[1:] for a in args if a.startswith("-") and not a.startswith("--")]
+        return (len(urls) == 1 and re.fullmatch(r"https?://[^\s\[\]{}]+", urls[0]) is not None  # no curl URL globbing
+                and all(a in CLEAN_CURL_FLAGS for a in args if a.startswith("-"))
+                and ("--silent" in args or any("s" in a for a in short)))  # -s: a quiet GET to stdout, nothing else
+    if name in ("git", "gh"):
+        sub = next((k for k in CLEAN_OPTS if k.startswith(name + " ") and words[1:len(k.split())] == k.split()[1:]),
+                   None)
+        if sub is None:
+            return False  # also git -C, git -c, git --exec-path, gh --web: only the listed subcommands, first
+        args = words[len(sub.split()):]
+    elif name in CLEAN_OPTS:
+        sub, args = name, words[1:]
+    else:
+        return False
+    if no_code and sub in CLEAN_SHOWS_CODE:
+        return False
+    if no_code and sub == "git log" and any(a == "--patch" or (a.startswith("-") and not a.startswith("--")
+                                                                and "p" in a) for a in args):
+        return False  # a log with patches shows code
+    if not _clean_opts_ok(CLEAN_OPTS[sub], args, tail=sub == "tail"):
+        return False
+    if name in ("cat", "head", "tail", "grep", "wc"):
+        return all(_clean_path_ok(a, cwd) for a in args if not a.startswith("-"))
+    return True
+
+
+def clean_command_ok(tool, ti, no_code=False, cwd=None):
+    """The one check for every tool that runs a command in the main session: Bash (never in the background) and Monitor
+    (a command, never a WebSocket) run only what clean_lookup_ok lets through, and Monitor also `datastash watch`.
+    PowerShell and any other tool with a "command" are refused: the check reads bash only."""
+    if tool not in CLEAN_COMMAND_TOOLS or not isinstance(ti, dict):
+        return False
+    if tool == "Bash" and ti.get("run_in_background"):
+        return False
+    if tool == "Monitor" and ti.get("ws") is not None:
+        return False
+    return clean_lookup_ok(ti.get("command"), no_code, cwd=cwd, watch=tool == "Monitor")
+
+
+def clean_tool_ok(inp, no_code=False):
+    """True for a main-session call clean sessions lets run; False for everything else (deny by default)."""
+    tool, ti = inp.get("tool_name"), inp.get("tool_input")
+    if not isinstance(tool, str) or not tool:
+        return False
+    if tool in CLEAN_COMMAND_TOOLS or (isinstance(ti, dict) and "command" in ti):
+        return clean_command_ok(tool, ti, no_code, cwd=inp.get("cwd"))  # Bash, Monitor, PowerShell, any command
+    if tool in CLEAN_ALLOWED_TOOLS:
+        return True
+    if not tool.startswith("mcp__") or "__" not in tool[5:]:
+        return False  # Edit, Write, MultiEdit, NotebookEdit, PowerShell, Skill, any unknown or future tool
+    server, name = tool[5:].split("__", 1)
+    # datastash's own: a server named so or on datastash's URL, or a ledger_ tool on any server (a claude.ai connector
+    # the person renamed); another server's tool may write, so it is refused
+    if not server or not (name.startswith("ledger_") or "datastash" in server.lower() or _trusted_connector(inp, tool)):
+        return False
+    return name in CLEAN_DS_READ_TOOLS or name in CLEAN_DS_STEP_TOOLS
+
+
+def clean_block(inp):
+    """XLI-396: the PreToolUse deny for the main session (Claude Code's hook input carries agent_id only inside a
+    subagent) while either clean sessions choice is on, or None. Deny by default: only clean_tool_ok's calls run. A
+    subagent is never refused; nor is the person's datastash main session (it keeps its own rules). The refusal is the
+    one fixed line; the command is never repeated."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse" or inp.get("agent_id"):
         return None
     sid = inp.get("session_id")
-    if not (isinstance(sid, str) and re.fullmatch(SID_RE, sid)) or os.path.exists(_main_path(sid)):
+    if isinstance(sid, str) and re.fullmatch(SID_RE, sid) and os.path.exists(_main_path(sid)):
         return None
-    if not clean_settings()["commands"]:
+    cur = clean_settings()
+    if not (cur["commands"] or cur["no_code"]):
         return None
-    path = _clean_nudge_path(sid)
-    now = int(time.time())
-    last = read_json(path, {}).get("at")
-    if isinstance(last, int) and 0 <= now - last < CLEAN_NUDGE_EVERY:
+    if clean_tool_ok(inp, cur["no_code"]):
         return None
-    ensure_dirs()
-    write_private(path, json.dumps({"at": now}))
-    return CLEAN_NUDGE
+    return CLEAN_DENY
+
+
+CLEAN_DENY = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                     "permissionDecisionReason": CLEAN_BLOCK}}
 
 
 CLEAN_PHRASES = (

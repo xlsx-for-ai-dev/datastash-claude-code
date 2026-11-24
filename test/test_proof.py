@@ -36,6 +36,7 @@ def updated(out):
 class ProofBase(PrivateBase):
     def setUp(self):
         super().setUp()
+        ds.set_clean(commands=False)  # XLI-396: an agent's datastash writes, in a session clean sessions doesn't refuse
         ds.note_private({"agent_id": OWN_ID, "private": False}, OWN_ID)
         ds.write_private(ds.proof_path("web-app"), PROOF + "\n")
         self.other = self.other_folder("docs")
