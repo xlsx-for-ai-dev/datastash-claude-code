@@ -733,11 +733,7 @@ class OptIn(Base):
             rc = ds.cmd_time_per_card(list(args))
         return rc, out.getvalue()
 
-    def test_off_until_on_then_the_hooks_start_a_background_send(self):
-        self.assertEqual(self.hook("SubagentStop"), 0)
-        self.assertEqual(self.spawned, [])
-        rc, out = self.say()
-        self.assertIn("time per card is off", out)
+    def test_on_then_the_hooks_start_a_background_send(self):
         rc, out = self.say("on")
         self.assertEqual(rc, 0, out)
         self.assertIn("time per card is on", out)
@@ -781,7 +777,116 @@ class OptIn(Base):
         rc, out = self.say("on")
         self.assertEqual(rc, 1)
         self.assertIn("not set up", out)
+        self.assertIsNone(ds.tpc_choice(self.folder))  # still never chose: on by default, set up later
+
+    # --- plugin 1.0.12: on by default (owner 11-24); a typed off is kept for good
+    def in_folder(self, fn):
+        old = os.getcwd()
+        os.chdir(self.folder)
+        try:
+            return fn()
+        finally:
+            os.chdir(old)
+
+    def settings(self):
+        with open(ds.TPC_PATH) as f:
+            return json.load(f)
+
+    def test_a_new_install_gives_on(self):
+        self.assertIsNone(ds.tpc_choice(self.folder))
+        inp = {"session_id": SID, "transcript_path": self.main, "cwd": self.folder}
+        ds.tpc_install_kick(inp)
+        self.assertEqual(self.spawned, [([ds.sys.executable, os.path.realpath(ds.__file__), "time-per-card", "setup",
+                                          "web-app"], self.folder)])
+        self.assertEqual(self.in_folder(lambda: ds.cmd_time_per_card(["setup", "web-app"])), 0)
+        self.assertEqual([a for n, a in self.fake.calls if n == "ledger_feeds_setup"], [{"workbook_id": WB, "services": ["burn"]}])
+        self.assertEqual(ds.tpc_choice(self.folder), "on")
+        self.assertEqual(self.settings()["projects"][self.folder]["by"], "default")
+        self.assertIn(ds.TPC_ON_LINE, ds.after_install(inp))
+        self.assertEqual(ds.TPC_ON_LINE, "Time per card is on. To turn it off, type: datastash time-per-card off")
+        rc, out = self.say()
+        self.assertIn("time per card is on for this folder", out)
+        ds.tpc_install_kick(inp)  # set up once: a second install starts nothing
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_an_existing_never_chose_install_becomes_on(self):
+        self.fake.card_tab = "Time per card"
+        rc, out = self.say()
+        self.assertIn("time per card is on (by default)", out)
+        self.assertEqual(self.hook("SubagentStop"), 0)
+        self.assertEqual([a[0][-5:] for a in self.spawned], [["run", "web-app", SID, self.main, "0"]])
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(5, [("Edit", {"file_path": "/a"})])
+        self.assertEqual(self.in_folder(lambda: ds.cmd_time_per_card(["run", "web-app", SID, self.main, "0"])), 0)
+        self.assertEqual([n for n, a in self.fake.calls][0], "ledger_feeds_setup")  # the tabs first, then the send
+        self.assertEqual(ds.tpc_choice(self.folder), "on")
+        self.assertEqual(ds._tpc_card_tab(WB), "Time per card")
+        self.assertIn("XLI-378", self.fake.tabs["Time per card"])
+        self.assertTrue(self.burn())
+        self.assertNotIn(CANARY, self.fake.sent_text())
+        self.in_folder(lambda: ds.cmd_time_per_card(["run", "web-app", SID, self.main, "1"]))
+        self.assertEqual(len([n for n, a in self.fake.calls if n == "ledger_feeds_setup"]), 1)  # set up once
+
+    def test_a_failed_default_set_up_sends_nothing_and_waits_an_hour(self):
+        self.fake.fail_next = [OSError("down")]
+        log = Log(self.main)
+        log.prompt(0)
+        log.turn(5, [("Edit", {"file_path": "/a"})])
+        self.in_folder(lambda: ds.cmd_time_per_card(["run", "web-app", SID, self.main, "0"]))
+        self.assertIsNone(ds.tpc_choice(self.folder))
+        self.assertEqual([n for n, a in self.fake.calls], ["ledger_feeds_setup"])
+        self.assertEqual(self.hook("SubagentStop"), 0)
+        self.assertEqual(self.spawned, [])  # tried in the last hour: wait
+        s = self.settings()
+        s["default_tried"][self.folder] -= ds.TPC_DEFAULT_RETRY
+        ds.write_private(ds.TPC_PATH, json.dumps(s))
+        self.hook("SubagentStop")
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_an_existing_off_install_stays_off(self):
+        ds.write_private(ds.TPC_PATH, json.dumps({"projects": {self.folder: {"on": False, "at": 1}}}))
+        self.assertEqual(ds.tpc_choice(self.folder), "off")
         self.assertFalse(ds.tpc_is_on(self.folder))
+        for event in ("SessionStart", "SubagentStop", "SessionEnd"):
+            self.hook(event)
+        inp = {"session_id": SID, "transcript_path": self.main, "cwd": self.folder}
+        ds.tpc_install_kick(inp)
+        self.assertEqual(self.spawned, [])
+        self.assertNotIn(ds.TPC_ON_LINE, ds.after_install(inp))
+        self.in_folder(lambda: ds.cmd_time_per_card(["setup", "web-app"]))  # a late install set-up: the off stands
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(ds.tpc_choice(self.folder), "off")
+        self.assertIn("time per card is off", self.say()[1])
+
+    def test_the_off_switch_works(self):
+        rc, out = self.say("off")
+        self.assertEqual(rc, 0)
+        self.assertIn("time per card is off for this folder", out)
+        self.assertEqual(ds.tpc_choice(self.folder), "off")
+        self.hook("SubagentStop")
+        self.hook("SessionEnd")
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.fake.calls, [])
+        self.assertIsNone(ds.tpc_default_on(self.folder, {"workbook_id": WB}, KEY)[1])  # a default never overrides it
+        self.assertEqual(ds.tpc_choice(self.folder), "off")
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.say("on")[0], 0)  # only a typed on turns it back on
+        self.assertEqual(ds.tpc_choice(self.folder), "on")
+        self.assertNotIn("by", self.settings()["projects"][self.folder])
+
+    def test_a_typed_off_during_a_default_set_up_wins(self):
+        real = self.fake.mcp_tool
+
+        def setup_then_off(key, name, args, timeout=60):
+            got = real(key, name, args, timeout)
+            if name == "ledger_feeds_setup":
+                self.say("off")
+            return got
+        ds.mcp_tool = setup_then_off
+        on, _why = ds.tpc_default_on(self.folder, {"workbook_id": WB}, KEY)
+        self.assertFalse(on)
+        self.assertEqual(ds.tpc_choice(self.folder), "off")
 
     def test_the_hooks_are_wired_beside_the_others(self):
         with open(os.path.join(HERE, "..", "plugins", "datastash", "hooks", "hooks.json")) as f:

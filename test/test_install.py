@@ -46,7 +46,8 @@ LIST = {"list_id": LIST_ID, "expires_in_seconds": 600,
                    {"agent_id": BETA, "name": "beta", "visibility": "public"}]}
 TOOL = "mcp__claude_ai_datastash__"
 OWN_TOOL = "mcp__plugin_datastash_datastash__"  # the plugin's own connector (https://getdatastash.com/mcp): trusted by URL
-PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path", "hook_input")
+PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path", "hook_input",
+           "spawn_detached")
 
 
 def real_entries(name):
@@ -73,6 +74,8 @@ class Base(unittest.TestCase):
         ds._stop_listener = lambda s: self.calls.append(("stop", s))
         gone = os.path.join(root, "gone-tombstone")
         ds._gone_path = lambda: gone
+        self.spawned = []
+        ds.spawn_detached = lambda argv, cwd: self.spawned.append((argv, cwd))
 
         def fake_http(method, path, key=None, body=None, form=None, timeout=40, accept=None):
             self.calls.append((method, path, key, body))
@@ -208,14 +211,15 @@ class Install(Base):
         self.assertEqual(done, "datastash is on for your agents:\n- web-app (public)\n- alpha (private)\n- beta (public)\n"
                                "To remove one or many: /datastash:uninstall and we'll show you the list of agents.\n"
                                "To make one private: say make <name> private.\n"
-                               "To make one public: say make <name> public.")
+                               "To make one public: say make <name> public.\n"
+                               "Time per card is on. To turn it off, type: datastash time-per-card off")
 
     def test_the_only_agent_gets_the_list_with_no_note(self):
         self.installed()
         self.slash("/datastash:install")
         out = self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:1]))
         self.assertEqual(out["systemMessage"], "datastash is on for your agents:\n- web-app (public)\n" + ds.REMOVE_LINE
-                         + "\n" + ds.PRIVATE_LINE + "\n" + ds.PUBLIC_LINE)
+                         + "\n" + ds.PRIVATE_LINE + "\n" + ds.PUBLIC_LINE + "\n" + ds.TPC_ON_LINE)
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_a_list_without_visibility_shows_private(self):

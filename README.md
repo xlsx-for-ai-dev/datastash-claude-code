@@ -330,13 +330,21 @@ datastash xlsx-test out/invoice.xlsx --set invoice --sha "$GITHUB_SHA" --branch 
   `datastash xlsx-test: did not run: no engine key. Run: npx xlsx-for-ai login (a link and a code, about a minute; the
   free plan covers test runs). Then run this again.` and exits 2. A brake answered with `Retry-After: 0` is still paced: at least 1 second before the next try.
 
-## Time per card (plugin 1.0.5)
+## Time per card (plugin 1.0.5; on by default from 1.0.12)
 
-`datastash time-per-card on`, run once in a project folder by its agent, turns time per card on for that folder and sets
-up the agent workbook's tabs (`ledger_feeds_setup {services: ["burn"]}`): **Burn** (one row per card, activity and model:
-minutes, tool calls and token counts), **Cards cost** (one total row per card) and **Prices** (your price per million
-tokens per model, so models can be weighed against each other). Until then the hooks do nothing; `datastash
-time-per-card off` stops it, and `datastash time-per-card` says which it is.
+Time per card is on. To turn it off, type: datastash time-per-card off
+
+It sets up the agent workbook's tabs (`ledger_feeds_setup {services: ["burn"]}`): **Burn** (one row per card, activity
+and model: minutes, tool calls and token counts), **Time per card** (one total row per card; **Cards cost** in an older
+workbook) and **Prices** (your price per million tokens per model, so models can be weighed against each other).
+
+- **On by default** (1.0.12). A folder whose agent never chose sets the tabs up the way `datastash time-per-card on`
+  does: in the background right after `/datastash:install`, else at its first subagent stop, session end or session
+  start; then it is on (saved as `{"on": true, "by": "default"}`). A set-up that failed is tried again at most once an
+  hour, and nothing is read or sent until it worked. Never in a folder datastash is off for.
+- **Off is kept.** `datastash time-per-card off` saves `{"on": false}` for the folder, and that choice is kept for good:
+  no default, update or install turns it back on. Only `datastash time-per-card on` does. A folder with no saved choice
+  is the one that never chose. `datastash time-per-card` says which it is ("on", "off" or "on (by default)").
 
 - **When.** At each subagent stop and session end the hook starts a background send and returns at once; a session is
   never slowed or failed by it. The send reads this session's own Claude Code transcripts on this computer (the main one
@@ -455,7 +463,10 @@ After `/datastash:install` the plugin shows which agents datastash is on (name, 
 To remove one or many: /datastash:uninstall and we'll show you the list of agents.
 To make one private: say make <name> private.
 To make one public: say make <name> public.
+Time per card is on. To turn it off, type: datastash time-per-card off
 ```
+
+The last line is left out when this folder's agent turned time per card off (plugin 1.0.12).
 
 **make <name> private / make <name> public** (plugin 1.0.1). Typed as the whole prompt in an agent's session, with the
 name as the list shows it (several names separated by commas; "all" and "this" are not names here, so "make this
@@ -972,7 +983,8 @@ An agent can send datastash a capability request, an error report or anything el
   2 with one line per problem; 1.0.9: XFA_API_KEY wins over the key the engine login saved, which is used otherwise and
   never printed; with neither it prints the sign-in line and exits 2 with nothing sent; Retry-After 0 still pauses 1
   second.
-- `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5; 1.0.7 the saved `card_tab`): off until `on` (which sets up the tabs), the
+- `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5; 1.0.7 the saved `card_tab`; 1.0.12 on by default: a new
+  install and a never-chose folder set the tabs up and are on, a typed off stays off, the off switch works), the
   hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's
   tokens counted once; active minutes only (no question, permission prompt, compaction or pause time; whole minutes
   sent, the rest carried); minutes without the person's typing time and with side-by-side calls counted once; wakes and
