@@ -56,7 +56,8 @@ Subcommands (run `datastash help`):
                             times, tokens, cost and a hash of the output are sent, never prompts or outputs. Agent key and
                             workbook as for ci-report. Always exits 0
   xlsx-test <file.xlsx> --set NAME [--sha S] [--record [--cells "Sheet!B7,..."]]
-                            a CI step: the produced file goes to the engine with your engine key (XFA_API_KEY), which
+                            a CI step: the produced file goes to the engine with your engine key (XFA_API_KEY, else
+                            the key `npx xlsx-for-ai login` saved), which
                             recalculates it, checks stale saved values and answers one comparison formula per expected
                             cell on tab "Expected outputs" (ledger_feeds_setup "outputs"); results into that tab and
                             "Output runs". --record copies the engine's values as expected. The file never goes to
@@ -5197,8 +5198,11 @@ def proof_file_deny(inp):
 # variables, a glob or brace, a symlink, any letter case, or split into pieces; nor any call that searches, copies or
 # archives a folder holding them (home, ~/.config, /), nor a keychain read of the datastash items. Only the listener
 # logs (state/agent-<name>.log) stay readable. The plugin's own scripts read the keys themselves, outside any tool call.
-KEY_DENY = ("datastash: the datastash folder (~/.config/datastash) holds this computer's datastash keys, so no tool call "
-            "reads, searches, lists or copies it, or searches a folder that holds it, and the keychain's datastash items "
+# 1.0.9: the engine login's folder (~/.xlsx-for-ai, its config.json holds the engine key xlsx-test uses) is guarded the
+# same way, all of it (it has no readable log).
+KEY_DENY = ("datastash: the datastash folder (~/.config/datastash) and the engine login's folder (~/.xlsx-for-ai) hold "
+            "this computer's keys, so no tool call "
+            "reads, searches, lists or copies them, or searches a folder that holds them, and the keychain's datastash items "
             "are never read. Don't work around it: use the datastash command (`datastash status`), read only the "
             "listener logs (state/agent-<name>.log), and search a narrower folder.")
 # Tools whose input is only prose or ids (a subagent's own tool calls are checked by its own hook calls)
@@ -5227,14 +5231,23 @@ KEY_FUNC_RE = re.compile(r"\b(?:read_key|read_main_key|_keychain_get|_answer_kc_
 KEY_RUN_RE = re.compile(r"\b(?:python[0-9.]*|node|perl|ruby|php|deno|bun|osascript|exec|import|runpy|sourcefileloader"
                         r"|importlib)\b")
 # Text written into a file (a script run later) that names the folder, other than a listener log
-KEY_FOLDER_TEXT_RE = re.compile(r"/\.config/datastash(?!/state/agent-[a-z0-9@][a-z0-9@\-]{0,99}\.log(?:\.1)?(?![\w./-]))",
-                                re.I)
+KEY_FOLDER_TEXT_RE = re.compile(r"/\.config/datastash(?!/state/agent-[a-z0-9@][a-z0-9@\-]{0,99}\.log(?:\.1)?(?![\w./-]))"
+                                r"|/\.xlsx-for-ai(?![\w-])", re.I)
+KEY_ENGINE_DIR = ".xlsx-for-ai"  # in HOME: the engine login's folder, all of it secret
+
+
+def _key_dot_skip(name, part):
+    """True when a wildcard part can't name the engine login's folder: like the shell (and Python's glob), a wildcard
+    matches a leading dot only when the part itself starts with one (so a bare * in the home folder is not a read of it;
+    .* or .x* is). A command that turns on dotglob is refused before this (see _key_text_deny)."""
+    return name.lower() == KEY_ENGINE_DIR and not part.startswith(".") and "**" not in part
 KEY_MAX_WORDS = 20000
 KEY_MAX_GLOB = 5000
 
 
 def _key_roots():
-    """The protected folders (each as written and as its real path, lowercased) and the main folders' marker files."""
+    """The protected folders (each as written and as its real path, lowercased), and the paths secret with all under them:
+    the main folders' marker files and the engine login's folder (~/.xlsx-for-ai)."""
     dirs, files = set(), set()
     for d in (CONF, os.path.join(HOME, ".config", "datastash")):
         for f in (os.path.normpath(os.path.abspath(d)), os.path.realpath(d)):
@@ -5247,6 +5260,9 @@ def _key_roots():
         for f in (os.path.normpath(os.path.abspath(os.path.join(m, MAIN_MARKER))),
                   os.path.realpath(os.path.join(m, MAIN_MARKER))):
             files.add(f.lower())
+    e = os.path.join(HOME, KEY_ENGINE_DIR)
+    for f in (os.path.normpath(os.path.abspath(e)), os.path.realpath(e)):
+        files.add(f.lower())
     return dirs, files
 
 
@@ -5274,7 +5290,7 @@ def _key_class(p, roots):
             return "secret"
         holds = holds or _key_within(r, low)
     for f in files:
-        if low == f:
+        if _key_within(low, f):  # the path itself or anything under it (the engine login's folder)
             return "secret"
         holds = holds or _key_within(f, low)
     return "holds" if holds else None
@@ -5312,7 +5328,7 @@ def _key_glob(pattern):
             continue
         pat = part.replace("**", "*").lower()
         for n in names:
-            if fnmatch.fnmatchcase(n.lower(), pat):
+            if fnmatch.fnmatchcase(n.lower(), pat) and not _key_dot_skip(n, part):
                 todo.append((os.path.join(base, n), i + 1))
     return found + [b for b, _i in todo]
 
@@ -5327,7 +5343,7 @@ def _key_glob_class(pattern, roots):
         for i in range(min(len(pc), len(rc))):
             if pc[i] == "**" or "**" in pc[i]:
                 return "secret"
-            if not fnmatch.fnmatchcase(rc[i], pc[i]):
+            if not fnmatch.fnmatchcase(rc[i], pc[i]) or (pc[i] != rc[i] and _key_dot_skip(rc[i], pc[i])):
                 break
         else:
             if len(pc) < len(rc):
@@ -5400,9 +5416,11 @@ def _key_text_deny(text, cwd, roots, recurse_tool=False, ancestors=True):
     squashed = re.sub(r"[\s'\"\\+,`]|\$\(|[()]", "", str(text)).lower()
     if KEY_NAME_RE.search(squashed) or KEY_NAME_RE.search(low):
         return True
-    for r in list(roots[0]) + ["/.config/datastash"]:
+    for r in list(roots[0]) + list(roots[1]) + ["/.config/datastash", "/" + KEY_ENGINE_DIR]:
         if squashed.count(r) > re.sub(r"\s", "", low).count(r):
             return True  # the folder's path split into pieces
+    if "dotglob" in low and any(c in t for c in KEY_GLOB_CHARS):
+        return True  # a wildcard that matches dot folders could name the engine login's folder
     if KEYCHAIN_READ_RE.search(low) and ("datastash" in low or re.search(r"dump-keychain|\bsearch\b", low)):
         return True
     if KEY_FUNC_RE.search(t) and KEY_RUN_RE.search(low):
@@ -5462,8 +5480,8 @@ def key_path_deny(inp):
         if name == "Glob" and isinstance(args.get("pattern"), str):
             paths.append(os.path.join(where, _key_norm(args["pattern"]).strip()))
         worst = {"secret"} | ({"holds"} if name == "Grep" else set())
-        for x in paths:
-            for f in _key_forms(_key_norm(x).strip(), [cwd]):
+        for x in [b for x in paths for b in _key_braces(_key_norm(x).strip())]:
+            for f in _key_forms(x, [cwd]):
                 k = _key_glob_class(f[1], roots) if isinstance(f, tuple) else _key_class(f, roots)
                 hit = hit or k in worst
         hit = hit or KEY_NAME_RE.search(json.dumps(args)) is not None
@@ -13597,7 +13615,8 @@ def cmd_eval_report(args):
 # moved, could not be checked or is stale, 2 when the test could not run (no key, no file, the engine unreachable). A
 # datastash write that fails after the engine answered is one line and does not change the exit code.
 XT_USAGE = ("usage: datastash xlsx-test <file.xlsx> --set NAME [--sha SHA] [--branch B] [--run-url U] [--workbook ID] "
-            "[--record [--cells \"Sheet!B7,Sheet!C9\"] [--tolerance 0]]  (engine key in XFA_API_KEY, agent key in "
+            "[--record [--cells \"Sheet!B7,Sheet!C9\"] [--tolerance 0]]  (engine key in XFA_API_KEY, else the one "
+            "`npx xlsx-for-ai login` saved; agent key in "
             "DATASTASH_AGENT_KEY, workbook id in DATASTASH_WORKBOOK_ID or --workbook)")
 XT_EXPECTED, XT_RUNS = "Expected outputs", "Output runs"
 XT_ENGINE_ORIGIN = "https://api.xlsx-for-ai.dev"
@@ -13608,10 +13627,33 @@ XT_CELL_RE = re.compile(r"\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})")
 XT_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
 XT_MIN_WAIT = 1.0  # 1.0.9: the shortest pause before trying a 429 or busy answer again (pacing, not a cap): Retry-After 0
 # would otherwise retry at once, over and over, until the deadline
-# 1.0.9: what xlsx-test says when XFA_API_KEY is not set (exit 2). The command is the engine's own device sign-in.
-XT_NO_ENGINE_KEY = ("datastash xlsx-test: did not run: no engine key. You need a free xlsx-for-ai engine key. To get one, "
-                    "run: npx xlsx-for-ai login (it shows a link and a code; about a minute). Then set XFA_API_KEY to "
-                    "that key. The free plan covers test runs.")
+# 1.0.9: what xlsx-test says when there is no engine key (exit 2): neither XFA_API_KEY nor a key saved by the engine's
+# own device sign-in. After that sign-in the next run finds the saved key by itself (xt_engine_key).
+XT_NO_ENGINE_KEY = ("datastash xlsx-test: did not run: no engine key. Run: npx xlsx-for-ai login (a link and a code, about "
+                    "a minute; the free plan covers test runs). Then run this again.")
+XT_ENGINE_CONFIG_MAX = 1024 * 1024  # a sign-in config is a few hundred bytes
+
+
+def xt_engine_config_path():
+    """Where the engine's own CLI (`npx xlsx-for-ai login`) saves its key: ~/.xlsx-for-ai/config.json, field api_key."""
+    return os.path.join(HOME, ".xlsx-for-ai", "config.json")
+
+
+def xt_engine_key():
+    """The engine key and where it came from ("env" or "login"), or ("", None): XFA_API_KEY first, then the api_key the
+    engine's login saved. The key is never printed, logged or put in any message; a config that can't be read is no key."""
+    k = os.environ.get("XFA_API_KEY", "").strip()
+    if k:
+        return k, "env"
+    try:
+        with open(xt_engine_config_path(), "rb") as f:
+            raw = f.read(XT_ENGINE_CONFIG_MAX + 1)
+        cfg = json.loads(raw.decode("utf-8")) if len(raw) <= XT_ENGINE_CONFIG_MAX else None
+    except (OSError, ValueError):
+        cfg = None
+    k = cfg.get("api_key") if isinstance(cfg, dict) else None
+    k = k.strip() if isinstance(k, str) else ""
+    return (k, "login") if k else ("", None)
 
 
 def xt_engine(path, body, engine_key, deadline, what):
@@ -13640,7 +13682,8 @@ def xt_engine(path, body, engine_key, deadline, what):
             err = err if isinstance(err, dict) else {"code": str(err)}
             code = ci_clean(err.get("code"), 60)
             if e.code in (401, 403):
-                raise CiProblem(f"{what}: the engine refused the key (HTTP {e.code}); check XFA_API_KEY")
+                raise CiProblem(f"{what}: the engine refused the key (HTTP {e.code}); check XFA_API_KEY, or run "
+                                "npx xlsx-for-ai login again")
             if e.code == 429 or code in ("busy", "rate_limited"):
                 try:
                     wait = float((e.headers or {}).get("Retry-After") or err.get("retry_after_seconds") or 5)
@@ -13909,15 +13952,17 @@ def cmd_xlsx_test(args):
     if any(a in ("-h", "--help") for a in args):
         print(XT_USAGE)
         return 0
-    engine_key = os.environ.get("XFA_API_KEY", "").strip()
+    engine_key, key_from = xt_engine_key()
     if not engine_key:
-        # 1.0.9: no engine key, no test. Checked first: nothing is read, uploaded or sent (to the engine or to datastash)
+        # 1.0.9: no engine key (neither XFA_API_KEY nor the engine login's saved key), no test. Checked first: nothing is read, uploaded or sent (to the engine or to datastash)
         # and nothing else is tried in its place.
         print(XT_NO_ENGINE_KEY)
         return 2
     try:
         if re.search(r"[\s\x00-\x1f]", engine_key):
-            raise CiProblem("XFA_API_KEY has a space or control character in it; set it to your engine key alone")
+            raise CiProblem("XFA_API_KEY has a space or control character in it; set it to your engine key alone"
+                            if key_from == "env" else "the engine key saved by npx xlsx-for-ai login has a space or "
+                            "control character in it; run npx xlsx-for-ai login again")
         o = _xt_args(args)
         key = os.environ.get("DATASTASH_AGENT_KEY", "").strip()
         if not re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key):

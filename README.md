@@ -312,7 +312,7 @@ datastash xlsx-test out/invoice.xlsx --set invoice --sha "$GITHUB_SHA" --branch 
 ```
 
 - **The engine does the work.** The file goes from CI to the engine (`https://api.xlsx-for-ai.dev`, or `XFA_API_BASE`)
-  with your own engine key in `XFA_API_KEY`: the chunked cache upload, the engine's stale-value check on that handle,
+  with your own engine key (`XFA_API_KEY`, else the key `npx xlsx-for-ai login` saved): the chunked cache upload, the engine's stale-value check on that handle,
   and one comparison formula per cell (`=ABS('Summary'!B7-(1234.5))<=0.005`, `=EXACT('Summary'!B9,"Total")`, or
   `DATE(...)` for a date). TRUE passes, FALSE fails, and anything else (an error, a decline) is "not known" and fails.
   This command compares nothing itself.
@@ -322,9 +322,13 @@ datastash xlsx-test out/invoice.xlsx --set invoice --sha "$GITHUB_SHA" --branch 
 - **Exit codes.** 0 every cell passed and no stale saved value; 1 a value moved, could not be checked or is stale (one
   line per cell); 2 the test could not run (a missing key, no file, the engine unreachable). A datastash write that fails
   after the engine answered is one line and keeps the exit code. Agent key and workbook as for ci-report.
-- **No engine key (1.0.9).** Without `XFA_API_KEY` it sends nothing anywhere and tries nothing else. It says how to get
-  a free engine key (`npx xlsx-for-ai login`: a link and a code, about a minute; the free plan covers test runs) and
-  exits 2. A brake answered with `Retry-After: 0` is still paced: at least 1 second before the next try.
+- **The engine key (1.0.9).** `XFA_API_KEY` first (a CI secret), else the `api_key` the engine's own
+  `npx xlsx-for-ai login` saved in `~/.xlsx-for-ai/config.json`, so on your own computer you sign in once and run it
+  again, with nothing to set. The key is never printed, and the plugin refuses every tool call that reaches
+  `~/.xlsx-for-ai`, in any path form, the same way it guards the datastash folder.
+- **No engine key (1.0.9).** With neither it sends nothing anywhere and tries nothing else. It prints
+  `datastash xlsx-test: did not run: no engine key. Run: npx xlsx-for-ai login (a link and a code, about a minute; the
+  free plan covers test runs). Then run this again.` and exits 2. A brake answered with `Retry-After: 0` is still paced: at least 1 second before the next try.
 
 ## Time per card (plugin 1.0.5)
 
@@ -927,7 +931,8 @@ An agent can send datastash a capability request, an error report or anything el
   `find -exec`, `xargs`, `tar`), chained `cd`s, the plugin's script loaded to call its key readers, a file written
   with a script that reads the folder, in the main session and a subagent with clean sessions off and on, never showing
   a key; ordinary project work, the listener logs, the datastash command and connector, and the plugin's own key reads
-  still work.
+  still work. 1.0.9: the same refusal for the engine login's folder (`~/.xlsx-for-ai`, all of it) in every path form; a
+  bare `*` in the home folder is not a read of it unless dotglob is on.
 - `python3 -I test/test_clean.py`: clean sessions (plugin 0.8.0; enforced in 1.0.3, XLI-396): the two choices and their
   phrases, the session-start rules, and the refusal: deny by default (Monitor, PowerShell, an unknown tool and an MCP
   write refused; the allowed tools and the datastash connector's reads still run; a glob or brace refused), the main
@@ -947,8 +952,9 @@ An agent can send datastash a capability request, an error report or anything el
   sent to datastash; a chunked upload under one handle; one engine formula per cell (number with tolerance, text with
   EXACT and doubled quotes, a date, a quoted sheet name), engine TRUE/FALSE copied, anything else "not known"; stale
   saved values fail; calls of at most 100 formulas; --record (error cells skipped, a row's tolerance kept); exit 0, 1 and
-  2 with one line per problem; 1.0.9: no engine key prints the sign-in line and exits 2 with nothing sent; Retry-After 0
-  still pauses 1 second.
+  2 with one line per problem; 1.0.9: XFA_API_KEY wins over the key the engine login saved, which is used otherwise and
+  never printed; with neither it prints the sign-in line and exits 2 with nothing sent; Retry-After 0 still pauses 1
+  second.
 - `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5; 1.0.7 the saved `card_tab`): off until `on` (which sets up the tabs), the
   hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's
   tokens counted once; active minutes only (no question, permission prompt, compaction or pause time; whole minutes

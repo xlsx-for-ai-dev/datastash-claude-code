@@ -4,7 +4,8 @@
   another MCP server's tools, an unknown tool) that names a file the plugin keeps in the datastash folder, the folder
   itself, or a main folder's marker, in every path form: absolute, relative to the session's folder or to a `cd`, ~,
   $HOME, ${HOME} and $XDG_CONFIG_HOME, a glob or a brace, a symlink to the folder or to one file, any letter case, a
-  path split into pieces, and a keychain read of the datastash items.
+  path split into pieces, and a keychain read of the datastash items. 1.0.9: the same for the engine login's folder
+  (~/.xlsx-for-ai, all of it: its config.json holds the engine key xlsx-test reads).
 - In the file tools (Read, Grep, Glob and the rest), a search of a folder that holds the datastash folder (home,
   ~/.config, /) is refused too, including a Grep with no path in such a folder. Bash and Monitor are refused only
   when their text names the folder or a key file in a literal form: normal repo work after a `cd` from a session
@@ -353,6 +354,115 @@ class StillWorks(KeyBase):
         self.assert_allowed("Grep", {"pattern": "x"}, foreign)
         self.assert_refused("Bash", {"command": "cat ../agent-keys-test.key"}, foreign)
         self.assert_refused("Bash", {"command": "ls .."}, foreign)
+
+
+# 1.0.9 review 1: the engine login's folder (~/.xlsx-for-ai: its config.json holds the engine key xlsx-test reads) is
+# guarded like the datastash folder, all of it, in every path form
+ENGINE = os.path.join(HOME, ".xlsx-for-ai")
+FAKE_ENGINE_KEY = "xfa_" + "e" * 30  # made up, never a real key
+ENGINE_FORMS = (
+    ("absolute", os.path.join(ENGINE, "config.json"), None),
+    ("the folder itself", ENGINE, None),
+    ("relative to the session's folder", os.path.join(".xlsx-for-ai", "config.json"), None),
+    ("relative with ..", os.path.join("..", "..", ".xlsx-for-ai", "config.json"), "PROJECT/src"),
+    ("tilde", "~/.xlsx-for-ai/config.json", None),
+    ("tilde folder", "~/.xlsx-for-ai/", None),
+    ("$HOME", "$HOME/.xlsx-for-ai/config.json", None),
+    ("${HOME}", "${HOME}/.xlsx-for-ai/config.json", None),
+    ("glob on the folder", "~/.xlsx-*/config.json", None),
+    ("glob on the file", "~/.xlsx-for-ai/*", None),
+    ("glob on both", "~/.x?sx-for-a*/c*", None),
+    ("brace", "~/.{xlsx-for-ai,other}/config.json", None),
+    ("symlink to the folder", "LINKS/engine-link/config.json", None),
+    ("symlink to the file", "LINKS/engine-file", None),
+    ("upper case", "~/.XLSX-For-AI/CONFIG.JSON", None),
+    ("another file in there", "~/.xlsx-for-ai/config.json.tmp-123", None),
+)
+
+
+class EngineLoginFolder(KeyBase):
+    def setUp(self):
+        super().setUp()
+        put(os.path.join(ENGINE, "config.json"), json.dumps({"client_id": "c-1", "api_key": FAKE_ENGINE_KEY}))
+        put(os.path.join(ENGINE, "config.json.tmp-123"), "made-up\n")
+        os.symlink(ENGINE, os.path.join(self.links, "engine-link"))
+        os.symlink(os.path.join(ENGINE, "config.json"), os.path.join(self.links, "engine-file"))
+        self.addCleanup(os.replace, ENGINE, os.path.join(self.links, "moved-engine"))
+
+    def form(self, raw, cwd):
+        return raw.replace("LINKS", self.links), (cwd or HOME).replace("PROJECT", self.project)
+
+    def test_every_tool_refuses_every_path_form(self):
+        for label, raw, cwd in ENGINE_FORMS:
+            p, c = self.form(raw, cwd)
+            for name, ti in (("Read", {"file_path": p}), ("Write", {"file_path": p, "content": "x"}),
+                             ("Edit", {"file_path": p, "old_string": "a", "new_string": "b"}),
+                             ("MultiEdit", {"file_path": p, "edits": []}),
+                             ("NotebookEdit", {"notebook_path": p, "new_source": "x"}),
+                             ("Grep", {"pattern": "api_key", "path": p}), ("Glob", {"pattern": "*", "path": p}),
+                             ("Bash", {"command": f"cat {p}"}), ("Bash", {"command": f'head -c 9 "{p}"'}),
+                             ("Bash", {"command": f"cp {p} /tmp/x"}), ("Bash", {"command": f"jq -r .api_key {p}"}),
+                             ("Monitor", {"command": f"tail -f {p}"}), ("mcp__files__read_file", {"path": p}),
+                             ("SomeNewTool", {"target": {"file": p}})):
+                with self.subTest(form=label, tool=name):
+                    self.assert_refused(name, ti, c)
+
+    def test_a_cd_a_split_path_and_a_script_are_refused(self):
+        for cmd in ("cd ~ && cat .xlsx-for-ai/config.json", "cd ~/.xlsx-for-ai; cat config.json",
+                    "cd ~/.xlsx-for-ai && grep -rn api_key .", "ls ~/.xlsx-for-ai",
+                    "cat ~/.xlsx''-for-ai/config.json", 'cat ~/".xlsx"-for-ai/config.json', "cat ~/.xl\\sx-for-ai/config.json",
+                    "python3 -c \"import os;print(open(os.path.expanduser('~/.xlsx'+'-for-ai/config.json')).read())\"",
+                    "node -e \"fs.readFileSync(HOME+'/.xlsx-'+'for-ai/config.json')\""):
+            with self.subTest(cmd=cmd):
+                self.assert_refused("Bash", {"command": cmd}, self.project)
+        body = "import os\nprint(open(os.path.expanduser('~/.xlsx-for-ai/config.json')).read())\n"
+        for name, ti in (("Write", {"file_path": os.path.join(self.project, "x.py"), "content": body}),
+                         ("Edit", {"file_path": os.path.join(self.project, "x.py"), "old_string": "a", "new_string": body})):
+            with self.subTest(tool=name):
+                self.assert_refused(name, ti, self.project)
+
+    def test_a_search_of_a_folder_holding_it_is_refused_in_the_file_tools(self):
+        self.assert_refused("Grep", {"pattern": "api_key", "path": HOME})
+        self.assert_refused("Glob", {"pattern": ".x*/**", "path": HOME})
+        self.assert_refused("Bash", {"command": "cat ~/.*/config.json"})
+
+    def test_the_hook_refuses_in_the_main_session_and_in_a_subagent(self):
+        for clean in (False, True):
+            ds.set_clean(commands=clean, no_code=False)
+            for agent_id in (None, "a1b2c3d4"):
+                for name, ti in (("Read", {"file_path": "~/.xlsx-for-ai/config.json"}),
+                                 ("Bash", {"command": "cat $HOME/.xlsx-for-ai/config.json"}),
+                                 ("Grep", {"pattern": "api_key", "path": "~/.xlsx-for-ai"})):
+                    with self.subTest(clean=clean, subagent=bool(agent_id), tool=name):
+                        out = self.hook(ds.cmd_agent_tool, self.call(name, ti, agent_id=agent_id))
+                        self.assertTrue(self.key_denied(out), out)
+                        self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], ds.KEY_DENY)
+                        self.assertNotIn(FAKE_ENGINE_KEY, json.dumps(out))
+        ds.set_clean(commands=False, no_code=False)
+
+    def test_ordinary_work_and_the_engine_name_are_not_refused(self):
+        p = self.project
+        for name, ti in (("Bash", {"command": "npx xlsx-for-ai login"}),
+                         ("Bash", {"command": "curl -s https://api.xlsx-for-ai.dev/healthz"}),
+                         ("Bash", {"command": "datastash xlsx-test out.xlsx --set invoice"}),
+                         ("Bash", {"command": "git status && grep -rn xlsx-for-ai ."}),
+                         ("Read", {"file_path": os.path.join(p, "src", "app.py")}),
+                         ("Write", {"file_path": os.path.join(p, "ci.yml"), "content": "run: npx xlsx-for-ai login\n"})):
+            with self.subTest(tool=name, ti=ti):
+                self.assert_allowed(name, ti, p)
+
+    def test_a_bare_wildcard_in_home_is_not_a_read_of_it_unless_dotglob_is_on(self):
+        for cmd in ("ls *", "wc -l * | tail -1", "cat ~/*/config.json"):
+            with self.subTest(cmd=cmd):
+                self.assert_allowed("Bash", {"command": cmd}, HOME)
+        for cmd in ("shopt -s dotglob; cat */config.json", "shopt -s dotglob && cat ~/*/*"):
+            with self.subTest(cmd=cmd):
+                self.assert_refused("Bash", {"command": cmd}, HOME)
+
+    def test_the_plugins_own_reader_still_gets_the_key(self):
+        old = os.environ.pop("XFA_API_KEY", None)
+        self.addCleanup(lambda: old is None or os.environ.__setitem__("XFA_API_KEY", old))
+        self.assertEqual(ds.xt_engine_key(), (FAKE_ENGINE_KEY, "login"))
 
 
 if __name__ == "__main__":

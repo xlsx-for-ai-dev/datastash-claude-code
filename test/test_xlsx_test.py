@@ -8,8 +8,10 @@
 - The engine's stale_cached_value findings fail the run; formulas go in calls of at most 100.
 - --record copies the engine's values as expected (an error cell is skipped; a row's own tolerance is kept).
 - Exit 0 all passed, 1 a value moved / not known / stale, 2 the test could not run; one line per problem, no traceback.
-- 1.0.9: no XFA_API_KEY says how to get a free engine key and exits 2 before anything is read or sent (no fallback);
-  a 429 with Retry-After 0 still pauses XT_MIN_WAIT before the next try.
+- 1.0.9: the engine key is XFA_API_KEY, else the api_key the engine's own `npx xlsx-for-ai login` saved in
+  ~/.xlsx-for-ai/config.json (a fake one in the throwaway HOME); the env var wins; the key is never printed. With
+  neither it says how to sign in and exits 2 before anything is read or sent; a 429 with Retry-After 0 still pauses
+  XT_MIN_WAIT before the next try.
 No network, no key; the fake datastash of test_ci_report, under test/harness.py.
 Run: python3 -I test/test_xlsx_test.py"""
 import json
@@ -221,7 +223,7 @@ class XlsxTest(unittest.TestCase):
         for args, key, wb, engine, want in (
                 ([self.xlsx] + good, KEY, WB, ENGINE_KEY, "network off"),
                 ([self.xlsx] + good, "", WB, ENGINE_KEY, "DATASTASH_AGENT_KEY"),
-                ([self.xlsx] + good, KEY, WB, "", "XFA_API_KEY"),
+                ([self.xlsx] + good, KEY, WB, "", "no engine key"),
                 ([self.xlsx] + good, KEY, "nope", ENGINE_KEY, "DATASTASH_WORKBOOK_ID"),
                 ([self.xlsx], KEY, WB, ENGINE_KEY, "--set is missing"),
                 ([self.xlsx] + good + ["--sha", "zz"], KEY, WB, ENGINE_KEY, "--sha"),
@@ -242,10 +244,10 @@ class XlsxTest(unittest.TestCase):
         self.assertIn("usage: datastash xlsx-test", h.stdout)
 
     def test_no_engine_key_says_how_to_get_one_and_sends_nothing(self):
-        want = ("datastash xlsx-test: did not run: no engine key. You need a free xlsx-for-ai engine key. To get one, run: "
-                "npx xlsx-for-ai login (it shows a link and a code; about a minute). Then set XFA_API_KEY to that key. "
-                "The free plan covers test runs.")
+        want = ("datastash xlsx-test: did not run: no engine key. Run: npx xlsx-for-ai login (a link and a code, about a "
+                "minute; the free plan covers test runs). Then run this again.")
         self.assertEqual(ds.XT_NO_ENGINE_KEY, want)
+        self.assertFalse(os.path.lexists(ds.xt_engine_config_path()))  # neither the env var nor a saved login
         for args in ([self.xlsx, "--set", "invoice"], [self.xlsx, "--set", "invoice", "--record"], []):
             for engine in ("", "   "):
                 r = self.run_cli(*args, engine=engine)
@@ -282,6 +284,102 @@ class XlsxTest(unittest.TestCase):
         self.assertEqual(self.engine.calls, [])
         self.assertEqual(len(self.fake.calls), calls_before)
         self.assertNotIn(self.xlsx, opened)
+
+    # --- 1.0.9 review 1: the key the engine's own login saved (~/.xlsx-for-ai/config.json, field api_key)
+
+    def login_config(self, text, move_after=True):
+        """A fake engine login config in the throwaway HOME; moved out (never deleted by hand) after the test."""
+        path = ds.xt_engine_config_path()
+        self.assertTrue(path.startswith(harness.FAKE_HOME + os.sep), path)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        if move_after:
+            self.addCleanup(os.replace, os.path.dirname(path), os.path.join(self.dir, "moved-xlsx-for-ai"))
+        return path
+
+    def env(self, **kw):
+        old_env = {k: os.environ.get(k) for k in ("DATASTASH_AGENT_KEY", "XFA_API_KEY", "DATASTASH_WORKBOOK_ID")}
+
+        def restore():
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+        os.environ.update(DATASTASH_AGENT_KEY=KEY, DATASTASH_WORKBOOK_ID=WB)
+        os.environ.pop("XFA_API_KEY", None)
+        os.environ.update(kw)
+
+    def run_cmd(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = ds.cmd_xlsx_test([self.xlsx, "--set", "invoice", "--sha", SHA])
+        return code, buf.getvalue()
+
+    def test_the_env_var_wins_over_the_saved_login(self):
+        other = "xfa_savedloginkeysavedloginkey"
+        self.login_config(json.dumps({"client_id": "c-1", "api_key": other, "telemetry": False}))
+        self.env(XFA_API_KEY=ENGINE_KEY)
+        self.assertEqual(ds.xt_engine_key(), (ENGINE_KEY, "env"))
+        self.expect("B7", "number", "1234.5")
+        code, out = self.run_cmd()  # the fake engine asserts every call carries ENGINE_KEY
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.engine.calls)
+        self.assertNotIn(other, out)
+        self.assertNotIn(ENGINE_KEY, out)
+
+    def test_the_saved_login_key_is_used_and_never_printed(self):
+        self.login_config(json.dumps({"client_id": "c-1", "api_key": "  " + ENGINE_KEY + "\n", "registered_at": "x"}))
+        for blank in (None, "", "   "):
+            with self.subTest(env=blank):
+                self.env() if blank is None else self.env(XFA_API_KEY=blank)
+                self.assertEqual(ds.xt_engine_key(), (ENGINE_KEY, "login"))
+        self.env()
+        self.expect("B7", "number", "1234.5")
+        calls_before = len(self.engine.calls)
+        code, out = self.run_cmd()
+        self.assertEqual(code, 0, out)
+        self.assertGreater(len(self.engine.calls), calls_before)
+        self.assertIn("ok set invoice", out)
+        self.assertNotIn(ENGINE_KEY, out)
+        # The real CLI with no XFA_API_KEY finds it too: past the key check (the network is off), and never shows it
+        r = self.run_cli(self.xlsx, "--set", "invoice", engine="")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("network off", r.stdout)
+        self.assertNotIn("no engine key", r.stdout)
+        self.assertNotIn(ENGINE_KEY, r.stdout + r.stderr)
+
+    def test_a_saved_key_with_a_space_is_refused_without_echoing_it(self):
+        self.login_config(json.dumps({"api_key": "xfa_bad saved"}))
+        r = self.run_cli(self.xlsx, "--set", "invoice", engine="")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("saved by npx xlsx-for-ai login has a space", r.stdout)
+        self.assertNotIn("xfa_bad", r.stdout + r.stderr)
+
+    def test_no_env_var_and_no_usable_login_exits_2_and_sends_nothing(self):
+        want = ds.XT_NO_ENGINE_KEY + "\n"
+        for text in (None, "", "not json", "[]", json.dumps({"client_id": "c-1"}), json.dumps({"api_key": ""}),
+                     json.dumps({"api_key": "   "}), json.dumps({"api_key": 12345}), json.dumps({"apiKey": ENGINE_KEY})):
+            with self.subTest(config=text):
+                path = None if text is None else self.login_config(text, move_after=False)
+                try:
+                    self.env()
+                    self.assertEqual(ds.xt_engine_key(), ("", None))
+                    engine_before, ds_before = len(self.engine.calls), len(self.fake.calls)
+                    code, out = self.run_cmd()
+                    self.assertEqual((code, out), (2, want))
+                    self.assertEqual(len(self.engine.calls), engine_before)
+                    self.assertEqual(len(self.fake.calls), ds_before)
+                    r = self.run_cli(self.xlsx, "--set", "invoice", engine="")
+                    self.assertEqual((r.returncode, r.stdout, r.stderr), (2, want, ""))
+                finally:
+                    if path is not None:  # the next case starts with no config at all (moved, never deleted by hand)
+                        os.replace(os.path.dirname(path), os.path.join(self.dir, "gone-%d" % len(os.listdir(self.dir))))
 
     def test_a_key_with_a_space_is_refused_without_echoing_it(self):
         r = self.run_cli(self.xlsx, "--set", "invoice", engine="xfa_bad key")
