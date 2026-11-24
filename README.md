@@ -299,6 +299,30 @@ datastash eval-report results.jsonl --suite checkout --version v12 --model model
 - Like ci-report, it never fails a build: every problem prints one line and exits 0. It uses the same agent key
   (`DATASTASH_AGENT_KEY`), workbook (`DATASTASH_WORKBOOK_ID` or `--workbook`), brake waits and idempotent 1,000-row pages.
 
+## Spreadsheet output tests (plugin 1.0.8)
+
+`datastash xlsx-test` fails a build when a number in a produced .xlsx moves. Set the tabs up once with
+`ledger_feeds_setup {services: ["outputs"]}`. **Expected outputs** has one row per set, sheet and cell (kind number, text
+or date; expected; tolerance). **Output runs** has one row per set and commit. The engine computes failing, fail_rate and
+ok (the answer has a ready watch, "an output test failed").
+
+```
+datastash xlsx-test out/invoice.xlsx --set invoice --record --cells "Summary!B7,Summary!B9"   # once: check the values
+datastash xlsx-test out/invoice.xlsx --set invoice --sha "$GITHUB_SHA" --branch "$GITHUB_REF_NAME" --run-url "$RUN_URL"
+```
+
+- **The engine does the work.** The file goes from CI to the engine (`https://api.xlsx-for-ai.dev`, or `XFA_API_BASE`)
+  with your own engine key in `XFA_API_KEY`: the chunked cache upload, the engine's stale-value check on that handle,
+  and one comparison formula per cell (`=ABS('Summary'!B7-(1234.5))<=0.005`, `=EXACT('Summary'!B9,"Total")`, or
+  `DATE(...)` for a date). TRUE passes, FALSE fails, and anything else (an error, a decline) is "not known" and fails.
+  This command compares nothing itself.
+- **--record** copies the engine's current values as expected (an error cell is skipped; a row's tolerance is kept
+  unless `--tolerance` is given). Run it once and check the values.
+- **The file never goes to datastash**: only set, sheet and cell names, expected and actual values, pass and counts.
+- **Exit codes.** 0 every cell passed and no stale saved value; 1 a value moved, could not be checked or is stale (one
+  line per cell); 2 the test could not run (a missing key, no file, the engine unreachable). A datastash write that fails
+  after the engine answered is one line and keeps the exit code. Agent key and workbook as for ci-report.
+
 ## Time per card (plugin 1.0.5)
 
 `datastash time-per-card on`, run once in a project folder by its agent, turns time per card on for that folder and sets
@@ -916,6 +940,11 @@ An agent can send datastash a capability request, an error report or anything el
   answers and outputs never sent or printed, only allow-listed fields; JSONL, promptfoo and Inspect read; runs folded with
   whole-number incs; `--vs` copying prev_passed (read before the write) and none for a new case; exit 0 with one line for
   every problem.
+- `python3 -I test/test_xlsx_test.py`: `datastash xlsx-test` (plugin 1.0.8): the file's bytes and the engine key never
+  sent to datastash; a chunked upload under one handle; one engine formula per cell (number with tolerance, text with
+  EXACT and doubled quotes, a date, a quoted sheet name), engine TRUE/FALSE copied, anything else "not known"; stale
+  saved values fail; calls of at most 100 formulas; --record (error cells skipped, a row's tolerance kept); exit 0, 1 and
+  2 with one line per problem.
 - `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5; 1.0.7 the saved `card_tab`): off until `on` (which sets up the tabs), the
   hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's
   tokens counted once; active minutes only (no question, permission prompt, compaction or pause time; whole minutes

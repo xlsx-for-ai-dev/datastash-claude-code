@@ -55,6 +55,12 @@ Subcommands (run `datastash help`):
                             pass at PREV so the engine flags the cases that got worse. Only names, pass, scores, counts,
                             times, tokens, cost and a hash of the output are sent, never prompts or outputs. Agent key and
                             workbook as for ci-report. Always exits 0
+  xlsx-test <file.xlsx> --set NAME [--sha S] [--record [--cells "Sheet!B7,..."]]
+                            a CI step: the produced file goes to the engine with your engine key (XFA_API_KEY), which
+                            recalculates it, checks stale saved values and answers one comparison formula per expected
+                            cell on tab "Expected outputs" (ledger_feeds_setup "outputs"); results into that tab and
+                            "Output runs". --record copies the engine's values as expected. The file never goes to
+                            datastash. Exits 1 when a value moved, could not be checked or is stale; 2 when it can't run
   time-per-card [on | off]  time per card for this folder's agent (off until on; on sets up the tabs Burn, Time per
                             card and Prices; an older workbook keeps its Cards cost tab): at each subagent stop and session end the plugin reads this session's own Claude
                             Code transcripts here and sends minutes, tool calls and token counts per card, activity and
@@ -132,6 +138,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 try:  # POSIX only; without it the connector's headersHelper still answers (see cmd_token)
     import fcntl
@@ -13575,6 +13582,364 @@ def cmd_eval_report(args):
     return 0
 
 
+# --- XLI-378 G: datastash xlsx-test, spreadsheet output tests (ledger_feeds_setup services ["outputs"]: Expected outputs,
+# one row per set, sheet and cell; Output runs, one row per set and commit).
+#
+# A CI step after the build. The produced .xlsx goes from CI straight to the engine (api.xlsx-for-ai.dev, or XFA_API_BASE)
+# with the dev's own engine key (XFA_API_KEY): its chunked cache upload, then xlsx_check on the handle (stale saved values)
+# and xlsx_eval on the handle with one comparison formula per expected cell, e.g. =ABS('Summary'!B7-(1234.5))<=0.005 or
+# =EXACT('Summary'!B9,"Total"), plus ='Summary'!B7 for the value now. The engine's TRUE is a pass, its FALSE a fail, and
+# anything else (an error, a decline) is "not known", which fails too. This command compares nothing itself; it builds the
+# formula text and copies the engine's answers into the tabs. The file never goes to datastash.
+# --record copies the engine's current values as the expected ones (for the dev to check once), for --cells or for the
+# set's rows already there.
+# Unlike ci-report this is a test: exit 0 when every cell passed and the file has no stale saved value, 1 when a value
+# moved, could not be checked or is stale, 2 when the test could not run (no key, no file, the engine unreachable). A
+# datastash write that fails after the engine answered is one line and does not change the exit code.
+XT_USAGE = ("usage: datastash xlsx-test <file.xlsx> --set NAME [--sha SHA] [--branch B] [--run-url U] [--workbook ID] "
+            "[--record [--cells \"Sheet!B7,Sheet!C9\"] [--tolerance 0]]  (engine key in XFA_API_KEY, agent key in "
+            "DATASTASH_AGENT_KEY, workbook id in DATASTASH_WORKBOOK_ID or --workbook)")
+XT_EXPECTED, XT_RUNS = "Expected outputs", "Output runs"
+XT_ENGINE_ORIGIN = "https://api.xlsx-for-ai.dev"
+XT_CHUNK = 16 * 1024 * 1024  # the engine cache's chunk size (a transport detail, not a cap)
+XT_EVAL_ITEMS = 100  # formulas per xlsx_eval call on a handle (the engine's own cap)
+XT_FORMULA_CHARS = 4096  # the engine's longest formula
+XT_CELL_RE = re.compile(r"\$?([A-Za-z]{1,3})\$?([1-9][0-9]{0,6})")
+XT_DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+
+
+def xt_engine(path, body, engine_key, deadline, what):
+    """One engine call (POST <XFA_API_BASE>/<path>), its JSON answer. A 429 or busy answer is waited out until the deadline;
+    a network or server error is tried CI_RETRIES times; any other refusal raises CiProblem with the engine's code."""
+    if os.environ.get("DATASTASH_NO_NETWORK") == "1":
+        raise CiProblem(f"{what}: network off (DATASTASH_NO_NETWORK=1)")
+    base = (os.environ.get("XFA_API_BASE") or "").strip() or XT_ENGINE_ORIGIN
+    url = base.rstrip("/") + "/" + path.lstrip("/")
+    data = json.dumps(body).encode()
+    tries = 0
+    while True:
+        req = urllib.request.Request(url, data=data, method="POST", headers={
+            "Content-Type": "application/json", "Accept": "application/json", "User-Agent": USER_AGENT,
+            "Authorization": "Bearer " + engine_key})
+        wait = None
+        try:
+            with _opener.open(req, timeout=max(1.0, min(CI_CALL_SECONDS * 2, deadline - time.time()))) as r:
+                return json.loads(r.read().decode("utf-8", "replace") or "{}")
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", "replace") if e.fp else ""
+            try:
+                err = (json.loads(text) or {}).get("error") or {}
+            except (ValueError, AttributeError):
+                err = {}
+            err = err if isinstance(err, dict) else {"code": str(err)}
+            code = ci_clean(err.get("code"), 60)
+            if e.code in (401, 403):
+                raise CiProblem(f"{what}: the engine refused the key (HTTP {e.code}); check XFA_API_KEY")
+            if e.code == 429 or code in ("busy", "rate_limited"):
+                try:
+                    wait = float((e.headers or {}).get("Retry-After") or err.get("retry_after_seconds") or 5)
+                except (TypeError, ValueError):
+                    wait = 5.0
+            elif e.code >= 500 and tries < CI_RETRIES:
+                tries += 1
+                wait = CI_RETRY_SECONDS * tries
+            else:
+                msg = ci_clean(err.get("message"), 200)
+                raise CiProblem(f"{what}: the engine answered HTTP {e.code} {code}" + (f" ({msg})" if msg else ""))
+        except (OSError, ValueError, httpclient.HTTPException) as e:
+            if tries >= CI_RETRIES:
+                raise CiProblem(f"{what}: the engine can't be reached ({ci_clean(e, 120)})")
+            tries += 1
+            wait = CI_RETRY_SECONDS * tries
+        if time.time() + wait > deadline:
+            raise CiProblem(f"{what}: the engine was still busy at the deadline")
+        CiClient.sleep(wait)
+
+
+def xt_upload(path, engine_key, deadline):
+    """The file into the engine's cache under a new random handle; the handle."""
+    try:
+        size = os.path.getsize(path)
+        f = open(path, "rb")
+    except OSError as e:
+        raise CiProblem(f"{os.path.basename(path)}: can't be read ({e.strerror or e})")
+    if size == 0:
+        f.close()
+        raise CiProblem(f"{os.path.basename(path)}: the file is empty")
+    handle = str(uuid.uuid4())
+    total = (size + XT_CHUNK - 1) // XT_CHUNK
+    with f:
+        for i in range(total):
+            chunk = f.read(XT_CHUNK)
+            xt_engine("api/v1/cache/upload-chunk", {"handle": handle, "chunk_index": i, "total_chunks": total,
+                                                    "chunk_b64": base64.b64encode(chunk).decode("ascii")},
+                      engine_key, deadline, "uploading the file to the engine")
+    xt_engine("api/v1/cache/finalize", {"handle": handle, "ttl_seconds": 3600}, engine_key, deadline, "finalizing the upload")
+    return handle
+
+
+def xt_stale(handle, engine_key, deadline):
+    """The engine's xlsx_check on the handle: (stale saved values, whether the list was cut short)."""
+    out = xt_engine("api/v1/tools/xlsx_check", {"cache_handle": handle}, engine_key, deadline, "the engine's check")
+    meta = out.get("_meta") if isinstance(out, dict) and isinstance(out.get("_meta"), dict) else {}
+    findings = [f for f in meta.get("findings") or [] if isinstance(f, dict)]
+    return (sum(1 for f in findings if f.get("code") == "stale_cached_value"),
+            any(f.get("code") == "findings_truncated" for f in findings))
+
+
+def xt_eval(handle, formulas, engine_key, deadline):
+    """The engine's typed answer to each formula, in order ({"type", "value"}; None where it gave none)."""
+    out = []
+    for i in range(0, len(formulas), XT_EVAL_ITEMS):
+        part = formulas[i:i + XT_EVAL_ITEMS]
+        body = xt_engine("api/v1/tools/xlsx_eval", {"cache_handle": handle, "formulas": part, "options": {"value_format": "typed"}},
+                         engine_key, deadline, "the engine's eval")
+        meta = body.get("_meta") if isinstance(body, dict) and isinstance(body.get("_meta"), dict) else {}
+        vals = [v for v in meta.get("cell_values") or [] if isinstance(v, dict)]
+        by_index = {v["index"]: v for v in vals if isinstance(v.get("index"), int) and not isinstance(v.get("index"), bool)}
+        out += [by_index.get(n) for n in range(len(part))]  # index is the 0-based place in formulas
+    return out
+
+
+def xt_ref(sheet, cell):
+    """The formula reference 'Sheet'!B7, or None for a cell that is not one A1 address."""
+    m = XT_CELL_RE.fullmatch((cell or "").strip())
+    if not m or not sheet:
+        return None
+    return "'" + sheet.replace("'", "''") + "'!" + m.group(1).upper() + m.group(2)
+
+
+def xt_number_text(v):
+    """A number as formula text that reads back the same (repr of a float, no inf or nan), or None."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return repr(int(f)) if f.is_integer() and abs(f) < 1e15 else repr(f)
+
+
+def xt_compare(ref, kind, expected, tolerance):
+    """The one comparison formula for an expected cell (the engine answers TRUE or FALSE), or None when it can't be built."""
+    tol = xt_number_text(tolerance if tolerance not in (None, "") else 0)
+    if tol is None or float(tol) < 0:
+        return None
+    if kind == "text":
+        f = "=EXACT(" + ref + ",\"" + str(expected if expected is not None else "").replace("\"", "\"\"") + "\")"
+    elif kind == "date" and XT_DATE_RE.fullmatch(str(expected or "").strip()):
+        y, mo, d = XT_DATE_RE.fullmatch(str(expected).strip()).groups()
+        f = f"=ABS({ref}-DATE({int(y)},{int(mo)},{int(d)}))<={tol}"
+    elif kind in ("number", "date"):
+        n = xt_number_text(expected)
+        if n is None:
+            return None
+        f = f"=ABS({ref}-({n}))<={tol}"
+    else:
+        return None
+    return f if len(f) <= XT_FORMULA_CHARS else None
+
+
+def xt_value_text(v):
+    """The engine's typed value as the text kept in last_actual or expected."""
+    if not isinstance(v, dict):
+        return ""
+    t, val = v.get("type"), v.get("value")
+    if t == "number" or t == "date":
+        return xt_number_text(val) or ""
+    if t == "boolean":
+        return "TRUE" if val is True else "FALSE"
+    if t == "blank" or val is None:
+        return ""
+    return ci_clean(val, 2000) if t == "error" else str(val)[:4000]
+
+
+def xt_parse_cells(text):
+    """--cells "Summary!B7,'My sheet'!C9" as [(sheet, cell)]; raises CiProblem for one that is not Sheet!A1."""
+    out = []
+    for part in re.findall(r"(?:'(?:[^']|'')*'|[^,])+", text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        sheet, sep, cell = part.rpartition("!")
+        if sheet.startswith("'") and sheet.endswith("'") and len(sheet) >= 2:
+            sheet = sheet[1:-1].replace("''", "'")
+        if not sep or not sheet or not XT_CELL_RE.fullmatch(cell.strip()):
+            raise CiProblem(f"--cells: {ci_clean(part, 60)} is not Sheet!A1")
+        m = XT_CELL_RE.fullmatch(cell.strip())
+        out.append((ci_clean(sheet, 200), m.group(1).upper() + m.group(2)))
+    if not out:
+        raise CiProblem("--cells names no cell (\"Sheet!B7,Sheet!C9\")")
+    return out
+
+
+def xlsx_test(path, set_name, key, wb, engine_key, sha="", branch="", run_url="", record=False, cells=None, tolerance=None,
+              now=None):
+    """One output test (or --record). Returns a summary dict; raises CiProblem when it can't run. tolerance (record only):
+    set on each recorded number cell; None keeps a row's own (0 for a new one)."""
+    now = time.time() if now is None else now
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(now))
+    deadline = time.time() + CI_WAIT_SECONDS
+    client = CiClient(key, wb, deadline)
+    ekey = lambda sheet, cell: f"{set_name} / {sheet}!{cell}"  # noqa: E731
+    if record and cells:
+        rows = [{"key": ekey(s, c), "sheet": s, "cell": c} for s, c in cells]
+    else:
+        rows = [r for r in client.filter(XT_EXPECTED, {"eq": ["set", set_name]}) if isinstance(r.get("key"), str)]
+        rows.sort(key=lambda r: r["key"])
+    if not rows:
+        raise CiProblem(f"set {set_name!r} has no expected cells on tab \"{XT_EXPECTED}\"; record them first: "
+                        "datastash xlsx-test <file> --set NAME --record --cells \"Sheet!B7\"")
+    handle = xt_upload(path, engine_key, deadline)
+    refs = [xt_ref(str(r.get("sheet") or ""), str(r.get("cell") or "")) for r in rows]
+    if record:
+        vals = xt_eval(handle, ["=" + ref for ref in refs if ref], engine_key, deadline)
+        it, out, skipped = iter(vals), [], []
+        for r, ref in zip(rows, refs):
+            v = next(it) if ref else None
+            if ref is None or not isinstance(v, dict) or v.get("type") == "error":
+                skipped.append(r["key"])
+                continue
+            kind = "number" if v.get("type") in ("number", "date") else "text"
+            m = XT_CELL_RE.fullmatch(str(r["cell"]))
+            row = {"key": r["key"], "set": set_name, "sheet": r["sheet"], "cell": m.group(1).upper() + m.group(2),
+                   "kind": kind, "expected": xt_value_text(v)}
+            if kind != "number":
+                row["tolerance"] = 0
+            elif tolerance is not None or "tolerance" not in r:
+                row["tolerance"] = tolerance or 0
+            out.append(row)
+        if out:
+            client.upsert(XT_EXPECTED, out, "xlsx-test-" + secrets.token_hex(8))
+        return {"record": True, "recorded": len(out), "skipped": skipped}
+    stale, cut = xt_stale(handle, engine_key, deadline)
+    formulas, slots = [], []
+    for r, ref in zip(rows, refs):
+        cmp_ = xt_compare(ref, str(r.get("kind") or "number"), r.get("expected"), r.get("tolerance")) if ref else None
+        if cmp_ is None:
+            slots.append(None)
+            continue
+        slots.append(len(formulas))
+        formulas += ["=" + ref, cmp_]
+    vals = xt_eval(handle, formulas, engine_key, deadline) if formulas else []
+    results, upd = [], []
+    for r, slot in zip(rows, slots):
+        actual = vals[slot] if slot is not None and slot < len(vals) else None
+        answer = vals[slot + 1] if slot is not None and slot + 1 < len(vals) else None
+        if isinstance(answer, dict) and answer.get("type") == "boolean" and isinstance(answer.get("value"), bool):
+            outcome = "pass" if answer["value"] else "fail"
+        else:
+            outcome = "unknown"
+        results.append((r["key"], outcome, xt_value_text(actual), r.get("expected")))
+        row = {"key": r["key"], "runs": {"inc": 1}, "fails": {"inc": 0 if outcome == "pass" else 1},
+               "last_pass": outcome == "pass", "last_actual": xt_value_text(actual) if slot is not None else "", "last_run": iso}
+        if sha:
+            row["last_sha"] = sha
+        upd.append(row)
+    s = {"record": False, "checked": len(results), "passed": sum(1 for x in results if x[1] == "pass"),
+         "failed": sum(1 for x in results if x[1] == "fail"), "unknown": sum(1 for x in results if x[1] == "unknown"),
+         "stale": stale, "stale_cut": cut, "results": results, "write_problem": None}
+    try:
+        tag = "xlsx-test-" + secrets.token_hex(8)
+        client.upsert(XT_EXPECTED, upd, tag + "-e")
+        if sha:
+            run = {"key": f"{set_name} / {sha}", "set": set_name, "sha": sha, "file": ci_clean(os.path.basename(path), 200),
+                   "runs": {"inc": 1}, "checked": s["checked"], "passed": s["passed"], "failed": s["failed"],
+                   "unknown": s["unknown"], "stale_cells": stale, "first_seen": {"min": iso}, "last_seen": {"max": iso}}
+            if branch:
+                run["branch"] = branch
+            if run_url:
+                run["run_url"] = run_url
+            client.upsert(XT_RUNS, [run], tag + "-r")
+    except CiProblem as e:
+        s["write_problem"] = str(e)
+    return s
+
+
+def _xt_args(args):
+    opts = {"paths": [], "set": "", "sha": "", "branch": "", "run_url": "", "cells": "", "tolerance": None,
+            "workbook": os.environ.get("DATASTASH_WORKBOOK_ID", ""), "record": False}
+    flags = {"--set": "set", "--sha": "sha", "--branch": "branch", "--run-url": "run_url", "--cells": "cells",
+             "--tolerance": "tolerance", "--workbook": "workbook"}
+    it = iter(args)
+    for a in it:
+        if a in flags:
+            v = next(it, None)
+            if v is None:
+                raise CiProblem(f"{a} needs a value. {XT_USAGE}")
+            opts[flags[a]] = v
+        elif a == "--record":
+            opts["record"] = True
+        elif a.startswith("--"):
+            raise CiProblem(f"unknown option {ci_clean(a, 40)}. {XT_USAGE}")
+        else:
+            opts["paths"].append(a)
+    if len(opts["paths"]) != 1:
+        raise CiProblem("name one .xlsx file. " + XT_USAGE)
+    if not ci_clean(opts["set"], 200):
+        raise CiProblem(f"--set is missing. {XT_USAGE}")
+    sha = opts["sha"].strip()
+    if sha and not CI_SHA_RE.fullmatch(sha):
+        raise CiProblem("--sha takes a commit sha (7 to 64 hex characters)")
+    if opts["cells"] and not opts["record"]:
+        raise CiProblem("--cells goes with --record (a test run checks the set's rows)")
+    tol = None if opts["tolerance"] is None else xt_number_text(opts["tolerance"])
+    if opts["tolerance"] is not None and (tol is None or float(tol) < 0):
+        raise CiProblem("--tolerance takes a number, 0 or more")
+    if tol is not None and not opts["record"]:
+        raise CiProblem("--tolerance goes with --record (a test run uses each row's own tolerance)")
+    if not CI_WB_RE.fullmatch(opts["workbook"].strip()):
+        raise CiProblem("set DATASTASH_WORKBOOK_ID (or --workbook) to the agent workbook's id")
+    return {"path": opts["paths"][0], "set": ci_clean(opts["set"], 200), "sha": sha.lower(), "branch": ci_clean(opts["branch"], 200),
+            "run_url": ci_clean(opts["run_url"], 500), "record": opts["record"],
+            "cells": xt_parse_cells(opts["cells"]) if opts["cells"] else None, "tolerance": None if tol is None else float(tol),
+            "wb": opts["workbook"].strip().lower()}
+
+
+def cmd_xlsx_test(args):
+    """datastash xlsx-test: 0 all passed, 1 a value moved, was not known or is stale, 2 the test could not run."""
+    if any(a in ("-h", "--help") for a in args):
+        print(XT_USAGE)
+        return 0
+    try:
+        o = _xt_args(args)
+        key = os.environ.get("DATASTASH_AGENT_KEY", "").strip()
+        if not re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key):
+            raise CiProblem("set DATASTASH_AGENT_KEY (a CI secret) to the agent's key (ldgr_ag_...)")
+        engine_key = os.environ.get("XFA_API_KEY", "").strip()
+        if not engine_key or re.search(r"[\s\x00-\x1f]", engine_key):
+            raise CiProblem("set XFA_API_KEY (a CI secret) to your engine key (from POST https://api.xlsx-for-ai.dev/api/v1/clients)")
+        s = xlsx_test(o["path"], o["set"], key, o["wb"], engine_key, sha=o["sha"], branch=o["branch"], run_url=o["run_url"],
+                      record=o["record"], cells=o["cells"], tolerance=o["tolerance"])
+    except CiProblem as e:
+        print(f"datastash xlsx-test: did not run: {ci_clean(e, 300)}")
+        return 2
+    except SystemExit:
+        print("datastash xlsx-test: did not run: stopped")
+        return 2
+    except Exception as e:  # noqa: BLE001 one line, never a traceback with a key in it
+        print(f"datastash xlsx-test: did not run: unexpected {type(e).__name__}")
+        return 2
+    if s["record"]:
+        extra = f"; not recorded (no value or an error): {', '.join(s['skipped'][:10])}" if s["skipped"] else ""
+        print(f"datastash xlsx-test: recorded {s['recorded']} expected values for set {o['set']} from the engine; check them "
+              f"once on tab \"{XT_EXPECTED}\"{extra}")
+        return 0
+    for k, outcome, actual, expected in s["results"]:
+        if outcome != "pass":
+            what = "moved" if outcome == "fail" else "could not be checked"
+            print(f"datastash xlsx-test: {ci_clean(k, 200)} {what}: expected {ci_clean(expected, 80)}, the engine reads {ci_clean(actual, 80)}")
+    if s["stale"]:
+        print(f"datastash xlsx-test: {'at least ' if s['stale_cut'] else ''}{s['stale']} saved values in the file do not match "
+              "their formulas (the engine's check); recalculate before saving")
+    if s["write_problem"]:
+        print(f"datastash xlsx-test: results not written to datastash: {ci_clean(s['write_problem'], 200)}")
+    bad = s["failed"] + s["unknown"] + s["stale"]
+    print(f"datastash xlsx-test: {'FAIL' if bad else 'ok'} set {o['set']}: {s['passed']} of {s['checked']} cells passed"
+          f" ({s['failed']} moved, {s['unknown']} not known, {s['stale']} stale)")
+    return 1 if bad else 0
+
+
 # --- XLI-378 E: time per card. The plugin side of ledger_feeds_setup services ["burn"] (tabs Burn, Cards cost, Prices):
 # at each subagent stop and session end it reads this session's own Claude Code transcripts (the main one and its
 # subagents' files) ON THIS COMPUTER and sends, per card, activity and model, the minutes, tool calls and token counts.
@@ -14495,7 +14860,7 @@ def main():
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
-             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report,
+             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat}
     if cmd not in table:
         print(__doc__)
