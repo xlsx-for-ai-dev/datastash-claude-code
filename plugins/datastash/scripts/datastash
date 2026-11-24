@@ -6931,6 +6931,13 @@ CLEAN_ALLOWED_TOOLS = frozenset((
     "SendMessage", "TaskStop", "ListAgents", "ReadNotifications",  # talk to, stop and list agents and their notices
     "ToolSearch", "AskUserQuestion",  # load a tool's schema; ask the person
     "WebFetch", "WebSearch",  # read the web
+    # 1.0.3 review MEDIUM: harmless tools a person's normal use needs. Enter plan mode (only narrows the session); the
+    # to-do and task lists (Claude Code's own list state, at a path it fixes; no path, file or command from the model);
+    # read a background task's output; list MCP resources. Left out on purpose: ExitPlanMode (saves the model's plan
+    # text to a plan file and changes the permission mode), Skill (a skill's !`command` lines run a shell command when
+    # it loads, outside this hook) and ReadMcpResourceTool (saves a binary resource to a file on disk, from any server).
+    "EnterPlanMode", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput",
+    "ListMcpResourcesTool",
 ))
 CLEAN_COMMAND_TOOLS = ("Bash", "Monitor")  # the shell tools the check below understands (PowerShell is another shell)
 # The datastash connector's read-only tools (readOnlyHint true in datastash's own tool list).

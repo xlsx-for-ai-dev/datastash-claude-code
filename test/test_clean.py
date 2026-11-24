@@ -349,7 +349,10 @@ ALLOWED_INPUTS = {"Read": {"file_path": "/x/a.py"}, "Grep": {"pattern": "x"}, "G
                   "SendMessage": {"to": "a", "message": "hi"}, "TaskStop": {"task_id": "t1"},
                   "ToolSearch": {"query": "select:Monitor"}, "AskUserQuestion": {"questions": []},
                   "ListAgents": {}, "ReadNotifications": {}, "WebFetch": {"url": "https://example.invalid/", "prompt": "x"},
-                  "WebSearch": {"query": "x"}}
+                  "WebSearch": {"query": "x"}, "EnterPlanMode": {}, "TodoWrite": {"todos": []},
+                  "TaskCreate": {"subject": "x", "description": "x"}, "TaskUpdate": {"taskId": "1", "status": "completed"},
+                  "TaskList": {}, "TaskGet": {"taskId": "1"}, "TaskOutput": {"task_id": "t1", "block": False},
+                  "ListMcpResourcesTool": {}}
 GLOBS = ("cat /pro?/self/environ", "cat /d?v/zero", "cat /proc/sel?/environ", "ls *", "ls ./*", "cat ./a*",
          "cat [a]", "cat /[p]roc/self/environ", "ls {a,b}", "cat /{proc,x}/self/environ", "ls a{,}",
          "grep -r --include=*.py x .", "wc -l a*", "git log -- *", "curl -s 'http://x/[1-3]'",
@@ -390,7 +393,8 @@ class DenyByDefault(Base):
             self.assertTrue(denied(self.call("PowerShell", {"command": cmd})), repr(cmd))
 
     def test_an_unknown_or_future_tool_is_refused(self):
-        for tool, ti in (("FutureTool", {"path": "/x"}), ("Skill", {"skill": "x"}), ("TodoWrite", {"todos": []}),
+        for tool, ti in (("FutureTool", {"path": "/x"}), ("Skill", {"skill": "x"}), ("ExitPlanMode", {"plan": "x"}),
+                         ("ReadMcpResourceTool", {"server": "x", "uri": "x://y"}),
                          ("EnterWorktree", {}), ("Workflow", {"script": "x"}), ("LSP", {}), ("bash", {"command": "ls"}),
                          ("Read ", {"file_path": "/x"}), ("", {}), (None, {}), ("Shell", {"command": "ls"}),
                          ("FutureRunner", {"command": "touch F"}), ("Grep", {"pattern": "x", "command": "touch F"})):
@@ -432,6 +436,45 @@ class DenyByDefault(Base):
             self.assertFalse(denied(self.call(tool, ti)), tool)
         for cmd in READ_ONLY:
             self.assertFalse(denied(self.call("Bash", {"command": cmd})), repr(cmd))
+
+    # 1.0.3 review MEDIUM: one test per tool added to the main session's list; each runs, and a command key still
+    # sends it through the command check (refused).
+    def _added_tool_runs(self, tool):
+        self.assertIn(tool, ds.CLEAN_ALLOWED_TOOLS)
+        self.assertFalse(denied(self.call(tool, ALLOWED_INPUTS[tool])), tool)
+        self.assertTrue(denied(self.call(tool, dict(ALLOWED_INPUTS[tool], command="touch F"))), tool)
+        self.assertTrue(denied(self.call(tool.lower(), ALLOWED_INPUTS[tool])), tool)  # names match exactly
+
+    def test_enter_plan_mode_runs(self):
+        self._added_tool_runs("EnterPlanMode")
+
+    def test_todo_write_runs(self):
+        self._added_tool_runs("TodoWrite")
+
+    def test_task_create_runs(self):
+        self._added_tool_runs("TaskCreate")
+
+    def test_task_update_runs(self):
+        self._added_tool_runs("TaskUpdate")
+
+    def test_task_list_runs(self):
+        self._added_tool_runs("TaskList")
+
+    def test_task_get_runs(self):
+        self._added_tool_runs("TaskGet")
+
+    def test_task_output_runs(self):
+        self._added_tool_runs("TaskOutput")
+
+    def test_list_mcp_resources_runs(self):
+        self._added_tool_runs("ListMcpResourcesTool")
+
+    def test_exit_plan_mode_skill_and_read_mcp_resource_stay_refused(self):
+        for tool, ti in (("ExitPlanMode", {"plan": "x"}), ("Skill", {"skill": "x"}),
+                         ("ReadMcpResourceTool", {"server": "x", "uri": "x://y"})):
+            self.assertNotIn(tool, ds.CLEAN_ALLOWED_TOOLS)
+            self.assertTrue(denied(self.call(tool, ti)), tool)
+            self.assertFalse(denied(self.call(tool, ti, agent_id="a1b2c3")), tool)
 
     def test_a_subagent_is_unaffected(self):
         for tool, ti in (("Monitor", {"command": "touch /tmp/F", "description": "x", "timeout_ms": 1000}),
