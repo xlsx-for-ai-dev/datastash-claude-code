@@ -46,7 +46,7 @@ LIST = {"list_id": LIST_ID, "expires_in_seconds": 600,
                    {"agent_id": BETA, "name": "beta", "visibility": "public"}]}
 TOOL = "mcp__claude_ai_datastash__"
 OWN_TOOL = "mcp__plugin_datastash_datastash__"  # the plugin's own connector (https://getdatastash.com/mcp): trusted by URL
-PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path")
+PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path", "hook_input")
 
 
 def real_entries(name):
