@@ -1663,7 +1663,8 @@ class ZzAnswerRoute(unittest.TestCase):
             skill = f.read()
         self.assertIn("status_answer", skill)
         self.assertNotIn("person_answer", skill)
-        self.assertNotIn("undo N", skill)
+        # XLI-388: "undo N" is only the undo of a default an agent took, never an undo of an answer (XLI-341 stays off)
+        self.assertEqual(re.findall(r'"undo N"[^.;]*', skill), ['"undo N" reverses that default'])
         self.assertNotIn("answering asks from here is coming", skill)
         for phrase in ('"do N"', '"no to N"', '"N: <text>"'):
             self.assertIn(phrase, skill)

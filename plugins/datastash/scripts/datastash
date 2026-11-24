@@ -6383,7 +6383,24 @@ ANSWER_NOTE = ("{note}: the person typed an answer to ask {n}, from {agent}. The
                "sends it itself. Never call ledger_agent_status with action answer for it, and never send it any other "
                "way. Say in one plain line that the answer is on its way.")
 ANSWER_OPTIONS_LINE = 'Ask {n}, from {agent}, takes exactly one of: {options}. Type "{n}: <one of them>". Nothing was sent.'
+# XLI-388: the person's typed answers to datastash's own asks (a stalled hand-off, agents stuck waiting on each other or
+# chattering) and their typed undo of a default an agent took are numbered in the same list and signed the same way
+# (x-live #493): answers under TYPED_PROOF_LABEL to the answer route, the undo under its own label over the fixed answer
+# TYPED_UNDO_DEFAULT_ANSWER to the undo route, so a proof for one kind or ask never passes as another.
+PERSON_DEFAULT_UNDO_PATH = "/api/v1/person/status/default/undo"
+TYPED_UNDO_DEFAULT_LABEL = "datastash-typed-undo-default/v1"
+TYPED_UNDO_DEFAULT_ANSWER = "undo_default"
+TYPED_LABELS = (TYPED_PROOF_LABEL, TYPED_UNDO_DEFAULT_LABEL)
+PERSON_ASK_KINDS = ("handoff", "stuck", "default")
+STUCK_KINDS = ("circle", "wait", "chatter")
+UNDO_NOTE = ("{note}: the person typed an undo of the default {agent} took (number {n}). The plugin checks it was typed "
+             "by them and sends it itself. Never call ledger_agent_status with action undo_default for it, and never "
+             "send it any other way. Say in one plain line that the undo is on its way.")
+UNDO_ONLY_LINE = 'Number {n} is a default {agent} took. To reverse it, type "undo {n}". Nothing was sent.'
+UNDO_SENT_LINE = "Sent: {agent} will undo the default it took."
 ANSWER_SENT_LINE = 'Sent "{answer}" to {agent}.'
+PERSON_OPTIONS_WORDS_LINE = ('Ask {n}, about {agent}, takes one of: {options}, or your own words. Type "{n}: <your answer>". '
+                             "Nothing was sent.")
 ANSWER_HELD_LINE = "{agent}'s ask needs your OK on the datastash site: {url}"
 ANSWER_HELD_NOLINK = "{agent}'s ask needs your OK on the datastash site; nothing was sent."
 ANSWER_CHANGED_LINE = "That ask changed or was already answered, so nothing was sent. Say status again."
@@ -6699,7 +6716,7 @@ _KEEP_MORNING = object()  # an agent key's read has no morning lines: the copy k
 
 
 def save_status_cache(workbook_id, rows, fetched_at, merge=True, morning=_KEEP_MORNING, changed=_KEEP_MORNING,
-                      listening=_KEEP_MORNING):
+                      listening=_KEEP_MORNING, person_asks=_KEEP_MORNING):
     ensure_dirs()
     with StateLock(f"status-{_wb_tag(workbook_id)}"):
         old = read_status_cache(workbook_id)
@@ -6726,6 +6743,10 @@ def save_status_cache(workbook_id, rows, fetched_at, merge=True, morning=_KEEP_M
             listening = (old or {}).get("listening")  # an agent key's read has no lists: keep the person's last
         if isinstance(listening, dict):
             c["listening"] = listening
+        if person_asks is _KEEP_MORNING or person_asks is None:
+            person_asks = _person_asks_of(old)  # XLI-388: an agent key's read has none: keep the person's last
+        if person_asks:
+            c["person_asks"] = person_asks
         write_private(status_cache_path(workbook_id), json.dumps(c))
     return c
 
@@ -6755,6 +6776,8 @@ def put_own_row(workbook_id, row):
             c["morning_asked"] = old["morning_asked"]
         if isinstance(old.get("listening"), dict):
             c["listening"] = old["listening"]
+        if _person_asks_of(old):
+            c["person_asks"] = _person_asks_of(old)  # XLI-388
         write_private(status_cache_path(workbook_id), json.dumps(c))
 
 
@@ -6823,6 +6846,7 @@ def fetch_status(sess, timeout=10, asked=False):
     morning = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
     changed = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
     listening = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
+    person_asks = _KEEP_MORNING
     try:
         for _ in range(STATUS_MAX_PAGES):
             body = _status_page(path, key, wb, cursor, timeout, asked)
@@ -6830,6 +6854,8 @@ def fetch_status(sess, timeout=10, asked=False):
                 morning = body.get("morning")
                 changed = body.get("changed")  # XLI-306: "Changed in the last hour", the person's first page only
                 listening = norm_listening(body)  # XLI-375 P2: waiting for the OK, and not listening
+                person_asks = norm_person_asks(body)  # XLI-388: hand-off and stuck asks, defaults taken
+                person_asks = [] if person_asks is None else person_asks  # the person's read: none now means none
             if cursor is not None and body.get("note") and not restarted:
                 # the server could not read our cursor and served page 1 again: start the walk over, once
                 restarted, rows, cursor = True, [], None
@@ -6856,7 +6882,8 @@ def fetch_status(sess, timeout=10, asked=False):
     note_door(True)
     # Addendum 6 N2: a `keep` value in this reply is ignored. Until the site has a person-only action that sets it (never
     # an agent key, the sync tool or anything an agent can call), only the person's typed words here turn keeping on.
-    return save_status_cache(wb, rows, time.time(), morning=morning, changed=changed, listening=listening)
+    return save_status_cache(wb, rows, time.time(), morning=morning, changed=changed, listening=listening,
+                             person_asks=person_asks)
 
 
 # --- consent (PM ruling H2): the person's one yes, per project folder
@@ -8085,11 +8112,12 @@ def _agent_block(group, n, now, screen, item_cap, numbers):
     return n, hidden
 
 
-def status_list(rows, now, only=None):
+def status_list(rows, now, only=None, person_asks=None):
     """(lines, numbers): one bounded screen. Agents with asks first, each a bold name, its paragraph, one context line
     and its numbered asks; an agent on several projects gets a one-line roll-up; idle agents one line each. One running
     number across everything. Past SHOW_ITEMS_PER_AGENT, SHOW_AGENTS or SHOW_CHARS: "N more: say 'more on <agent>'"
-    lines (nothing is dropped from storage). only: one agent's name ("more on <agent>"), with no item cap."""
+    lines (nothing is dropped from storage). only: one agent's name ("more on <agent>"), with no item cap.
+    person_asks (XLI-388): datastash's own asks to the person and the defaults agents took, numbered after the agents."""
     groups = _groups(rows)
     if only is not None:
         groups = [g for g in groups if g[0]["agent"].lower() == only.lower()]
@@ -8110,6 +8138,23 @@ def status_list(rows, now, only=None):
         if hidden:
             screen.add([f"   {hidden} more: say 'more on {g[0]['agent']}'" if only is None
                         else f"   {hidden} more not shown here; they show as these are answered."])
+    asks = person_asks if only is None and person_asks else []
+    if asks:
+        screen.budget -= 80
+        head, left = ["Waiting for you (from datastash):"], 0
+        for i, a in enumerate(asks):
+            line = person_ask_line(n + 1, a)
+            if i >= SHOW_ITEMS_PER_AGENT or not screen.fits(head + [line]):
+                left += 1
+                continue
+            screen.add(head + [line])
+            head = []
+            n += 1
+            numbers[str(n)] = {"agent": a["agent"], "project": a.get("project") or "", "ask": None, "person_ask": a["kind"],
+                               **{k: a[k] for k in ("instance", "text", "options", "to", "stuck", "default") if k in a}}
+        screen.budget += 80
+        if left:
+            screen.add([f"   {left} more waiting for you; they show as these are answered."])
     if hidden_agents:
         names = _clean(", ".join(hidden_agents), 200)
         screen.add([f"{len(hidden_agents)} more agent{'s' if len(hidden_agents) > 1 else ''} ({names}): say 'more on <agent>'"])
@@ -8308,6 +8353,87 @@ def norm_listening(body):
     return {"waiting": waiting, "approve_url": url, "not_listening": quiet}
 
 
+# --- XLI-388: datastash's own asks to the person (stalled hand-offs, stuck agents) and the defaults agents took
+
+def _option_ok(o):
+    """An option as the server wrote it (an agent's name or a fixed word): kept exactly, as the answer must match it."""
+    return isinstance(o, str) and 0 < len(o) <= 200 and o.strip() != "" and not re.search(r"[\x00-\x1f\x7f]", o)
+
+
+def _person_ask(kind, instance, text, options=(), agent="", **extra):
+    if kind not in PERSON_ASK_KINDS or not (isinstance(instance, str) and re.fullmatch(GRANT_ID_RE, instance.lower())):
+        return None
+    text = _clean(text, 400)
+    opts = list(options) if isinstance(options, (list, tuple)) else []
+    if not text or not all(_option_ok(o) for o in opts) or (kind != "default" and not opts):
+        return None
+    return {"kind": kind, "instance": instance.lower(), "text": text, "options": opts, "agent": _clean(agent, 200), **extra}
+
+
+def norm_person_asks(body):
+    """The person status's own asks, checked, in the server's order: each stalled hand-off's ask (an agent's name),
+    each stuck ask (circle, wait or chatter; circle and chatter also take the person's own words) and each default an
+    agent took (undone with "undo N"). None when the server sent none of these blocks (an agent key's read)."""
+    if not isinstance(body, dict) or not any(k in body for k in ("handoffs", "stuck", "defaults")):
+        return None
+    out = []
+    for h in _list(body.get("handoffs")):
+        a = h.get("ask") if isinstance(h, dict) else None
+        if isinstance(a, dict) and a.get("kind") == "handoff":
+            to = h.get("to") if _option_ok(h.get("to")) else None
+            x = _person_ask("handoff", a.get("instance"), a.get("text"), a.get("options"), _one_line_name(h.get("from")),
+                            **({"to": to} if to else {}))
+            if x:
+                out.append(x)
+    for a in _list(body.get("stuck")):
+        if isinstance(a, dict) and a.get("kind") in STUCK_KINDS:
+            names = [_one_line_name(m.get("name")) for m in _list(a.get("agents")) if isinstance(m, dict)]
+            x = _person_ask("stuck", a.get("instance"), a.get("text"), a.get("options"), ", ".join(n for n in names if n),
+                            stuck=a["kind"])
+            if x:
+                out.append(x)
+    for d in _list(body.get("defaults")):
+        if isinstance(d, dict):
+            ask = d.get("ask") if isinstance(d.get("ask"), dict) else {}
+            took = ask.get("default")
+            took = _clean(took, 160) if isinstance(took, (str, int, float)) and not isinstance(took, bool) else ""
+            x = _person_ask("default", d.get("instance"), ask.get("text") or ask.get("id"), (), _one_line_name(d.get("agent")),
+                            project=_clean(d.get("project"), 64), default=took)
+            if x:
+                out.append(x)
+    return out
+
+
+def _person_asks_of(c):
+    """The person asks kept in the local copy, checked again (it is a file)."""
+    v = c.get("person_asks") if isinstance(c, dict) else None
+    out = []
+    for x in _list(v):
+        if not isinstance(x, dict):
+            continue
+        extra = {k: x[k] for k in ("to", "project", "default") if isinstance(x.get(k), str)}
+        if x.get("kind") == "stuck":
+            if x.get("stuck") not in STUCK_KINDS:
+                continue
+            extra["stuck"] = x["stuck"]
+        if "to" in extra and not _option_ok(extra["to"]):
+            continue
+        y = _person_ask(x.get("kind"), x.get("instance"), x.get("text"), x.get("options"), x.get("agent"), **extra)
+        if y:
+            out.append(y)
+    return out
+
+
+def person_ask_line(n, a):
+    """One numbered line for a person ask, and what to type."""
+    if a["kind"] == "default":
+        took = f": {a['default']}" if a.get("default") else ""
+        return (f'{n}. Default taken by {_b(a["agent"])} on "{a["text"]}"{took}. Type "undo {n}" to reverse it.')
+    opts = ", ".join(_clean(o, 80) for o in a["options"])
+    words = " or your own words" if a["kind"] == "stuck" and a.get("stuck") in ("circle", "chatter") else ""
+    return f'{n}. {a["text"]} Type "{n}: <one of: {opts}>"{words}.'
+
+
 def _label(w):
     return w["name"] + (f' ({w["server"]})' if w.get("server") else "")
 
@@ -8397,7 +8523,7 @@ def render_status_all(here, me, install=False, live_timeout=10, only=None, for_p
     try:
         if c is not None:
             now = time.time()
-            lines, numbers = status_list(c["agents"], now, only=only)
+            lines, numbers = status_list(c["agents"], now, only=only, person_asks=_person_asks_of(c))
             wb = c["workbook_id"]
             if only is not None and not lines:
                 return []
@@ -8479,6 +8605,10 @@ def _save_page(sid, n, wb, target, nxt):
 def _detail_lines(row, target, n, now):
     """(head, items): everything stored for number n, one line per card, running item, waiting and done entry, so a
     screen can stop between any two of them. The agent's own words come first."""
+    if target.get("person_ask"):  # XLI-388: datastash's own ask, or a default taken: all of it is in the list's line
+        a = dict(target, kind=target["person_ask"], agent=_clean(target.get("agent"), 200), text=_clean(target.get("text"), 400),
+                 options=[o for o in target.get("options") or [] if isinstance(o, str)])
+        return [person_ask_line(n, a)], []
     if row is None:
         return [f'{n} was "{_clean(target["agent"], 64)}", which has no status now.'], []
     if target.get("ask"):
@@ -9149,6 +9279,9 @@ def cmd_status_verify(args):
         elif rec.get("kind") == "answer":
             for line in send_typed_answer(rec, v):  # XLI-310 item 2: only the person's own typed answer
                 add_outcome(sid, line)
+        elif rec.get("kind") == "undo_default":
+            for line in send_typed_answer(rec, v, undo=True):  # XLI-388: only the person's own typed "undo N"
+                add_outcome(sid, line)
     except OSError:
         return 0
     return 0
@@ -9177,25 +9310,45 @@ def js_json(s):
     return "".join(out) + '"'
 
 
-def typed_proof(key, grant_id, workbook_id, instance, answer, prompt_id, typed_text, typed_at, iat):
+def typed_proof(key, grant_id, workbook_id, instance, answer, prompt_id, typed_text, typed_at, iat, label=TYPED_PROOF_LABEL):
     """XLI-310 item 2: the typed_proof for one answer (src/agents/answers.ts checkTypedProof): HMAC-SHA256 with the
     whole answer key over the label, grant, workbook, instance, sha256 of JSON.stringify(answer), prompt id, sha256 of
     the typed text, typed_at and iat (ms), joined by newlines. The server proves only that the key's holder made it for
-    this ask and answer, just now, once; that the person typed it is proved here, by the transcript checker."""
+    this ask and answer, just now, once; that the person typed it is proved here, by the transcript checker. XLI-388:
+    label is TYPED_PROOF_LABEL for every answer (agent asks, hand-off asks, stuck asks) and TYPED_UNDO_DEFAULT_LABEL,
+    over TYPED_UNDO_DEFAULT_ANSWER, for an undo of a default (x-live #493)."""
+    if label not in TYPED_LABELS or (label == TYPED_UNDO_DEFAULT_LABEL and answer != TYPED_UNDO_DEFAULT_ANSWER):
+        raise ValueError("typed proof: unknown label, or the undo label with another answer")
     typed_sha = hashlib.sha256(typed_text.encode("utf-8", "surrogatepass")).hexdigest()
-    lines = [TYPED_PROOF_LABEL, grant_id.lower(), workbook_id.lower(), instance.lower(),
+    lines = [label, grant_id.lower(), workbook_id.lower(), instance.lower(),
              hashlib.sha256(js_json(answer).encode("utf-8")).hexdigest(), prompt_id, typed_sha, str(typed_at), str(iat)]
     mac = hmac.new(key.encode("utf-8"), "\n".join(lines).encode("utf-8"), hashlib.sha256).hexdigest()
     return {"v": 1, "prompt_id": prompt_id, "typed_sha256": typed_sha, "typed_at": typed_at, "iat": iat, "mac": mac}
 
 
-def send_typed_answer(rec, entry):
-    """The checker, after the person's own typed answer (proved by find_typed, fresh, used once): signs the proof and
-    sends the answer itself with this computer's login token. The lines for the person. Never prints the key or token."""
+def _prompt_matches(rec, undo):
+    """XLI-388: the typed prompt itself names the same number and kind as the checker's record: an undo only for the
+    person's "undo N", an answer only for "do N", "no to N" or "N: <text>" with that answer (as folded)."""
     d = rec.get("data") if isinstance(rec.get("data"), dict) else {}
-    wb, inst, answer, agent = d.get("workbook"), d.get("instance"), d.get("answer"), _clean(d.get("agent"), 64) or "the agent"
+    n, prompt = d.get("n"), rec.get("prompt")
+    if not isinstance(n, int) or isinstance(n, bool):
+        return False
+    if undo:
+        return undo_phrase(prompt) == n
+    got = answer_phrase(prompt) if undo_phrase(prompt) is None else None
+    return got is not None and got[0] == n and _fold(got[1]) == _fold(d.get("answer"))
+
+
+def send_typed_answer(rec, entry, undo=False):
+    """The checker, after the person's own typed answer (proved by find_typed, fresh, used once): signs the proof and
+    sends the answer itself with this computer's login token. The lines for the person. Never prints the key or token.
+    XLI-388 undo: the person's typed "undo N" on a default taken: signed under its own label, sent to the undo route."""
+    d = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    wb, inst, agent = d.get("workbook"), d.get("instance"), _clean(d.get("agent"), 64) or "the agent"
+    answer = TYPED_UNDO_DEFAULT_ANSWER if undo else d.get("answer")
     if not (isinstance(wb, str) and re.fullmatch(GRANT_ID_RE, wb.lower()) and isinstance(inst, str)
-            and re.fullmatch(GRANT_ID_RE, inst.lower()) and isinstance(answer, str) and answer.strip()):
+            and re.fullmatch(GRANT_ID_RE, inst.lower()) and isinstance(answer, str) and answer.strip()
+            and _prompt_matches(rec, undo)):
         return []
     got = read_answer_key()
     if got is None:
@@ -9204,14 +9357,16 @@ def send_typed_answer(rec, entry):
     typed_at = _when(entry.get("timestamp"))
     if typed_at is None:
         return []
-    proof = typed_proof(got[0], got[1], wb, inst, answer, rec["pid"], rec["prompt"], int(typed_at * 1000), int(time.time() * 1000))
+    proof = typed_proof(got[0], got[1], wb, inst, answer, rec["pid"], rec["prompt"], int(typed_at * 1000), int(time.time() * 1000),
+                        label=TYPED_UNDO_DEFAULT_LABEL if undo else TYPED_PROOF_LABEL)
     got = None
     token = login_token()
     if token is None:
         return [ANSWER_NO_LOGIN_LINE]
+    path, body = ((PERSON_DEFAULT_UNDO_PATH, {"workbook_id": wb, "instance": inst, "typed_proof": proof}) if undo else
+                  (PERSON_ANSWER_PATH, {"workbook_id": wb, "instance": inst, "answer": answer, "typed_proof": proof}))
     try:
-        status, _ct, text = http("POST", PERSON_ANSWER_PATH, key=token, timeout=20,
-                                 body={"workbook_id": wb, "instance": inst, "answer": answer, "typed_proof": proof})
+        status, _ct, text = http("POST", path, key=token, timeout=20, body=body)
         try:
             body = json.loads(text)
         except ValueError:
@@ -9228,9 +9383,11 @@ def send_typed_answer(rec, entry):
             return [ANSWER_HELD_NOLINK.format(agent=agent)]
         _open_browser(url)
         return [ANSWER_HELD_LINE.format(agent=agent, url=url)]
-    if status == 409 or code in ("ask_changed", "already_answered"):
+    if status == 409 or code in ("ask_changed", "already_answered", "already_undone") or (undo and code == "not_found"):
         return [ANSWER_CHANGED_LINE]
     if 200 <= status < 300 and not code:
+        if undo:
+            return [UNDO_SENT_LINE.format(agent=agent)]
         return [ANSWER_SENT_LINE.format(answer=_clean(answer, 120), agent=agent)]
     return [f"Not sent: datastash answered {_clean(code if isinstance(code, str) else status, 40)}."]
 
@@ -9274,6 +9431,7 @@ STATUS_OF_RE = re.compile(r"(what is |what's |show |show me |give me )?(the )?st
 DO_RE = re.compile(r"do #?(\d{1,3})")
 ANSWER_NO_RE = re.compile(r"(?:no to|don'?t do|do not do) #?(\d{1,3})")  # XLI-310 item 2 (D1)
 ANSWER_TEXT_RE = re.compile(r"#?(\d{1,3})\s*:\s*(\S.*)", re.S)
+UNDO_RE = re.compile(r"undo #?(\d{1,3})")  # XLI-388: only against a default taken, on this session's list
 LEAVE_OFF_RE = re.compile(r"leave ([a-z0-9][a-z0-9 ._\-]{0,63}?) off(?: datastash)?|leave off ([a-z0-9][a-z0-9 ._\-]{0,63})"
                           r"|keep ([a-z0-9][a-z0-9 ._\-]{0,63}?) off datastash")  # XLI-328: all are full OFF
 HERE_OFF_RE = re.compile(r"(?:turn )?datastash off(?: here| in this folder)?")
@@ -9341,19 +9499,75 @@ def answer_phrase(text):
     return None
 
 
+def undo_phrase(text):
+    """XLI-388: n for the person's whole prompt "undo N", else None."""
+    if not isinstance(text, str) or len(text) > 200:
+        return None
+    m = UNDO_RE.fullmatch(_phrase(text))
+    return int(m.group(1)) if m else None
+
+
+def _fold(v):
+    """As the server folds an answer against an option (NFKC, trimmed, lower case)."""
+    return unicodedata.normalize("NFKC", v).strip().lower() if isinstance(v, str) else ""
+
+
+def person_answer_context(inp, text, n, answer, undo, target, view):
+    """XLI-388: the prompt hook's answer to a typed answer on one of datastash's own asks (a stalled hand-off, a stuck
+    ask) or a typed "undo N" on a default taken, numbered in this session's fresh list. Handed to the checker exactly as
+    a plain ask's answer is (the transcript proves the person typed it; the checker signs it); never sent from here."""
+    kind = target.get("person_ask")
+    agent = _clean(target.get("agent"), 64) or "the agent"
+    wb, inst = view.get("workbook_id"), target.get("instance")
+    if not (kind in PERSON_ASK_KINDS and isinstance(inst, str) and re.fullmatch(GRANT_ID_RE, inst.lower())
+            and isinstance(wb, str) and re.fullmatch(GRANT_ID_RE, wb.lower()) and answer_key_kept()):
+        return None  # as for a plain ask without the answer key: the prompt goes on as an ordinary one
+    if kind == "default":
+        if not undo:
+            return {"show": UNDO_ONLY_LINE.format(n=n, agent=agent)}
+        shape = hook_shape(inp)
+        if shape is None or not start_check(shape, "undo_default", text, {"workbook": wb, "instance": inst, "agent": agent,
+                                                                        "n": n}):
+            return None
+        return UNDO_NOTE.format(note=STATUS_NOTE, n=n, agent=agent)
+    if undo:
+        return None  # "undo N" is only for a default taken: an ordinary prompt
+    opts = [o for o in target.get("options") or [] if isinstance(o, str)]
+    allowed = opts + [target["to"]] if kind == "handoff" and isinstance(target.get("to"), str) else opts
+    t = _phrase(text).replace("\u2019", "'")
+    words = not (DO_RE.fullmatch(t) or ANSWER_NO_RE.fullmatch(t))  # only "N: <text>" names an option or gives words
+    hits = list(dict.fromkeys(o for o in allowed if _fold(o) == _fold(answer))) if words else []
+    free = kind == "stuck" and target.get("stuck") in ("circle", "chatter")
+    if len(hits) == 1:
+        answer = hits[0]
+    elif free and words and not hits:
+        answer = answer.strip()
+    else:
+        line = PERSON_OPTIONS_WORDS_LINE if free else ANSWER_OPTIONS_LINE
+        return {"show": line.format(n=n, agent=agent, options=", ".join(_clean(o, 80) for o in opts))}
+    shape = hook_shape(inp)
+    if shape is None or not start_check(shape, "answer", text, {"workbook": wb, "instance": inst, "answer": answer,
+                                                               "agent": agent, "n": n, "person_ask": kind}):
+        return None
+    return ANSWER_NOTE.format(note=STATUS_NOTE, n=n, agent=agent)
+
+
 def typed_answer_context(inp, text):
     """The prompt hook's answer to a typed answer phrase on an ask of this session's fresh list, or None (not one: the
     prompt goes on as before). A plain ask with the answer key kept: handed to the checker and passed through to the AI
     with a note (a blocked prompt is never in the transcript, so it could never be proved). Else the "do N" answer and
     the site line; nothing is sent."""
-    got = answer_phrase(text)
+    undo = undo_phrase(text)
+    got = answer_phrase(text) if undo is None else (undo, TYPED_UNDO_DEFAULT_ANSWER)
     if got is None:
         return None
     n, answer = got
     sid = inp.get("session_id") if isinstance(inp.get("session_id"), str) and re.fullmatch(SID_RE, inp.get("session_id")) else None
     view = read_view(sid)
     target = (view or {}).get("numbers", {}).get(str(n))
-    if not isinstance(target, dict) or not target.get("ask") or target.get("lookup"):
+    if isinstance(target, dict) and target.get("person_ask") and not target.get("lookup"):
+        return person_answer_context(inp, text, n, answer, undo is not None, target, view)  # XLI-388
+    if undo is not None or not isinstance(target, dict) or not target.get("ask") or target.get("lookup"):
         return None
     agent = _clean(target.get("agent"), 64)
     wb, inst = view.get("workbook_id"), target.get("instance")

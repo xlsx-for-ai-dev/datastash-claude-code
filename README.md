@@ -668,6 +668,17 @@ list, asks first and idle agents last, from any session: "status", "status of al
   older list with no ask instance, or a login with no answer key yet (it comes with the next sign-in or token refresh,
   and is asked for again if the kept key is lost) goes exactly as in 0.9.8: "do 4" gets the old answer (tell that agent
   in its own session), and "no to 4" or "4: ..." is an ordinary prompt to the AI.
+- **Typed answers to datastash's own asks, and undoing a default (1.0.10).** The list also numbers, after the agents,
+  what waits for the person from datastash itself: a stalled hand-off ("4: <agent name>", one of its takers or the
+  receiver), agents stuck waiting on each other, waiting long, or chattering ("4: <one of its options>"; a circle or a
+  chatter ask also takes "4: <your own words>"), and each default an agent took ("undo 4"). They come from the person's
+  status read (the `handoffs`, `stuck` and `defaults` blocks; an agent key's read keeps the last ones). They are checked
+  and signed exactly like a plain ask's answer: answers under `datastash-typed-answer/v1` over that ask's instance and
+  the answer as sent, to `POST /api/v1/person/status/answer`; an undo under its own label
+  `datastash-typed-undo-default/v1` over the fixed answer `undo_default`, to `POST /api/v1/person/status/default/undo`
+  (x-live #493), so a proof for one ask or kind never passes for another. The checker also reads the typed words again:
+  an undo is signed only for the person's "undo N" and an answer only for an answer phrase with that number and answer.
+  "undo N" on anything but a default, or with no answer key, is an ordinary prompt.
 - **Keeping (one yes per computer).** The person types "Keep my agents' status and what I tell them to remember in
   datastash" (the install step). The prompt hook recognizes it in plain code (case, punctuation and "my agent's" /
   "my agents'" don't matter) and acts only once a checker confirms it as the person's own typed prompt: the transcript
@@ -883,6 +894,12 @@ An agent can send datastash a capability request, an error report or anything el
   when datastash can't be reached, Retry-After, a stalled network never holding the session start), the "signed in now"
   line, the first-use re-show, one background poll per computer, a poll never dropping a newer code, the
   imported-connector line said once per computer, and doctor's line.
+- `python3 -I test/test_typed_kinds.py`: 1.0.10's typed answers to hand-off and stuck asks and the typed "undo N": the
+  list, the requests, MACs checked against an independent copy of the server's formula and Node vectors for both labels,
+  and nothing sent for a forged, headless, system, reused or mismatched prompt. `DATASTASH_SERVER_DIR=<x-live checkout
+  with node_modules> python3 -I test/test_typed_kinds_server.py` runs `test/e2e/typed-kinds.e2e.test.ts` inside that
+  checkout: the plugin's own code turns the real server's status reply and typed prompts into its requests, which the
+  real doors take click-free; replays and proofs moved to another ask or kind go to the site (skipped without it).
 - `python3 -I test/test_release.py`: fails when the plugin's files change and `plugin.json`'s version does not (Claude
   Code pins a plugin to its set version); `test/plugin-release.json` records each version's fingerprint.
   Main in any session: main in an agent-linked folder for that session only, another session in that folder staying
