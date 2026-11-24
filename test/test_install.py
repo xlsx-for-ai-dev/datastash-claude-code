@@ -804,10 +804,13 @@ class ReservedWords(Base):
             "a b c": ["a", "b", "c"], "bc": ["bc"], "b c": ["b", "c"], "alpha beta": ["alpha", "beta"],
             "alpha-beta": ["alpha-beta"], "alex alex-2": ["alex", "alex-2"], "alex-2, alex": ["alex", "alex-2"],
             "alex and alex-2": ["alex", "alex-2"], "alex alex ALEX": ["alex"],
-            '"alpha" alpha': ["alpha"], "all": "every", "  ALL  ": "every", "all,": "every",
+            '"alpha" alpha': ["alpha"], "all": "every", "  ALL  ": "every", "all,": None,
         }
         for text, exp in want.items():
             got = ds.resolve_picks(text, lst, None)
+            if exp is None:  # confirm review HIGH (PM ruling): "all" with a stray separator refuses the command
+                self.assertIsNone(got, text)
+                continue
             if exp == "every":  # stored-name HIGH: "all" alone asks to confirm every agent first
                 self.assertEqual(got, "confirm", text)
                 self.assertEqual(sorted(ds.all_confirm(lst)["ids"]), every)
@@ -1088,8 +1091,8 @@ class OldStyleNames(Base):
             lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
             for text in (old, old.upper(), f'"{old}"', f"vault {old}", f"{old} vault", f"  {old}  "):
                 got = picks_of(text, lst, OWN)
-                # "all," typed alone is "all" alone: it never picks; it asks to confirm the whole list (stored-name HIGH)
-                alone = [(t.casefold(), q) for t, q in ds.pick_tokens(text, keep_and=True)[0]] == [("all", False)]
+                # only "all" alone asks to confirm the whole list; "all," and "all and" refuse (confirm review HIGH)
+                alone = text.strip().casefold() == "all"
                 self.assertEqual(got, "confirm" if alone else None, (old, text))
                 self.assertIsNone(ds.resolve_picks(text, ds.norm_list(lst), None, reserved=False), (old, text))
             line = ds.pick_refused_line(f"vault {old}", ds.norm_list(lst), OWN)
@@ -1104,7 +1107,7 @@ class OldStyleNames(Base):
     def test_the_critical_end_to_end_all_comma_on_the_slash_line_and_after_the_list(self):
         for old in ("all,", "all and", ",all", "and all", "all ,"):
             lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
-            alone = ds.pick_tokens(old, keep_and=True)[0] == [("all", False)]  # "all,", ",all", "all ,": read as "all" alone
+            alone = old.strip().casefold() == "all"  # confirm review HIGH: "all,", ",all", "all ," refuse, never confirm
             out = self.picks(old, lst)
             if alone:  # stored-name HIGH: the confirm step, which lists the old-style name too; nothing removed yet
                 self.assertEqual(out["systemMessage"], ds.all_confirm_lines(ds.norm_list(lst)), old)
@@ -1135,8 +1138,9 @@ class OldStyleNames(Base):
         for old in OLD_WORDLIKE + ("Ꭺll", "Ꭺll,", "a n d", "this?", "t,his", "(and)"):
             lst = plain("web-app", "vault", old, ids=[OWN, X, KEPT])
             words = ds._old_words(old)
-            for word in ("all", "ALL", "all,"):
+            for word in ("all", "ALL"):
                 self.assertEqual(picks_of(word, lst, OWN), "confirm", (old, word))
+            self.assertIsNone(picks_of("all,", lst, OWN), old)  # confirm review HIGH: a stray separator refuses
             self.assertEqual(picks_of("this", lst, OWN), None if "this" in words else [OWN], old)
             self.assertEqual(picks_of("vault and web-app", lst, OWN), None if "and" in words else [X, OWN], old)
             for word in ("this", "and"):
@@ -1346,6 +1350,36 @@ class AllConfirm(Base):
                                                                      ids=[OWN, AX, AX2, KEPT]))
             self.prompt(text)
             self.assertEqual(sorted(self.note()["updatedInput"]["targets"]), sorted(want), text)
+
+    def test_all_with_any_other_token_or_stray_separator_is_refused_whole(self):
+        """1.0.11 confirm review HIGH (PM ruling): typed "all" anywhere must be the whole input. "all and", "and all",
+        "all,", ", all" and "all" with any other word refuse the command; nothing falls back to this session's agent."""
+        bad = ("all and", "and all", "all,", ", all", "all all", "all this", "this and all", "all alpha", "alpha all",
+               "all, and", "and, all", "ALL AND", "And All", ",all", "all ,", "all and alpha")
+        for lst in (LIST, self.OLD_LIST):
+            for text in bad:
+                self.assertIsNone(picks_of(text, lst, OWN), (text, len(lst["agents"])))
+                for slash in (False, True):
+                    if slash:
+                        self.slash("/datastash:uninstall " + text)
+                        shown = self.tool("PostToolUse", "ledger_agents_list", {}, lst)["systemMessage"]
+                    else:
+                        self.prompt("/datastash:uninstall")
+                        self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+                        v, _ = self.prompt(text)
+                        self.assertEqual(v["decision"], "block", text)
+                        shown = v["reason"]
+                    self.assertIn("Nothing was removed.", shown, (text, slash))
+                    self.assertNotIn("remove all", shown, (text, slash))  # no confirm step is opened
+                    self.assertEqual(self.note()["permissionDecision"], "deny", (text, slash))
+                    self.prompt("remove all 3")  # no step is open, so this confirms nothing
+                    self.assertEqual(self.note()["permissionDecision"], "deny", (text, slash))
+        self.assertTrue(os.path.exists(ds.key_path("web-app")))
+        for text in ("all", " ALL ", "all\t", "\u00a0all"):  # "all" alone (whitespace only) still asks to confirm
+            self.assertEqual(picks_of(text, LIST, OWN), "confirm", repr(text))
+        self.assertEqual(picks_of("this", LIST, OWN), [OWN])  # only "this" typed alone picks this session's agent
+        self.assertIsNone(picks_of("this", LIST, None))
+        self.assertEqual(picks_of("", LIST, OWN), "none")  # empty input picks nothing (no default target)
 
     def test_low1_punctuation_beside_a_word_reads_as_the_word(self):
         for name, word in (("all!", "all"), ("all;", "all"), ("(all)", "all"), ("al'l", "all"), ("a,ll", "all"),

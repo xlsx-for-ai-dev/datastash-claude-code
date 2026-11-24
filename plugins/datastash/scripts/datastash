@@ -12611,11 +12611,15 @@ def pick_check(text, lst, own, reserved=True):
     removes anything by itself: it is "confirm" (with every listed agent; why "all"), and the plugin asks the person to
     type "remove all N" (all_confirm_lines)."""
     toks, err = pick_tokens(text, keep_and=True)
-    if reserved and not err and len(toks) == 1 and not toks[0][1] and toks[0][0].casefold() == "all":
+    if reserved and not err and (text or "").strip().casefold() == "all":
         return ("confirm", None, "all") if lst["agents"] else (None, toks[0][0], "unknown")
     old = _old_typed(text, lst)
     if old:  # 1.0.11 final (PM ruling): an old-style name typed as listed is refused, whatever its tokens read as
         return None, old[0]["name"], "old"
+    if reserved and any(not q and t.casefold() == "all" for t, q in toks):
+        # 1.0.11 confirm review HIGH (PM ruling): typed "all" anywhere must be the whole input, "all" alone; with any
+        # other token or stray separator ("all and", "and all", "all,", ", all", "all all") the command is refused
+        return None, next(t for t, q in toks if not q and t.casefold() == "all"), "mixed"
     idx = _pick_index(lst)
     seen = [(t, q, *_pick_match(t, q, idx)) for t, q in toks]
     seen = [x for x in seen if x[2] != "skip"]
@@ -12638,7 +12642,10 @@ def pick_check(text, lst, own, reserved=True):
             return None, res[0], "reserved"
         if len(seen) > 1:
             return None, res[0], "mixed"
-        return ([own], None, None) if own else (None, res[0], "unknown")
+        # 1.0.11 confirm review HIGH (PM ruling): only a typed "this" alone picks this session's agent; never a fallback
+        if res[0].casefold() == "this" and own:
+            return [own], None, None
+        return None, res[0], "unknown"
     if first_bad[0] is not None:
         return None, *first_bad
     picked = []
