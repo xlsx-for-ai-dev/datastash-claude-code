@@ -467,14 +467,38 @@ typed twice picks its agent once. "all" works only when it is the single token (
 private/public). If any token is unknown or ambiguous, or "all" is typed next to another token, the whole command is
 refused and nothing changes: the refusal names the failing token and its closest exact names, and the AI is told to say
 only "Nothing was removed." (or "Nothing was changed.").
-"all", "this" and "and" are words of these commands, never agent names (compared ignoring case, spaces, dashes, dots
-and look-alike letters, so "ALL", "a-ll" and a fullwidth "ａｌｌ" count too). No naming path gives one: a folder or
-`claude --agent` name that is one gets the next free name by the install rule (a folder named "all" is agent "all-2"),
-and `datastash link`, `datastash fetch`, `datastash api POST /api/v1/agent/register` and the AI's own
-`ledger_agent_register` call refuse it. An agent that already has such a name (made before names were checked) is never
-picked by name: typing the word, quoted or not, refuses the whole command and says that agent must be renamed first (the
-plugin picks agents only by name, never by id); every other name still works. Two names that differ only by case, a
-dot, a dash or a space are picked one at a time in double quotes, typed character for character as the list shows them.
+**Plain names (1.0.11, PM ruling).** An agent name is plain ASCII: only the letters a-z, digits, "-", "_" and "."
+(compared ignoring case). No look-alike, accented, small-capital, fullwidth or invisible letter is ever part of a new
+name, so no name can pass for another one or for "all", "this" or "and". Every naming path (a folder's name, a
+`claude --agent` name, `/datastash:install`, self-registration) makes the name plain by one rule:
+1. every character that is not an ASCII letter, digit, "-", "_" or "." becomes "-" (a space, an accent, a look-alike);
+2. the name is lowercased;
+3. runs of "-" become one "-", and "-" is trimmed from both ends; at most 40 characters, as before;
+4. if nothing is left the name is "agent", as before; if the result is a reserved word ("person", "datastash", or a
+   word below) or another agent here has it, the install suffix rule adds -2, -3 ...
+So "Ꭺll" (a Cherokee A) is agent "ll", "My Project" is "my-project", "ᴀʟʟ" is "agent" and a folder named "all" is
+"all-2". A name sent for a new agent (the AI's `ledger_agent_register` call, `datastash api POST
+/api/v1/agent/register` and `/api/v1/agent/join/redeem`) that is not plain is refused, unless an agent on this computer
+already has exactly that name (registering it again answers that agent). `datastash link` and `datastash fetch` name an
+agent datastash already has; they refuse a name with any character that is not plain ASCII. datastash itself refuses
+new names that are not plain too (no agent is renamed).
+
+"all", "this" and "and" are words of these commands, never agent names (compared ignoring case, spaces, dashes, dots,
+underscores and look-alike digits, so "ALL", "a-ll" and "a11" count too). No naming path gives one (see the -2 rule
+above), and the register paths refuse it. Typed names are ASCII only: if a token has any character that is not plain
+ASCII (a look-alike, an accent, a zero-width or other invisible character), the whole command is refused and nothing
+changes. An agent made before these rules keeps its name, and:
+- if its name reads as one of the words ("ALL", "a-ll"), it is never picked by name: typing the word, quoted or not,
+  refuses the whole command;
+- if its stored name is not plain ASCII (even when the list shows it without the hidden character), it is never picked
+  by name: a typed name of the same length whose plain letters match (each other letter standing for any one letter;
+  "web" for "ᴡeb", "cafe" for "café") refuses the whole command;
+- while such an agent may read as "all", "this" or "and" (at most 4 letters once invisible ones are dropped, or its
+  plain letters all fit inside one of the words, as "Ꭺll" and "ᴛhis" do), "all", "this" and "and" are refused too,
+  so typing the word as the list shows it never removes every agent or this session's own.
+The refusal says why: agents can't be renamed, and the plugin picks agents only by name, never by id, so such an agent
+is left, or switched off on the agents page. Every other name still works. Two names that differ only by case, a dot,
+a dash or a space are picked one at a time in double quotes, typed character for character as the list shows them.
 A token longer than 64 characters is never a name.
 
 **make <name> private / make <name> public** (plugin 1.0.1). Typed as the whole prompt in an agent's session, with the

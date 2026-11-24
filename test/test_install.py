@@ -42,7 +42,7 @@ FIXTURES = os.path.join(HERE, "fixtures")
 KEY, ANSWER = "ldgr_ag_" + "k" * 40, "A" * 43
 LIST = {"list_id": LIST_ID, "expires_in_seconds": 600,
         "agents": [{"agent_id": OWN, "name": "web-app", "visibility": "public"},
-                   {"agent_id": ALPHA, "name": "alpha‮", "visibility": "private"},
+                   {"agent_id": ALPHA, "name": "alpha", "visibility": "private"},
                    {"agent_id": BETA, "name": "beta", "visibility": "public"}]}
 TOOL = "mcp__claude_ai_datastash__"
 OWN_TOOL = "mcp__plugin_datastash_datastash__"  # the plugin's own connector (https://getdatastash.com/mcp): trusted by URL
@@ -625,7 +625,8 @@ class ReservedWords(Base):
         self.assertIn(f'"{word}" is a word this command keeps, never a name, and your agent "{name}" is named like it',
                       line)
         self.assertTrue(line.startswith(("Not done: ", '"')), line)
-        self.assertIn("it must be renamed first", line)
+        self.assertIn("agents can't be renamed", line)  # 1.0.11 redesign LOW 1: no step that does not exist
+        self.assertIn("leave it, or switch it off on the agents page", line)
         self.assertIn("never by id", line)
 
     def mkdir(self, name):
@@ -650,15 +651,15 @@ class ReservedWords(Base):
     # 2. every naming path
     def test_install_folder_named_a_pick_word_gets_the_next_free_name(self):
         for word in ("all", "This", "and", "a-ll", "ALL"):
-            self.assertEqual(ds._free_name(self.mkdir(word)), word + "-2", word)
-            self.assertEqual(ds._free_name(self.mkdir(word), prefer=word), word + "-2", word)
+            self.assertEqual(ds._free_name(self.mkdir(word)), word.lower() + "-2", word)  # names are lowercase
+            self.assertEqual(ds._free_name(self.mkdir(word), prefer=word), word.lower() + "-2", word)
 
     def test_auto_name_never_gives_a_pick_word(self):
         for word in WORDS + ("AND",):
             kind, name = ds.auto_name(self.mkdir(word), None)
-            self.assertEqual((kind, name), ("name", word + "-2"), word)
-            kind, name = ds.auto_name(self.mkdir("plain-" + word), None, session_name=word)  # claude --agent <word>
-            self.assertEqual((kind, name), ("name", word + "-2"), word)
+            self.assertEqual((kind, name), ("name", word.lower() + "-2"), word)
+            kind, name = ds.auto_name(self.mkdir("plain-" + word), None, session_name=ds._folder_name(word))
+            self.assertEqual((kind, name), ("name", word.lower() + "-2"), word)  # claude --agent <word>
 
     def test_register_sends_the_next_free_name(self):
         rid = str(uuid.UUID(int=0x91))
@@ -797,7 +798,7 @@ class ReservedWords(Base):
             got = ds.VISIBILITY_RE.fullmatch(text)
             self.assertNotIsInstance(ds.resolve_picks(got.group(1), lst, None, reserved=False), list, text)
         self.assertEqual(sorted(ds.resolve_picks("a b c", lst, None, reserved=False)), sorted([ids["a"], ids["b"], ids["c"]]))
-        self.assertEqual(ds.resolve_picks("al\u200bpha", lst, None), [ids["alpha"]])  # zero-width: dropped
+        self.assertIsNone(ds.resolve_picks("al\u200bpha", lst, None))  # 1.0.11 final: zero-width is not ASCII: refused
         for text in ("\u0430lpha", "ａｌｐｈａ", "alpha\u0301"):  # look-alikes are unknown
             self.assertNotIsInstance(ds.resolve_picks(text, lst, None), list, repr(text))
         self.assertEqual(ds.resolve_picks("tell me about alpha", lst, None), None)
@@ -842,6 +843,181 @@ class ReservedWords(Base):
         out = self.picks('"alpha."', lst)
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]["targets"], [B])
         self.assertIsNotNone(out)
+
+
+LOOKALIKES = ("\u13aall", "\u1d00\u029f\u029f", "\uab7all", "\u1d1bhis", "\u1d1b\u029c\u026a\ua731", "\u13a2his",
+              "\u0430ll", "\u0430nd", "th\u0456s", "\uff41\uff4c\uff4c", "\uff54\uff48\uff49\uff53", "a\u200bll",
+              "al\u200dl", "\u2060this", "all\u3164", "a\u01c1", "all\u0301")  # Ꭺll ᴀʟʟ ꭺll ᴛhis ᴛʜɪꜱ Ꭲhis, Cyrillic, fullwidth, zero-width
+
+
+class PlainNames(Base):
+    """1.0.11 final (PM ruling after the redesign review HIGH): agent names are plain ASCII (a-z, 0-9, "-", "_", "."),
+    everywhere. Every naming path makes a folder name plain; typed names are ASCII tokens only; an existing agent whose
+    stored name is not plain ASCII is never picked by name, and while one that may read as "all", "this" or "and" is
+    listed those words are refused too."""
+    def setUp(self):
+        super().setUp()
+        self.installed()
+
+    def mkdir(self, name):
+        d = os.path.join(os.path.dirname(self.folder), name)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def picks(self, args, lst):
+        self.slash("/datastash:uninstall " + args)
+        return self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+
+    def denied(self):
+        return self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    # 1. the rule that makes a folder name plain
+    def test_the_plain_name_rule(self):
+        want = {"\u13aall": "ll", "\u1d00\u029f\u029f": "", "\u1d1bhis": "his", "My Project": "my-project",
+                "  --a__b--  ": "a__b", "Q4  launch--plan": "q4-launch-plan", "caf\u00e9 bot": "caf-bot", "\u0430ll": "ll",
+                "\uff41\uff4c\uff4c": "", "a\u200bll": "a-ll", "web.App_2": "web.app_2", "\u212aey": "ey",
+                "\u0130stanbul": "stanbul", "x" * 50: "x" * 40, "-" * 5: ""}
+        for raw, plain_ in want.items():
+            self.assertEqual(ds.plain_agent_name(raw), plain_, repr(raw))
+            self.assertTrue(plain_ == "" or ds.plain_name(plain_), repr(raw))
+
+    def test_every_folder_and_session_name_becomes_plain(self):
+        for raw in LOOKALIKES + ("My Project", "caf\u00e9", "\u65e5\u672c", "UPPER Case"):
+            name = ds._free_name(self.mkdir(raw))
+            self.assertTrue(ds.plain_name(name), (raw, name))
+            self.assertEqual(name, name.lower(), raw)
+            self.assertIsNone(ds.pick_word_like(name), (raw, name))
+            kind, auto = ds.auto_name(self.mkdir("s-" + raw.replace("/", "-")), None, session_name=ds._session_name({"agent_type": raw}))
+            self.assertTrue(ds.plain_name(auto) and ds.pick_word_like(auto) is None, (raw, auto))
+        self.assertEqual(ds._free_name(self.mkdir("\u13aall")), "ll")  # the ruling's example
+        self.assertEqual(ds._free_name(self.mkdir("\u1d00\u029f\u029f")), "agent")  # nothing left: the old fallback
+        self.assertEqual(ds._free_name(self.mkdir("a\u200bll")), "a-ll-2")  # reads as "all": the -2 rule
+        self.assertEqual(ds._free_name(self.mkdir("ALL")), "all-2")
+        self.assertEqual(ds.auto_name(self.mkdir("q"), None, after="My Agent")[1], "my-agent-2")
+
+    def test_the_install_command_registers_the_plain_name(self):
+        self.folder = self.mkdir("\u13a2his Project")
+        self.slash("/datastash:install")
+        ctx = ((self.prompt("/datastash:install")[0] or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
+        self.assertIn('ledger_agent_register with name "his-project"', ctx)
+
+    # 2. names sent for a new agent
+    def test_the_ai_registering_a_name_that_is_not_plain_is_denied(self):
+        for n in LOOKALIKES + ("Research Bot", "caf\u00e9", "web/app", "a,b", "x\ty"):
+            out = self.tool("PreToolUse", "ledger_agent_register", {"name": n})
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", repr(n))
+        for n in ("research-bot", "web.app_2", "Researcher"):
+            out = self.tool("PreToolUse", "ledger_agent_register", {"name": n})
+            self.assertNotEqual((out or {}).get("hookSpecificOutput", {}).get("permissionDecision"), "deny", n)
+
+    def test_an_agent_already_here_keeps_its_name(self):
+        """Redesign LOW 2: this computer's agent made before names were plain (or named "and") finishes install."""
+        for n in ("and", "My Agent"):
+            ds.save_agent(n, str(uuid.uuid4()), KEY, WB, self.mkdir("old-" + n.replace(" ", "")))
+            out = self.tool("PreToolUse", "ledger_agent_register", {"name": n})
+            self.assertNotEqual((out or {}).get("hookSpecificOutput", {}).get("permissionDecision"), "deny", n)
+        out = self.tool("PreToolUse", "ledger_agent_register", {"name": "Your Agent"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_api_register_and_join_redeem_refuse_names_that_are_not_plain(self):
+        """Redesign LOW 3: the join path is checked too."""
+        for path in (ds.AGENT_REGISTER_PATH, "/api/v1/agent/join/redeem", "/api/v1/agent/join/redeem/"):
+            for n in LOOKALIKES[:6] + ("and", "Research Bot"):
+                with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                    ds.cmd_api(["POST", path, json.dumps({"name": n, "code": "x"})])
+        self.assertFalse([c for c in self.calls if "register" in c[1] or "redeem" in c[1]])
+
+    def test_link_and_fetch_refuse_a_name_that_is_not_ascii(self):
+        for n in LOOKALIKES:
+            with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                ds.cmd_link([n, "--workbook", WB])
+            with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                ds.cmd_fetch([n, "abcdef123456"])
+        self.assertFalse([c for c in self.calls if c[1] == ds.PICKUP_PATH])
+
+    # 3. typed names
+    def test_a_typed_name_that_is_not_ascii_refuses_the_whole_command(self):
+        lst = plain("web-app", "alpha", "all-2", ids=[OWN, X, Y])
+        for tok in LOOKALIKES + ("alph\u0430", "\uff41lpha", "alpha\u200b"):
+            for text in (tok, f"alpha {tok}", f'"{tok}"', f"{tok}, web-app"):
+                self.assertIsNone(picks_of(text, lst, OWN), repr(text))
+                self.assertIsNone(ds.resolve_picks(text, ds.norm_list(lst), None, reserved=False), repr(text))
+                self.assertIn("not plain ASCII", ds.pick_refused_why(text, ds.norm_list(lst), OWN), repr(text))
+        out = self.picks("\u13aall", lst)
+        self.assertIn("Nothing was removed.", out["systemMessage"])
+        self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.PICK_REFUSED_AI)
+        self.assertTrue(self.denied())
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+        v, _ = self.prompt("\u1d00\u029f\u029f")
+        self.assertEqual(v["decision"], "block")
+        self.assertIn("Nothing was removed.", v["reason"])
+        self.assertTrue(self.denied())
+        self.prompt("make \u1d1bhis public")
+        out = self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+        self.assertIn("Nothing was changed.", out["systemMessage"])
+        self.assertTrue(self.denied())
+
+    # 4. an agent whose stored name is not plain ASCII
+    def test_redesign_high_typing_all_or_this_beside_a_look_alike_agent_removes_nothing(self):
+        for odd in LOOKALIKES:
+            lst = plain("web-app", "vault", odd, ids=[OWN, X, KEPT])
+            for word in ("all", "ALL", "this", "and", '"all"', "vault and web-app"):
+                self.assertIsNone(picks_of(word, lst, OWN), (odd, word))
+            why = ds.pick_refused_why("all", ds.norm_list(lst), OWN)
+            self.assertIn("is not plain ASCII", why, repr(odd))
+            self.assertIn("never by id", why)
+            self.assertIn("leave it, or switch it off on the agents page", why)
+            self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), repr(odd))
+            out = self.picks("all", lst)
+            self.assertIn("Nothing was removed.", out["systemMessage"])
+            self.assertTrue(self.denied())
+            self.prompt("/datastash:uninstall")
+            self.tool("PostToolUse", "ledger_agents_list", {}, lst)
+            v, _ = self.prompt("this")
+            self.assertEqual(v["decision"], "block", repr(odd))
+            self.assertTrue(self.denied())
+
+    def test_an_agent_whose_name_is_not_plain_ascii_is_never_picked_by_name(self):
+        for odd, typed in (("alpha\u202e", "alpha"), ("caf\u00e9", "cafe"), ("\u0430lpha", "alpha"),
+                           ("\uff41\uff4c\uff50\uff48\uff41", "alpha"), ("al\u200bpha", "alpha"),
+                           ("\u1d21eb", "web")):
+            lst = plain("web-app", odd, ids=[OWN, KEPT])
+            for text in (typed, f'"{typed}"', typed.upper(), f"web-app {typed}"):
+                self.assertIsNone(picks_of(text, lst, OWN), (odd, text))
+            why = ds.pick_refused_why(typed, ds.norm_list(lst), OWN)
+            self.assertIn("whose name is not plain ASCII", why, repr(odd))
+            self.assertIn("can't be picked by name", why)
+            self.assertEqual(picks_of("web-app", lst, OWN), [OWN], repr(odd))
+        lst = plain("web-app", "alpha\u202e", "beta", ids=[OWN, KEPT, X])  # a long odd name can't read as "all"
+        self.assertEqual(sorted(picks_of("all", lst, OWN)), sorted([OWN, KEPT, X]))
+        lst = plain("web-app", "\u1d00\u029f\u029f", "vault", ids=[OWN, KEPT, X])  # "???": any 3 letters may be it
+        self.assertIsNone(picks_of("web", plain("web", "\u1d00\u029f\u029f", ids=[OWN, KEPT]), OWN))
+        self.assertEqual(picks_of("vault", lst, OWN), [X])
+
+    def test_the_stored_name_decides_not_the_shown_one(self):
+        got = ds.norm_list(plain("al\u200bpha", "alpha\u202e", "alpha", ids=[A, B, C]))
+        self.assertEqual([a["name"] for a in got["agents"]], ["alpha", "alpha", "alpha"])  # shown alike
+        self.assertEqual([a["plain"] for a in got["agents"]], [False, False, True])
+        self.assertIsNone(ds.resolve_picks("alpha", got, None))
+        self.assertIsNone(ds.resolve_picks('"alpha"', got, None))
+
+    def test_the_plugin_picks_agents_only_by_name_never_by_id(self):
+        lst = plain("web-app", "alpha", ids=[OWN, X])
+        self.assertEqual(picks_of(X, lst, OWN), "none")  # an agent id typed is not on the list
+        self.assertIsNone(picks_of(f"alpha {X}", lst, OWN))
+
+    def test_every_attack_of_the_three_reviews_with_a_look_alike_listed(self):
+        lst = ds.norm_list(plain("a", "b", "c", "bc", "alpha", "beta", "alpha-beta", "\u13aall",
+                                 ids=[str(uuid.UUID(int=0x200 + i)) for i in range(8)]))
+        ids = {a["name"]: a["id"] for a in lst["agents"]}
+        for text, exp in {"a b c": ["a", "b", "c"], "bc": ["bc"], "alpha beta": ["alpha", "beta"],
+                          "alpha-beta": ["alpha-beta"], "alpha, beta": ["alpha", "beta"]}.items():
+            self.assertEqual(sorted(ds.resolve_picks(text, lst, None)), sorted(ids[n] for n in exp), text)
+        for text in ("all", "this", "x all", "all x", "alpha all", "all, alpha", "alpha and beta", "a ll", '"all"',
+                     "\u13aall", "alpha \u13aall", "make alpha all public", "alpha\u200b", "remove all"):
+            self.assertNotIsInstance(ds.resolve_picks(text, lst, None), list, repr(text))
+            self.assertNotIsInstance(ds.resolve_picks(text, lst, None, reserved=False), list, repr(text))
 
 
 class RealSlashShape(Base):
@@ -1178,7 +1354,7 @@ class HomeFolderInstall(Base):
             shape = [h for h in json.load(f) if h["prompt"] == "/datastash:install"][0]
         v = self.hook(ds.cmd_prompt, dict(shape, session_id="s1", cwd=self.folder, prompt_id=str(uuid.uuid4()),
                                           transcript_path=self.transcript("s1"), agent_type="SPM"))
-        self.assertIn('ledger_agent_register with name "SPM"', v["hookSpecificOutput"]["additionalContext"])
+        self.assertIn('ledger_agent_register with name "spm"', v["hookSpecificOutput"]["additionalContext"])  # lowercase
 
     def test_the_agent_this_session_listens_for_is_reused(self):
         ds.save_agent("SPM", OWN, KEY, WB, self.folder)  # the computer's one agent with no folder (home: never linked)

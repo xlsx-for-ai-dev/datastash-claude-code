@@ -1642,7 +1642,7 @@ class SelfRegistration(MainBase):
         self.be("sess-R", (1201, "tR"))
         proj = os.path.join(harness.tmpdir(self, dir=TMP), "Q4 launch-plan")
         os.makedirs(proj)
-        self.assertEqual(self.name_in(proj), "name: Q4 launch-plan")
+        self.assertEqual(self.name_in(proj), "name: q4-launch-plan")  # 1.0.11: plain, lowercase, "-" for the space
         odd = os.path.join(harness.tmpdir(self, dir=TMP), 'we"ird$name`')
         os.makedirs(odd)
         self.assertEqual(self.name_in(odd), "name: we-ird-name")
