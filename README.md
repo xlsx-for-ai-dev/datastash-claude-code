@@ -796,6 +796,11 @@ An agent can send datastash a capability request, an error report or anything el
   throwaway config folder) wakes when an agent sends the person an ask, with no message text in the session.
   `ANYWHERE=1 MAIN_KEY_FILE=<a main key file>` runs it in a clean folder (no agent link, no person link) with a main key
   on the machine: the person types "datastash main" there, the session turns into the main, and it wakes as the person.
+- `test/e2e-install.sh` (live, needs tmux and claude) types the Install steps above into a real interactive Claude
+  Code on an empty HOME, in the home folder and in a fresh repo folder: marketplace add, install "for you", restart,
+  `/mcp` datastash must offer Authenticate and its link must open datastash's sign-in page, and `/datastash:install`
+  must reach the plugin with the right agent name. `E2E_TAG=v1.0.1 test/e2e-install.sh` runs it on an older release
+  (1.0.1 fails it). Finishing the sign-in and the steps after it are not run there (see the script header).
 - `test/wake-test.sh` proves the idle wake on this box with the test account (needs tmux; see the script header).
   `BURST=5 test/wake-test.sh` sends 5 messages within seconds instead and passes when the session wakes once or
   twice and handles all 5.
