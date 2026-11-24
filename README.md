@@ -274,6 +274,36 @@ the commit's flaky bookkeeping (no Test failures or Test runs rows), since the r
   `flaky_commits` once.
 - The key is an agent key kept as a CI secret; it is never printed.
 
+## Time per card (plugin 1.0.5)
+
+`datastash time-per-card on`, run once in a project folder by its agent, turns time per card on for that folder and sets
+up the agent workbook's tabs (`ledger_feeds_setup {services: ["burn"]}`): **Burn** (one row per card, activity and model:
+minutes, tool calls and token counts), **Cards cost** (one total row per card) and **Prices** (your price per million
+tokens per model, so models can be weighed against each other). Until then the hooks do nothing; `datastash
+time-per-card off` stops it, and `datastash time-per-card` says which it is.
+
+- **When.** At each subagent stop and session end the hook starts a background send and returns at once; a session is
+  never slowed or failed by it. The send reads this session's own Claude Code transcripts on this computer (the main one
+  and its subagents' files, only inside `~/.claude/projects`), from where the last send stopped.
+- **What is sent.** Minutes, tool calls, token counts (in, out, cache read, cache write), retries and wakes, per card,
+  activity and model. Never a prompt, answer, file text, command text or path: commands and paths are read in memory
+  only to pick the activity. The split is by activity only.
+- **Activities.** Edit, Write and shell commands that write a file: coding. A test runner: testing. git commit, push or
+  merge, `gh pr create`/`merge`/`ready`, a lander or deploy: landing. A subagent whose description says review: reviewing
+  (all its calls). Monitor, a wake-up, `sleep` or `datastash watch`: wakes. A read (Read, Grep, Glob, a web read, a
+  read-only shell command, an outside-tool lookup): orienting, or lookups when the session already read that target. The
+  rest (delegating, messages, other commands): planning. A model turn's tokens go to its first tool call's activity.
+- **Minutes.** A model turn from its input to its end, and a tool from its call to its result (calls side by side counted
+  once). The time before the person types is never counted, nor a subagent's run in its parent's time.
+- **The card.** A subagent's description ("Build XLI-12"), else `DATASTASH_CARD`, else the git branch (`xli-12-login`);
+  else "no card". Card ids are letters, a dash and digits only.
+- **Never twice.** Each send carries an idempotency key from where it was read, and the read position moves only after
+  datastash took the rows; a send that was cut short goes again with the same rows and keys.
+- **Past 10,000 Burn rows** (the size the card totals read whole), finished cards are folded, oldest first, never a card
+  in the send: their Burn sums go into the card's `folded_*` cells and their Burn rows are removed, so each card's
+  totals read the same. A fold cut short is finished first the next time. The totals and shares are always the
+  engine's formula columns.
+
 ## Lookups kept ready (plugin 0.6.0)
 
 Agents repeat slow lookups: where a PR stands, how CI went, the state of a card. The plugin counts them on this computer
@@ -837,6 +867,13 @@ An agent can send datastash a capability request, an error report or anything el
   refused; rows folded; flaky in either order (also across legs that ran different tests), at once (counted once), in a
   retry, and never for shards, skips, another commit or a `--local` run; main_broke_at; the week four weeks back; pages of 1,000 with idempotency keys; 429 and busy waited out; old
   Test runs rows removed; exit 0 with one line for every problem, a bad wait or retry setting and a server that does not answer.
+- `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5): off until `on` (which sets up the tabs), the
+  hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's
+  tokens counted once; minutes without the person's typing time and with side-by-side calls counted once; wakes and
+  retries; review subagents; a canary in prompts, commands, paths and results never sent; only new lines sent, a
+  half-written line left for later, a cut-short send sent again without counting twice, files outside Claude Code's
+  projects folder never read; the fold past the limit (oldest first, never this send's card, sums into `folded_*`, rows
+  removed, a cut-short fold finished once).
 - `python3 -I test/test_fingerprint.py`: `datastash fingerprint` (plugin 0.9.10): git blob SHAs that match git's own
   for tracked files (also after an edit), sha256 for untracked and outside files, folders, gone paths, the repo name
   without host or token, the HEAD commit and branch, `--url` and `--lookup` from stdin, never a file's text in the

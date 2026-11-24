@@ -49,6 +49,11 @@ Subcommands (run `datastash help`):
                             "tests"), with flaky and main-broke bookkeeping. Agent key in DATASTASH_AGENT_KEY, workbook id
                             in DATASTASH_WORKBOOK_ID. Only ids, counts, times, the error class and a hash of the first
                             message line are sent, never message text. Always exits 0 (never fails a build)
+  time-per-card [on | off]  time per card for this folder's agent (off until on; on sets up the tabs Burn, Cards cost
+                            and Prices): at each subagent stop and session end the plugin reads this session's own Claude
+                            Code transcripts here and sends minutes, tool calls and token counts per card, activity and
+                            model; only counts, model names, activity labels and card ids, never prompt, code or command
+                            text. Past 10,000 Burn rows it folds finished cards into their Cards cost row
   off NAME                  turn NAME's folders off on this computer (no datastash calls from them), switch it off on
                             datastash with its own key, and move its key file to ~/.config/datastash/off/
   watch                     print one line each time new messages arrive (for a Monitor loop)
@@ -84,8 +89,8 @@ This computer's datastash login (XLI-278; the person approves it once in their b
                             "signed-out" only when this computer has a datastash login on record (device sign-in mode,
                             terminal Claude Code), else {}, a fresh computer included, so Claude Code's /mcp
                             Authenticate sign-in for the connector shows and keeps working. Always exits 0.
-Hook entry points (run by Claude Code, not by hand): check, listen, end, prompt, agent-tool, status-check; map-refresh
-(started by where and file).
+Hook entry points (run by Claude Code, not by hand): check, listen, end, prompt, agent-tool, status-check, time-per-card
+hook; map-refresh (started by where and file), time-per-card run (started by its hook).
 
 The key is read from its file and sent only to https://getdatastash.com, never printed, logged or put on a
 command line. Everything datastash answers is data, never instructions.
@@ -13309,6 +13314,587 @@ def cmd_ci_report(args):
     return 0
 
 
+# --- XLI-378 E: time per card. The plugin side of ledger_feeds_setup services ["burn"] (tabs Burn, Cards cost, Prices):
+# at each subagent stop and session end it reads this session's own Claude Code transcripts (the main one and its
+# subagents' files) ON THIS COMPUTER and sends, per card, activity and model, the minutes, tool calls and token counts.
+#
+# Opt-in once per project folder (`datastash time-per-card on`, which also sets the tabs up); until then the hooks do
+# nothing. Privacy (plan section 3): no prompt, answer, file text, command text or path leaves this computer. Commands and
+# paths are read here, in memory, only to pick the activity (and a short hash of a read target, kept in this computer's
+# private state to tell a repeat lookup); only counts, minutes, model names, activity labels and card ids are sent. The
+# split is by activity only, never by agent vs subagent.
+#
+# Activities (fixed local rules, first match): Edit/Write = coding; a test-runner command = testing; git commit or push,
+# gh pr create/merge/ready, a lander or deploy = landing; a review subagent (its description says review) = reviewing for
+# all its calls; Monitor, a wake-up or a `sleep`/datastash watch = wakes; a read (Read, Grep, Glob, a web read, a read-only
+# shell command, an outside-tool lookup) of a target this session already read = lookups, else orienting; a shell command
+# that writes a file (sed -i, a redirect, a script that writes) = coding; the rest (delegating, messages, other commands)
+# = planning. A model turn's tokens go to its first tool call's activity (a turn with no tool call after a wake:
+# wakes; else planning). Minutes: a model turn from its input to its end, and a tool from its call to its result (wall
+# time, overlaps counted once); the time before the person types is never counted, nor a subagent's run in its parent.
+# The card: a subagent's description, else DATASTASH_CARD, else the git branch (an id like XLI-12), else "no card".
+#
+# Each send has an idempotency key from where it was read, so a retry never counts twice; the read offsets move only
+# after datastash took the rows. Then, past TPC_FOLD_AT Burn rows (the range-sheet limit of the card totals; an existing
+# ruling, not a cap), finished cards (oldest last_seen first, never a card in this report) are folded: their Burn rows'
+# sums are added to the card's folded_* cells and those rows are deleted, so each card reads the same totals. The fold
+# only moves counts already sent; every total, share and price a person reads is the engine's formula column.
+# Never fails or slows a session: the hook starts a background run and returns at once.
+TPC_USAGE = "usage: datastash time-per-card [on | off]   (time per card for this folder's agent; off by default)"
+TPC_PATH = os.path.join(CONF, "time-per-card.json")  # {"projects": {folder: {"on": bool, "at": time}}}
+TPC_BURN, TPC_CARDS = "Burn", "Cards cost"
+TPC_FOLD_AT = 10_000  # x-live RANGE_SHEET_MAX_ROWS: past it the Cards cost totals can't be read (XLI-378 F review)
+TPC_PROGRESS = ("coding", "testing", "landing")
+TPC_WAIT_SECONDS = 300.0
+TPC_LOCK_SECONDS = 120.0
+TPC_STEP = "-"
+TPC_CARD_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,10})-(\d{1,7})(?![0-9])")
+TPC_NOT_CARD = {"alpha", "beta", "build", "bugfix", "chore", "deps", "dev", "develop", "feat", "feature", "fix", "hotfix",
+                "main", "master", "patch", "pr", "prod", "rc", "rel", "release", "stage", "staging", "temp", "test",
+                "tests", "tmp", "ver", "version", "wip"}
+TPC_EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+TPC_READ_TOOLS = {"Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "ToolSearch", "NotebookRead"}
+TPC_WAKE_TOOLS = {"Monitor", "ScheduleWakeup", "TaskOutput"}
+TPC_AGENT_TOOLS = {"Agent", "Task"}
+TPC_TEST_RE = re.compile(
+    r"(?:^|[\s/])(?:pytest|py\.test|vitest|jest|mocha|rspec|phpunit|tox|nox|xpm-vitest|unittest|go\s+test|cargo\s+test|"
+    r"dotnet\s+test|deno\s+test|bun\s+test|playwright\s+test|mvn\s+(?:\S+\s+)*test|gradlew?\s+(?:\S+\s+)*test|"
+    r"make\s+(?:\S+\s+)*(?:test|check)|(?:npm|pnpm|yarn)\s+(?:run\s+)?test|python3?\s+(?:-\S+\s+)*\S*test\S*\.py)(?:\s|$)")
+TPC_LAND_RE = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?(?:commit|push|merge)\b|\bgh\s+pr\s+(?:create|merge|ready)\b|land-pr\b|"
+                         r"\blander\b|\bdeploy")
+TPC_WAKE_RE = re.compile(r"^\s*(?:sleep\s+\d|\S*datastash\s+(?:watch|listen|inbox)\b)")
+TPC_EDIT_RE = re.compile(r"\bsed\s+(?:-\S*\s+)*-i|\bperl\s+-\S*i|\btee\b|\bpatch\b|\bgit\s+apply\b|"
+                         r"(?<![0-9&>])>{1,2}\s*(?!/dev/null)[^&\s|>]|\.write(?:_text)?\(|open\([^)]*['\"][wa]")
+TPC_READ_RE = re.compile(r"^\s*(?:cat|head|tail|less|grep|egrep|rg|find|ls|tree|wc|stat|file|jq|sort|uniq|cut|tr|awk|nl|"
+                         r"column|comm|diff|cmp|du|df|date|pwd|which|type|basename|dirname|realpath|readlink|sha256sum|"
+                         r"md5sum|sed\s+-n|git\s+(?:-C\s+\S+\s+)?(?:log|show|status|diff|blame|grep|ls-files|branch|"
+                         r"rev-parse|remote|fetch|worktree\s+list|describe|tag\s+--list))(?:\s|$)")
+TPC_NEUTRAL_RE = re.compile(r"^\s*(?:(?:cd|pushd|popd|export|set|true|echo|printf|:)(?:\s|$)|\d*>?\s*$|"
+                            r"[A-Za-z_][A-Za-z0-9_]*=\S*\s*$)")
+
+
+def tpc_card(text):
+    """The first card id in a branch name or a description ("xli-378e" -> "XLI-378"), or None. Ids are letters, a dash
+    and digits only, so a sent id never holds a wildcard or an operator."""
+    for m in TPC_CARD_RE.finditer(text if isinstance(text, str) else ""):
+        if m.group(1).lower() not in TPC_NOT_CARD:
+            return f"{m.group(1).upper()}-{int(m.group(2))}"
+    return None
+
+
+def _tpc_hash(*parts):
+    return hashlib.sha256("\0".join(str(p) for p in parts).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def tpc_bash_kind(cmd):
+    """("testing" | "landing" | "wakes" | "read" | None, read target) for one shell command, from its text in memory."""
+    if not isinstance(cmd, str):
+        return None, None
+    segs = [s.strip() for s in _SEG_RE.split(cmd[:100000]) if s.strip() and not TPC_NEUTRAL_RE.match(s)]
+    for kind, rx in (("testing", TPC_TEST_RE), ("landing", TPC_LAND_RE)):
+        if any(rx.search(s) for s in segs):
+            return kind, None
+    if TPC_EDIT_RE.search(cmd[:100000]):
+        return "coding", None
+    if segs and all(TPC_WAKE_RE.search(s) for s in segs):
+        return "wakes", None
+    if segs and all(TPC_READ_RE.search(s) or lookup_shape(s) for s in segs):
+        return "read", _tpc_hash("Bash", " ".join(cmd.split()))
+    return None, None
+
+
+def tpc_tool_kind(name, args):
+    """(activity or "read", read target or None) for one tool call."""
+    args = args if isinstance(args, dict) else {}
+    if name in TPC_EDIT_TOOLS:
+        return "coding", None
+    if name in TPC_WAKE_TOOLS:
+        return "wakes", None
+    if name in TPC_AGENT_TOOLS:
+        about = f"{args.get('description') or ''} {args.get('subagent_type') or ''}"
+        return ("reviewing" if re.search(r"review", about, re.I) else "planning"), None
+    if name in ("Bash", "PowerShell"):
+        kind, target = tpc_bash_kind(args.get("command"))
+        return kind or "planning", target
+    if name in TPC_READ_TOOLS:
+        what = next((args.get(k) for k in ("file_path", "notebook_path", "url", "pattern", "query", "path") if args.get(k)), "")
+        return "read", _tpc_hash(name, what, args.get("path") or "", args.get("glob") or "")
+    return "planning", None
+
+
+
+
+class TpcReader:
+    """One transcript file's new part, folded per (card, activity, model). Its state (open tool calls, read targets, the
+    turn being read, the last input's time) carries over to the next read. Only numbers leave it."""
+
+    def __init__(self, state, card_hint=None, review=False):
+        self.st, self.card_hint, self.review = state, card_hint, review
+        self.rows, self.cards = {}, {}
+
+    @staticmethod
+    def _span(r, ts):
+        if ts is not None:
+            r["first"] = ts if r.get("first") is None else min(r["first"], ts)
+            r["last"] = ts if r.get("last") is None else max(r["last"], ts)
+        return r
+
+    def row(self, card, activity, model, ts):
+        r = self.rows.setdefault((card, activity, model), {"minutes": 0.0, "calls": 0, "tokens_in": 0, "tokens_out": 0,
+                                                           "cache_read": 0, "cache_write": 0, "retries": 0})
+        return self._span(r, ts)
+
+    def card_row(self, card, ts):
+        return self._span(self.cards.setdefault(card, {"wakes": 0, "retries": 0}), ts)
+
+    def card_of(self, e):
+        return (self.card_hint or tpc_card(os.environ.get("DATASTASH_CARD", "")) or tpc_card(e.get("gitBranch"))
+                or "no card")
+
+    def activity(self, kind, target):
+        if self.review:
+            return "reviewing"
+        if kind != "read":
+            return kind
+        seen = self.st.setdefault("seen", [])
+        if target in seen:
+            return "lookups"
+        seen.append(target)
+        return "orienting"
+
+    def minutes(self, card, activity, model, secs, ts):
+        if secs > 0:
+            self.row(card, activity, model, ts)["minutes"] += secs / 60.0
+
+    def finish_turn(self):
+        """The turn being read is complete (or the read ends): its tokens and its time from its input to its end."""
+        t = self.st.pop("turn", None)
+        if not t:
+            return
+        activity = t.get("activity") or ("reviewing" if self.review else "wakes" if t.get("wake") else "planning")
+        r = self.row(t["card"], activity, t["model"], t.get("end"))
+        for col, v in (t.get("usage") or {}).items():
+            r[col] += v
+        if t.get("start") is not None and t.get("end") is not None:
+            self.minutes(t["card"], activity, t["model"], t["end"] - t["start"], t["end"])
+        if t.get("end") is not None:
+            self.st["mark"] = t["end"]
+
+    def entry(self, e):
+        if not isinstance(e, dict):
+            return
+        ts = _week_ts(e.get("timestamp"))
+        if e.get("type") == "assistant":
+            self.assistant(e, ts)
+        elif e.get("type") == "user":
+            self.finish_turn()
+            self.user(e, ts)
+
+    def user(self, e, ts):
+        st = self.st
+        msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+        content = msg.get("content")
+        results = [c for c in content if isinstance(c, dict) and c.get("type") == "tool_result"] if isinstance(content, list) else []
+        if results:
+            for c in results:
+                call = st.setdefault("open", {}).pop(str(c.get("tool_use_id")), None)
+                if call is None:
+                    continue
+                if c.get("is_error") is True:
+                    st["error"] = call["sig"]
+                if ts is not None and call["timed"]:
+                    since = max(call["ts"], st.get("until") or 0)
+                    self.minutes(call["card"], call["activity"], call["model"], ts - since, ts)
+                    st["until"] = max(st.get("until") or 0, ts)
+            st["wake"] = False
+        elif not e.get("isMeta"):
+            origin = e.get("origin") if isinstance(e.get("origin"), dict) else {}
+            st["wake"] = origin.get("kind") == "task-notification"
+            if st["wake"]:
+                self.card_row(self.card_of(e), ts)["wakes"] += 1
+        if ts is not None:
+            st["mark"] = ts
+
+    def assistant(self, e, ts):
+        st = self.st
+        msg = e.get("message") if isinstance(e.get("message"), dict) else {}
+        model = re.sub(r"[^A-Za-z0-9._:@/\-]", "", str(msg.get("model") or ""))[:80] or "unknown"
+        if model == "synthetic":
+            return
+        mid = str(msg.get("id") or e.get("requestId") or e.get("uuid") or "")
+        card = self.card_of(e)
+        if (st.get("turn") or {}).get("id") != mid:
+            self.finish_turn()
+            if mid and mid in st.setdefault("done", []):
+                t = None  # the rest of a turn already counted at an earlier read: its tool calls only
+            else:
+                u = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+                usage = {col: u[k] for col, k in (("tokens_in", "input_tokens"), ("tokens_out", "output_tokens"),
+                                                  ("cache_read", "cache_read_input_tokens"),
+                                                  ("cache_write", "cache_creation_input_tokens"))
+                         if isinstance(u.get(k), int) and not isinstance(u.get(k), bool) and u[k] > 0}
+                t = st["turn"] = {"id": mid, "card": card, "model": model, "usage": usage, "start": st.get("mark"),
+                                  "end": ts, "wake": st.get("wake"), "activity": None}
+                st["done"] = (st["done"] + [mid])[-50:]
+        else:
+            t = st["turn"]
+            if ts is not None:
+                t["end"] = ts
+        blocks = msg.get("content") if isinstance(msg.get("content"), list) else []
+        for b in blocks:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            name = str(b.get("name") or "")
+            args = b.get("input") if isinstance(b.get("input"), dict) else {}
+            activity = self.activity(*tpc_tool_kind(name, args))
+            r = self.row(card, activity, model, ts)
+            r["calls"] += 1
+            sig = _tpc_hash(name, json.dumps(args, sort_keys=True, default=str))
+            if st.get("error") == sig:
+                r["retries"] += 1
+                self.card_row(card, ts)["retries"] += 1
+            st["error"] = None
+            st.setdefault("open", {})[str(b.get("id"))] = {"ts": ts or 0, "card": card, "activity": activity, "model": model,
+                                                           "sig": sig, "timed": ts is not None and name not in TPC_AGENT_TOOLS}
+            if t is not None and t["activity"] is None:
+                t["activity"] = activity
+
+
+def tpc_read(path, fst, card_hint=None, review=False):
+    """Read path's complete lines from fst["offset"]; returns (reader, new offset). fst (the file's state) is changed in
+    place; the caller keeps it only once the rows were sent."""
+    rd = TpcReader(fst, card_hint, review)
+    off = int(fst.get("offset") or 0)
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            if f.tell() < off:
+                off = 0  # the file was replaced: read it from the start
+            f.seek(off)
+            while True:
+                line = f.readline()
+                if not line.endswith(b"\n"):
+                    break  # a line still being written: next time
+                off += len(line)
+                try:
+                    rd.entry(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return rd, int(fst.get("offset") or 0)
+    rd.finish_turn()
+    return rd, off
+
+
+def _tpc_iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t)) if isinstance(t, (int, float)) else None
+
+
+def _tpc_projects_root():
+    return os.path.realpath(os.path.join(CLAUDE_DIR, "projects"))
+
+
+def tpc_files(transcript, sid):
+    """[(path, card hint, review)] for this session: its main transcript and each of its subagents' files, only regular
+    files of this user inside Claude Code's own projects folder."""
+    root = _tpc_projects_root()
+    out = []
+    real = os.path.realpath(transcript) if isinstance(transcript, str) and transcript else ""
+
+    def ok(p):
+        try:
+            s = os.lstat(p)
+        except OSError:
+            return False
+        return stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and os.path.realpath(p).startswith(root + os.sep)
+    if real and ok(real):
+        out.append((real, None, False))
+        sub = os.path.join(os.path.dirname(real), sid or "", "subagents")
+        try:
+            names = sorted(os.listdir(sub)) if sid else []
+        except OSError:
+            names = []
+        for n in names:
+            p = os.path.join(sub, n)
+            if not re.fullmatch(r"agent-[A-Za-z0-9_\-]{1,80}\.jsonl", n) or not ok(p):
+                continue
+            meta = read_json(p[:-len(".jsonl")] + ".meta.json", {})
+            about = f"{meta.get('description') or ''} {meta.get('agentType') or ''}"
+            out.append((os.path.realpath(p), tpc_card(str(meta.get("description") or "")), bool(re.search(r"review", about, re.I))))
+    return out
+
+
+def tpc_rows(readers, ended, main_card, now):
+    """The Burn and Cards cost rows for one send: Burn one row per (card, activity, model), Cards cost one per card."""
+    burn, cards = [], {}
+
+    def card(c):
+        return cards.setdefault(c, {"card": c})
+    for rd, new_sub in readers:
+        for (c, activity, model), r in sorted(rd.rows.items()):
+            row = {"key": f"{c} / {TPC_STEP} / {activity} / {model}", "card": c, "step": TPC_STEP, "activity": activity,
+                   "model": model, "minutes": {"inc": round(r["minutes"], 3)}, "calls": {"inc": r["calls"]},
+                   "tokens_in": {"inc": r["tokens_in"]}, "tokens_out": {"inc": r["tokens_out"]},
+                   "cache_read": {"inc": r["cache_read"]}, "cache_write": {"inc": r["cache_write"]},
+                   "retries": {"inc": r["retries"]}}
+            if r.get("first") is not None:
+                row["first_seen"], row["last_seen"] = {"min": _tpc_iso(r["first"])}, {"max": _tpc_iso(r["last"])}
+            burn.append(row)
+            cr = card(c)
+            if r.get("first") is not None:
+                cr["first_seen"] = {"min": min(_tpc_iso(r["first"]), (cr.get("first_seen") or {}).get("min") or "9")}
+                cr["last_seen"] = {"max": max(_tpc_iso(r["last"]), (cr.get("last_seen") or {}).get("max") or "")}
+        for c, x in rd.cards.items():
+            cr = card(c)
+            for col in ("wakes", "retries"):
+                if x[col]:
+                    cr[col] = {"inc": (cr.get(col) or {}).get("inc", 0) + x[col]}
+        if new_sub:
+            cr = card(new_sub)
+            cr["subagents"] = {"inc": (cr.get("subagents") or {}).get("inc", 0) + 1}
+    if ended:
+        cr = card(main_card or "no card")
+        cr["sessions"] = {"inc": 1}
+        cr.setdefault("last_seen", {"max": _tpc_iso(now)})
+    return burn, [cards[c] for c in sorted(cards)]
+
+
+def _tpc_state_path(sid):
+    return os.path.join(STATE, f"tpc-{sid}.json")
+
+
+def tpc_fold(client, keep, journal_path):
+    """Past TPC_FOLD_AT Burn rows, fold finished cards (oldest last_seen first, never one in `keep`, only ones not folded
+    before) until Burn is back at the limit. A card's fold: its Burn rows' sums added to its folded_* cells (one upsert,
+    its idempotency key from those rows), then those rows deleted. A fold cut short is finished first on the next run (the
+    journal), so nothing counts twice. Returns the cards folded."""
+    j = read_json(journal_path, None)
+    if isinstance(j, dict) and isinstance(j.get("row"), dict) and isinstance(j.get("keys"), list):
+        _tpc_fold_apply(client, j)
+        _drop(journal_path)
+    body = client.tool("ledger_rows_filter", {"workbook_id": client.wb, "tab": TPC_BURN, "where": {"ne": ["key", ""]},
+                                              "limit": 1}, "counting Burn", missing_ok=True)
+    n = int(_ci_num((body or {}).get("rows_matched")))
+    folded = []
+    if n <= TPC_FOLD_AT:
+        return folded
+    oldest = client.filter(TPC_CARDS, {"blank": ["folded_tokens"]}, order=[{"column": "last_seen", "dir": "asc"}], pages=1)
+    for c in oldest:
+        card = c.get("card")
+        if not isinstance(card, str) or not card or card in keep:
+            continue
+        rows = [r for r in client.filter(TPC_BURN, {"eq": ["card", card]}) if isinstance(r.get("key"), str)]
+        if not rows:
+            continue
+        tot = {"folded_minutes": 0.0, "folded_calls": 0.0, "folded_tokens": 0.0, "folded_progress_tokens": 0.0,
+               "folded_est_cost": 0.0}
+        for r in rows:
+            toks = r.get("tokens")
+            toks = toks if isinstance(toks, (int, float)) and not isinstance(toks, bool) else sum(
+                _ci_num(r.get(k)) for k in ("tokens_in", "tokens_out", "cache_read", "cache_write"))
+            tot["folded_minutes"] += _ci_num(r.get("minutes"))
+            tot["folded_calls"] += _ci_num(r.get("calls"))
+            tot["folded_tokens"] += toks
+            if r.get("activity") in TPC_PROGRESS:
+                tot["folded_progress_tokens"] += toks
+            cost = r.get("est_cost")
+            if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                tot["folded_est_cost"] += cost  # the engine's value at fold time (no Prices row yet: none)
+        keys = sorted(r["key"] for r in rows)
+        row = {"card": card, **{k: {"inc": round(v, 6)} for k, v in tot.items()}}
+        j = {"row": row, "keys": keys, "idem": "tpc-fold-" + _tpc_hash(card, *keys, json.dumps(row, sort_keys=True))}
+        write_private(journal_path, json.dumps(j))
+        _tpc_fold_apply(client, j)
+        _drop(journal_path)
+        folded.append(card)
+        n -= len(keys)
+        if n <= TPC_FOLD_AT:
+            break
+    return folded
+
+
+def _tpc_fold_apply(client, j):
+    client.tool("ledger_rows_upsert", {"workbook_id": client.wb, "tab": TPC_CARDS, "rows": [j["row"]], "key": "card",
+                                       "idempotency_key": j["idem"]}, "folding a card")
+    for i in range(0, len(j["keys"]), CI_PAGE):
+        client.tool("ledger_rows_delete", {"workbook_id": client.wb, "tab": TPC_BURN, "keys": j["keys"][i:i + CI_PAGE]},
+                    "folding a card")
+
+
+def tpc_run(sid, transcript, ended, key, wb, now=None):
+    """One send for this session: read what is new, send it, then fold if Burn is past the limit. Returns a summary."""
+    now = time.time() if now is None else now
+    path = _tpc_state_path(sid)
+    lock = open(path + ".lock", "a")
+    try:
+        deadline = time.time() + TPC_LOCK_SECONDS
+        while fcntl is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    raise CiProblem("another send for this session is still running")
+                time.sleep(0.5)
+        state = read_json(path, {})
+        files = state.setdefault("files", {})
+        client = CiClient(key, wb, time.time() + TPC_WAIT_SECONDS)
+        pend = state.get("pending")
+        if isinstance(pend, dict):  # a send that did not finish: the same rows and keys again, then its offsets
+            _tpc_send(client, pend)
+            state["files"] = files = pend["files"]
+            state.pop("pending", None)
+            write_private(path, json.dumps(state))
+        new_files = json.loads(json.dumps(files))
+        readers, main_card, sent = [], state.get("main_card"), {"burn": 0, "cards": 0}
+        todo = tpc_files(transcript, sid)
+        if not todo:  # no transcript of this user inside Claude Code's projects folder: nothing is read or sent
+            return dict(sent, folded=[], fold_problem=None)
+        for p, hint, review in todo:
+            fst = new_files.setdefault(p, {"offset": 0})
+            start = int(fst.get("offset") or 0)
+            rd, off = tpc_read(p, fst, hint, review)
+            fst["offset"] = off
+            new_sub = None
+            if p != os.path.realpath(transcript) and not fst.get("counted") and (rd.rows or off):
+                fst["counted"] = True
+                new_sub = hint or (sorted(rd.rows)[0][0] if rd.rows else "no card")
+            if p == os.path.realpath(transcript) and rd.rows:
+                main_card = max(rd.rows.items(), key=lambda kv: kv[1].get("last") or 0)[0][0]
+            readers.append((rd, new_sub))
+            fst["read_from"] = start
+        burn, cards = tpc_rows(readers, ended, main_card, now)
+        tag = "tpc-" + _tpc_hash(sid, json.dumps(sorted((p, f.get("read_from"), f.get("offset")) for p, f in new_files.items())),
+                                 bool(ended))
+        pend = {"tag": tag, "burn": burn, "cards": cards, "files": new_files}
+        if burn or cards:
+            state["pending"] = pend
+            write_private(path, json.dumps(state))
+            _tpc_send(client, pend)
+            sent = {"burn": len(burn), "cards": len(cards)}
+        state.pop("pending", None)
+        state["files"], state["main_card"] = new_files, main_card
+        write_private(path, json.dumps(state))
+        folded, fold_problem = [], None
+        if burn:
+            try:
+                folded = tpc_fold(client, {c["card"] for c in cards}, os.path.join(STATE, f"tpc-fold-{wb}.json"))
+            except CiProblem as e:  # the rows are sent; the fold is tried again at the next send
+                fold_problem = str(e)
+        return dict(sent, folded=folded, fold_problem=fold_problem)
+    finally:
+        lock.close()
+
+
+def _tpc_send(client, pend):
+    if pend.get("burn"):
+        client.upsert(TPC_BURN, pend["burn"], pend["tag"] + "-b")
+    for i in range(0, len(pend.get("cards") or []), CI_PAGE):
+        client.tool("ledger_rows_upsert", {"workbook_id": client.wb, "tab": TPC_CARDS, "rows": pend["cards"][i:i + CI_PAGE],
+                                           "key": "card", "idempotency_key": f"{pend['tag']}-c-{i // CI_PAGE}"},
+                    f"writing {TPC_CARDS}")
+
+
+def _tpc_settings():
+    s = read_json(TPC_PATH, {})
+    return s if isinstance(s.get("projects"), dict) else {"projects": {}}
+
+
+def tpc_is_on(folder):
+    return (_tpc_settings()["projects"].get(os.path.realpath(folder)) or {}).get("on") is True
+
+
+def cmd_time_per_card(args):
+    """`datastash time-per-card [on|off]`: this folder's choice (off until on); on also sets up the tabs. The hook entry
+    points (`hook`, `run`) are run by Claude Code and by the hook itself."""
+    sub = args[0] if args else ""
+    if sub == "hook":
+        return _tpc_hook()
+    if sub == "run":
+        return _tpc_bg(args[1:])
+    if sub in ("-h", "--help") or sub not in ("", "on", "off"):
+        print(TPC_USAGE)
+        return 0 if sub in ("-h", "--help") else 1
+    folder = os.path.realpath(project_of({}))
+    if sub == "":
+        print(f"time per card is {'on' if tpc_is_on(folder) else 'off'} for this folder. {TPC_USAGE}")
+        return 0
+    agent = _own_agent({})
+    if sub == "on":
+        key = read_key(agent["slug"]) if agent else None
+        if agent is None or not key:
+            print("time per card: this folder has no datastash agent with a key yet; nothing changed")
+            return 1
+        try:
+            is_err, body = mcp_tool(key, "ledger_feeds_setup", {"workbook_id": agent["workbook_id"], "services": ["burn"]})
+        except (OSError, ValueError, ApiError, httpclient.HTTPException) as e:
+            print(f"time per card: datastash can't be reached ({ci_clean(e, 120)}); nothing changed")
+            return 1
+        feed = next((f for f in body.get("feeds") or [] if isinstance(f, dict) and f.get("service") == "burn"), {})
+        if is_err or feed.get("ok") is not True:
+            print(f"time per card: the tabs were not set up ({ci_clean(feed.get('message') or body.get('message') or body.get('code'), 200)}); nothing changed")
+            return 1
+    ensure_dirs()
+    s = _tpc_settings()
+    s["projects"][folder] = {"on": sub == "on", "at": int(time.time())}
+    write_private(TPC_PATH, json.dumps(s))
+    if sub == "on":
+        print(f'time per card is on for this folder: at each subagent stop and session end, minutes, tool calls and token '
+              f'counts per card, activity and model go to "{disp(agent["name"])}"\'s workbook (tab Burn, and one total row '
+              f'per card worked out by the engine; a price per model in the Prices tab weighs models against each other). '
+              f'Only counts, model names, activity labels and card ids are sent, never prompt, code or command text. '
+              f'To stop: datastash time-per-card off')
+    else:
+        print("time per card is off for this folder: nothing more is read or sent. To start again: datastash time-per-card on")
+    return 0
+
+
+def _tpc_hook():
+    """SubagentStop and SessionEnd: when this folder is on, start the background send and return at once."""
+    inp = hook_input()
+    try:
+        folder = project_of(inp)
+        sid, tp = inp.get("session_id"), inp.get("transcript_path")
+        if not tpc_is_on(folder) or not isinstance(sid, str) or not re.fullmatch(SID_RE, sid) or not isinstance(tp, str):
+            return 0
+        agent = _own_agent(inp)
+        if agent is None or not read_key(agent["slug"]):
+            return 0
+        ended = "1" if inp.get("hook_event_name") == "SessionEnd" else "0"
+        spawn_detached([sys.executable, os.path.realpath(__file__), "time-per-card", "run", agent["slug"], sid, tp, ended],
+                       os.path.realpath(folder))
+    except Exception:  # noqa: BLE001 a hook never fails a session
+        pass
+    return 0
+
+
+def _tpc_bg(args):
+    """The background send: one line in the agent's log, never an error out of it."""
+    if len(args) != 4 or not re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,63}", args[0]) or not re.fullmatch(SID_RE, args[1]):
+        return 1
+    s, sid, tp, ended = args
+    try:
+        agent = read_json(conf_path(s), None)
+        key = read_key(s)
+        if not agent or not key or not CI_WB_RE.fullmatch(str(agent.get("workbook_id") or "")):
+            return 0
+        ensure_dirs()
+        r = tpc_run(sid, tp, ended == "1", key, agent["workbook_id"].lower())
+        line = f"time per card: sent {r['burn']} Burn and {r['cards']} Cards cost rows" + \
+               (f"; folded {len(r['folded'])} finished cards" if r["folded"] else "") + \
+               (f"; fold not done: {ci_clean(r['fold_problem'], 200)}" if r["fold_problem"] else "")
+    except CiProblem as e:
+        line = f"time per card: not sent: {ci_clean(e, 300)}"
+    except Exception as e:  # noqa: BLE001
+        line = f"time per card: not sent: unexpected {type(e).__name__}"
+    try:
+        with open(log_path(s), "a") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + line + "\n")
+    except OSError:
+        pass
+    return 0
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     args = sys.argv[2:]
@@ -13320,7 +13906,8 @@ def main():
              "status-set": cmd_status_set, "status-send": cmd_status_send, "status-check": cmd_status_check,
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
-             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report}
+             "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report,
+             "time-per-card": cmd_time_per_card}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
