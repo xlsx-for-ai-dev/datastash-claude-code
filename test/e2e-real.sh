@@ -417,12 +417,13 @@ next_start_cleans() {  # next_start_cleans <tag> <HOME> <folder> <name>: that ag
   T="$keep"
 }
 ds_cli() {  # ds_cli <HOME> <folder> <proxy or ""> <args...>: the installed plugin's own datastash command in that folder, as
-  # a person's terminal would run it (no session); a proxy blocks datastash for this one run
+  # a person's terminal would run it (no session; DS_AS names the agent, as DATASTASH_AGENT: a home folder is never
+  # linked, its agent comes from its session); a proxy blocks datastash for this one run
   local h="$1" dir="$2" proxy="$3" script; shift 3
   script="$(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["plugins"]["datastash@datastash"][0]["installPath"])' \
     "$h/.claude/plugins/installed_plugins.json" 2>/dev/null)/scripts/datastash"
   [[ -x "$script" || -r "$script" ]] || { echo "no installed datastash command"; return 9; }
-  (cd "$dir" && env -i PATH="$WORK/bin:/usr/local/bin:/usr/bin:/bin" HOME="$h" LANG=C.UTF-8 CLAUDE_PROJECT_DIR="$dir" \
+  (cd "$dir" && env -i PATH="$WORK/bin:/usr/local/bin:/usr/bin:/bin" HOME="$h" LANG=C.UTF-8 CLAUDE_PROJECT_DIR="$dir" ${DS_AS:+DATASTASH_AGENT=$DS_AS} \
     ${proxy:+HTTPS_PROXY=$proxy} ${proxy:+https_proxy=$proxy} python3 "$script" "$@")
 }
 
@@ -434,10 +435,10 @@ step9_outbox() {  # step9_outbox <HOME> <folder> <agent>: XLI-408, server blocke
   mark="e2e-outbox-$RUN-$(date +%s)"
   pkill -f "$h/.claude/plugins/" 2>/dev/null; sleep 2  # no listener of this computer sends while datastash is "down"
   for i in 1 2 3; do
-    out="$(ds_cli "$h" "$dir" "$dead" api POST /api/v1/agent/inbox "{\"workbook_id\":\"$wb\",\"to\":\"$name\",\"message\":\"$mark #$i\"}" 2>&1)"
+    out="$(DS_AS="$name" ds_cli "$h" "$dir" "$dead" api POST /api/v1/agent/inbox "{\"workbook_id\":\"$wb\",\"to\":\"$name\",\"message\":\"$mark #$i\"}" 2>&1)"
     grep -qF "saved, will send when the server is back" <<<"$out" || { fail "9: write $i while blocked was not kept: $(head -c 300 <<<"$out")"; ok=0; }
   done
-  out="$(ds_cli "$h" "$dir" "$dead" api GET "/api/v1/agent/inbox?workbook_id=$wb" 2>&1)"
+  out="$(DS_AS="$name" ds_cli "$h" "$dir" "$dead" api GET "/api/v1/agent/inbox?workbook_id=$wb" 2>&1)"
   grep -qF "nothing was read. Try again shortly." <<<"$out" || { fail "9: a read while blocked did not fail plainly: $(head -c 300 <<<"$out")"; ok=0; }
   n="$(find "$ob" -maxdepth 1 -regextype posix-extended -regex '.*/[0-9]{16}\.json' 2>/dev/null | wc -l)"
   ((n == 3)) || { fail "9: $n write(s) kept on disk, wanted 3 (the read is never kept)"; ok=0; }
