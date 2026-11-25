@@ -9558,6 +9558,10 @@ STATUS_REMINDER = (
     "keys, tokens or private values in it. Next time, write it as the last step of your answer, so no reminder is needed.")
 
 
+STATUS_VIA_SUBAGENT = (" Commands through subagents is on here: do not run it yourself; hand that one command, with its "
+                       "JSON, to a subagent (Agent tool) that runs it and reports only done or not done.")
+
+
 def _last_assistant_text(path):
     """The last thing the assistant said in a transcript (text only), or ""."""
     for v in reversed(_jsonl_tail(path, 256 * 1024)):
@@ -9656,7 +9660,11 @@ def _status_remind(inp, sid):
         write_private(os.path.join(STATE, f"status-reminded-{agent['slug']}"), "1")
     except OSError:
         return None  # can't record the ask: never risk asking twice
-    return {"decision": "block", "reason": STATUS_REMINDER}
+    try:  # 1.0.18 real e2e: with commands through subagents on (the default) this session's own Bash is refused
+        via = STATUS_VIA_SUBAGENT if clean_settings()["commands"] else ""
+    except Exception:  # noqa: BLE001
+        via = STATUS_VIA_SUBAGENT
+    return {"decision": "block", "reason": STATUS_REMINDER + via}
 
 
 # --- the person's own typed words (PM ruling M2)

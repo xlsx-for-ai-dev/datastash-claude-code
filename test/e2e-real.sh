@@ -281,6 +281,8 @@ answer_dialog() {  # a permission dialog on screen: Yes for a datastash connecto
   elif grep -qE "ledger_(agent|agents)_[a-z_]+|plugin[:_]datastash[:_]datastash" <<<"$s"; then tmux send-keys -t "$T" Enter
   elif ((ONBOARD_BASH)) && grep -qE "datastash[\"']? status(-set -| --all)" <<<"$s" && grep -qE "Bash command" <<<"$s"; then
     tmux send-keys -t "$T" Enter  # 1.0.18 onboarding: the agent saves its own status and shows the list (SEED_NOTE)
+  elif grep -qE "datastash[\"']? status-set -" <<<"$s" && grep -qE "Bash command" <<<"$s"; then
+    tmux send-keys -t "$T" Enter  # 1.0.18: the end-of-turn status write (keeping is on once datastash sync ran)
   else BADTOOL=1; say "    refused a non-datastash tool:"; grep -vE "^[[:space:]]*$" <<<"$s" | tail -n 8 | sed 's/^/    | /'; tmux send-keys -t "$T" Escape
   fi
   sleep 2

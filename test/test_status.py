@@ -554,6 +554,8 @@ class StopHook(Base):
         v = self.stop()  # no status yet from this machine: worth one
         self.assertEqual(v["decision"], "block")
         self.assertIn("datastash status-set -", v["reason"])
+        # 1.0.18: commands through subagents is on by default, so the session hands the one command to a subagent
+        self.assertTrue(v["reason"].endswith(ds.STATUS_VIA_SUBAGENT) == ds.clean_settings()["commands"])
         self.assertIsNone(self.stop(active=True))
         self.assertIsNone(self.stop())  # at most once per turn
         self.turn()
