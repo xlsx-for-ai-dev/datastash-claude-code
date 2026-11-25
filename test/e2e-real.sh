@@ -36,6 +36,11 @@
 #      gets one first in ~/code/api, so step 5 has a cross-computer half.)
 #   5  B: /datastash:uninstall all, the typed "remove all N": server: none on; then A's next session start cleans its
 #      agents up on A (their key files go).
+#   11 1.0.17, with E2E_CANDIDATE and E2E_NEXT_REF (a pushed test ref: the candidate's code at a higher version): right
+#      after step 1, the candidate catalog moves to that ref and one ordinary message is sent; with self-update held off,
+#      Claude Code's own auto-update (on since step 1's /datastash:install: "Auto-update is on for datastash.") must move
+#      the installed version within 12 minutes, with nobody typing an update. Every 1.0.17+ install also checks the
+#      setting is on; an uninstall of the last agent on a computer checks it is off ("Auto-update is off for datastash.").
 #   6  update, two ways, each from an older tag (E2E_OLD_TAG, default v1.0.12) in a local copy of the catalog pinned to it,
 #      then the catalog moved to the published pin (what a release does):
 #      6a `/plugin marketplace update datastash` + `/reload-plugins` (self-update held off for that HOME): the installed
@@ -360,6 +365,52 @@ new_lines() {  # new_lines <HOME>: the installed plugin is 1.0.16 or later (the 
 
 key_file() { printf '%s/.config/datastash/agent-%s.key' "$1" "$2"; }
 
+# 1.0.17: Claude Code's own auto-update for the datastash marketplace, as Claude Code reads it: the user settings'
+# extraKnownMarketplaces entry first, then the /plugin toggle's known_marketplaces.json ("true", "false" or "none").
+has_autoupdate() {  # has_autoupdate <HOME>: the installed plugin is 1.0.17 or later
+  python3 -I -c 'import sys; v=tuple(int(x) for x in (sys.argv[1] or "0").split(".")[:3] if x.isdigit()); sys.exit(0 if v >= (1, 0, 17) else 1)' "$(installed_version "$1")"
+}
+autoupdate_state() {  # autoupdate_state <HOME>
+  python3 -I - "$1/.claude/settings.json" "$1/.claude/plugins/known_marketplaces.json" <<'PY2'
+import json, sys
+def entry(path, keys):
+    try:
+        v = json.load(open(path))
+    except (OSError, ValueError):
+        return None
+    for k in keys:
+        v = v.get(k) if isinstance(v, dict) else None
+    return v if isinstance(v, dict) else None
+found = None
+for path, keys in ((sys.argv[1], ["extraKnownMarketplaces", "datastash"]), (sys.argv[2], ["datastash"])):
+    e = entry(path, keys)
+    if e is None:
+        continue
+    found = found or "false"
+    if isinstance(e.get("autoUpdate"), bool):
+        print(str(e["autoUpdate"]).lower()); sys.exit()
+print(found or "none")
+PY2
+}
+local_agents() {  # local_agents <HOME>: how many agents are set up on this computer (the plugin's own records)
+  python3 -I - "$1/.config/datastash" <<'PY2'
+import json, os, re, sys
+n = 0
+try:
+    names = os.listdir(sys.argv[1])
+except OSError:
+    names = []
+for f in names:
+    if re.fullmatch(r"agent-[a-z0-9\-]+\.json", f):
+        try:
+            c = json.load(open(os.path.join(sys.argv[1], f)))
+        except (OSError, ValueError):
+            continue
+        n += bool(isinstance(c, dict) and c.get("name") and c.get("workbook_id"))
+print(n)
+PY2
+}
+
 readme_steps() {  # readme_steps <tag> <HOME> <folder> <catalog>: marketplace add, install for you, /exit, start again
   local tag="$1" h="$2" dir="$3" src="$4"
   start_claude "$h" "$dir" || { fail "$tag: claude did not start"; show_tail; return 1; }
@@ -437,6 +488,12 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
   for n in "$@"; do grep -qF -- "- $n (" <<<"${f##*datastash is on for your agents:}" || { fail "$tag: the install list lacks \"$n\""; ok=0; }; done
   grep -qF "Time per card is on." <<<"$f" || { fail "$tag: no \"Time per card is on\" line"; ok=0; }
   if new_lines "$h"; then visible_ok "$tag" "$cmd" "Done. Datastash is on for $name. Time per card is on." || ok=0; fi
+  if has_autoupdate "$h"; then  # 1.0.17: Claude Code's own auto-update is on for datastash, and the person is told
+    grep -qF "Auto-update is on for datastash." <<<"$f" || { fail "$tag: no \"Auto-update is on for datastash.\" line"; ok=0; }
+    local au; au="$(autoupdate_state "$h")"
+    [[ "$au" == true ]] && pass "$tag: Claude Code's auto-update setting for datastash is on" \
+      || { fail "$tag: Claude Code's auto-update setting for datastash is \"$au\", wanted true"; ok=0; }
+  fi
   [[ "$name" != agent ]] && grep -qF -- "- agent (" <<<"${f##*datastash is on for your agents:}" && { fail "$tag: an agent named \"agent\" was made"; ok=0; }
   [[ -s "$(key_file "$h" "$name")" ]] || { fail "$tag: no key file for \"$name\" on this computer"; ok=0; }
   has_agent "$name" || { fail "$tag: server: \"$name\" is not on"; ok=0; }
@@ -491,6 +548,17 @@ ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server:
   [[ "$args" == all && -n "${m:-}" ]] && last="$m"
   [[ -z "$args" ]] && last="$*"
   if [[ "$offtxt" != "datastash is off for" ]]; then visible_ok "$tag" "$last" "Done. Datastash is uninstalled from" || ok=0; fi
+  if has_autoupdate "$h"; then  # 1.0.17: the last agent on this computer turns auto-update off and says so; else it stays
+    local au left; au="$(autoupdate_state "$h")"; left="$(local_agents "$h")"
+    if ((left == 0)); then
+      grep -qF "Auto-update is off for datastash." <<<"$f" || { fail "$tag: the last agent here: no \"Auto-update is off for datastash.\" line"; ok=0; }
+      [[ "$au" == false ]] && pass "$tag: the last agent here: auto-update for datastash is off" \
+        || { fail "$tag: the last agent here: auto-update for datastash is \"$au\", wanted false"; ok=0; }
+    else
+      [[ "$au" == true ]] && pass "$tag: $left agent(s) still here: auto-update for datastash stays on" \
+        || { fail "$tag: $left agent(s) still here: auto-update for datastash is \"$au\", wanted true"; ok=0; }
+    fi
+  fi
   ((ok)) && pass "$tag: /datastash:uninstall $args: removed $*; server: $(agents)"
   ((ok))
 }
@@ -608,6 +676,7 @@ core() {
   authenticate "1 A home" || { stop_claude; return; }
   ds_install "1 A home" "$A" "$HA"  # 1.0.16: the computer's user name, never "agent"
   stop_claude
+  [[ -n "${E2E_NEXT_REF:-}" ]] && step11_hands_free "$A"
   start_claude "$A" "$A" || { fail "2: claude did not start"; return; }
   ds_install "2 A home retry (no -2)" "$A" "$HA"
   TA="$T"  # the home agent's own session, kept for step 3
@@ -652,6 +721,47 @@ core() {
   fi
 
   step5_from_b "$A"
+}
+
+step11_hands_free() {  # step11_hands_free <A's HOME>: 1.0.17: a new release arrives with nobody typing an update.
+  # The candidate catalog (a local copy, as in every candidate run) is moved to E2E_NEXT_REF, a pushed test ref with the
+  # candidate's code and a higher version; self-update is held off for A (its day's check counts as done), so only
+  # Claude Code's own auto-update (turned on by step 1's /datastash:install) can move it. One ordinary message, then wait
+  # (Claude Code: a random delay of up to 10 minutes after the first message). No sign-in.
+  local h="$1" sha want v i cat="$WORK/cand/catalog/.claude-plugin/marketplace.json"
+  [[ -n "${E2E_CANDIDATE:-}" ]] || { say "11: skipped (needs E2E_CANDIDATE: the catalog is the published one)"; return; }
+  git -C "$REPO" fetch -q "$(git -C "$REPO" remote | head -n 1)" "$E2E_NEXT_REF" 2>/dev/null
+  sha="$(git -C "$REPO" rev-parse --verify --quiet FETCH_HEAD^{commit})" || { fail "11: $E2E_NEXT_REF is not on the plugin repo's remote"; return; }
+  want="$(git -C "$REPO" show "$sha:plugins/datastash/.claude-plugin/plugin.json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+  [[ "$(autoupdate_state "$h")" == true ]] || { fail "11: auto-update is not on for datastash after step 1"; return; }
+  say "== 11 hands-free release: catalog moved to $E2E_NEXT_REF at ${sha:0:7} (plugin $want); installed $(installed_version "$h")"
+  python3 -I - "$cat" "$E2E_NEXT_REF" "$sha" <<'PY2'
+import json, sys
+cat = json.load(open(sys.argv[1]))
+for p in cat["plugins"]:
+    if p["name"] == "datastash":
+        p["source"].update(ref=sys.argv[2], sha=sys.argv[3])
+json.dump(cat, open(sys.argv[1], "w"), indent=2)
+PY2
+  printf '{"checked_at": %s, "result": "current"}\n' "$(date +%s)" > "$h/.config/datastash/state/self-update.json"
+  start_claude "$h" "$h" || { fail "11: claude did not start"; return; }
+  ((LOGIN)) || { waiting "11: hands-free release (needs the Claude login for a first message)"; stop_claude; return; }
+  type_line "Reply with only the word ok."
+  for ((i = 0; i < 720; i++)); do
+    answer_dialog >/dev/null 2>&1
+    v="$(installed_version "$h")"
+    [[ "$v" == "$want" ]] && break
+    sleep 1
+  done
+  local r; r="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("result",""))' "$h/.config/datastash/state/self-update.json" 2>/dev/null)"
+  if [[ "$v" == "$want" && "$r" == current ]]; then
+    pass "11: hands-free release: Claude Code's own auto-update moved $NEW_VERSION -> $v after ${i}s, no update typed (self-update held off: \"$r\")"
+    pane | grep -qF "Plugin updated" && pass "11: Claude Code told the person: $(pane | grep -oE "Plugin updated[^·]*" | tail -n 1)"
+  else
+    fail "11: hands-free release: installed $v after ${i}s (wanted $want; self-update \"$r\")"; show_tail 10
+  fi
+  stop_claude
+  say "11: the catalog stays on $E2E_NEXT_REF (the candidate's code at version $want) for the rest of the run"
 }
 
 step5_from_b() {  # step5_from_b <A's HOME>: computer B: step 1 from a repo folder, 8, 5 (folder "site": a name no

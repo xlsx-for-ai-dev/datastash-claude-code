@@ -12456,6 +12456,315 @@ def cmd_self_update(_args):
     return 0
 
 
+# ------------------------------------------------------------------ 1.0.17: Claude Code's own marketplace auto-update
+# Claude Code updates a marketplace's plugins by itself (in an interactive session, a random wait of up to 10 minutes
+# after the first message; the new version loads at the next start or /reload-plugins) only when auto-update is on for
+# that marketplace, and it is off by default for a third-party one like datastash. marketplace.json has no field for it.
+# /datastash:install turns it on the way the /plugin Marketplaces toggle does (Claude Code docs, plugins/loading
+# "Which marketplaces and plugins auto-update"): `autoUpdate` on the datastash entry of the plugins folder's
+# known_marketplaces.json, and, only when the person's user settings (~/.claude/settings.json) already declare the
+# datastash marketplace under extraKnownMarketplaces, on that one entry there too (it is read first). Nothing else in
+# either file changes: the one value is edited in the file's own text (formatting kept), checked by parsing the result,
+# written atomically over a backup (<file>.datastash-backup), file mode kept, a symlinked file written at its target.
+# Never another marketplace, permissions or hooks. A file this user can't write (a root-owned settings file) is never
+# replaced: when the setting is not on for the computer then, the next-best documented scope is this folder's own local
+# settings (.claude/settings.local.json, the datastash entry only) and the line says "in this folder only"; when nothing
+# can be written it says so, and the install still finishes. While the person's settings turn Claude Code's updates off
+# (DISABLE_UPDATES, DISABLE_AUTOUPDATER, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, unless FORCE_AUTOUPDATE_PLUGINS) the
+# plugin writes nothing and says so. The /datastash:uninstall that removes the last agent on this computer turns it off.
+# The once-a-day self-update at session start stays as the backstop.
+AUTOUPDATE_ON_LINE = "Auto-update is on for datastash."
+AUTOUPDATE_OFF_LINE = "Auto-update is off for datastash."
+AUTOUPDATE_ENV_LINE = "Auto-update is turned off on this computer by your settings."
+AUTOUPDATE_FOLDER_LINE = "Auto-update is on for datastash in this folder only."
+AUTOUPDATE_FAILED_LINE = "Couldn't turn on auto-update here; datastash still checks for updates when a session starts."
+AUTOUPDATE_ENV_OFF = ("DISABLE_UPDATES", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+AUTOUPDATE_ENV_FORCE = "FORCE_AUTOUPDATE_PLUGINS"
+AUTOUPDATE_BACKUP = ".datastash-backup"
+
+
+def _env_on(v):
+    return isinstance(v, (str, int, bool)) and str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def autoupdate_env_off():
+    """True when this computer's settings turn Claude Code's plugin auto-update off: the variables in this process (Claude
+    Code passes its environment to hooks) or in the user settings' "env" block (read only)."""
+    envs = [os.environ]
+    e = read_json(os.path.join(CLAUDE_DIR, "settings.json"), {}).get("env")
+    if isinstance(e, dict):
+        envs.append(e)
+    if any(_env_on(x.get(AUTOUPDATE_ENV_FORCE)) for x in envs):
+        return False
+    return any(_env_on(x.get(k)) for x in envs for k in AUTOUPDATE_ENV_OFF)
+
+
+def claude_plugins_dir(root=None):
+    """Claude Code's plugins folder: the one this copy was installed in (<plugins>/cache/datastash/datastash/<v>), else
+    CLAUDE_CODE_PLUGIN_CACHE_DIR, else ~/.claude/plugins."""
+    root = os.path.realpath(root or os.environ.get("CLAUDE_PLUGIN_ROOT") or PLUGIN_ROOT)
+    if installed_from_marketplace(root):
+        return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(root))))
+    return os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR") or os.path.join(CLAUDE_DIR, "plugins")
+
+
+_JSON_WS = " \t\r\n"
+
+
+def _json_members(text, i):
+    """The members of the JSON object whose "{" is at text[i]: [(key, key_start, value_start, value_end)], or None."""
+    dec, out, n = json.JSONDecoder(), [], len(text)
+
+    def ws(j):
+        while j < n and text[j] in _JSON_WS:
+            j += 1
+        return j
+    j = ws(i + 1)
+    if j < n and text[j] == "}":
+        return out
+    while j < n and text[j] == '"':
+        key, k_end = dec.raw_decode(text, j)
+        c = ws(k_end)
+        if c >= n or text[c] != ":":
+            return None
+        v = ws(c + 1)
+        _, v_end = dec.raw_decode(text, v)
+        out.append((key, j, v, v_end))
+        j = ws(v_end)
+        if j < n and text[j] == "}":
+            return out
+        if j >= n or text[j] != ",":
+            return None
+        j = ws(j + 1)
+    return None
+
+
+def _json_find(text, path):
+    """(start, end) of the object at path (a list of keys) in the JSON text, or None."""
+    i = len(text) - len(text.lstrip(_JSON_WS))
+    if i >= len(text) or text[i] != "{":
+        return None
+    end = None
+    for key in path:
+        ms = _json_members(text, i)
+        hit = [m for m in ms or [] if m[0] == key]
+        if not hit or text[hit[-1][2]] != "{":
+            return None
+        i, end = hit[-1][2], hit[-1][3]
+    return i, end
+
+
+def json_set(text, path, key, value):
+    """The JSON text with only `key` of the object at `path` (a list of keys; [] is the whole file) set to `value`: the
+    value replaced in place, or the member added first in that object, in its neighbours' indent. None when the object is
+    not there, the text is not plain JSON, or the result would differ from the original by anything else."""
+    try:
+        whole = json.loads(text)
+        at = _json_find(text, path)
+        if at is None:
+            return None
+        ms = _json_members(text, at[0])
+        if ms is None:
+            return None
+        lit = json.dumps(value)
+        hit = [m for m in ms if m[0] == key]
+        if hit:
+            new = text[:hit[-1][2]] + lit + text[hit[-1][3]:]
+        elif ms:
+            k0 = ms[0][1]
+            new = text[:k0] + json.dumps(key) + ": " + lit + "," + text[at[0] + 1:k0] + text[k0:]
+        else:
+            new = text[:at[0] + 1] + json.dumps(key) + ": " + lit + text[at[0] + 1:]
+        obj = whole
+        for p in path:
+            obj = obj[p]
+        obj[key] = value
+        return new if json.loads(new) == whole else None
+    except (ValueError, TypeError, KeyError, IndexError, RecursionError):
+        return None
+
+
+def json_set_flag(text, path, key, value):
+    return json_set(text, path, key, bool(value))
+
+
+def write_claude_file(path, text):
+    """Replace a Claude Code file atomically: one backup of it as it was (<file>.datastash-backup, same mode), the new text
+    written beside it with the same mode, then renamed over it. A symlinked file is written at its target."""
+    real = os.path.realpath(path)
+    if os.path.exists(real):
+        if not os.access(real, os.W_OK):  # a root-owned or read-only file is the person's setup: never replaced
+            raise PermissionError(errno.EACCES, "not writable", real)
+        mode = stat.S_IMODE(os.stat(real).st_mode)
+        shutil.copy2(real, real + AUTOUPDATE_BACKUP)
+    else:  # a new file (the folder's own local settings): readable by this user only
+        os.makedirs(os.path.dirname(real), exist_ok=True)
+        mode = 0o600
+    tmp = os.path.join(os.path.dirname(real), f".{os.path.basename(real)}.datastash.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, real)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _autoupdate_files():
+    """[(file, path to the datastash entry)]: the user settings' extraKnownMarketplaces entry first (read first by Claude
+    Code), then known_marketplaces.json."""
+    return [(os.path.join(CLAUDE_DIR, "settings.json"), ["extraKnownMarketplaces", MARKETPLACE_NAME]),
+            (os.path.join(claude_plugins_dir(), "known_marketplaces.json"), [MARKETPLACE_NAME])]
+
+
+def _entry(path, keys):
+    v = read_json(path, None)
+    for k in keys:
+        v = v.get(k) if isinstance(v, dict) else None
+    return v if isinstance(v, dict) else None
+
+
+def marketplace_autoupdate():
+    """Claude Code's auto-update setting for the datastash marketplace from these two files, in Claude Code's order: True,
+    False, or None when neither declares the marketplace."""
+    found = False
+    for path, keys in _autoupdate_files():
+        e = _entry(path, keys)
+        if e is None:
+            continue
+        found = True
+        if isinstance(e.get("autoUpdate"), bool):
+            return e["autoUpdate"]
+    return False if found else None
+
+
+AUTOUPDATE_STATE = os.path.join(STATE, "autoupdate.json")  # the folders whose local settings datastash turned it on in
+
+
+def _set_entry_flag(path, keys, on):
+    """Set autoUpdate on the declared entry at keys in one file; True when it now holds that value."""
+    e = _entry(path, keys)
+    if e is None:
+        return False
+    if e.get("autoUpdate", False) is bool(on):
+        return True
+    try:
+        with open(path) as f:
+            new = json_set_flag(f.read(), keys, "autoUpdate", on)
+        if new is None:
+            return False
+        write_claude_file(path, new)
+    except OSError:
+        return False
+    return _entry(path, keys).get("autoUpdate") is bool(on)
+
+
+def _local_settings(folder):
+    return os.path.join(folder, ".claude", "settings.local.json")
+
+
+def _local_folders():
+    v = read_json(AUTOUPDATE_STATE, {}).get("folders")
+    return [f for f in v if isinstance(f, str) and os.path.isabs(f)] if isinstance(v, list) else []
+
+
+def _set_local_autoupdate(folder, on, source):
+    """The next-best documented scope: this folder's own local settings (.claude/settings.local.json), the datastash
+    entry under extraKnownMarketplaces with the same source Claude Code already has, autoUpdate set. Only that entry
+    changes; the file is made when there is none. True when it now holds that value."""
+    path = _local_settings(folder)
+    keys = ["extraKnownMarketplaces", MARKETPLACE_NAME]
+    if _entry(path, keys) is not None:
+        return _set_entry_flag(path, keys, on)
+    if not on:
+        return True
+    if not isinstance(source, dict):
+        return False
+    try:
+        text = "{}\n"
+        if os.path.lexists(path):
+            with open(path) as f:
+                text = f.read()
+        top = json.loads(text)
+        if not isinstance(top, dict):
+            return False
+        entry = {"source": source, "autoUpdate": True}
+        if isinstance(top.get("extraKnownMarketplaces"), dict):
+            new = json_set(text, ["extraKnownMarketplaces"], MARKETPLACE_NAME, entry)
+        elif "extraKnownMarketplaces" in top:
+            return False
+        else:
+            new = json_set(text, [], "extraKnownMarketplaces", {MARKETPLACE_NAME: entry})
+        if new is None:
+            return False
+        write_claude_file(path, new)
+    except (OSError, ValueError):
+        return False
+    return (_entry(path, keys) or {}).get("autoUpdate") is True
+
+
+def set_marketplace_autoupdate(on, folder=None):
+    """Turn Claude Code's auto-update for the datastash marketplace on or off. "env" (the person's settings keep it off;
+    nothing written, only for on), "on" / "off" (that is now the setting for this computer), "folder" (on only in this
+    folder's local settings: the user settings or the /plugin toggle's file could not be written), "missing" (no datastash
+    marketplace here) or "failed" (no scope could be written)."""
+    if on and autoupdate_env_off():
+        return "env"
+    files = _autoupdate_files()
+    entries = [(p, k, _entry(p, k)) for p, k in files]
+    if all(e is None for _, _, e in entries):
+        return "missing"
+    for p, k, e in entries:
+        if e is not None:
+            _set_entry_flag(p, k, on)  # one file that can't be written (a root-owned settings file) never stops the rest
+    if not on:
+        for f in _local_folders():
+            _set_local_autoupdate(f, False, None)
+        return "off" if marketplace_autoupdate() is False else "failed"
+    if marketplace_autoupdate() is True:
+        return "on"
+    folder = folder or os.getcwd()
+    source = next((e.get("source") for _, _, e in entries if e is not None and isinstance(e.get("source"), dict)), None)
+    if folder and os.path.isabs(folder) and _set_local_autoupdate(folder, True, source):
+        try:
+            ensure_dirs()
+            write_private(AUTOUPDATE_STATE, json.dumps({"folders": ([x for x in _local_folders() if x != folder]
+                                                                    + [folder])[-50:]}))
+        except OSError:
+            pass
+        return "folder"
+    return "failed"
+
+
+def autoupdate_install_line(folder=None):
+    """The install's auto-update line, after turning it on; None for a copy with no datastash marketplace (development).
+    Never fails the install."""
+    try:
+        got = set_marketplace_autoupdate(True, folder)
+    except Exception:  # noqa: BLE001  never in the install's way
+        got = "failed"
+    return {"on": AUTOUPDATE_ON_LINE, "env": AUTOUPDATE_ENV_LINE, "folder": AUTOUPDATE_FOLDER_LINE,
+            "failed": AUTOUPDATE_FAILED_LINE}.get(got)
+
+
+def autoupdate_uninstall_line():
+    """After an uninstall: when no agent is left on this computer, auto-update goes off and says so; else None (it stays
+    on)."""
+    try:
+        if any(not is_person(a) for a in all_agents()):
+            return None
+        return AUTOUPDATE_OFF_LINE if set_marketplace_autoupdate(False) == "off" else None
+    except Exception:  # noqa: BLE001  never in the uninstall's way
+        return None
+
+
 # ------------------------------------------------------------------ XLI-390 P1: one install command, one uninstall command
 # The person's typed /datastash:install (always all agents, owner 11-23) or /datastash:uninstall (the list, then names or
 # "all"); the typed phrases "datastash install" / "datastash uninstall" are the fallback. The key comes through the
@@ -12510,7 +12819,9 @@ def install_text(inp, rec, lst):
     tpc = [x for x in after if x == TPC_ON_LINE]
     name = show_name((rec or {}).get("name") or "")
     head = INSTALL_DONE_LINE.format(name=name) if name != "?" else "Done. Datastash is on."
-    lines = [" ".join([head] + tpc)] + list_lines(lst, ON_HEAD)
+    here = inp.get("cwd") if isinstance(inp, dict) and isinstance(inp.get("cwd"), str) else None
+    au = autoupdate_install_line(here)
+    lines = [" ".join([head] + tpc)] + ([au] if au else []) + list_lines(lst, ON_HEAD)
     wait = waiting_lines(rec)
     if wait:
         lines += [WAITING_HEAD] + wait
@@ -13482,7 +13793,9 @@ def _join_names(names):
 def uninstall_line(done, not_removed=(), why="", waiting=(), left=()):
     """1.0.16: the one final uninstall line. done: names removed; not_removed: names datastash kept (why); waiting:
     removed, not yet cleaned up on their own computers; left: removed, files still on this computer."""
-    tail = ([ELSEWHERE_LINE.format(names=_join_names(waiting))] if waiting else []) + [CONNECTOR_SAME_LINE]
+    au = autoupdate_uninstall_line() if done else None  # 1.0.17: the last agent here turns auto-update off
+    tail = ([ELSEWHERE_LINE.format(names=_join_names(waiting))] if waiting else []) + [CONNECTOR_SAME_LINE] + \
+        ([au] if au else [])
     if done and not not_removed and not left:
         return " ".join([UNINSTALL_DONE_LINE.format(names=_join_names(done)).replace(" " + CONNECTOR_SAME_LINE, "")] + tail)
     out = [UNINSTALL_PART_LINE.format(names=_join_names(done)) if done else UNINSTALL_NONE_LINE]

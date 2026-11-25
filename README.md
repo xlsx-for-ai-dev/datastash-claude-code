@@ -51,6 +51,18 @@ What it adds:
   datastash names the plugin's version (`X-Datastash-Plugin-Version` and the User-Agent). Releases:
   `tools/release-gate` tags, pins and approves main only at commits with a recorded independent review PASS; the
   catalog pin is set only by the release step (`release-gate pin vX.Y.Z`), never on a feature branch.
+- **Claude Code's own auto-update** (1.0.17): `/datastash:install` turns on auto-update for the `datastash`
+  marketplace only, the way the `/plugin` Marketplaces toggle does: `autoUpdate` on the datastash entry of Claude
+  Code's `known_marketplaces.json`, and on the datastash entry of `extraKnownMarketplaces` in `~/.claude/settings.json`
+  only when that file already declares it. Only that one value changes (the file's formatting kept, written
+  atomically over a `.datastash-backup` copy); never permissions, hooks or another marketplace. A file this user
+  can't write (a root-owned settings file) is never replaced: the folder's own `.claude/settings.local.json` is used
+  instead ("Auto-update is on for datastash in this folder only."), and when nothing can be written the install says
+  so and still finishes. While `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` or `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
+  is set, nothing is written: "Auto-update is turned off on this computer by your settings." The
+  `/datastash:uninstall` that removes the last agent on this computer turns it off again ("Auto-update is off for
+  datastash."). Claude Code then updates datastash by itself in interactive sessions; the self-update above stays as
+  the backstop.
 
 Requires `python3` (3.8 or later, standard library only) and Claude Code with plugin hooks.
 
