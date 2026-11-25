@@ -13,10 +13,13 @@ Run with python3 -I. Never prints a secret, a code or a token.
   other-apps               the names of the account's app connections other than this script's own, as JSON (Claude
                            Code's sign-ins share one client, so they show as one app)
   disconnect-all           disconnect every app connection on the account, this script's own last (cleanup)
+  disconnect-others        disconnect every app connection but this script's own (the clean start of a run)
   inbox-marks WB INBOX MARK  (XLI-408 step 9) every message in that inbox of workbook WB whose text holds "MARK #<n>",
                            as a JSON list of the n's in the order datastash added them (a repeat shows twice)
 
-Env: E2E_SELFTEST_SECRET_FILE (the bare secret, mode 600), E2E_ACCOUNT (the selftest label), E2E_SERVER_TOKEN_FILE.
+Env: E2E_SELFTEST_SECRET_FILE (the bare secret, mode 600), E2E_ACCOUNT (the selftest label), E2E_SERVER_TOKEN_FILE,
+E2E_SIGNIN_LEDGER (optional: each selftest sign-in appends its time there). A refused selftest sign-in names the
+server's reason (rate_limited, too_many_accounts, ...) and its text.
 Exit 0 ok, 1 refused or failed (one line on stderr), 2 can't run.
 """
 import base64, hashlib, json, os, secrets, stat, sys, time, urllib.error, urllib.parse, urllib.request
@@ -48,6 +51,40 @@ def secret():
 
 
 LABEL = os.environ.get("E2E_ACCOUNT", "plugin-e2e")
+
+# The server's refusals (x-live src/auth/selftest-oauth.ts) are plain text "selftest sign-in refused: <text>"; the
+# code is told apart by its text. Neither text holds a secret.
+REFUSALS = (("selftest sign-ins an hour", "rate_limited (the hourly sign-in limit; wait, then run again)"),
+            ("selftest accounts; use an existing label", "too_many_accounts (no new label can be made; use an existing one)"),
+            ("not a selftest test account", "not_a_test_account"),
+            ("being deleted", "closing"),
+            ("test account label is", "bad_label"))
+
+
+def refusal_code(status, body):
+    for text, code in REFUSALS:
+        if text in (body or ""):
+            return code
+    return "no known code"
+
+
+def refusal_text(body):
+    t = " ".join((body or "").split())[:200]
+    return t.removeprefix("selftest sign-in refused: ") or "(no text)"
+
+
+def note_signin():
+    """One line per selftest sign-in this harness made (a time, nothing else): the run's budget check reads it."""
+    p = os.environ.get("E2E_SIGNIN_LEDGER", "")
+    if not p:
+        return
+    try:
+        os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(f"{int(time.time())}\n")
+    except OSError:
+        pass
 
 
 class Keep(urllib.request.HTTPRedirectHandler):
@@ -101,7 +138,8 @@ def selftest_code(auth_url, redirect):
     if status == 404:
         die("selftest sign-in refused (404): off on the server, a wrong secret, or not the build box")
     if status not in (302, 303):
-        die(f"selftest sign-in refused (HTTP {status})")
+        die(f"selftest sign-in refused (HTTP {status}, {refusal_code(status, body)}): {refusal_text(body)}")
+    note_signin()
     loc = (h.get("Location") if h else "") or ""
     r = urllib.parse.urlsplit(redirect)
     for _ in range(8):
@@ -252,14 +290,15 @@ def apps():
     return lst
 
 
-def cmd_disconnect_all():
-    lst = apps()
-    mine = [a for a in lst if isinstance(a, dict) and a.get("this_connection") is True]
+def cmd_disconnect_all(keep_mine=False):
+    lst = [a for a in apps() if isinstance(a, dict)]
+    mine = [a for a in lst if a.get("this_connection") is True]
+    todo = [a for a in lst if a.get("this_connection") is not True] + ([] if keep_mine else mine)
     bad = 0
-    for a in [a for a in lst if isinstance(a, dict) and a.get("this_connection") is not True] + mine:
+    for a in todo:
         err, _ = tool("sync", {"action": "disconnect", "connection": a.get("connection")})
         bad += bool(err)
-    print(f"disconnected {len(lst) - bad} of {len(lst)} app connections")
+    print(f"disconnected {len(todo) - bad} of {len(todo)} app connections" + (" (the read-back's own kept)" if keep_mine else ""))
     if bad:
         sys.exit(1)
 
@@ -305,6 +344,8 @@ def main(argv):
         return None
     if c == "disconnect-all":
         return cmd_disconnect_all()
+    if c == "disconnect-others":
+        return cmd_disconnect_all(keep_mine=True)
     if c == "inbox-marks" and len(argv) == 4:
         return cmd_inbox_marks(argv[1], argv[2], argv[3])
     die("unknown command", 2)

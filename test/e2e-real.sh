@@ -5,7 +5,8 @@
 # for one comped, flagged test account, and every step is read back from the server (test/e2e_server.py), not only from
 # what the plugin printed. Runs against prod (https://getdatastash.com) and the published plugin.
 #
-# The matrix (computer = one throwaway HOME; all of them share the one selftest test account, label E2E_ACCOUNT):
+# The matrix (computer = one throwaway HOME; all of them share the one selftest test account, label E2E_ACCOUNT, the
+# same fixed label every run):
 #   1  computer A, home folder: marketplace add, install for you, /exit and restart, /mcp Authenticate (selftest),
 #      /datastash:install: agent "agent", the install list and "Time per card is on"; server: "agent" is on.
 #      Computer B, repo folder ~/code/site (below, 8): the same README steps from a repo folder: agent "site".
@@ -45,8 +46,16 @@
 #                    line). Missing: the steps that need a model turn (every /datastash:install and :uninstall) are
 #                    reported WAITING and everything else still runs.
 #   E2E_SELFTEST_SECRET_FILE  default /home/xpm/handover/selftest-oauth.secret (the bare secret, mode 600).
-# Note (run 11-25): before x-live's XLI-390 reinstall fix an uninstalled agent stayed switched off on the server under its
-#   name and the install refused that name (step 7); give each run a fresh label (the server allows 10 selftest accounts).
+# The test account: one fixed label (E2E_ACCOUNT, default plugin-e2e), the same every run. The server allows at most 10
+#   selftest labels and 20 selftest sign-ins in a rolling hour (x-live src/auth/selftest-oauth.ts), so a run never makes a
+#   new label. Clean start: before the matrix the read-back (the person's own connection) switches off every agent left
+#   on and disconnects every app connection but its own (ledger_agent_switch_off, sync disconnect: the product's own
+#   paths); the run stops if any is left. The same cleanup runs at the end, pass or fail (trap). An agent once switched
+#   off is installed again under its own name (x-live #510), so the same label serves every run.
+# Sign-in budget: a run counts the selftest sign-ins it needs (the read-back 1; core 2, step5 2, outbox 1, update 2) and
+#   stops before it starts when those plus this harness's own sign-ins of the last hour (E2E_SIGNIN_LEDGER, default
+#   ~/.local/state/datastash-e2e/selftest-signins: one time per line) would pass 20. A server refusal (HTTP 429) names
+#   its reason: rate_limited (the hourly limit) or too_many_accounts (no new label can be made).
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
 #   E2E_PARTS ("core update", default both; "step5" runs step 5 alone; "outbox" runs step 9 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
 #   E2E_CANDIDATE=<branch or tag, pushed to the plugin repo>: test that commit before it is released: the core steps
@@ -66,6 +75,8 @@ export E2E_SELFTEST_SECRET_FILE="${E2E_SELFTEST_SECRET_FILE:-/home/xpm/handover/
 export E2E_ACCOUNT="${E2E_ACCOUNT:-plugin-e2e}"
 PARTS="${E2E_PARTS:-core update}"
 OLD_TAG="${E2E_OLD_TAG:-v1.0.12}"
+export E2E_SIGNIN_LEDGER="${E2E_SIGNIN_LEDGER:-$REAL_HOME/.local/state/datastash-e2e/selftest-signins}"
+SIGNIN_MAX_PER_HOUR=20
 RUN="dsreal-$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ds-e2e-real.XXXXXX")"
 export E2E_SERVER_TOKEN_FILE="$WORK/server.tok"
@@ -109,8 +120,30 @@ else
   say "Claude login: NONE ($CLAUDE_ENV missing): every model step is WAITING"
 fi
 
-# --- the server read-back: its own connection to the selftest account; the account must start with no agent on.
-"${SRV[@]}" signin || { echo "CAN'T RUN: the read-back could not sign in to the selftest account"; exit 2; }
+# --- the sign-in budget: what this run needs against the server's hourly limit, before anything signs in.
+NEED=1  # the read-back's own sign-in
+for p in $PARTS; do
+  case "$p" in core|step5|update) NEED=$((NEED + 2)) ;; outbox) NEED=$((NEED + 1)) ;; esac
+done
+read -r USED FREE_AT < <(python3 -I - "$E2E_SIGNIN_LEDGER" <<'PY'
+import sys, time
+now = time.time()
+try:
+    ts = sorted(int(l) for l in open(sys.argv[1]) if l.strip().isdigit() and now - int(l) < 3600)
+except OSError:
+    ts = []
+print(len(ts), time.strftime("%H:%M:%SZ", time.gmtime(ts[0] + 3600)) if ts else "-")
+PY
+)
+if ((USED + NEED > SIGNIN_MAX_PER_HOUR)); then
+  echo "CAN'T RUN: this run needs $NEED selftest sign-ins; $USED were used in the last hour (the server allows $SIGNIN_MAX_PER_HOUR an hour). The oldest frees at $FREE_AT; run again then."
+  exit 2
+fi
+say "sign-in budget: this run needs $NEED selftest sign-ins; $USED used in the last hour by this harness (limit $SIGNIN_MAX_PER_HOUR)"
+
+# --- the server read-back: its own connection to the selftest account; the account starts clean: no agent on, no app
+# connection but the read-back's own.
+"${SRV[@]}" signin || { echo "CAN'T RUN: the read-back could not sign in to the selftest account \"$E2E_ACCOUNT\" (reason above)"; exit 2; }
 agents() { "${SRV[@]}" agents; }
 has_agent() { agents | python3 -I -c 'import json,sys; sys.exit(0 if sys.argv[1] in json.load(sys.stdin) else 1)' "$1"; }
 START_AGENTS="$(agents)" || { echo "CAN'T RUN: ledger_agents_list refused on the read-back"; exit 2; }
@@ -119,7 +152,13 @@ if [[ "$START_AGENTS" != "[]" ]]; then
   for n in $(python3 -I -c 'import json,sys; print(*json.loads(sys.argv[1]))' "$START_AGENTS"); do "${SRV[@]}" off "$n"; done
   [[ "$(agents)" == "[]" ]] || { echo "CAN'T RUN: the test account still has agents on"; exit 2; }
 fi
-say "server: test account \"$E2E_ACCOUNT\" signed in for read-back; no agent on"
+START_APPS="$("${SRV[@]}" other-apps)" || { echo "CAN'T RUN: sync apps refused on the read-back"; exit 2; }
+if [[ "$START_APPS" != "[]" ]]; then
+  say "the test account has app connections left from an earlier run: $START_APPS; disconnecting them first"
+  "${SRV[@]}" disconnect-others | sed 's/^/  /'
+  [[ "$("${SRV[@]}" other-apps)" == "[]" ]] || { echo "CAN'T RUN: the test account still has other app connections"; exit 2; }
+fi
+say "server: test account \"$E2E_ACCOUNT\" signed in for read-back; clean: no agent on, no other app connection"
 
 # --- catalogs: the published one (as the README says), or a local copy pinned to a tag (for the update steps).
 pinned_catalog() {  # pinned_catalog <dir> <tag>: the repo's catalog with datastash pinned to <tag>'s commit
