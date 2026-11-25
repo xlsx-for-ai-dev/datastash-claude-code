@@ -67,6 +67,8 @@ class Base(unittest.TestCase):
         for name, leaf in (("AUTOUPDATE_STATE", "autoupdate.json"), ("AUTOUPDATE_ASIDE", "autoupdate-removed")):
             self.addCleanup(setattr, ds, name, getattr(ds, name))
             setattr(ds, name, os.path.join(self.claude, "state", leaf))
+        self.addCleanup(setattr, ds, "_AU_RESTORED", None)
+        ds._AU_RESTORED = None
         self.settings = os.path.join(self.claude, "settings.json")
         self.known = os.path.join(self.plugins, "known_marketplaces.json")
 
@@ -332,6 +334,13 @@ class InstallAndUninstall(Base):
         self.assertTrue(line.endswith(" Auto-update is off for datastash."), line)
         self.assertEqual(self.read(self.known), before)
         self.assertIs(ds.marketplace_autoupdate(), False)
+
+    def test_the_own_agent_line_and_the_final_line_say_the_same(self):
+        ds.set_marketplace_autoupdate(True)
+        self.fake_agents([])
+        first = ds.uninstall_line(["web-app"])  # uninstall_self's line, then the final one in the same hook run
+        self.assertTrue(first.endswith(" Auto-update is off for datastash."), first)
+        self.assertEqual(ds.uninstall_line(["web-app"]), first)
 
     def test_uninstall_with_no_record_leaves_it_and_says_so(self):
         self.write(self.known, known({"autoUpdate": True}))

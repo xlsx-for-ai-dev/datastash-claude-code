@@ -12914,13 +12914,19 @@ def autoupdate_install_line(folder=None):
             "failed": AUTOUPDATE_FAILED_LINE}.get(got)
 
 
+_AU_RESTORED = None  # this process's put-back result (one uninstall per hook run)
+
+
 def autoupdate_uninstall_line():
     """After an uninstall: when no agent is left on this computer, what install changed is put back and the line says
     what happened; else None (it stays as it is)."""
     try:
         if any(not is_person(a) for a in all_agents()):
             return None
-        got = restore_marketplace_autoupdate()
+        global _AU_RESTORED
+        if _AU_RESTORED is None:  # once per uninstall: its own agent's line (uninstall_self) and the final line agree
+            _AU_RESTORED = restore_marketplace_autoupdate()
+        got = _AU_RESTORED
         if got == "norecord" and marketplace_autoupdate() is None:
             return None  # a copy with no datastash marketplace (development)
         return {"off": AUTOUPDATE_OFF_LINE, "failed": AUTOUPDATE_RESTORE_FAILED_LINE}.get(got, AUTOUPDATE_LEFT_LINE)
