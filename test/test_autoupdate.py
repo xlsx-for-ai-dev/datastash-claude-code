@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Offline tests for plugin 1.0.17: /datastash:install turns on Claude Code's own auto-update for the datastash
 marketplace (what the /plugin Marketplaces toggle writes: known_marketplaces.json, and the user settings'
-extraKnownMarketplaces entry only when it is already declared there), says "Auto-update is on for datastash.", and the
-uninstall of the last agent on this computer turns it off again. Paths: no settings file, settings with other
+extraKnownMarketplaces entry only when it is already declared there), says "Auto-update is on for datastash.", records
+what it changed, and the uninstall of the last agent on this computer puts back exactly that (a value the person set is
+left alone; no record: left as it was). Paths: no settings file, settings with other
 marketplaces (only datastash's entry changes, formatting kept, a backup, atomic), already on, and the person's settings
 turning updates off (nothing written, the fixed line).
 No network, no Claude Code run; a throwaway HOME and config folder, enforced by test/harness.py.
@@ -61,6 +62,9 @@ class Base(unittest.TestCase):
                 v = os.environ.pop(k)
                 self.addCleanup(os.environ.__setitem__, k, v)
         self.addCleanup(lambda: [os.environ.pop(k, None) for k in ENVS])
+        for name, leaf in (("AUTOUPDATE_STATE", "autoupdate.json"), ("AUTOUPDATE_ASIDE", "autoupdate-removed")):
+            self.addCleanup(setattr, ds, name, getattr(ds, name))
+            setattr(ds, name, os.path.join(self.claude, "state", leaf))
         self.settings = os.path.join(self.claude, "settings.json")
         self.known = os.path.join(self.plugins, "known_marketplaces.json")
 
@@ -227,12 +231,33 @@ class Unwritable(Base):
         self.assertTrue(text.startswith("Done. Datastash is on for web-app."), text)
         self.assertIn("\nCouldn't turn on auto-update here;", text)
 
-    def test_the_last_uninstall_turns_the_folder_setting_off_too(self):
+    def test_the_last_uninstall_takes_out_the_folder_file_install_made(self):
         self.locked(self.settings, {"extraKnownMarketplaces": {"datastash": {"source": SOURCE, "autoUpdate": False}}})
         self.write(self.known, known())
+        before = self.read(self.known)
         self.assertEqual(ds.set_marketplace_autoupdate(True, self.folder), "folder")
-        self.assertEqual(ds.set_marketplace_autoupdate(False), "off")
-        self.assertIs(json.loads(self.read(self.local))["extraKnownMarketplaces"]["datastash"]["autoUpdate"], False)
+        self.assertTrue(os.path.exists(self.local))
+        self.assertEqual(ds.restore_marketplace_autoupdate(), "off")
+        self.assertEqual(self.read(self.known), before)
+        self.assertFalse(os.path.lexists(self.local), "the file install made is gone from the folder")
+        self.assertFalse(os.path.lexists(os.path.dirname(self.local)), "and the .claude folder it made")
+        self.assertEqual(len([n for n in os.listdir(ds.AUTOUPDATE_ASIDE) if n.endswith("-settings.local.json")]), 1,
+                         "moved aside, never deleted")
+        self.assertEqual(os.listdir(self.folder), [])
+
+    def test_the_last_uninstall_takes_out_only_the_entry_install_added_to_a_folder_file(self):
+        self.locked(self.settings, {"extraKnownMarketplaces": {"datastash": {"source": SOURCE, "autoUpdate": False}}})
+        self.write(self.known, known())
+        os.makedirs(os.path.dirname(self.local))
+        for text in ('{\n  "permissions": {"allow": ["Read"]}\n}\n',
+                     '{\n  "extraKnownMarketplaces": {"other": {"source": "x"}},\n  "env": {}\n}\n'):
+            with self.subTest(text):
+                self.write(self.local, text)
+                self.assertEqual(ds.set_marketplace_autoupdate(True, self.folder), "folder")
+                self.assertNotEqual(self.read(self.local), text)
+                ds.restore_marketplace_autoupdate()
+                self.assertEqual(self.read(self.local), text, "the person's file, byte for byte")
+                self.assertFalse(os.path.exists(self.local + ".datastash-backup"), "the backup install made is moved aside")
 
 
 class EnvOff(Base):
@@ -266,6 +291,17 @@ class EnvOff(Base):
 
 
 class InstallAndUninstall(Base):
+    def test_already_on_before_install_the_last_uninstall_says_left(self):
+        self.write(self.known, known({"autoUpdate": True}))
+        before = self.read(self.known)
+        ds.set_marketplace_autoupdate(True)
+        old = ds.all_agents
+        ds.all_agents = lambda: []
+        self.addCleanup(setattr, ds, "all_agents", old)
+        self.assertTrue(ds.uninstall_line(["web-app"]).endswith(" Auto-update for datastash left as it was."))
+        self.assertEqual(self.read(self.known), before)
+
+
     def setUp(self):
         super().setUp()
         self.write(self.known, known())
@@ -285,13 +321,23 @@ class InstallAndUninstall(Base):
         self.assertEqual(lines[1], "Auto-update is on for datastash.")
         self.assertIs(ds.marketplace_autoupdate(), True)
 
-    def test_uninstall_of_the_last_agent_here_turns_it_off_and_says_so(self):
+    def test_uninstall_of_the_last_agent_here_puts_it_back_and_says_so(self):
+        before = self.read(self.known)
         ds.set_marketplace_autoupdate(True)
         self.fake_agents([])
         line = ds.uninstall_line(["web-app"])
         self.assertTrue(line.startswith("Done. Datastash is uninstalled from"), line)
         self.assertTrue(line.endswith(" Auto-update is off for datastash."), line)
+        self.assertEqual(self.read(self.known), before)
         self.assertIs(ds.marketplace_autoupdate(), False)
+
+    def test_uninstall_with_no_record_leaves_it_and_says_so(self):
+        self.write(self.known, known({"autoUpdate": True}))
+        before = self.read(self.known)
+        self.fake_agents([])
+        line = ds.uninstall_line(["web-app"])
+        self.assertTrue(line.endswith(" Auto-update for datastash left as it was."), line)
+        self.assertEqual(self.read(self.known), before)
 
     def test_a_partial_uninstall_leaves_it_on(self):
         ds.set_marketplace_autoupdate(True)
@@ -307,7 +353,93 @@ class InstallAndUninstall(Base):
         self.assertIs(ds.marketplace_autoupdate(), True)
 
 
+class Restore(Base):
+    """Uninstall of the last agent puts back exactly what install changed (and nothing the person set)."""
+
+    def test_already_on_before_install_stays_on(self):
+        self.write(self.known, known({"autoUpdate": True}))
+        before = self.read(self.known)
+        self.assertEqual(ds.set_marketplace_autoupdate(True), "on")
+        self.assertEqual(ds.restore_marketplace_autoupdate(), "left")
+        self.assertEqual(self.read(self.known), before)
+        self.assertIs(ds.marketplace_autoupdate(), True)
+
+    def test_off_before_install_goes_back_to_false(self):
+        self.write(self.known, known({"autoUpdate": False}))
+        before = self.read(self.known)
+        self.assertEqual(ds.set_marketplace_autoupdate(True), "on")
+        self.assertIs(ds.marketplace_autoupdate(), True)
+        self.assertEqual(ds.restore_marketplace_autoupdate(), "off")
+        self.assertEqual(self.read(self.known), before)
+
+    def test_key_absent_before_install_is_taken_out(self):
+        self.write(self.known, known())
+        before = self.read(self.known)
+        self.write(self.settings, SETTINGS_TEXT)
+        self.assertEqual(ds.set_marketplace_autoupdate(True), "on")
+        self.assertIn('"autoUpdate": true', self.read(self.known))
+        self.assertIn('"autoUpdate": true', self.read(self.settings))
+        self.assertEqual(ds.restore_marketplace_autoupdate(), "off")
+        self.assertEqual(self.read(self.known), before, "the file's own bytes, no autoUpdate key left")
+        self.assertEqual(self.read(self.settings), SETTINGS_TEXT)
+        self.assertFalse(os.path.exists(self.known + ".datastash-backup"))
+        self.assertFalse(os.path.exists(self.settings + ".datastash-backup"))
+
+    def test_a_second_install_keeps_the_first_record(self):
+        self.write(self.known, known())
+        before = self.read(self.known)
+        ds.set_marketplace_autoupdate(True)
+        self.assertEqual(ds.set_marketplace_autoupdate(True), "on")
+        self.assertEqual(ds.restore_marketplace_autoupdate(), "off")
+        self.assertEqual(self.read(self.known), before)
+
+    def test_a_value_the_person_changed_since_is_left_alone(self):
+        self.write(self.known, known())
+        ds.set_marketplace_autoupdate(True)
+        text = self.read(self.known).replace('"autoUpdate": true', '"autoUpdate": false')
+        self.write(self.known, text)
+        self.assertEqual(ds.restore_marketplace_autoupdate(), "left")
+        self.assertEqual(self.read(self.known), text)
+
+    def test_missing_record_leaves_it_as_it_is(self):
+        for v in (True, False):
+            with self.subTest(v):
+                self.write(self.known, known({"autoUpdate": v}))
+                before = self.read(self.known)
+                self.assertEqual(ds.restore_marketplace_autoupdate(), "norecord")
+                self.assertEqual(self.read(self.known), before)
+        os.makedirs(os.path.dirname(ds.AUTOUPDATE_STATE), exist_ok=True)
+        self.write(ds.AUTOUPDATE_STATE, {"folders": ["/somewhere"]})  # the unreleased 1.0.17 candidate's shape
+        self.assertEqual(ds.restore_marketplace_autoupdate(), "norecord")
+
+    def test_the_record_holds_no_secret_and_is_private(self):
+        self.write(self.known, known())
+        ds.set_marketplace_autoupdate(True)
+        rec = json.loads(self.read(ds.AUTOUPDATE_STATE))
+        self.assertEqual(rec["v"], 2)
+        self.assertEqual([(c["file"], c["keys"], c["had"]) for c in rec["changes"]], [(self.known, ["datastash"], False)])
+        self.assertEqual(stat.S_IMODE(os.stat(ds.AUTOUPDATE_STATE).st_mode), 0o600)
+
+    def test_no_record_no_change(self):
+        self.write(self.known, known())
+        before = self.read(self.known)
+        os.makedirs(os.path.dirname(ds.AUTOUPDATE_STATE), exist_ok=True)
+        old = ds.write_private
+        ds.write_private = lambda *a: (_ for _ in ()).throw(OSError("full"))
+        self.addCleanup(setattr, ds, "write_private", old)
+        self.assertEqual(ds.set_marketplace_autoupdate(True, "/nonexistent-folder"), "failed")
+        self.assertEqual(self.read(self.known), before, "what can't be recorded is never changed")
+
+
 class JsonEdit(unittest.TestCase):
+    def test_delete_is_the_inverse_of_set(self):
+        for t, path in (('{"datastash":{"x":1}}', ["datastash"]), ('{"datastash":{}}', ["datastash"]),
+                        ('{\n  "a": {\n    "x": 1,\n    "y": [2]\n  }\n}\n', ["a"]), ("{}\n", [])):
+            with self.subTest(t):
+                self.assertEqual(ds.json_del(ds.json_set_flag(t, path, "autoUpdate", True), path, "autoUpdate"), t)
+        self.assertEqual(ds.json_del('{"a": 1, "b": 2}', [], "b"), '{"a": 1}')
+        self.assertIsNone(ds.json_del('{"a": 1}', [], "b"))
+
     def test_compact_and_nested_text(self):
         t = '{"a":{"datastash":{"x":1}},"b":[1,{"datastash":{}}]}'
         self.assertEqual(ds.json_set_flag(t, ["a", "datastash"], "autoUpdate", True),

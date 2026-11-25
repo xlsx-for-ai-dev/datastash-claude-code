@@ -60,8 +60,11 @@ What it adds:
   instead ("Auto-update is on for datastash in this folder only."), and when nothing can be written the install says
   so and still finishes. While `DISABLE_UPDATES`, `DISABLE_AUTOUPDATER` or `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`
   is set, nothing is written: "Auto-update is turned off on this computer by your settings." The
-  `/datastash:uninstall` that removes the last agent on this computer turns it off again ("Auto-update is off for
-  datastash."). Claude Code then updates datastash by itself in interactive sessions; the self-update above stays as
+  install records what it changed (the plugin's `state/autoupdate.json`: files, entries and the values before; nothing
+  secret), and the `/datastash:uninstall` that removes the last agent on this computer puts back exactly that ("Auto-update
+  is off for datastash."): a value the person had already turned on is left alone, a key or entry the install added is
+  taken out, a folder file it made is moved aside. With no record (an install before 1.0.17) the setting is left as it
+  is ("Auto-update for datastash left as it was."). Claude Code then updates datastash by itself in interactive sessions; the self-update above stays as
   the backstop.
 
 Requires `python3` (3.8 or later, standard library only) and Claude Code with plugin hooks.

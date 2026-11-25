@@ -40,7 +40,8 @@
 #      after step 1, the candidate catalog moves to that ref and one ordinary message is sent; with self-update held off,
 #      Claude Code's own auto-update (on since step 1's /datastash:install: "Auto-update is on for datastash.") must move
 #      the installed version within 12 minutes, with nobody typing an update. Every 1.0.17+ install also checks the
-#      setting is on; an uninstall of the last agent on a computer checks it is off ("Auto-update is off for datastash.").
+#      setting is on; an uninstall of the last agent on a computer checks the setting is back exactly as it was before that
+#      HOME's first install (key absent, or its old value) and the line says so ("Auto-update is off for datastash.").
 #   6  update, two ways, each from an older tag (E2E_OLD_TAG, default v1.0.12) in a local copy of the catalog pinned to it,
 #      then the catalog moved to the published pin (what a release does):
 #      6a `/plugin marketplace update datastash` + `/reload-plugins` (self-update held off for that HOME): the installed
@@ -392,6 +393,31 @@ for path, keys in ((sys.argv[1], ["extraKnownMarketplaces", "datastash"]), (sys.
 print(found or "none")
 PY2
 }
+autoupdate_entries() {  # autoupdate_entries <HOME>: the datastash entry's autoUpdate in each file, as it is on disk
+  # ("absent" for a key not there, "no entry" for no entry): what the last uninstall must put back exactly
+  python3 -I - "$1/.claude/settings.json" "$1/.claude/plugins/known_marketplaces.json" <<'PY2'
+import json, sys
+out = []
+for path, keys in ((sys.argv[1], ["extraKnownMarketplaces", "datastash"]), (sys.argv[2], ["datastash"])):
+    try:
+        v = json.load(open(path))
+    except (OSError, ValueError):
+        v = None
+    for k in keys:
+        v = v.get(k) if isinstance(v, dict) else None
+    out.append("no entry" if not isinstance(v, dict) else json.dumps(v["autoUpdate"]) if "autoUpdate" in v else "absent")
+print("settings: %s; known_marketplaces: %s" % tuple(out))
+PY2
+}
+au_before() {  # au_before <HOME>: keep the setting as it was before this HOME's first install (until its last uninstall)
+  [[ -e "$1/.e2e-au-before" ]] || autoupdate_entries "$1" > "$1/.e2e-au-before"
+}
+au_recorded() {  # au_recorded <HOME>: the plugin's own record lists something its installs changed
+  python3 -I -c 'import json,sys
+try: r = json.load(open(sys.argv[1]))
+except (OSError, ValueError): sys.exit(1)
+sys.exit(0 if isinstance(r, dict) and r.get("changes") else 1)' "$1/.config/datastash/state/autoupdate.json"
+}
 local_agents() {  # local_agents <HOME>: how many agents are set up on this computer (the plugin's own records)
   python3 -I - "$1/.config/datastash" <<'PY2'
 import json, os, re, sys
@@ -474,6 +500,7 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
   local base_done; base_done="$(count " · done ")"  # the turn's own end line ("✻ Worked for 7s · done 12:27 AM")
   base_on="$(count "datastash is on for your agents:")"; base_fail="$(count "Not done")$(count "could not finish the install")$(count "datastash did not answer")"
   local cmd="/datastash:install${DS_INSTALL_ARG:+ $DS_INSTALL_ARG}"
+  au_before "$h"
   type_line "$cmd"
   drive_until '(( $(count "datastash is on for your agents:") > base_on )) || [[ "$(count "Not done")$(count "could not finish the install")$(count "datastash did not answer")" != "$base_fail" ]] || (( $(count " · done ") > base_done ))' 300
   wait_idle 120
@@ -509,6 +536,7 @@ ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server:
   new_lines "$h" || offtxt="datastash is off for"  # an older copy (6b): its own line
   ((LOGIN)) || { waiting "$tag: /datastash:uninstall $args (needs the Claude login)"; return 1; }
   BADTOOL=0 NOANSWER=0
+  local recorded=0; au_recorded "$h" && recorded=1  # 1.0.17: install changed the setting (so the last uninstall puts it back)
   local base_done; base_done="$(count " · done ")"
   base_off="$(count "$offtxt")"; base_no="$(count "Not done")/$(count "Datastash isn't installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")"
   type_line "/datastash:uninstall${args:+ $args}"
@@ -550,10 +578,15 @@ ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server:
   if [[ "$offtxt" != "datastash is off for" ]]; then visible_ok "$tag" "$last" "Done. Datastash is uninstalled from" || ok=0; fi
   if has_autoupdate "$h"; then  # 1.0.17: the last agent on this computer turns auto-update off and says so; else it stays
     local au left; au="$(autoupdate_state "$h")"; left="$(local_agents "$h")"
-    if ((left == 0)); then
-      grep -qF "Auto-update is off for datastash." <<<"$f" || { fail "$tag: the last agent here: no \"Auto-update is off for datastash.\" line"; ok=0; }
-      [[ "$au" == false ]] && pass "$tag: the last agent here: auto-update for datastash is off" \
-        || { fail "$tag: the last agent here: auto-update for datastash is \"$au\", wanted false"; ok=0; }
+    if ((left == 0)); then  # the last agent here: exactly the state before this HOME's first install comes back
+      local want="Auto-update for datastash left as it was." before now
+      ((recorded)) && [[ "$au" != true ]] && want="Auto-update is off for datastash."  # put back, and off now
+      before="$(cat "$h/.e2e-au-before" 2>/dev/null)"; now="$(autoupdate_entries "$h")"
+      grep -qF "$want" <<<"$f" || { fail "$tag: the last agent here: no \"$want\" line"; ok=0; }
+      if [[ -z "$before" ]]; then fail "$tag: the last agent here: no record of the setting before the first install"; ok=0
+      elif [[ "$now" == "$before" ]]; then pass "$tag: the last agent here: auto-update for datastash is back as before the install ($now)"
+      else fail "$tag: the last agent here: auto-update for datastash is \"$now\", wanted it back as before the install (\"$before\")"; ok=0; fi
+      [[ -e "$h/.e2e-au-before" ]] && mv "$h/.e2e-au-before" "$h/.e2e-au-checked-$(date +%s%N)"  # the next install starts afresh
     else
       [[ "$au" == true ]] && pass "$tag: $left agent(s) still here: auto-update for datastash stays on" \
         || { fail "$tag: $left agent(s) still here: auto-update for datastash is \"$au\", wanted true"; ok=0; }

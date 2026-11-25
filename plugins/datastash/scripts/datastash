@@ -12471,7 +12471,10 @@ def cmd_self_update(_args):
 # settings (.claude/settings.local.json, the datastash entry only) and the line says "in this folder only"; when nothing
 # can be written it says so, and the install still finishes. While the person's settings turn Claude Code's updates off
 # (DISABLE_UPDATES, DISABLE_AUTOUPDATER, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, unless FORCE_AUTOUPDATE_PLUGINS) the
-# plugin writes nothing and says so. The /datastash:uninstall that removes the last agent on this computer turns it off.
+# plugin writes nothing and says so. The install records what it changed (state/autoupdate.json: files, entries and the
+# values before, nothing secret); the /datastash:uninstall that removes the last agent on this computer puts back exactly
+# that: a value the person had already set is left alone, a key or entry install added is taken out, a folder file it
+# made is moved aside. With no record (an install before 1.0.17) the setting is left as it is, and the line says so.
 # The once-a-day self-update at session start stays as the backstop.
 AUTOUPDATE_ON_LINE = "Auto-update is on for datastash."
 AUTOUPDATE_OFF_LINE = "Auto-update is off for datastash."
@@ -12645,7 +12648,41 @@ def marketplace_autoupdate():
     return False if found else None
 
 
-AUTOUPDATE_STATE = os.path.join(STATE, "autoupdate.json")  # the folders whose local settings datastash turned it on in
+AUTOUPDATE_STATE = os.path.join(STATE, "autoupdate.json")  # what install changed (paths and prior values, no secrets)
+AUTOUPDATE_ASIDE = os.path.join(STATE, "autoupdate-removed")  # files install made, moved here (never deleted) at uninstall
+AUTOUPDATE_LEFT_LINE = "Auto-update for datastash left as it was."
+AUTOUPDATE_RESTORE_FAILED_LINE = "Couldn't put auto-update for datastash back as it was before the install."
+
+
+def json_del(text, path, key):
+    """The JSON text with only the member `key` of the object at `path` taken out, with the separator next to it (the
+    exact text json_set adds first in an object, so a key install added goes back to the original bytes). None when it
+    is not there once, the text is not plain JSON, or the result would differ by anything else."""
+    try:
+        whole = json.loads(text)
+        at = _json_find(text, path)
+        if at is None:
+            return None
+        ms = _json_members(text, at[0])
+        if ms is None:
+            return None
+        idx = [n for n, m in enumerate(ms) if m[0] == key]
+        if len(idx) != 1:
+            return None
+        n = idx[0]
+        if len(ms) == 1:
+            new = text[:ms[0][1]] + text[ms[0][3]:]
+        elif n < len(ms) - 1:
+            new = text[:ms[n][1]] + text[ms[n + 1][1]:]
+        else:
+            new = text[:ms[n - 1][3]] + text[ms[n][3]:]
+        obj = whole
+        for p in path:
+            obj = obj[p]
+        del obj[key]
+        return new if json.loads(new) == whole else None
+    except (ValueError, TypeError, KeyError, IndexError, RecursionError):
+        return None
 
 
 def _set_entry_flag(path, keys, on):
@@ -12670,21 +12707,14 @@ def _local_settings(folder):
     return os.path.join(folder, ".claude", "settings.local.json")
 
 
-def _local_folders():
-    v = read_json(AUTOUPDATE_STATE, {}).get("folders")
-    return [f for f in v if isinstance(f, str) and os.path.isabs(f)] if isinstance(v, list) else []
-
-
-def _set_local_autoupdate(folder, on, source):
+def _set_local_autoupdate(folder, source):
     """The next-best documented scope: this folder's own local settings (.claude/settings.local.json), the datastash
-    entry under extraKnownMarketplaces with the same source Claude Code already has, autoUpdate set. Only that entry
-    changes; the file is made when there is none. True when it now holds that value."""
+    entry under extraKnownMarketplaces with the same source Claude Code already has, autoUpdate on. Only that entry
+    changes; the file is made when there is none. True when it is now on."""
     path = _local_settings(folder)
     keys = ["extraKnownMarketplaces", MARKETPLACE_NAME]
     if _entry(path, keys) is not None:
-        return _set_entry_flag(path, keys, on)
-    if not on:
-        return True
+        return _set_entry_flag(path, keys, True)
     if not isinstance(source, dict):
         return False
     try:
@@ -12710,37 +12740,162 @@ def _set_local_autoupdate(folder, on, source):
     return (_entry(path, keys) or {}).get("autoUpdate") is True
 
 
+def _au_record():
+    """What the 1.0.17+ installs on this computer changed: [{file, keys, had, was} for a value set on, or {file, keys,
+    added: "entry" | "parent" | "file", dir} for a folder entry made], plus bak (the backup file was made too). None when
+    there is no record (an install from before 1.0.17)."""
+    r = read_json(AUTOUPDATE_STATE, None)
+    if not isinstance(r, dict) or r.get("v") != 2 or not isinstance(r.get("changes"), list):
+        return None
+    return [c for c in r["changes"] if isinstance(c, dict) and isinstance(c.get("file"), str)
+            and os.path.isabs(c["file"]) and isinstance(c.get("keys"), list)
+            and all(isinstance(k, str) for k in c["keys"])]
+
+
+def _au_save(changes):
+    ensure_dirs()
+    os.makedirs(os.path.dirname(AUTOUPDATE_STATE), mode=0o700, exist_ok=True)
+    write_private(AUTOUPDATE_STATE, json.dumps({"v": 2, "changes": changes}, indent=1) + "\n")
+
+
+def _au_change(changes, c, write):
+    """Record the change c first (so uninstall can always undo it), then make it with write(); a change that did not
+    happen is taken out of the record again. A file and entry an earlier install already recorded keep that first record
+    (the state before datastash), so a second install never takes datastash's own value for the person's."""
+    if any(x["file"] == c["file"] and x["keys"] == c["keys"] for x in changes):
+        return write()
+    c["bak"] = not os.path.lexists(os.path.realpath(c["file"]) + AUTOUPDATE_BACKUP)
+    try:
+        _au_save(changes + [c])
+    except OSError:
+        return False  # no record, no change: it could not be put back
+    if write():
+        changes.append(c)
+        return True
+    try:
+        _au_save(changes)
+    except OSError:
+        pass
+    return False
+
+
 def set_marketplace_autoupdate(on, folder=None):
-    """Turn Claude Code's auto-update for the datastash marketplace on or off. "env" (the person's settings keep it off;
-    nothing written, only for on), "on" / "off" (that is now the setting for this computer), "folder" (on only in this
-    folder's local settings: the user settings or the /plugin toggle's file could not be written), "missing" (no datastash
-    marketplace here) or "failed" (no scope could be written)."""
-    if on and autoupdate_env_off():
+    """Turn Claude Code's auto-update for the datastash marketplace on (install) or put it back (on=False: the uninstall
+    of the last agent here; see restore_marketplace_autoupdate). On: "env" (the person's settings keep it off; nothing
+    written), "on" (that is now the setting for this computer), "folder" (on only in this folder's local settings: the
+    user settings or the /plugin toggle's file could not be written), "missing" (no datastash marketplace here) or
+    "failed" (no scope could be written). Only what was changed is recorded; a value already on is left alone."""
+    if not on:
+        return restore_marketplace_autoupdate()
+    if autoupdate_env_off():
         return "env"
-    files = _autoupdate_files()
-    entries = [(p, k, _entry(p, k)) for p, k in files]
+    entries = [(p, k, _entry(p, k)) for p, k in _autoupdate_files()]
     if all(e is None for _, _, e in entries):
         return "missing"
+    changes = _au_record() or []
     for p, k, e in entries:
-        if e is not None:
-            _set_entry_flag(p, k, on)  # one file that can't be written (a root-owned settings file) never stops the rest
-    if not on:
-        for f in _local_folders():
-            _set_local_autoupdate(f, False, None)
-        return "off" if marketplace_autoupdate() is False else "failed"
+        if e is not None and e.get("autoUpdate") is not True:
+            c = {"file": p, "keys": k, "had": "autoUpdate" in e}
+            if c["had"]:
+                c["was"] = e["autoUpdate"]
+            _au_change(changes, c, lambda p=p, k=k: _set_entry_flag(p, k, True))  # one unwritable file never stops the rest
+    try:
+        if _au_record() is None:
+            _au_save(changes)  # nothing changed here: the record says so, and uninstall leaves the setting as it is
+    except OSError:
+        pass
     if marketplace_autoupdate() is True:
         return "on"
     folder = folder or os.getcwd()
+    if not (folder and os.path.isabs(folder)):
+        return "failed"
     source = next((e.get("source") for _, _, e in entries if e is not None and isinstance(e.get("source"), dict)), None)
-    if folder and os.path.isabs(folder) and _set_local_autoupdate(folder, True, source):
-        try:
-            ensure_dirs()
-            write_private(AUTOUPDATE_STATE, json.dumps({"folders": ([x for x in _local_folders() if x != folder]
-                                                                    + [folder])[-50:]}))
-        except OSError:
-            pass
+    path, keys = _local_settings(folder), ["extraKnownMarketplaces", MARKETPLACE_NAME]
+    e = _entry(path, keys)
+    if e is not None and e.get("autoUpdate") is True:
         return "folder"
-    return "failed"
+    if e is not None:
+        c = {"file": path, "keys": keys, "had": "autoUpdate" in e}
+        if c["had"]:
+            c["was"] = e["autoUpdate"]
+    elif not os.path.lexists(path):
+        c = {"file": path, "keys": keys, "added": "file", "dir": not os.path.lexists(os.path.dirname(path))}
+    else:
+        top = read_json(path, {})
+        c = {"file": path, "keys": keys, "added": "entry" if isinstance(top.get("extraKnownMarketplaces"), dict)
+             else "parent"}
+    return "folder" if _au_change(changes, c, lambda: _set_local_autoupdate(folder, source)) else "failed"
+
+
+def _au_aside(path):
+    """Move a file datastash made out of the way (never deleted): into the plugin's own state folder."""
+    os.makedirs(AUTOUPDATE_ASIDE, mode=0o700, exist_ok=True)
+    tag = hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    shutil.move(path, os.path.join(AUTOUPDATE_ASIDE, f"{time.strftime('%Y%m%d%H%M%S')}-{tag}-{os.path.basename(path)}"))
+
+
+def _au_undo(c):
+    """Put back one recorded change: True when it was put back, None when there is nothing of datastash's left there
+    (the person changed the value since, or the entry is gone: theirs, left alone), False when it could not be."""
+    path, keys = c["file"], c["keys"]
+    e = _entry(path, keys)
+    if e is None or e.get("autoUpdate") is not True:
+        return None
+    real = os.path.realpath(path)
+    try:
+        with open(real) as f:
+            text = f.read()
+        added = c.get("added")
+        if added in ("entry", "parent", "file"):
+            if set(e) <= {"source", "autoUpdate"}:
+                new = json_del(text, keys[:-1], keys[-1])
+                if new is not None and added in ("parent", "file") and json.loads(new).get(keys[0]) == {}:
+                    new = json_del(new, [], keys[0])
+            else:  # the person added to the entry since: only the value datastash set goes
+                new = json_del(text, keys, "autoUpdate")
+            if new is not None and added == "file" and json.loads(new) == {}:
+                _au_aside(real)
+                if c.get("dir"):
+                    try:
+                        os.rmdir(os.path.dirname(real))  # only when empty: the folder datastash made for the file
+                    except OSError:
+                        pass
+                return True
+        elif c.get("had"):
+            new = json_set(text, keys, "autoUpdate", c.get("was"))
+        else:
+            new = json_del(text, keys, "autoUpdate")
+        if new is None:
+            return False
+        write_claude_file(real, new)
+        if c.get("bak") and os.path.lexists(real + AUTOUPDATE_BACKUP):
+            _au_aside(real + AUTOUPDATE_BACKUP)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def restore_marketplace_autoupdate():
+    """The uninstall of the last agent here: put back exactly what the installs changed, nothing else. "off" (put back,
+    and it is now off), "left" (nothing of datastash's to put back: it was on before, or the person changed it since),
+    "norecord" (an install from before 1.0.17: left as it is) or "failed" (something could not be put back; kept in the
+    record for the next uninstall)."""
+    changes = _au_record()
+    if changes is None:
+        return "norecord"
+    keep, did = [], False
+    for c in changes:
+        r = _au_undo(c)
+        if r is False:
+            keep.append(c)
+        did = did or r is True
+    try:
+        _au_save(keep)
+    except OSError:
+        pass
+    if keep:
+        return "failed"
+    return "off" if did and marketplace_autoupdate() is not True else "left"
 
 
 def autoupdate_install_line(folder=None):
@@ -12755,12 +12910,15 @@ def autoupdate_install_line(folder=None):
 
 
 def autoupdate_uninstall_line():
-    """After an uninstall: when no agent is left on this computer, auto-update goes off and says so; else None (it stays
-    on)."""
+    """After an uninstall: when no agent is left on this computer, what install changed is put back and the line says
+    what happened; else None (it stays as it is)."""
     try:
         if any(not is_person(a) for a in all_agents()):
             return None
-        return AUTOUPDATE_OFF_LINE if set_marketplace_autoupdate(False) == "off" else None
+        got = restore_marketplace_autoupdate()
+        if got == "norecord" and marketplace_autoupdate() is None:
+            return None  # a copy with no datastash marketplace (development)
+        return {"off": AUTOUPDATE_OFF_LINE, "failed": AUTOUPDATE_RESTORE_FAILED_LINE}.get(got, AUTOUPDATE_LEFT_LINE)
     except Exception:  # noqa: BLE001  never in the uninstall's way
         return None
 
