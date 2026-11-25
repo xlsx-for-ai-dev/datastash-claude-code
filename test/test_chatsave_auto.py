@@ -119,6 +119,15 @@ class AutoSave(ChatBase):
         self.assertEqual([(p, a) for p, a, _b in got], [(ds.MCP_PATH, ds.MCP_ACCEPT)])
         self.assertEqual(got[0][2]["params"]["arguments"]["user_message"], "q1")
 
+    def test_a_refusal_in_the_tool_answer_is_logged_as_refused_not_saved(self):
+        self.answers[ds.MCP_PATH] = (200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [
+            {"type": "text", "text": json.dumps({"code": "person_approval_needed"})}]}})
+        self.exchange("s1", "q1", "a1")
+        self.assertEqual(self.run_save(), "refused")
+        self.assertEqual(self.run_save(), "saved already")  # never sent again
+        with open(ds.log_path("web-app")) as f:
+            self.assertIn("chat save: refused by datastash (person_approval_needed)", f.read())
+
     def test_off_after_do_not_save_my_sessions(self):
         ds.record_sessions(False)
         self.setting = dict(ON)

@@ -15388,7 +15388,7 @@ def chat_auto_save(s, sid, tp, wait=CHAT_AUTO_WAIT):
             outbox_send(s)
             return "kept"
         try:
-            http("POST", MCP_PATH, key=key, body=body, timeout=60, accept=MCP_ACCEPT)
+            _st, _ct, text = http("POST", MCP_PATH, key=key, body=body, timeout=60, accept=MCP_ACCEPT)
         except ApiError as e:
             why = unreachable(e)
             if why is None:
@@ -15400,9 +15400,31 @@ def chat_auto_save(s, sid, tp, wait=CHAT_AUTO_WAIT):
             outbox_put(s, "POST", MCP_PATH, body, unreachable(e) or "no answer", accept=MCP_ACCEPT)
         else:
             _chat_saved(s, sid, pid)
+            refused = _mcp_refusal(text)
+            if refused is not None:
+                log(s, f"chat save: refused by datastash ({refused})")
+                return "refused"
             return "saved"
         _chat_saved(s, sid, pid)
         return "kept"
+
+
+def _mcp_refusal(text):
+    """The code of a tools/call answer datastash marked isError (a short word), else None."""
+    try:
+        if text.lstrip().startswith(("event:", "data:")):
+            text = "\n".join(x[5:].strip() for x in text.splitlines() if x.startswith("data:"))
+        res = json.loads(text).get("result") or {}
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(res, dict) or not res.get("isError"):
+        return None
+    try:
+        blocks = [c.get("text") for c in res.get("content") or [] if isinstance(c, dict) and c.get("type") == "text"]
+        code = json.loads(blocks[0]).get("code") if blocks else None
+    except (ValueError, AttributeError):
+        code = None
+    return re.sub(r"[^A-Za-z0-9_\-]", "", str(code or "error"))[:60]
 
 
 def conf_agent(s):
