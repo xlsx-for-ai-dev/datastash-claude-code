@@ -17,6 +17,8 @@ Run with python3 -I. Never prints a secret, a code or a token.
                            Code's sign-ins share one client, so they show as one app)
   disconnect-all           disconnect every app connection on the account, this script's own last (cleanup)
   disconnect-others        disconnect every app connection but this script's own (the clean start of a run)
+  chat-count TEXT           (1.0.18) how many saved exchanges start "User: TEXT" across the account's saved chats, and
+                           whether one has an answer after it, as JSON {"count", "answered"}
   inbox-marks WB INBOX MARK  (XLI-408 step 9) every message in that inbox of workbook WB whose text holds "MARK #<n>",
                            as a JSON list of the n's in the order datastash added them (a repeat shows twice)
 
@@ -340,6 +342,42 @@ def cmd_inbox_marks(wb, inbox, mark):
     print(json.dumps([n for _mid, n in sorted(found)]))
 
 
+def cmd_chat_count(text):
+    """1.0.18 (XLI-413): how many times the exchange line "User: <text>" is saved across the account's saved chats (the
+    Chats tab, one row per chat, each read with sync read_chat), and whether one of them carries an answer after it.
+    Prints {"count": n, "answered": bool}."""
+    err, out = tool("ledger_workbook_list", {})
+    wbs = out.get("workbooks") if isinstance(out, dict) else None
+    wb = next((w.get("workbook_id") for w in wbs or [] if isinstance(w, dict) and w.get("kind") == "chats"), None)
+    if err or wb is None:
+        print(json.dumps({"count": 0, "answered": False, "why": "no Chats workbook"}))
+        return
+    err, out = tool("ledger_rows_filter", {"workbook_id": wb, "tab": "Chats", "limit": 200})
+    rows = out.get("rows") if isinstance(out, dict) else None
+    if err or not isinstance(rows, list):
+        die(f"ledger_rows_filter Chats refused ({out.get('code') if isinstance(out, dict) else 'no code'})")
+    want, n, answered = f"User: {text}\n", 0, False
+    for r in rows:
+        cells = next((r[k] for k in ("cells", "values", "data") if isinstance(r, dict) and isinstance(r.get(k), dict)), r)
+        cid = cells.get("chat_id") if isinstance(cells, dict) else None
+        if not isinstance(cid, str):
+            continue
+        cursor, whole = None, ""
+        for _page in range(100):
+            err, got = tool("sync", {"action": "read_chat", "chat_id": cid, **({"cursor": cursor} if cursor else {})})
+            if err or not isinstance(got, dict):
+                break
+            whole += str(got.get("transcript") or "")
+            cursor = got.get("next_cursor")
+            if not cursor:
+                break
+        n += whole.count(want)
+        for piece in whole.split(want)[1:]:
+            line = piece.split("\n", 1)[0]
+            answered = answered or len(line.split(": ", 1)[-1].strip()) > 0
+    print(json.dumps({"count": n, "answered": answered}))
+
+
 def main(argv):
     if not argv:
         die(__doc__.strip().splitlines()[0], 2)
@@ -364,6 +402,8 @@ def main(argv):
         return cmd_disconnect_all(keep_mine=True)
     if c == "chats" and len(argv) == 2 and argv[1] in ("on", "off"):
         return cmd_chats(argv[1])
+    if c == "chat-count" and len(argv) == 2:
+        return cmd_chat_count(argv[1])
     if c == "inbox-marks" and len(argv) == 4:
         return cmd_inbox_marks(argv[1], argv[2], argv[3])
     die("unknown command", 2)

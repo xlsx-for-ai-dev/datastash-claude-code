@@ -4760,8 +4760,9 @@ def outbox_entries(s):
     return sorted(n for n in names if re.fullmatch(r"\d{16}\.json", n))
 
 
-def outbox_put(s, method, path, body, why):
-    """Keep one write at the end of the line (fsynced before this returns). Answers its place (1 = next to go out)."""
+def outbox_put(s, method, path, body, why, accept=None):
+    """Keep one write at the end of the line (fsynced before this returns). Answers its place (1 = next to go out).
+    accept: the Accept header it is sent with, when not the REST door's (the plugin's own chat save on /mcp)."""
     ensure_dirs()
     d = outbox_dir(s)
     os.makedirs(d, mode=0o700, exist_ok=True)
@@ -4773,6 +4774,8 @@ def outbox_put(s, method, path, body, why):
         n = max([int(have[-1][:16]) if have else 0, last if isinstance(last, int) else 0]) + 1
         write_private(os.path.join(d, "next.json"), json.dumps({"n": n}))
         rec = {"method": method, "path": path, "body": body, "kept_at": time.time(), "why": why}
+        if accept:
+            rec["accept"] = accept
         write_private(os.path.join(d, f"{n:016d}.json"), json.dumps(rec))
     log(_outbox_slug(s), f"outbox: kept {method} {path.split('?', 1)[0]} ({why}); {len(have) + 1} waiting")
     return len(have) + 1, n
@@ -4836,7 +4839,8 @@ def outbox_send(s, want=None):
                 res["why"] = "no usable key now"
                 break
             try:
-                status, _ct, text = http(rec["method"], rec["path"], key=key, body=rec.get("body"), timeout=30)
+                status, _ct, text = http(rec["method"], rec["path"], key=key, body=rec.get("body"), timeout=30,
+                                         **({"accept": rec["accept"]} if isinstance(rec.get("accept"), str) else {}))
             except ApiError as e:
                 why = unreachable(e)
                 if why is not None or e.status in (401, 403, 410, 429):
@@ -6010,6 +6014,13 @@ def cmd_agent_tool(_args):
     except (Exception, SystemExit):  # fail closed: the call goes out with no agent_proof at all
         ti = bound if bound is not None else (inp.get("tool_input") if isinstance(inp, dict) else None)
         proofed = {k: v for k, v in ti.items() if k != PROOF_ARG} if isinstance(ti, dict) and PROOF_ARG in ti else None
+    try:  # 1.0.18 (XLI-413): while the plugin saves this session, the model's own chat_save is refused
+        refused = chat_save_refused(inp)
+    except Exception:  # noqa: BLE001  the call goes on to the key binding below
+        refused = None
+    if refused is not None:
+        print(json.dumps(refused), flush=True)
+        return 0
     try:  # XLI-391: the chat_key the plugin holds for this session, on the connector's chat_save
         keyed = chat_key_binding(inp, proofed if proofed is not None else inp.get("tool_input"))
     except (Exception, SystemExit):  # noqa: BLE001  the call goes out as the AI sent it
@@ -6188,6 +6199,10 @@ def cmd_prompt(_args):
     sid = sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None
     turn_started(sid)
     count_prompt(sid)
+    try:  # 1.0.18 (XLI-413): the last exchange, if the Stop hook's save did not run (saved once either way)
+        chat_auto_start(inp, say=False)
+    except Exception as e:  # noqa: BLE001  never in the person's way
+        log("status", f"chat save start: {type(e).__name__}")
     try:
         got = command_prompt(inp)  # XLI-390 P1: the install and uninstall commands, and the uninstall pick
     except Exception as e:  # noqa: BLE001  never in the person's way
@@ -9617,6 +9632,13 @@ def _status_check():
         return 0
     said = take_outcomes(sid)  # the checker's line for the person (a refused phrase): no model turn
     msg = {"systemMessage": "datastash: " + " ".join(said)} if said else None
+    try:  # 1.0.18 (XLI-413): the plugin saves this exchange itself, in the background; the person is told once
+        saving = chat_auto_start(inp) if not inp.get("stop_hook_active") else None
+    except Exception as e:  # noqa: BLE001  never in the session's way
+        log("status", f"chat save start: {type(e).__name__}")
+        saving = None
+    if saving:
+        msg = {"systemMessage": (msg["systemMessage"] + "\n" if msg else "") + saving}
     out = None
     if not inp.get("stop_hook_active"):
         try:  # XLI-390 P1: an install note in this turn's last datastash result (Claude Code writes _meta after the call)
@@ -15000,9 +15022,9 @@ def agent_removed(agent, key):
 # itself; the model never sees it (the hook takes it out of datastash answers), so saving needs nobody to ask for it.
 CHATSTASH_PATH = "/api/v1/agent/chatstash"  # {chatstash: {state, set_by, set_at}, chat_key}; ?chat_key= keeps one
 CHATSTASH_NOTE = "datastash note (chatstash; the person's own setting)"
-CHATSTASH_ON = (CHATSTASH_NOTE + ": chatstash is on for this account ({who}). After each reply, save the exchange with "
-                "the datastash connector's chat_save (user_message, ai_reply, and turn 1, 2, 3 ...), without asking the "
-                "person; the plugin adds this chat's chat_key itself, so never send, ask for or look for one.")
+CHATSTASH_ON = (CHATSTASH_NOTE + ": chatstash is on for this account ({who}). The datastash plugin saves each exchange "
+                "of this chat itself after your reply: never call chat_save for it, never write a \"Saved\" line, and "
+                "always give the person your full answer in your reply.")
 CHATSTASH_OFF = (CHATSTASH_NOTE + ": chatstash is off for this account ({who}). Save this chat's exchanges only when "
                  "the person asks.")
 CHATSTASH_WHO = "set by {by} at {at}"
@@ -15204,6 +15226,236 @@ def chatstash_meta_note(inp):
         return None
     _chat_put(own["slug"], sid, told=_chat_sig(st))
     return chatstash_line(st)
+
+
+# ------------------------------------------------------------------ 1.0.18 (owner 11-25, XLI-413): the plugin saves each exchange
+# On a real session the model put its whole answer only into chat_save's ai_reply, so the person saw just "Saved". Now
+# the plugin saves each exchange itself, after the reply is shown: the Stop hook (and, as a fallback, the next prompt)
+# starts one short background job that reads this session's own transcript and takes only the person's last typed
+# message and the assistant's last visible text after it (no tool calls, tool outputs, file contents or thinking). It
+# saves them with the connector's own chat_save (POST /mcp, tools/call, on the agent's key), keyed by this chat's
+# chat_key and a turn number the plugin gives each typed message once, so a retry or a second hook saves it once. While
+# datastash can't be reached the save waits in the offline outbox and goes out once. Only while session saving is on
+# from this computer ("datastash sync" turned it on; "do not save my sessions" turns it off) and the account's setting
+# is not off. The model no longer calls chat_save for these chats (its call is refused with one line while the plugin
+# saves), and the person is told once per session, in the plugin's own line, that the session is being saved.
+CHAT_SAVE_TOOL = "chat_save"
+CHAT_AUTO_LINE = 'datastash: this session is being saved to your Chats tab. To stop, type "do not save my sessions".'
+CHAT_SAVE_BY_PLUGIN = ("Not needed: the datastash plugin saves this chat's exchanges itself after each reply. Give the "
+                       "person your full answer in your reply and don't mention saving.")
+CHAT_AUTO_WAIT = 1.5  # seconds the background job waits for Claude Code to finish writing the turn
+CHAT_AUTO_READ = 64 * 1024 * 1024  # how much of the transcript's end is read for the last exchange (a read window)
+CHAT_AUTO_KEEP = 200  # typed messages whose turn numbers are remembered per session
+_NOT_CHAT_RE = re.compile(r"\s*<(command-(message|name|args)|local-command-[a-z]+|bash-(input|stdout|stderr)|"
+                          r"task-notification|system-reminder|user-prompt-submit-hook)\b")
+
+
+def last_exchange(tp):
+    """(prompt id, the person's last typed message, the assistant's last visible text after it) from a transcript, or
+    None when the last typed message has no answer yet. Only typed text and the final run of assistant text blocks (after
+    the turn's last tool call) are read; tool calls and results, thinking, meta and side-chain entries never are."""
+    entries = _jsonl_tail(tp, CHAT_AUTO_READ)
+    at = None
+    for i in range(len(entries) - 1, -1, -1):
+        t = _typed_text(entries[i])
+        if t is not None and t.strip() and not _NOT_CHAT_RE.match(t):
+            at = i
+            break
+    if at is None:
+        return None
+    e = entries[at]
+    pid = e.get("promptId") or e.get("uuid")
+    if not isinstance(pid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-]{7,63}", pid):
+        return None
+    run = []
+    for v in entries[at + 1:]:
+        if v.get("isSidechain") or v.get("isMeta"):
+            continue
+        msg = v.get("message") if isinstance(v.get("message"), dict) else {}
+        c = msg.get("content")
+        if v.get("type") == "user":
+            if isinstance(c, list) and any(isinstance(x, dict) and x.get("type") == "tool_result" for x in c):
+                run = []  # a tool ran: the visible answer is what comes after it
+            continue
+        if v.get("type") != "assistant" or v.get("isApiErrorMessage"):
+            continue
+        for x in c if isinstance(c, list) else [{"type": "text", "text": c}] if isinstance(c, str) else []:
+            if not isinstance(x, dict):
+                continue
+            if x.get("type") == "tool_use":
+                run = []
+            elif x.get("type") == "text" and isinstance(x.get("text"), str) and x["text"].strip():
+                run.append(x["text"].strip())
+    if not run:
+        return None
+    return pid, _typed_text(e).strip(), "\n\n".join(run)
+
+
+def chat_auto_on(agent, sid=None):
+    """True when this agent's session is saved by the plugin: an agent (never the person's own view) with its key, and
+    session saving on: turned on from this computer ("datastash sync"), never after "do not save my sessions" here;
+    with no choice made here, the account's setting as this session was last told it (turned on elsewhere)."""
+    if agent is None or is_person(agent) or read_key(agent["slug"]) is None:
+        return False
+    here = sessions_on()
+    if here is not None:
+        return here
+    told = _chat_sessions(agent["slug"]).get(sid, {}).get("told") if sid else None
+    return isinstance(told, list) and bool(told) and told[0] == "on"
+
+
+def _chat_turn(s, sid, pid):
+    """This typed message's turn number in this session's chat (given once, kept), and whether it was saved already."""
+    with StateLock(s):
+        ses = _chat_sessions(s)
+        cur = ses.get(sid, {})
+        turns = cur.get("turns") if isinstance(cur.get("turns"), dict) else {}
+        saved = cur.get("saved") if isinstance(cur.get("saved"), list) else []
+        if pid in turns and isinstance(turns[pid], int):
+            return turns[pid], pid in saved
+        n = max([cur.get("next_turn") if isinstance(cur.get("next_turn"), int) else 1] +
+                [t + 1 for t in turns.values() if isinstance(t, int)])
+        turns[pid] = n
+        cur["turns"] = dict(list(turns.items())[-CHAT_AUTO_KEEP:])
+        cur["next_turn"] = n + 1
+        ses[sid] = cur
+        write_private(chatkey_path(s), json.dumps({"sessions": dict(list(ses.items())[-CHATS_KEEP:])}))
+        return n, False
+
+
+def _chat_saved(s, sid, pid):
+    with StateLock(s):
+        ses = _chat_sessions(s)
+        cur = ses.get(sid, {})
+        saved = cur.get("saved") if isinstance(cur.get("saved"), list) else []
+        cur["saved"] = (saved + [pid])[-CHAT_AUTO_KEEP:]
+        ses[sid] = cur
+        write_private(chatkey_path(s), json.dumps({"sessions": dict(list(ses.items())[-CHATS_KEEP:])}))
+
+
+def _chat_key_for(agent, key, sid):
+    """This session's chat_key: the one held, else read now (the account's setting with it), else a new one the plugin
+    makes in the server's own shape and holds (kept by the next read with ?chat_key=). (key, the account setting or None)."""
+    st = None
+    try:
+        st = chatstash_fetch(agent, key, sid, timeout=10)
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        pass
+    held = held_chat_key(agent["slug"], sid)
+    if held is None:
+        held = "c-" + uuid.uuid4().hex[:16]
+        _chat_put(agent["slug"], sid, key=held)
+    return held, st
+
+
+def chat_save_body(chat_key, turn, user, reply):
+    return {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": CHAT_SAVE_TOOL, "arguments": {
+        "chat_key": chat_key, "turn": turn, "user_message": user, "ai_reply": reply}}}
+
+
+MCP_ACCEPT = "application/json, text/event-stream"
+
+
+def chat_auto_save(s, sid, tp, wait=CHAT_AUTO_WAIT):
+    """The background job: save this session's last exchange once. Answers what happened (a short word, for the log)."""
+    agent = conf_agent(s)
+    if not chat_auto_on(agent, sid):
+        return "off"
+    if not _transcript_ok(tp, sid):
+        return "no transcript"
+    with _OutboxLock(s, f"chat-{sid}", wait=False) as held:
+        if held is None:
+            return "busy"  # another hook's job is saving this session now
+        if wait:
+            time.sleep(wait)
+        ex = last_exchange(tp)
+        if ex is None:
+            return "nothing new"
+        pid, user, reply = ex
+        turn, done = _chat_turn(s, sid, pid)
+        if done:
+            return "saved already"
+        key = read_key(s)
+        if key is None:
+            return "no key"
+        ck, st = _chat_key_for(agent, key, sid)
+        if st is not None and st.get("state") == "off":
+            return "account off"
+        body = chat_save_body(ck, turn, user, reply)
+        if outbox_entries(s):  # behind kept writes: in line, in order
+            outbox_put(s, "POST", MCP_PATH, body, "behind kept writes", accept=MCP_ACCEPT)
+            _chat_saved(s, sid, pid)
+            outbox_send(s)
+            return "kept"
+        try:
+            http("POST", MCP_PATH, key=key, body=body, timeout=60, accept=MCP_ACCEPT)
+        except ApiError as e:
+            why = unreachable(e)
+            if why is None:
+                log(s, f"chat save: refused (HTTP {e.status} {_code(e)})")
+                _chat_saved(s, sid, pid)  # a refusal is not sent again
+                return "refused"
+            outbox_put(s, "POST", MCP_PATH, body, why, accept=MCP_ACCEPT)
+        except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+            outbox_put(s, "POST", MCP_PATH, body, unreachable(e) or "no answer", accept=MCP_ACCEPT)
+        else:
+            _chat_saved(s, sid, pid)
+            return "saved"
+        _chat_saved(s, sid, pid)
+        return "kept"
+
+
+def conf_agent(s):
+    """The agent record of slug s on this computer (with its slug), or None."""
+    if not isinstance(s, str) or not re.fullmatch(r"[a-z0-9\-]{1,64}", s):
+        return None
+    a = read_json(conf_path(s), None)
+    return dict(a, slug=s) if isinstance(a, dict) and isinstance(a.get("agent_id"), str) else None
+
+
+def cmd_chat_save(args):
+    """Internal (started by the Stop and prompt hooks, detached): chat-save <slug> <session id> <transcript>."""
+    if len(args) != 3 or not re.fullmatch(SID_RE, args[1]):
+        return 1
+    try:
+        log(args[0] if re.fullmatch(r"[a-z0-9\-]{1,64}", args[0]) else "status",
+            "chat save: " + chat_auto_save(args[0], args[1], args[2]))
+    except Exception as e:  # noqa: BLE001 — a background job; never in the session's way
+        log("status", f"chat save: {type(e).__name__}")
+    return 0
+
+
+def chat_auto_start(inp, say=True):
+    """From a hook (Stop, UserPromptSubmit): start the background save of this session's last exchange when the plugin
+    saves this session. Answers the person's one line for this session (the first time only), else None. Never waits."""
+    sid, tp = _sid(inp), inp.get("transcript_path") if isinstance(inp, dict) else None
+    if not sid or not isinstance(tp, str) or inp.get("agent_id"):
+        return None
+    agent = _own(inp)
+    if not chat_auto_on(agent, sid) or not _transcript_ok(tp, sid, must_exist=False, cwd=inp.get("cwd")):
+        return None
+    spawn_detached([sys.executable, os.path.abspath(__file__), "chat-save", agent["slug"], sid, os.path.realpath(tp)],
+                   inp.get("cwd") if isinstance(inp.get("cwd"), str) and os.path.isdir(inp["cwd"]) else HOME)
+    if not say or _chat_sessions(agent["slug"]).get(sid, {}).get("said"):
+        return None
+    _chat_put(agent["slug"], sid, said=True)
+    return CHAT_AUTO_LINE
+
+
+def chat_save_refused(inp):
+    """PreToolUse of the connector's own chat_save for a private chat while the plugin saves this session: the deny,
+    else None (a shared workbook's save, or saving off: the call goes out as before)."""
+    if not isinstance(inp, dict) or inp.get("hook_event_name") != "PreToolUse":
+        return None
+    name, ti = str(inp.get("tool_name") or ""), inp.get("tool_input")
+    if not CHAT_SAVE_RE.fullmatch(name) or not _datastash_call(inp, name):
+        return None
+    if isinstance(ti, dict) and ti.get("workbook_id") not in (None, ""):
+        return None
+    if not chat_auto_on(_own(inp), _sid(inp)):
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": CHAT_SAVE_BY_PLUGIN}}  # for the model only
 
 
 # --- XLI-378 B: datastash ci-report, per-test results from CI into the "tests" preset (ledger_feeds_setup services
@@ -17453,7 +17705,8 @@ def main():
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
-             "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send}
+             "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
+             "chat-save": cmd_chat_save}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

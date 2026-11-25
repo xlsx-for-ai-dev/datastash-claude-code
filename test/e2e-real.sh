@@ -624,6 +624,7 @@ onboard_flow() {
   [[ -z "$hours" ]] && grep -qF "Last week, we estimate" <<<"$after" && { fail "$tag onboarding: an hours line was shown with no number from the counter"; ok=0; }
   grep -qF "save my chats" <<<"$after" && { fail "$tag onboarding: the old save my chats ask was shown (owner 11-25: opt-out, not an ask)"; ok=0; }
   grep -qF "standing yes" <<<"$after" && { fail "$tag onboarding: house rules were shown at the end (owner 11-25: dropped)"; ok=0; }
+  if [[ "$(ds_plugin "$h" 'm.sessions_on()')" == True ]]; then chat_saved_once "$tag" "$h" || ok=0; fi
   onboard_turn "do not save my sessions"
   if got="$(said "do not save my sessions" "$offline")" && [[ "$(ds_plugin "$h" 'm.sessions_on()')" == False ]]; then
     pass "$tag onboarding: do not save my sessions -> \"$offline\""
@@ -635,6 +636,42 @@ onboard_flow() {
   ((BADTOOL)) && { fail "$tag onboarding: the model asked for a tool that is not datastash's (refused)"; ok=0; }
   "${SRV[@]}" chats off >/dev/null || say "    (could not turn chat saving off after the onboarding)"
   ((ok)) && pass "$tag onboarding: every step, one ask at a time"
+  ((ok))
+}
+
+# 1.0.18 MUST-FIX (XLI-413, owner 11-25): with session saving on, a normal question gets its full answer in the session
+# (no "Saved" line standing in for it), the plugin's own once-per-session line is shown once, and the exchange is in
+# the Chats tab exactly once (the plugin saves it in the background after the reply; read back by the person's own
+# connection with read_chat). chat_saved_once <tag> <HOME>: in the onboarding session, after datastash sync.
+chat_saved_once() {
+  local tag="$1" h="$2" ok=1 q got after i n line base_done
+  q="e2e ${RUN}-$(date +%s): what is the capital of France? One short sentence."
+  line="$(ds_plugin "$h" 'm.CHAT_AUTO_LINE')"
+  for ((i = 0; i < 120; i++)); do screen | grep -qE "background agents? to finish|esc to interrupt" || break; sleep 1; done
+  wait_idle 120; sleep 5; wait_idle 120
+  base_done="$(count " · done ")"
+  type_line "$q"
+  drive_until '[[ "$(pane | python3 -I -c "import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])" "$q")" == *Paris* ]] || (( $(count " · done ") > base_done ))' 240
+  wait_idle 120
+  after="$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "$q")"
+  if grep -qF "Paris" <<<"$after"; then pass "$tag chat save: the normal question's full answer is visible in the session"
+  else fail "$tag chat save: the answer to a normal question is not visible after datastash sync"; show_tail 12; ok=0; fi
+  if grep -vF "${line#datastash: }" <<<"$after" | grep -qiE "(^|[^a-z])saved( this exchange|\.|$| to (your )?chats)"; then
+    fail "$tag chat save: a \"Saved\" line is shown for the exchange"; show_tail 12; ok=0
+  else pass "$tag chat save: no \"Saved\" line stands in for the answer"; fi
+  n="$(count "$line")"
+  if ((n == 1)); then pass "$tag chat save: the plugin's line \"$line\" was shown once this session"
+  else fail "$tag chat save: the plugin's once-per-session line was shown $n times"; ok=0; fi
+  for ((i = 0; i < 90; i++)); do
+    got="$("${SRV[@]}" chat-count "${q}")" || got='{"count": -1}'
+    [[ "$got" == *'"count": 0'* || "$got" == *'"count": -1'* ]] || break
+    sleep 2
+  done
+  sleep 20  # a second save (the next prompt's hook, a retry) would land by now
+  got="$("${SRV[@]}" chat-count "${q}")" || got='{"count": -1}'
+  if [[ "$got" == *'"count": 1,'* && "$got" == *'"answered": true'* ]]; then
+    pass "$tag chat save: the exchange is in the Chats tab exactly once, with its answer ($got)"
+  else fail "$tag chat save: the Chats tab read-back is not one answered exchange ($got)"; ok=0; fi
   ((ok))
 }
 

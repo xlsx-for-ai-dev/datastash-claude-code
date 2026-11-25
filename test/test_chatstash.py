@@ -26,9 +26,8 @@ CK, CK2 = "c-0123456789abcdef", "c-fedcba9876543210"
 ON = {"state": "on", "set_by": "Claude Code", "set_at": "2026-11-23T14:02:11.000Z"}
 OFF = {"state": "off", "set_by": None, "set_at": None}
 ON_LINE = ('datastash note (chatstash; the person\'s own setting): chatstash is on for this account (set by "Claude Code" '
-           "at 2026-11-23 14:02 UTC). After each reply, save the exchange with the datastash connector's chat_save "
-           "(user_message, ai_reply, and turn 1, 2, 3 ...), without asking the person; the plugin adds this chat's "
-           "chat_key itself, so never send, ask for or look for one.")
+           "at 2026-11-23 14:02 UTC). The datastash plugin saves each exchange of this chat itself after your reply: never "
+           'call chat_save for it, never write a "Saved" line, and always give the person your full answer in your reply.')
 OFF_LINE = ("datastash note (chatstash; the person's own setting): chatstash is off for this account (who set it and when "
             "is not recorded). Save this chat's exchanges only when the person asks.")
 
@@ -131,6 +130,7 @@ class Chatstash(ChatBase):
 
     def test_chat_save_gets_the_held_key_and_the_answer_never_shows_it(self):
         self.setting = dict(ON)
+        ds.record_sessions(False)  # 1.0.18: the model's own chat_save (the plugin saves while this is on)
         self.start("s1")
         out = self.tool("PreToolUse", "chat_save", {"user_message": "q", "ai_reply": "a", "turn": 1, "chat_key": "ai-made"})
         self.assertEqual(out["hookSpecificOutput"]["updatedInput"],
@@ -185,6 +185,7 @@ class ReviewFixes(ChatBase):
 
     def test_item1_a_look_alike_connector_gets_no_chat_key_and_says_no_setting(self):
         self.setting = dict(ON)
+        ds.record_sessions(False)  # 1.0.18: the model's own chat_save (the plugin saves while this is on)
         self.start("s1")
         for via in self.look_alikes():  # named datastash, but not https on getdatastash.com itself (TOOL: no URL here)
             self.assertIsNone(self.tool("PreToolUse", "chat_save", {"user_message": "q", "ai_reply": "a"}, via=via), via)
@@ -197,6 +198,7 @@ class ReviewFixes(ChatBase):
 
     def test_item2_a_failed_call_that_shows_the_key_retires_it(self):
         self.setting = dict(ON)
+        ds.record_sessions(False)  # 1.0.18: the model's own chat_save (the plugin saves while this is on)
         self.start("s1")
         fail = {"session_id": "s1", "hook_event_name": "PostToolUseFailure", "tool_name": OWN_TOOL + "chat_save",
                 "tool_input": {"chat_key": CK}, "cwd": self.folder, "error": f"chat_save failed for chat_key {CK}: busy"}
