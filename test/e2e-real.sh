@@ -8,7 +8,10 @@
 # The matrix (computer = one throwaway HOME; all of them share the one selftest test account, label E2E_ACCOUNT, the
 # same fixed label every run):
 #   1  computer A, home folder: marketplace add, install for you, /exit and restart, /mcp Authenticate (selftest),
-#      /datastash:install: agent "agent", the install list and "Time per card is on"; server: "agent" is on.
+#      /datastash:install: agent "$E2E_USER" (the computer's user, never "agent"), the install list and "Time per card is
+#      on"; server: it is on. 1.0.16: every install and uninstall also checks what the person sees: the model's own reply
+#      starts with the plugin's line ("Done. Datastash is on for <name>." / "Done. Datastash is uninstalled from ..."),
+#      and nothing after the typed command reads "denied", "error" or "not run" (test/e2e_visible.py).
 #      Computer B, repo folder ~/code/site (below, 8): the same README steps from a repo folder: agent "site".
 #      Also: the first session in a folder Claude Code never ran in (A's ~/code/web-app, ~/code/notes) must work; when the
 #      plugin gives no note there ("datastash did not answer") that FAILs, and the step is tried once more in a second
@@ -18,8 +21,11 @@
 #      "agent"'s key (the owner's case): web-app off on the server, its key gone here at once (1.0.14: not at its next
 #      start), "agent" untouched.
 #      (A's ~/code/web-app gets its agent first: /datastash:install there, "web-app".)
-#   3  A: /datastash:uninstall agent from agent's own session: off on the server, its key gone here.
-#   7  A: /datastash:install after that uninstall: "agent" again (no "-2"), on the server.
+#   3  A: /datastash:uninstall <home agent> from its own session: off on the server, its key gone here.
+#   3b A, same session: /datastash:uninstall again: "Datastash isn't installed on this agent. Nothing was removed."
+#   7  A, same session: /datastash:install after that uninstall: the same name again (no "-2", never "agent").
+#   10 A, ~/code/named: /datastash:install pat-named (a typed name), uninstall it, then a plain /datastash:install in the
+#      same session: "pat-named" again (the uninstall's name record), not the folder's "named"; then removed.
 #   9  A (XLI-408, the offline outbox): datastash blocked for "agent" in A's home folder (its own datastash command with
 #      HTTPS_PROXY at a closed local port, so every call fails to connect; no listener of A runs meanwhile): three inbox
 #      writes answer "saved, will send when the server is back" and wait on disk (mode 700/600); a read fails plainly and
@@ -81,6 +87,10 @@ REAL_HOME="$HOME"
 CLAUDE_ENV="${E2E_CLAUDE_ENV:-/home/xpm/handover/claude-e2e.env}"
 export E2E_SELFTEST_SECRET_FILE="${E2E_SELFTEST_SECRET_FILE:-/home/xpm/handover/selftest-oauth.secret}"
 export E2E_ACCOUNT="${E2E_ACCOUNT:-plugin-e2e}"
+# 1.0.16: the throwaway computers' user name (USER/LOGNAME in every session): a home folder's agent is named after it,
+# never "agent" (the owner's Mac: "robertsenoff").
+E2E_USER="${E2E_USER:-e2e-home}"
+HA="$E2E_USER"
 PARTS="${E2E_PARTS:-core update}"
 OLD_TAG="${E2E_OLD_TAG:-v1.0.12}"
 export E2E_SIGNIN_LEDGER="${E2E_SIGNIN_LEDGER:-$REAL_HOME/.local/state/datastash-e2e/selftest-signins}"
@@ -302,7 +312,7 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
   T="$RUN-$((++STARTS))"
   mkdir -p "$dir"
   tmux new-session -d -s "$T" -x 250 -y 50 -c "$dir" \
-    "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
+    "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER='$E2E_USER' LOGNAME='$E2E_USER' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
   if wait_for "trust this folder" 40; then
     # The dialog's default is "No, exit" and it shows its text before it takes keys: a Down sent too soon is dropped and
     # the Enter then picks No ("Claude Code didn't start because this folder isn't trusted"). A home folder's Yes lasts
@@ -332,6 +342,22 @@ installed_version() {  # installed_version <HOME>
   python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(*(e.get("version") for e in d["plugins"]["datastash@datastash"]))' \
     "$1/.claude/plugins/installed_plugins.json" 2>/dev/null || echo "?"
 }
+# 1.0.16: what the person sees. said: the model's own reply after the typed command starts with the plugin's line
+# (relayed word for word); clean: nothing after it reads "denied", "error" or "not run".
+said() { pane | python3 -I "$HERE/e2e_visible.py" said "$1" "$2"; }
+clean_out() { pane | python3 -I "$HERE/e2e_visible.py" clean "$1"; }
+visible_ok() {  # visible_ok <tag> <typed command> <expected start of the reply>
+  local got
+  if got="$(said "$2" "$3")"; then pass "$1: the reply the person sees: \"${got:0:160}\""
+  else fail "$1: the person's visible reply is not the plugin's line \"$3\" ($got)"; show_tail 12; return 1; fi
+  if got="$(clean_out "$2")"; then pass "$1: nothing visible says denied, error or not run"
+  else fail "$1: the visible output reads as a failure: $got"; return 1; fi
+}
+
+new_lines() {  # new_lines <HOME>: the installed plugin is 1.0.16 or later (the visible result lines); 6b stays on the pin
+  python3 -I -c 'import sys; v=tuple(int(x) for x in (sys.argv[1] or "0").split(".")[:3] if x.isdigit()); sys.exit(0 if v >= (1, 0, 16) else 1)' "$(installed_version "$1")"
+}
+
 key_file() { printf '%s/.config/datastash/agent-%s.key' "$1" "$2"; }
 
 readme_steps() {  # readme_steps <tag> <HOME> <folder> <catalog>: marketplace add, install for you, /exit, start again
@@ -396,7 +422,8 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
   BADTOOL=0 NOANSWER=0
   local base_done; base_done="$(count " · done ")"  # the turn's own end line ("✻ Worked for 7s · done 12:27 AM")
   base_on="$(count "datastash is on for your agents:")"; base_fail="$(count "Not done")$(count "could not finish the install")$(count "datastash did not answer")"
-  type_line "/datastash:install"
+  local cmd="/datastash:install${DS_INSTALL_ARG:+ $DS_INSTALL_ARG}"
+  type_line "$cmd"
   drive_until '(( $(count "datastash is on for your agents:") > base_on )) || [[ "$(count "Not done")$(count "could not finish the install")$(count "datastash did not answer")" != "$base_fail" ]] || (( $(count " · done ") > base_done ))' 300
   wait_idle 120
   f="$(flat)"
@@ -408,7 +435,9 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
   grep -qF -- "- $name (" <<<"${f##*datastash is on for your agents:}" || { fail "$tag: the install list has no \"$name\""; ok=0; }
   grep -qE -- "- $name-[0-9]+ \(" <<<"${f##*datastash is on for your agents:}" && { fail "$tag: the install list has a \"$name-N\""; ok=0; }
   for n in "$@"; do grep -qF -- "- $n (" <<<"${f##*datastash is on for your agents:}" || { fail "$tag: the install list lacks \"$n\""; ok=0; }; done
-  grep -qF "Time per card is on." <<<"${f##*datastash is on for your agents:}" || { fail "$tag: no \"Time per card is on\" line"; ok=0; }
+  grep -qF "Time per card is on." <<<"$f" || { fail "$tag: no \"Time per card is on\" line"; ok=0; }
+  if new_lines "$h"; then visible_ok "$tag" "$cmd" "Done. Datastash is on for $name. Time per card is on." || ok=0; fi
+  [[ "$name" != agent ]] && grep -qF -- "- agent (" <<<"${f##*datastash is on for your agents:}" && { fail "$tag: an agent named \"agent\" was made"; ok=0; }
   [[ -s "$(key_file "$h" "$name")" ]] || { fail "$tag: no key file for \"$name\" on this computer"; ok=0; }
   has_agent "$name" || { fail "$tag: server: \"$name\" is not on"; ok=0; }
   agents | python3 -I -c 'import json,re,sys; n=sys.argv[1]; sys.exit(1 if any(re.fullmatch(re.escape(n)+r"-\d+", a) for a in json.load(sys.stdin)) else 0)' "$name" \
@@ -419,13 +448,14 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
 
 ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server: those off; their key files gone here
   local tag="$1" h="$2" args="$3"; shift 3
-  local base_off base_no ok=1 n f m
+  local base_off base_no ok=1 n f m offtxt="Datastash is uninstalled from"
+  new_lines "$h" || offtxt="datastash is off for"  # an older copy (6b): its own line
   ((LOGIN)) || { waiting "$tag: /datastash:uninstall $args (needs the Claude login)"; return 1; }
   BADTOOL=0 NOANSWER=0
   local base_done; base_done="$(count " · done ")"
-  base_off="$(count "datastash is off for")"; base_no="$(count "Not done")/$(count "Datastash isn't installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")"
+  base_off="$(count "$offtxt")"; base_no="$(count "Not done")/$(count "Datastash isn't installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")"
   type_line "/datastash:uninstall${args:+ $args}"
-  local cond='(( $(count "datastash is off for") > base_off )) || [[ "$(count "Not done")/$(count "Datastash isn'"'"'t installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")" != "$base_no" ]] || (( $(count " · done ") > base_done ))'
+  local cond='(( $(count "$offtxt") > base_off )) || [[ "$(count "Not done")/$(count "Datastash isn'"'"'t installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")" != "$base_no" ]] || (( $(count " · done ") > base_done ))'
   drive_until "$cond" 300
   wait_idle 120
   f="$(flat)"
@@ -447,16 +477,35 @@ ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server:
     f="$(flat)"
   fi
   ((BADTOOL)) && { fail "$tag: the model asked for a tool that is not datastash's (refused)"; ok=0; }
-  if (( $(count "datastash is off for") <= base_off )); then
+  if (( $(count "$offtxt") <= base_off )); then
     if grep -qF "datastash did not answer" <<<"$f"; then NOANSWER=1; fail "$tag: \"datastash did not answer\" (the plugin's prompt hook gave no note)"; show_tail 8; return 1; fi
-    fail "$tag: /datastash:uninstall $args: no \"datastash is off for\" line"; show_tail 20; return 1
+    fail "$tag: /datastash:uninstall $args: no \"$offtxt\" line"; show_tail 20; return 1
   fi
+  local line; line="$(grep -oE "$offtxt [^.]*\." <<<"$f" | tail -n 1)"
   for n in "$@"; do
-    grep -qF -- "\"$n\"" <<<"${f##*datastash is off for}" || { fail "$tag: the uninstall line does not name \"$n\""; ok=0; }
+    grep -qE -- "(from|,|and) \"?$n\"?(,| and|\.)" <<<"$line" || grep -qF -- "\"$n\"" <<<"$line" \
+      || { fail "$tag: the uninstall line does not name \"$n\" ($line)"; ok=0; }
     has_agent "$n" && { fail "$tag: server: \"$n\" is still on"; ok=0; }
   done
+  local last="/datastash:uninstall${args:+ $args}"
+  [[ "$args" == all && -n "${m:-}" ]] && last="$m"
+  [[ -z "$args" ]] && last="$*"
+  if [[ "$offtxt" != "datastash is off for" ]]; then visible_ok "$tag" "$last" "Done. Datastash is uninstalled from" || ok=0; fi
   ((ok)) && pass "$tag: /datastash:uninstall $args: removed $*; server: $(agents)"
   ((ok))
+}
+
+ds_not_installed() {  # ds_not_installed <tag>: /datastash:uninstall where nothing is installed: the owner's line, plainly
+  local tag="$1" want="Datastash isn't installed on this agent. Nothing was removed." base
+  base="$(count "$want")"
+  type_line "/datastash:uninstall"
+  drive_until '(( $(count "$want") > base ))' 60
+  wait_idle 30
+  if (( $(count "$want") > base )); then pass "$tag: the second /datastash:uninstall shows \"$want\""
+  else fail "$tag: the second /datastash:uninstall did not show \"$want\""; show_tail 10; return 1; fi
+  if pane | python3 -I "$HERE/e2e_visible.py" shown "/datastash:uninstall" "did not answer"; then
+    fail "$tag: it said \"did not answer\""; return 1
+  fi
 }
 
 key_gone() {  # key_gone <tag> <HOME> <name> [seconds]
@@ -479,7 +528,7 @@ ds_cli() {  # ds_cli <HOME> <folder> <proxy or ""> <args...>: the installed plug
   script="$(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["plugins"]["datastash@datastash"][0]["installPath"])' \
     "$h/.claude/plugins/installed_plugins.json" 2>/dev/null)/scripts/datastash"
   [[ -x "$script" || -r "$script" ]] || { echo "no installed datastash command"; return 9; }
-  (cd "$dir" && env -i PATH="$WORK/bin:/usr/local/bin:/usr/bin:/bin" HOME="$h" LANG=C.UTF-8 CLAUDE_PROJECT_DIR="$dir" ${DS_AS:+DATASTASH_AGENT=$DS_AS} \
+  (cd "$dir" && env -i PATH="$WORK/bin:/usr/local/bin:/usr/bin:/bin" HOME="$h" USER="$E2E_USER" LOGNAME="$E2E_USER" LANG=C.UTF-8 CLAUDE_PROJECT_DIR="$dir" ${DS_AS:+DATASTASH_AGENT=$DS_AS} \
     ${proxy:+HTTPS_PROXY=$proxy} ${proxy:+https_proxy=$proxy} python3 "$script" "$@")
 }
 
@@ -526,11 +575,11 @@ outbox_only() {  # E2E_PARTS=outbox: step 1 (A home), step 9, then the agent's o
   say "== outbox only: computer A, home folder: one agent"
   readme_steps "9 setup A home" "$A" "$A" "$CORE_SRC" || return
   authenticate "9 setup A home" || { stop_claude; return; }
-  ds_install "9 setup A home" "$A" agent || { stop_claude; return; }
+  ds_install "9 setup A home" "$A" "$HA" || { stop_claude; return; }
   stop_claude
-  step9_outbox "$A" "$A" agent
+  step9_outbox "$A" "$A" "$HA"
   start_claude "$A" "$A" || { fail "9 cleanup: claude did not start"; return; }
-  ds_uninstall "9 cleanup" "$A" agent agent
+  ds_uninstall "9 cleanup" "$A" "$HA" "$HA"
   stop_claude
 }
 
@@ -557,32 +606,43 @@ core() {
   say "== computer A, home folder"
   readme_steps "1 A home" "$A" "$A" "$CORE_SRC" || return
   authenticate "1 A home" || { stop_claude; return; }
-  ds_install "1 A home" "$A" agent
+  ds_install "1 A home" "$A" "$HA"  # 1.0.16: the computer's user name, never "agent"
   stop_claude
   start_claude "$A" "$A" || { fail "2: claude did not start"; return; }
-  ds_install "2 A home retry (no -2)" "$A" agent
-  TA="$T"  # agent's own session, kept for step 3
+  ds_install "2 A home retry (no -2)" "$A" "$HA"
+  TA="$T"  # the home agent's own session, kept for step 3
   say "== computer A, repo folder ~/code/web-app (a second agent on A)"
   new_repo "$A/code/web-app"
-  first_then_second "4 setup: A repo" "$A" "$A/code/web-app" ds_install web-app agent
+  first_then_second "4 setup: A repo" "$A" "$A/code/web-app" ds_install web-app "$HA"
   stop_claude
   say "== computer A, ~/code/notes: a session that is no agent"
   if first_then_second "4 non-agent session, uninstall web-app" "$A" "$A/code/notes" ds_uninstall web-app web-app; then
     key_gone "4 (at once, 1.0.14)" "$A" web-app 10  # a removed agent set up on this computer goes at once
-    key_here "4" "$A" agent
-    has_agent agent && pass "4: server: \"agent\" is still on" || fail "4: server: \"agent\" was removed too"
+    key_here "4" "$A" "$HA"
+    has_agent "$HA" && pass "4: server: \"$HA\" is still on" || fail "4: server: \"$HA\" was removed too"
   fi
   stop_claude
   T="$TA"
-  say "== computer A, agent's own session"
-  ds_uninstall "3 agent session, uninstall agent" "$A" agent agent && key_gone "3" "$A" agent 10
+  say "== computer A, the home agent's own session"
+  ds_uninstall "3 own session, uninstall $HA" "$A" "$HA" "$HA" && key_gone "3" "$A" "$HA" 10
+  # 1.0.16: the second run, same session: nothing is installed on A now (web-app went in step 4)
+  ds_not_installed "3b second uninstall, same session"
+  # 1.0.16 (owner's reinstall, 11-25): /datastash:install in the same session brings the same name back
+  ds_install "7 reinstall after uninstall, same session" "$A" "$HA"
   stop_claude
-  start_claude "$A" "$A" || { fail "7: claude did not start"; return; }
-  ds_install "7 reinstall after uninstall" "$A" agent
+  # 1.0.16: a name that is no default (typed once) comes back too: the uninstall's record, not the folder's name
+  say "== computer A, ~/code/named: a typed name, uninstalled, then the same session's plain reinstall"
+  new_repo "$A/code/named"
+  start_claude "$A" "$A/code/named" || { fail "10: claude did not start"; return; }
+  DS_INSTALL_ARG=pat-named ds_install "10 install with a typed name" "$A" pat-named "$HA"
+  ds_uninstall "10 uninstall the typed name" "$A" pat-named pat-named && key_gone "10" "$A" pat-named 10
+  ds_install "10 reinstall, same session: the same name, not the folder's" "$A" pat-named "$HA"
+  grep -qF -- "- named (" <<<"$(flat)" && fail "10: the folder's name \"named\" was made instead"
+  ds_uninstall "10 cleanup" "$A" pat-named pat-named
   stop_claude
-  if ((LOGIN)) && has_agent agent; then
+  if ((LOGIN)) && has_agent "$HA"; then
     say "== computer A, home folder: the offline outbox (XLI-408)"
-    step9_outbox "$A" "$A" agent
+    step9_outbox "$A" "$A" "$HA"
   fi
   if ((LOGIN)) && [[ "$(agents)" == "[]" ]]; then  # step 5 needs an agent on A for its cross-computer half
     say "== computer A, ~/code/api: an agent on A for step 5 (A has none on)"
@@ -616,7 +676,7 @@ step5_from_b() {  # step5_from_b <A's HOME>: computer B: step 1 from a repo fold
   if ((${#a_keys[@]})); then
     say "== computer A again: each removed agent's next start cleans it up (${a_keys[*]})"
     for n in "${a_keys[@]}"; do
-      dir="$A/code/$n"; [[ "$n" == agent ]] && dir="$A"
+      dir="$A/code/$n"; [[ "$n" == "$HA" ]] && dir="$A"
       next_start_cleans "5 A" "$A" "$dir" "$n"
     done
   elif ((LOGIN)); then
@@ -630,7 +690,7 @@ step5_only() {  # E2E_PARTS=step5: step 5 alone: A (home folder) gets "agent", t
   say "== step 5 only: computer A, home folder: one agent"
   readme_steps "5 setup A home" "$A" "$A" "$CORE_SRC" || return
   authenticate "5 setup A home" || { stop_claude; return; }
-  ds_install "5 setup A home" "$A" agent || { stop_claude; return; }
+  ds_install "5 setup A home" "$A" "$HA" || { stop_claude; return; }
   stop_claude
   step5_from_b "$A"
 }
@@ -719,7 +779,7 @@ typed_cleanup() {  # typed_cleanup <tag> [<sign-ins still to make after it>]: ev
     break
   done
   if [[ -n "$h" ]]; then
-    dir="$h/code/$n"; [[ "$n" == agent || ! -d "$dir" ]] && dir="$h"
+    dir="$h/code/$n"; [[ "$n" == "$HA" || ! -d "$dir" ]] && dir="$h"
     say "== $tag: ${h#"$WORK/"}, \"$n\"'s own folder (its key signs the typed names)"
     start_claude "$h" "$dir" || { say "$tag: WARNING claude did not start"; T="$keep"; return 1; }
   else

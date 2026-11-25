@@ -2078,7 +2078,9 @@ def _free_name(folder, taken=None, prefer=None):
     """The name for folder's new agent: the folder's name (or prefer: the name the person used), -2, -3 ... past any
     agent on this computer (or a name datastash refused as taken)."""
     mine = {a["slug"] for a in all_agents()} | {slug(r["name"]) for r in _enrolled().values()}
-    name = _next_name(taken) if taken else (_folder_name(prefer) if prefer else _folder_name(folder))
+    name = _next_name(taken) if taken else ((_folder_name(prefer) if prefer else _folder_name(folder)) or user_name())
+    if not name:
+        return None
     for _ in range(1000):
         if not name_reserved(name) and slug(name) not in mine:
             return name
@@ -5225,9 +5227,9 @@ def plain_agent_name(text, cut=40):
 
 
 def _folder_name(here):
-    """The agent name a folder gives: its own name, made plain (plain_agent_name, at most 40 characters); "agent" when
+    """The agent name a folder gives: its own name, made plain (plain_agent_name, at most 40 characters); "" when
     nothing is left. A name that is reserved or taken gets -2, -3 ... (_next_name) where it is used."""
-    return plain_agent_name(os.path.basename(here.rstrip("/")) or "") or "agent"
+    return plain_agent_name(os.path.basename(here.rstrip("/")) or "")
 
 
 def _next_name(name):
@@ -5246,14 +5248,24 @@ def _home_or_root(here):
 def auto_name(here, me, after=None, session_name=None):
     """("linked", name) when this folder already has its agent (reuse it), ("main", None) for the person's session (never
     registers), else ("name", the name to register): the session's own agent name (`claude --agent`), else the folder's
-    name (never for the home folder or "/": the home folder's name is the computer's user, so it is "agent" there), with -2, -3 when another agent on this machine has it (or datastash refused `after` as taken)."""
+    name (the computer's user name for the home folder or "/"), with -2, -3 when another agent on this machine has it
+    (or datastash refused `after` as taken); ("ask", None) when no name can be made (1.0.16: never "agent")."""
     if is_main_session(me) or main_root(here) is not None:
         return "main", None
     sess = session_for(here, me=me)
     if sess is not None:
         return ("main", None) if is_person(sess) else ("linked", sess["name"])
     mine = {a["slug"]: a for a in all_agents()}
-    name = _next_name(plain_agent_name(after, 44) or "agent") if after else session_name or ("agent" if _home_or_root(here) else _folder_name(here))
+    # 1.0.16: never "agent": the session's own name, else the name this session or folder had before an uninstall,
+    # else the folder's name (the computer's user name for the home folder or "/"); none of them: ask the person.
+    if after:
+        name = plain_agent_name(after, 44)
+        name = _next_name(name) if name else None
+    else:
+        name = session_name or last_name(here, me) or (user_name() if _home_or_root(here) else _folder_name(here)) \
+            or user_name()
+    if not name:
+        return "ask", None
     for _ in range(1000):
         other = mine.get(slug(name))
         here_linked = other is not None and any(os.path.realpath(p) == here for p in other.get("projects") or [])
@@ -5322,6 +5334,8 @@ def cmd_auto_name(args):
             die(PRIVATE_REFUSAL.format(folder=here, url=AGENTS_URL))  # a private agent is never reused in another folder
     if kind != "main":
         mark_agent_use(me, "auto-name")  # self-registration has begun: this session is an agent, never main
+    if kind == "ask":
+        die("no agent name can be made here: ask the person for one")
     if kind == "main":
         print("main: this is the person's own session; it never registers an agent")
     elif kind == "linked":
@@ -6155,6 +6169,12 @@ def cmd_prompt(_args):
     """UserPromptSubmit hook: the person typed "datastash main" (or "main datastash") in this session. Records the
     request for this session (bound to its process), or tells the AI in one line why this session can't be main."""
     inp = hook_input()
+    if isinstance(inp.get("prompt"), str) and UNINSTALL_RE.fullmatch(inp["prompt"]) and not installed_here():
+        # 1.0.16: nothing of datastash on this computer (a second uninstall, say): the owner's line, shown plainly,
+        # before anything else runs (the plugin's folder is gone, so no later step could answer).
+        print(json.dumps({"decision": "block", "reason": NOT_INSTALLED_LINE, "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": True}}))
+        return 0
     if isinstance(inp.get("prompt"), str) and INSTALL_RE.fullmatch(inp["prompt"]):
         _mark_gone(False)  # XLI-390 P1: the person's own install lifts an uninstall's tombstone, before anything writes
     hook_heartbeat("prompt", inp, throttle=TOOL_HEARTBEAT_EVERY)
@@ -12442,7 +12462,7 @@ def cmd_self_update(_args):
 # person's connector: the call carries only the S256 challenge; the plugin collects the key with the verifier. Notes carry
 # a typed proof over agent ids from the list id (EPM MUST 2); install notes come only from one dedicated answer field
 # (MUST 3); an uninstall reaches an agent only as 410 agent_removed, and cleanup touches only the fixed paths (note b).
-INSTALL_RE = re.compile(r"\s*(?:/datastash:install|datastash install)\s*", re.I)
+INSTALL_RE = re.compile(r"\s*(?:/datastash:install|datastash install)(?:\s+(\S{1,64}))?\s*", re.I)  # 1.0.16: [name]
 UNINSTALL_RE = re.compile(r"\s*(?:/datastash:uninstall|datastash uninstall)(?:\s+(\S.*?))?\s*", re.I | re.S)
 # X6: the person's whole typed prompt "make <name> private" / "make <name> public" (names as the list shows them; "all"
 # and "this" are not names here, so "make this private" stays an ordinary prompt).
@@ -12480,16 +12500,57 @@ def after_install(inp):
     except Exception:  # noqa: BLE001
         off = False
     return AFTER_INSTALL + ([] if off else [TPC_ON_LINE])
+
+
+def install_text(inp, rec, lst):
+    """1.0.16: the install's final result, plain lines the model relays word for word: "Done. Datastash is on for
+    <this agent>." (and time per card's line), the agent list, anything waiting for the person (one line each, with how
+    to answer), then how to remove or make one private or public."""
+    after = after_install(inp)
+    tpc = [x for x in after if x == TPC_ON_LINE]
+    name = show_name((rec or {}).get("name") or "")
+    head = INSTALL_DONE_LINE.format(name=name) if name != "?" else "Done. Datastash is on."
+    lines = [" ".join([head] + tpc)] + list_lines(lst, ON_HEAD)
+    wait = waiting_lines(rec)
+    if wait:
+        lines += [WAITING_HEAD] + wait
+    return "\n".join(lines + [x for x in after if x != TPC_ON_LINE])
+
+
+def waiting_lines(rec):
+    """What waits for the person, from this computer's status copy of the agent's workbook (no network): agents waiting
+    for the OK or not listening (with the fix), and datastash's asks; one line each. [] when none or no copy."""
+    try:
+        c = read_json(conf_path(slug(rec["name"])), {}) if isinstance((rec or {}).get("name"), str) else {}
+        wb = c.get("workbook_id") or (rec or {}).get("workbook_id")
+        cache = read_status_cache(wb) if isinstance(wb, str) and wb else None
+        if cache is None:
+            return []
+        out = [f"- {x}" for x in listening_lines(cache)]
+        out += [WAITING_ASK_LINE.format(text=_clean(a.get("text"), 200)) for a in _person_asks_of(cache)
+                if a.get("kind") != "default" and _clean(a.get("text"), 200)]
+        return out[:20]
+    except Exception:  # noqa: BLE001  never in the install's way
+        return []
 LIST_HEAD = "Your datastash agents:"
 PICK_LINE = "Type the names to remove, separated by commas, or all."
-OFF_LINE = "datastash is off for {names}. Removed: listener, key, settings and local copies."
-REMOVED_LINE = "Removed {n} agents."
-UNCONFIRMED_LINE = "Not yet confirmed: {names} (they clean up when they next start)."
-# 1.0.14: an agent removed by this uninstall that is set up on this computer is cleaned up here at once; when that can't
-# finish, the person is told which one, plainly.
-LOCAL_LEFT_LINE = ("Not cleaned up on this computer: {names} (their files could not be removed here; they are removed "
-                   "from datastash, and clean up when they next start).")
 CONNECTOR_SAME_LINE = "Your datastash connector in Claude is unchanged."
+# 1.0.16 (owner's Mac, 11-25): the uninstall's final result is ONE plain line the model relays word for word (a hook
+# note alone is collapsed and missed). Partial: what was removed, and what was not, by name.
+UNINSTALL_DONE_LINE = "Done. Datastash is uninstalled from {names}. " + CONNECTOR_SAME_LINE
+UNINSTALL_PART_LINE = "Partly done. Datastash is uninstalled from {names}."
+UNINSTALL_NONE_LINE = "Not done. Nothing was removed."
+NOT_REMOVED_LINE = "Not removed: {names} ({why})."
+ELSEWHERE_LINE = "Still to clean up on their own computers when they next start: {names}."
+LOCAL_LEFT_LINE = ("Not cleaned up on this computer: {names} (removed from datastash, but their files could not be "
+                   "removed here; they go when they next start).")
+# 1.0.16: nothing of datastash on this computer (owner's wording): never "did not answer".
+NOT_INSTALLED_LINE = "Datastash isn't installed on this agent. Nothing was removed."
+INSTALL_DONE_LINE = "Done. Datastash is on for {name}."
+ASK_NAME_LINE = ("Datastash needs a name for this agent. Type /datastash:install and a name, like: "
+                 "/datastash:install my-agent")
+WAITING_HEAD = "Waiting for you:"
+WAITING_ASK_LINE = "- {text} To answer, type: status, then the number it shows."
 PICK_UNKNOWN_LINE = ("Not done: a name you typed is not on the list, or matches two agents. Nothing was removed. Type the "
                      "names as the list shows them, or all.")
 # 1.0.11 stored-name HIGH (PM ruling): "all" alone lists every agent and goes ahead only on the person's typed
@@ -12514,8 +12575,7 @@ NO_OWN_AGENT_LINE = ("Not done: this session has no datastash agent key on this 
 # 1.0.13 (owner's Mac, 11-24): an uninstall never needs this session to be an agent. The person's typed names are signed
 # by any agent of theirs still set up on this computer (note_signer); only when there is none at all is this said. Never
 # "type /datastash:install": that would make one more agent.
-NO_SIGNER_LINE = ("Datastash isn't installed on this agent. Nothing was removed. Type /datastash:uninstall on a computer "
-                  "where one of your agents runs.")
+NO_SIGNER_LINE = NOT_INSTALLED_LINE
 NOT_TYPED_LINE = ("Not done: the plugin could not find your typed command in this session's transcript, so it sent "
                   "nothing. Type the command again. Nothing changed.")
 USED_LINE = "Not done: that typed command was already used once. Type it again. Nothing changed."
@@ -12527,8 +12587,14 @@ OTHERS_FAILED_LINE = "datastash could not reach your other agents just now. Type
 MAIN_HERE_LINE = "This is your datastash main session, not an agent: type /datastash:install in an agent's session."
 REMOVED_HERE_LINE = ("datastash removed this agent from this computer: its listener, key, settings and local copies are "
                      "gone. Your data in datastash stays.")
-_SAY = "The plugin adds every secret and proof itself and shows the person the result. Never send a code_challenge, " \
-       "typed_proof, targets or list_id yourself, never read or print a key, and say at most one short line."
+_SAY = "The plugin adds every secret and proof itself. Never send a code_challenge, typed_proof, targets or list_id " \
+       "yourself and never read or print a key. Say nothing about the steps (never \"goes last\", \"will confirm\", " \
+       "\"the plugin will show\"): the plugin's last note gives the result, and your reply is that text, word for word."
+# 1.0.16: the final result, for the model to relay verbatim as its whole reply (the person sees plain text, not only a
+# collapsed hook note).
+RELAY_AI = (f"{CMD_NOTE}: the plugin's final result. Make no more datastash calls. Your whole reply is exactly the text "
+            "between the two lines below, word for word, with nothing before or after it: no step narration, no summary, "
+            "no \"the plugin says\".\n----\n{text}\n----")
 INSTALL_AI = (f"{CMD_NOTE}: the person typed the datastash install command. In this turn make exactly these datastash "
               "connector calls, in order, and nothing else: {steps}ledger_agents_list; then ledger_agents_note with kind "
               f'"install". {_SAY} If no datastash connector tool is there, tell the person exactly: "{NO_CONNECTOR_LINE}"')
@@ -12661,6 +12727,69 @@ def _drop_standby_locks(s):
             _drop(os.path.join(STATE, f))
 
 
+def _last_names_path():
+    """1.0.16: the uninstall's non-secret record of the names it removed (name, its folders, the sessions it ran in), so a
+    later /datastash:install here brings the same name back. Beside the plugin's folder (that folder goes on the last
+    uninstall), mode 600; no key, id or token is ever in it."""
+    return CONF.rstrip("/") + "-last-names.json"
+
+
+LAST_NAMES_MAX = 50
+
+
+def _remember_name(s, c):
+    try:
+        name = plain_agent_name(c.get("name") or s, 64) if isinstance(c, dict) else ""
+        if not name:
+            return
+        sids = []
+        try:
+            for f in os.listdir(STATE):
+                m = re.fullmatch(r"session-agent-(" + SID_RE + r")\.json", f)
+                rec = read_json(_session_agent_path(m.group(1)), None) if m else None
+                if isinstance(rec, dict) and rec.get("slug") == s:
+                    sids.append(m.group(1))
+        except OSError:
+            pass
+        folders = [os.path.realpath(p) for p in (c.get("projects") or []) if isinstance(p, str)][:20]
+        old = read_json(_last_names_path(), {})
+        rows = [r for r in (old.get("names") if isinstance(old, dict) else None) or []
+                if isinstance(r, dict) and r.get("name") != name]
+        rows = ([{"name": name, "folders": folders, "sids": sids[-20:], "at": int(time.time())}] + rows)[:LAST_NAMES_MAX]
+        p = _last_names_path()
+        tmp = f"{p}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"names": rows}))
+        os.replace(tmp, p)
+    except Exception as e:  # noqa: BLE001  never in the uninstall's way
+        log("uninstall", f"last name: {type(e).__name__}")
+
+
+def last_name(here, me):
+    """1.0.16: the name this session had before an uninstall, else the last one this folder had; None when neither."""
+    rows = read_json(_last_names_path(), {})
+    rows = [r for r in (rows.get("names") if isinstance(rows, dict) else None) or [] if isinstance(r, dict)]
+    sid = (me or {}).get("sid")
+    rp = os.path.realpath(here) if here else None
+    for test in ((lambda r: sid and sid in (r.get("sids") or [])), (lambda r: rp and rp in (r.get("folders") or []))):
+        for r in rows:
+            n = plain_agent_name(r.get("name"), 64)
+            if n and test(r) and not name_reserved(n):
+                return n
+    return None
+
+
+def user_name():
+    """1.0.16: this computer's user name made plain (how a home-folder agent is named), "" when none."""
+    try:
+        import getpass
+        u = getpass.getuser()
+    except Exception:  # noqa: BLE001
+        u = ""
+    return plain_agent_name(u) or plain_agent_name(os.path.basename(HOME.rstrip("/")))
+
+
 def _drop_session_agents(s):
     """Uninstall: every state/session-agent-<sid>.json that names agent `s` (fixed file names; the slug read from each)."""
     try:
@@ -12681,7 +12810,7 @@ def _session_name(inp):
     if not isinstance(inp, dict) or inp.get("agent_id") is not None or not isinstance(inp.get("agent_type"), str):
         return None
     n = _folder_name(inp["agent_type"])
-    return None if n == "agent" or n.lower() in ("general-purpose", "default") else n
+    return None if not n or n.lower() in ("agent", "general-purpose", "default") else n
 
 
 def save_agent_answer(s, key):
@@ -12719,6 +12848,7 @@ def remove_agent_here(s):
     if not re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,63}", s or ""):
         return False
     c = read_json(conf_path(s), {})
+    _remember_name(s, c)
     _REMOVED_HERE.add(s)
     _stop_listener(s)
     for a in AGENT_KEYCHAIN:
@@ -12783,6 +12913,14 @@ def box_gone():
     except OSError:
         return False
     return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and time.time() - st.st_mtime < GONE_SECONDS
+
+
+def installed_here():
+    """1.0.16: True when any agent of the person's is set up on this computer with its key (an uninstall can sign)."""
+    try:
+        return any(not is_person(a) and isinstance(a.get("slug"), str) and read_key(a["slug"]) for a in all_agents())
+    except Exception:  # noqa: BLE001  unsure: let the ordinary steps answer
+        return True
 
 
 def _mark_gone(on):
@@ -13198,11 +13336,18 @@ def command_prompt(inp):
     sid, tp, pid = shape
     base = {"sid": sid, "tp": tp, "pid": pid, "prompt": prompt, "at": time.time()}
     m = UNINSTALL_RE.fullmatch(prompt)
-    if INSTALL_RE.fullmatch(prompt):
+    im = INSTALL_RE.fullmatch(prompt)
+    if im:
         _mark_gone(False)  # the person's own install: the plugin may set itself up here again
         me, here = this_session(inp), project_of(inp)
+        typed = im.group(1)
+        if typed is not None:  # 1.0.16: the person's own name for this agent (asked for when none can be made)
+            if not plain_name(typed):
+                return NOT_PLAIN_NAME_LINE.format(name=show_name(typed)), None, True
+            if name_reserved(typed):
+                return RESERVED_NAME_LINE.format(name=show_name(typed)), None, True
         try:
-            kind, name = auto_name(here, me, session_name=_session_name(inp))
+            kind, name = auto_name(here, me, session_name=typed.lower() if typed else _session_name(inp))
         except SystemExit:
             return INSTALL_FAILED_LINE, None, True
         if kind == "main":
@@ -13210,6 +13355,8 @@ def command_prompt(inp):
         own = _own(inp)
         if own is not None and read_agent_answer(own["slug"]):
             name = own["name"]  # XLI-390 install fix: this session's agent again, never a new "-2"
+        elif kind == "ask":
+            return ASK_NAME_LINE, None, True
         save_cmd(sid, dict(base, kind="install", name=name, here=here))
         steps = "" if own is not None and read_agent_answer(own["slug"]) else INSTALL_KEY_STEPS.format(name=name)
         return None, INSTALL_AI.format(steps=steps), False
@@ -13309,12 +13456,41 @@ def note_proof(key, signer, list_id, kind, targets, prompt_id, typed_text, typed
 
 def _deny(line):
     return {"systemMessage": line, "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                                          "permissionDecisionReason": f"{CMD_NOTE}: {line}"}}
+                                                          "permissionDecisionReason": RELAY_AI.format(text=line)}}
 
 
 def _post(line=None, ai=None, event="PostToolUse"):
     out = {"hookSpecificOutput": {"hookEventName": event, **({"additionalContext": ai} if ai else {})}}
     return dict(out, systemMessage=line) if line else out
+
+
+def _final(text, event="PostToolUse"):
+    """1.0.16: an install or uninstall's final result, shown as success: the person's line (systemMessage), the MCP
+    tool's own result replaced by that text (so the call reads as the result, never as denied or an error), and the
+    model told to reply with exactly that text."""
+    out = _post(text, RELAY_AI.format(text=text), event)
+    if event == "PostToolUse":
+        out["hookSpecificOutput"]["updatedMCPToolOutput"] = [{"type": "text", "text": text}]
+    return out
+
+
+def _join_names(names):
+    names = [show_name(n) for n in names]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def uninstall_line(done, not_removed=(), why="", waiting=(), left=()):
+    """1.0.16: the one final uninstall line. done: names removed; not_removed: names datastash kept (why); waiting:
+    removed, not yet cleaned up on their own computers; left: removed, files still on this computer."""
+    tail = ([ELSEWHERE_LINE.format(names=_join_names(waiting))] if waiting else []) + [CONNECTOR_SAME_LINE]
+    if done and not not_removed and not left:
+        return " ".join([UNINSTALL_DONE_LINE.format(names=_join_names(done)).replace(" " + CONNECTOR_SAME_LINE, "")] + tail)
+    out = [UNINSTALL_PART_LINE.format(names=_join_names(done)) if done else UNINSTALL_NONE_LINE]
+    if not_removed:
+        out.append(NOT_REMOVED_LINE.format(names=_join_names(not_removed), why=why or "datastash refused it"))
+    if left:
+        out.append(LOCAL_LEFT_LINE.format(names=_join_names(left)))
+    return " ".join(out + tail)
 
 
 def note_signer(lst, targets):
@@ -13370,8 +13546,11 @@ def note_input(inp, rec):
     typed_at = _when(entry.get("timestamp"))
     write_private(_typed_used_path(rec["sid"]), json.dumps({"ids": (used + [rec["pid"]])[-50:]}))
     mine = own["agent_id"].lower()
-    if rec["kind"] == "uninstall" and targets == [mine] and not borrowed:
-        return _deny(uninstall_self(own))  # an agent may always end itself, on its own key (no proof needed)
+    if rec["kind"] == "uninstall" and targets == [mine] and not borrowed and read_agent_answer(own["slug"]) is None:
+        # an agent may always end itself, on its own key (no proof needed). 1.0.16: only when it can't sign; with its
+        # answer key the note goes out signed like any pick, so the result arrives as the call's own answer
+        # (note_result), never as a denied call.
+        return _deny(uninstall_self(own))
     if borrowed:  # the note's answer is read with the signer's record (note_result), never this session's
         save_cmd(rec["sid"], dict(rec, signer={"slug": own["slug"], "agent_id": mine}))
     key = read_agent_answer(own["slug"])
@@ -13399,7 +13578,7 @@ def uninstall_self(own, run_id=None):
     except (urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
         return REFUSED_LINE
     remove_agent_here(own["slug"])
-    return " ".join([OFF_LINE.format(names=f'"{show_name(own["name"])}"'), CONNECTOR_SAME_LINE])
+    return uninstall_line([own["name"]])
 
 
 def collect_key(verifier, mint_id):
@@ -13576,8 +13755,7 @@ def command_tool(inp):
             if not rec["targets"]:  # this is the account's only agent: no note to send, the list is the whole answer
                 _drop(_cmd_path(sid))
                 tpc_install_kick(inp)
-                return _post("\n".join(list_lines(lst, ON_HEAD) + after_install(inp)),
-                             "The plugin showed the person the list. Make no more datastash calls; say nothing more.")
+                return _final(install_text(inp, rec, lst))
         elif rec.get("picks"):
             got = resolve_picks(rec["picks"], lst, mine)
             if got == "confirm":  # 1.0.11 stored-name HIGH: "/datastash:uninstall all" asks to confirm first
@@ -13591,14 +13769,14 @@ def command_tool(inp):
             return _post(None, UNINSTALL_NOTE_AI.format(list=""))
         save_cmd(sid, rec)
         if rec["kind"] == "uninstall":
-            return _post("\n".join(list_lines(lst, LIST_HEAD) + [PICK_LINE]), "The plugin showed the person the list. "
-                         "Say nothing more; wait for their answer.")
+            shown = "\n".join(list_lines(lst, LIST_HEAD) + [PICK_LINE])  # 1.0.16: relayed word for word, then wait
+            return _post(shown, RELAY_AI.format(text=shown) + " Then wait for the person's answer.")
         return None
     if tool == "ledger_agents_note" and rec and rec.get("kind") in ("install", "uninstall") + VIS_KINDS:
         _drop(_cmd_path(sid))
         if rec["kind"] == "install":
             tpc_install_kick(inp)
-        return _post(note_result(inp, rec, body))
+        return _final(note_result(inp, rec, body))
     return None
 
 
@@ -13632,7 +13810,7 @@ def note_result(inp, rec, body):
         return server_refused(body, OTHERS_FAILED_LINE) if rec["kind"] == "install" else (
             BRAKED_LINE if code in ("braked", "rate_limit_exceeded") else server_refused(body))
     if rec["kind"] == "install":
-        return "\n".join(list_lines(lst, ON_HEAD) + after_install(inp))
+        return install_text(inp, rec, lst)
     names = {a["id"]: a["name"] for a in lst["agents"]}
     own = _signer_of(inp, rec)  # 1.0.13: the agent that signed, when this session has none of its own
     mine = own["agent_id"].lower() if own else None
@@ -13640,18 +13818,17 @@ def note_result(inp, rec, body):
     others = [names[t] for t in targets if t != mine and t in names and t not in here]
     waiting = _run_waiting(own, body.get("status_path"), others) if own and others else others
     waiting = [n for n in waiting if n not in {show_name(names[t]) for t in here if t in names}]
-    lines = [OFF_LINE.format(names=", ".join(f'"{names[t]}"' for t in targets if t in names)),
-             REMOVED_LINE.format(n=len(targets))]
-    if waiting:
-        lines.append(UNCONFIRMED_LINE.format(names=", ".join(f'"{n}"' for n in waiting)))
-    if left:
-        lines.append(LOCAL_LEFT_LINE.format(names=", ".join(f'"{n}"' for n in left)))
+    done = [show_name(names[t]) for t in targets if t in names]
+    kept, why = [], ""
     if own is not None and mine in targets:
         run = body.get("run_id")
         last = uninstall_self(own, run if isinstance(run, str) and re.fullmatch(GRANT_ID_RE, run.lower()) else None)
         if last in (BRAKED_LINE, REFUSED_LINE):
-            lines.append(f'"{show_name(own["name"])}" (this agent): {last}')
-    return " ".join(lines + [CONNECTOR_SAME_LINE])
+            kept = [show_name(names.get(mine) or own["name"])]
+            why = "too many removals just now; wait a few minutes, then try again" if last == BRAKED_LINE \
+                else "datastash refused it"
+            done = [n for n in done if n not in kept]
+    return uninstall_line(done, kept, why, [n for n in waiting if n not in left], left)
 
 
 def remove_local_targets(ids):

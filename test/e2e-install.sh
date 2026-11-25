@@ -99,7 +99,7 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
   local h="$1" dir="$2"
   T="$RUN-$((++STARTS))"
   tmux new-session -d -s "$T" -x 200 -y 50 -c "$dir" \
-    "env -i PATH='$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' TERM=xterm-256color LANG=C.UTF-8 '$CLAUDE_BIN'"
+    "env -i PATH='$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER=person LOGNAME=person TERM=xterm-256color LANG=C.UTF-8 '$CLAUDE_BIN'"
   if wait_for "trust this folder" 40; then
     tmux send-keys -t "$T" Down; sleep 0.5; tmux send-keys -t "$T" Enter
   fi
@@ -124,7 +124,7 @@ PY
 
 run_folder() {  # run_folder home|repo
   local where="$1" h dir want
-  h="$WORK/$where/person"  # the HOME's own name is the computer user's ("person"): never an agent's name
+  h="$WORK/$where/person"  # the HOME's own name is the computer user's ("person", USER in the session)
   mkdir -p "$h"
   # A brand-new computer, past Claude Code's first-run theme screen (the person picks a theme), with no Claude login.
   printf '{"hasCompletedOnboarding": true, "theme": "dark"}\n' > "$h/.claude.json"
@@ -133,7 +133,7 @@ run_folder() {  # run_folder home|repo
     mkdir -p "$dir" && git -C "$dir" init -q && git -C "$dir" -c user.name=Test -c user.email=test@example.invalid \
       commit -q --allow-empty -m init
   else
-    dir="$h"; want="agent"
+    dir="$h"; want="person"  # 1.0.16: the home folder's agent is the computer's user, never "agent"
   fi
   say "== $where folder (claude started in ${dir#"$WORK/"})"
 
