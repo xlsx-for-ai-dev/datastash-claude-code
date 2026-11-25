@@ -466,6 +466,13 @@ To make one public: say make <name> public.
 Time per card is on. To turn it off, type: datastash time-per-card off
 ```
 
+**First session, reinstall, local cleanup (1.0.14).** `/datastash:install` and `/datastash:uninstall` work in the
+first session of a folder Claude Code never ran in (before, that session said "datastash did not answer"). Installing
+again a name you uninstalled brings that agent back through the same typed install (no "-2", no extra step). A confirmed
+uninstall cleans up every removed agent set up on this computer at once (its listener, key, settings and local copies),
+not at its next start; an agent on another computer still cleans up when it next starts there, and an agent whose files
+can't be removed here is named in one plain line.
+
 **From any session (1.0.13).** `/datastash:uninstall` works in a session that is no agent of its own (your main
 session, or a folder with no agent): the names you type are signed by one of your agents still set up on this computer
 (one you are not removing first; else one you are, which goes last on its own key). Only when none of your agents is

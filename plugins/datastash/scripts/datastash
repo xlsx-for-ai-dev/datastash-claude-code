@@ -9177,9 +9177,29 @@ def _status_remind(inp, sid):
 
 # --- the person's own typed words (PM ruling M2)
 
-def _transcript_ok(path, sid, must_exist=True):
+def _cc_project_folder(cwd):
+    """The folder name Claude Code gives a working folder under <CLAUDE_DIR>/projects: every character that is not a
+    letter or digit becomes "-" (a name over 200 characters is cut there and gets a "-<hash>" tail). None for no cwd."""
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return None
+    return re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def _new_folder_ok(folder, cwd):
+    """A folder Claude Code never ran in has no projects/<folder> yet when the first prompt's hooks run (Claude Code
+    makes it with the transcript, after them). Accept that missing folder only when it is the one Claude Code names for
+    this session's own working folder, so the path can point nowhere else once it appears."""
+    want = _cc_project_folder(cwd)
+    if want is None or not re.fullmatch(r"[A-Za-z0-9-]{1,255}", folder or ""):
+        return False
+    return folder == want or (len(want) > 200 and folder.startswith(want[:200] + "-"))
+
+
+def _transcript_ok(path, sid, must_exist=True, cwd=None):
     """True when path is this session's own Claude Code transcript: <CLAUDE_DIR>/projects/<folder>/<session id>.jsonl, a
-    regular file of this user (not a link)."""
+    regular file of this user (not a link). must_exist=False (the prompt hook, before Claude Code writes the file): a
+    missing file is accepted when its folder is there, or (a folder's first session, XLI-390) when the folder is missing
+    too but is the one Claude Code names for cwd. Every later read checks the real file again (must_exist=True)."""
     if not isinstance(path, str) or not isinstance(sid, str) or not re.fullmatch(SID_RE, sid):
         return False
     root = os.path.realpath(os.path.join(CLAUDE_DIR, "projects"))
@@ -9189,7 +9209,15 @@ def _transcript_ok(path, sid, must_exist=True):
     try:
         st = os.lstat(path)
     except OSError:
-        return not must_exist and os.path.isdir(os.path.dirname(rp))  # a new session's transcript comes after the hook
+        if must_exist:
+            return False
+        folder = os.path.dirname(rp)
+        if os.path.isdir(folder):
+            return True  # a new session's transcript comes after the hook
+        # a folder's first session: nothing there yet (not even a link) and it is this session's own folder name
+        # (Claude Code's own projects folder may be new too: there, or not there at all, never a dangling link)
+        return (not os.path.lexists(folder) and (os.path.isdir(root) or not os.path.lexists(root))
+                and _new_folder_ok(os.path.basename(folder), cwd))
     return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
 
 
@@ -9226,15 +9254,24 @@ def _typed_used_path(sid):
 PROMPT_ID_RE = r"[A-Za-z0-9][A-Za-z0-9\-]{7,63}"
 
 
+class _Shape(tuple):
+    """(session id, transcript path, prompt id), with the hook's own cwd beside it (a folder's first session)."""
+
+    def __new__(cls, items, cwd=None):
+        t = super().__new__(cls, items)
+        t.cwd = cwd if isinstance(cwd, str) else None
+        return t
+
+
 def hook_shape(inp):
     """(session id, transcript path, prompt id) when the input has the real UserPromptSubmit hook's shape, else None.
     Shape alone proves nothing (an AI can type any JSON); the checker below proves the prompt was typed."""
     if not isinstance(inp, dict) or inp.get("hook_event_name") != "UserPromptSubmit":
         return None
     sid, tp, pid = inp.get("session_id"), inp.get("transcript_path"), inp.get("prompt_id")
-    if not isinstance(pid, str) or not re.fullmatch(PROMPT_ID_RE, pid) or not _transcript_ok(tp, sid, must_exist=False):
+    if not isinstance(pid, str) or not re.fullmatch(PROMPT_ID_RE, pid) or not _transcript_ok(tp, sid, must_exist=False, cwd=inp.get("cwd")):
         return None
-    return sid, os.path.realpath(tp), pid
+    return _Shape((sid, os.path.realpath(tp), pid), inp.get("cwd"))
 
 
 def _said_turns(entries, end, most=4):
@@ -9308,7 +9345,8 @@ def start_check(shape, kind, prompt, data):
     try:
         ensure_dirs()
         write_private(_pending_path(pid), json.dumps({"kind": kind, "sid": sid, "tp": tp, "pid": pid, "prompt": prompt,
-                                                      "at": time.time(), "data": data}))
+                                                      "at": time.time(), "data": data,
+                                                      "cwd": getattr(shape, "cwd", None)}))
         spawn_detached([sys.executable, os.path.abspath(__file__), "status-verify", pid], CONF)
         return True
     except OSError:
@@ -9325,7 +9363,8 @@ def cmd_status_verify(args):
         return 1
     path = _pending_path(args[0])
     rec = read_json(path, None)
-    if not rec or rec.get("pid") != args[0] or not _transcript_ok(rec.get("tp"), rec.get("sid"), must_exist=False):
+    if not rec or rec.get("pid") != args[0] or not _transcript_ok(rec.get("tp"), rec.get("sid"), must_exist=False,
+                                                                                  cwd=rec.get("cwd")):
         _drop(path)
         return 0
     deadline = time.time() + VERIFY_WAIT
@@ -12115,6 +12154,10 @@ PICK_LINE = "Type the names to remove, separated by commas, or all."
 OFF_LINE = "datastash is off for {names}. Removed: listener, key, settings and local copies."
 REMOVED_LINE = "Removed {n} agents."
 UNCONFIRMED_LINE = "Not yet confirmed: {names} (they clean up when they next start)."
+# 1.0.14: an agent removed by this uninstall that is set up on this computer is cleaned up here at once; when that can't
+# finish, the person is told which one, plainly.
+LOCAL_LEFT_LINE = ("Not cleaned up on this computer: {names} (their files could not be removed here; they are removed "
+                   "from datastash, and clean up when they next start).")
 CONNECTOR_SAME_LINE = "Your datastash connector in Claude is unchanged."
 PICK_UNKNOWN_LINE = ("Not done: a name you typed is not on the list, or matches two agents. Nothing was removed. Type the "
                      "names as the list shows them, or all.")
@@ -13242,18 +13285,53 @@ def note_result(inp, rec, body):
     names = {a["id"]: a["name"] for a in lst["agents"]}
     own = _signer_of(inp, rec)  # 1.0.13: the agent that signed, when this session has none of its own
     mine = own["agent_id"].lower() if own else None
-    others = [names[t] for t in targets if t != mine and t in names]
+    here, left = remove_local_targets([t for t in targets if t != mine])  # 1.0.14: this computer's, at once
+    others = [names[t] for t in targets if t != mine and t in names and t not in here]
     waiting = _run_waiting(own, body.get("status_path"), others) if own and others else others
+    waiting = [n for n in waiting if n not in {show_name(names[t]) for t in here if t in names}]
     lines = [OFF_LINE.format(names=", ".join(f'"{names[t]}"' for t in targets if t in names)),
              REMOVED_LINE.format(n=len(targets))]
     if waiting:
         lines.append(UNCONFIRMED_LINE.format(names=", ".join(f'"{n}"' for n in waiting)))
+    if left:
+        lines.append(LOCAL_LEFT_LINE.format(names=", ".join(f'"{n}"' for n in left)))
     if own is not None and mine in targets:
         run = body.get("run_id")
         last = uninstall_self(own, run if isinstance(run, str) and re.fullmatch(GRANT_ID_RE, run.lower()) else None)
         if last in (BRAKED_LINE, REFUSED_LINE):
             lines.append(f'"{show_name(own["name"])}" (this agent): {last}')
     return " ".join(lines + [CONNECTOR_SAME_LINE])
+
+
+def remove_local_targets(ids):
+    """1.0.14 (real e2e, 11-25): after the server confirmed an uninstall, each removed agent that is set up on this
+    computer (other than the signer, which goes last on its own key) is cleaned up here at once, as its own next start
+    would: its dead key's one confirm call, then the plugin's fixed-path cleanup (remove_agent_here: its listener, key,
+    settings and local copies). Only agents whose id the server's list named and this computer holds; nothing the
+    server says picks a path. (ids cleaned up here, names of the ones whose files are still here)."""
+    want = {str(t).lower() for t in ids if isinstance(t, str)}
+    done, left = set(), []
+    for a in all_agents():
+        aid = a.get("agent_id")
+        if is_person(a) or not isinstance(aid, str) or aid.lower() not in want:
+            continue
+        s = a["slug"]
+        key = read_key(s)
+        if key:
+            try:
+                api_json("POST", UNINSTALL_CONFIRM_PATH, key, body={}, timeout=15)
+            except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+                pass  # the key is dead server-side anyway; the cleanup goes on
+        key = None
+        try:
+            remove_agent_here(s)
+        except Exception as e:  # noqa: BLE001
+            log("uninstall", f"local cleanup of {s}: {type(e).__name__}")
+        if os.path.lexists(key_path(s)) or os.path.lexists(conf_path(s)):
+            left.append(show_name(a.get("name") or s))
+        else:
+            done.add(aid.lower())
+    return done, left
 
 
 def _vis_line_ok(line, kind, names):

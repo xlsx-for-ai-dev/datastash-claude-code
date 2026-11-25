@@ -21,6 +21,7 @@ import hmac
 import io
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -1654,11 +1655,12 @@ class UninstallNoKey(Base):
         line = self.tool("PostToolUse", "ledger_agents_note", got, {
             "run_id": RUN, "kind": "uninstall", "targets": 1, "removed": ["beta"], "this_agent_last": False,
             "status_path": status})["systemMessage"]
-        self.assertIn(("GET", status, KEY_A, None), self.calls)  # read on the signer's key
+        # 1.0.14: beta is set up on this computer, so it is cleaned up here at once (its dead key's one confirm)
+        self.assertIn(("POST", ds.UNINSTALL_CONFIRM_PATH, KEY_B, {}), self.calls)
         self.assertFalse(any(c[:2] == ("POST", ds.UNINSTALL_SELF_PATH) for c in self.calls))  # the signer stays
         self.assertEqual(line, 'datastash is off for "beta". Removed: listener, key, settings and local copies. Removed 1 '
-                               'agents. Not yet confirmed: "beta" (they clean up when they next start). Your datastash '
-                               "connector in Claude is unchanged.")
+                               "agents. Your datastash connector in Claude is unchanged.")
+        self.assertFalse(os.path.exists(ds.key_path("beta")))
         self.assertTrue(os.path.exists(ds.key_path("alpha")))
 
     def test_every_agent_on_this_computer_named_the_signer_goes_last_on_its_own_key(self):
@@ -1675,7 +1677,10 @@ class UninstallNoKey(Base):
             "status_path": status})["systemMessage"]
         self.assertIn(("POST", ds.UNINSTALL_SELF_PATH, KEY_A, {"run_id": RUN}), self.calls)  # the signer, last
         self.assertFalse(os.path.exists(ds.key_path("alpha")))  # and cleaned up here
-        self.assertIn('Removed 2 agents. Not yet confirmed: "beta"', line)
+        self.assertFalse(os.path.exists(ds.key_path("beta")))  # 1.0.14: beta, set up here too, at once
+        self.assertLess(self.calls.index(("POST", ds.UNINSTALL_CONFIRM_PATH, KEY_B, {})),
+                        self.calls.index(("POST", ds.UNINSTALL_SELF_PATH, KEY_A, {"run_id": RUN})))
+        self.assertIn("Removed 2 agents. Your datastash connector", line)
         self.assertNotIn("/datastash:install", line)
 
     def test_remove_all_from_a_session_with_no_key(self):
@@ -2047,6 +2052,148 @@ class FreshHome(Base):
         if answer is not None:
             inp["tool_response"] = [{"type": "text", "text": json.dumps(answer)}]
         return self.hook(ds.cmd_agent_tool, inp)
+
+
+class FirstSessionInNewFolder(Base):
+    """1.0.14 (real e2e, 11-25, bug A): in a folder Claude Code never ran in, the first session's
+    ~/.claude/projects/<folder> does not exist yet when the prompt hooks run (Claude Code makes it with the transcript,
+    after them), so /datastash:install and :uninstall got no note ("datastash did not answer"). That missing folder is
+    accepted only when it is the one Claude Code names for the session's own cwd; every later read checks the real file
+    again, so a typed check still needs the person's own typed entry in that file."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(ds.CLAUDE_DIR, "projects"), exist_ok=True)
+
+    def new_folder_transcript(self, sid, cwd=None):
+        name = re.sub(r"[^A-Za-z0-9]", "-", cwd or self.folder)
+        d = os.path.join(ds.CLAUDE_DIR, "projects", name)
+        self.assertFalse(os.path.lexists(d))
+        return d, os.path.join(d, f"{sid}.jsonl")
+
+    def hook_input(self, text, sid, tp, pid, cwd=None):
+        return {"session_id": sid, "prompt": text, "hook_event_name": "UserPromptSubmit", "cwd": cwd or self.folder,
+                "prompt_id": pid, "transcript_path": tp}
+
+    def test_the_first_install_in_a_new_folder_gets_its_note_and_still_needs_the_typed_entry(self):
+        sid, pid = "s-new-1", str(uuid.uuid4())
+        d, tp = self.new_folder_transcript(sid)
+        v = self.hook(ds.cmd_prompt, self.hook_input("/datastash:install", sid, tp, pid))
+        self.assertIn('ledger_agent_register with name "web-app"', v["hookSpecificOutput"]["additionalContext"])
+        self.assertFalse(os.path.lexists(d))  # the hook makes nothing in Claude Code's folder
+        self.assertIsNone(ds._typed_entry(dict(ds.read_json(ds._cmd_path(sid), {}), sid=sid)))  # no file yet: no proof
+        os.makedirs(d)
+        v2 = {"type": "user", "promptId": pid, "message": {"role": "user", "content": "/datastash:install"},
+              "promptSource": "typed", "origin": {"kind": "human"}, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+        with open(tp, "a") as f:
+            f.write(json.dumps(v2) + "\n")
+        self.assertEqual(ds._typed_entry(dict(ds.read_json(ds._cmd_path(sid), {}), sid=sid)), v2)
+
+    def test_the_first_uninstall_in_a_new_folder_gets_its_note(self):
+        sid, pid = "s-new-2", str(uuid.uuid4())
+        _, tp = self.new_folder_transcript(sid)
+        v = self.hook(ds.cmd_prompt, self.hook_input("/datastash:uninstall web-app", sid, tp, pid))
+        self.assertEqual(v["hookSpecificOutput"]["additionalContext"], ds.UNINSTALL_LIST_AI)
+
+    def test_a_missing_folder_that_is_not_this_sessions_own_is_still_refused(self):
+        sid = "s-new-3"
+        other = os.path.join(os.path.dirname(self.folder), "elsewhere")
+        _, tp = self.new_folder_transcript(sid, cwd=other)  # the folder name of another cwd
+        self.assertIsNone(self.hook(ds.cmd_prompt, self.hook_input("/datastash:install", sid, tp, str(uuid.uuid4()))))
+        self.assertIsNone(ds.hook_shape(self.hook_input("/datastash:install", sid, tp, str(uuid.uuid4()))))
+        for bad in ("..", ".", "a/b"):  # never a path out of projects/, whatever cwd says
+            self.assertIsNone(ds.hook_shape(self.hook_input("/datastash:install", sid, os.path.join(
+                ds.CLAUDE_DIR, "projects", bad, f"{sid}.jsonl"), str(uuid.uuid4()))))
+        no_cwd = self.hook_input("/datastash:install", sid, self.new_folder_transcript(sid)[1], str(uuid.uuid4()))
+        no_cwd.pop("cwd")
+        self.assertIsNone(ds.hook_shape(no_cwd))
+
+    def test_a_new_claude_code_with_no_projects_folder_yet(self):
+        root = os.path.join(ds.CLAUDE_DIR, "projects")
+        aside = root + ".aside-" + uuid.uuid4().hex[:8]
+        os.rename(root, aside)
+        try:
+            sid, pid = "s-new-6", str(uuid.uuid4())
+            _, tp = self.new_folder_transcript(sid)
+            self.assertIsNotNone(ds.hook_shape(self.hook_input("/datastash:install", sid, tp, pid)))
+        finally:
+            os.rename(aside, root)
+
+    def test_a_link_in_place_of_the_folder_is_refused(self):
+        sid = "s-new-4"
+        d, tp = self.new_folder_transcript(sid)
+        os.makedirs(os.path.join(os.path.dirname(self.folder), "target"))
+        os.symlink(os.path.join(os.path.dirname(self.folder), "target"), d)
+        self.assertIsNone(ds.hook_shape(self.hook_input("/datastash:install", sid, tp, str(uuid.uuid4()))))
+        dangling = os.path.join(ds.CLAUDE_DIR, "projects", re.sub(r"[^A-Za-z0-9]", "-", self.folder) + "-x")
+        os.symlink(os.path.join(os.path.dirname(self.folder), "nowhere"), dangling)  # a dangling link is no new folder
+        self.assertFalse(ds._transcript_ok(os.path.join(dangling, f"{sid}.jsonl"), sid, must_exist=False,
+                                           cwd=self.folder + "-x"))
+
+    def test_the_checker_waits_for_the_folder_and_then_reads_the_real_file(self):
+        sid, pid = "s-new-5", str(uuid.uuid4())
+        d, tp = self.new_folder_transcript(sid)
+        shape = ds.hook_shape(self.hook_input("keep this", sid, tp, pid))
+        self.assertEqual(shape.cwd, self.folder)
+        self.assertTrue(ds.start_check(shape, "keep", "keep this", {}))
+        rec = ds.read_json(ds._pending_path(pid), {})
+        self.assertEqual(rec["cwd"], self.folder)
+        self.assertTrue(ds._transcript_ok(rec["tp"], sid, must_exist=False, cwd=rec["cwd"]))
+        self.assertFalse(ds._transcript_ok(rec["tp"], sid))  # the real read needs the real file
+
+
+class UninstallCleansThisComputer(Base):
+    """1.0.14 (real e2e, 11-25, bug C): a confirmed uninstall cleans up, at once, every removed agent set up on this
+    computer (its dead key's one confirm, then the plugin's fixed-path cleanup), not only the signer; an agent on another
+    computer still cleans up at its own next start; and one whose files can't be removed here is named plainly."""
+
+    def setUp(self):
+        super().setUp()
+        two_agents_elsewhere(self)
+
+    def remove(self, text, targets, removed, not_confirmed):
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        self.prompt(text)
+        got = self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual(got["targets"], sorted(targets))
+        status = "/api/v1/agent/uninstall/" + RUN
+        self.answers[status] = (200, {"run_id": RUN, "kind": "uninstall", "total": len(targets), "confirmed": [],
+                                      "not_confirmed": not_confirmed})
+        return self.tool("PostToolUse", "ledger_agents_note", got, {
+            "run_id": RUN, "kind": "uninstall", "targets": len(targets), "removed": removed, "this_agent_last": False,
+            "status_path": status})["systemMessage"]
+
+    def test_a_removed_agent_on_this_computer_goes_at_once_and_one_elsewhere_is_left_to_its_next_start(self):
+        line = self.remove("web-app beta", [OWN, BETA], ["web-app", "beta"], ["web-app", "beta"])  # web-app: not here
+        self.assertFalse(os.path.exists(ds.key_path("beta")))
+        self.assertFalse(os.path.exists(ds.conf_path("beta")))
+        self.assertIn(("stop", "beta"), self.calls)
+        self.assertIn(("POST", ds.UNINSTALL_CONFIRM_PATH, KEY_B, {}), self.calls)
+        self.assertTrue(os.path.exists(ds.key_path("alpha")))  # the signer, not named, stays
+        self.assertIn('Not yet confirmed: "web-app" (they clean up when they next start).', line)
+        self.assertNotIn('"beta" (they', line)
+        self.assertNotIn("Not cleaned up", line)
+        self.assertNotIn(KEY_B, line)
+
+    def test_a_cleanup_that_cannot_finish_says_so(self):
+        keep = ds.remove_agent_here
+        ds.remove_agent_here = lambda s: False  # its files stay (a folder that is not writable)
+        try:
+            line = self.remove("beta", [BETA], ["beta"], ["beta"])
+        finally:
+            ds.remove_agent_here = keep
+        self.assertIn('Not cleaned up on this computer: "beta"', line)
+        self.assertTrue(os.path.exists(ds.key_path("beta")))
+
+    def test_nothing_here_is_touched_when_the_server_refused(self):
+        self.prompt("/datastash:uninstall")
+        self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
+        self.prompt("beta")
+        got = self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]
+        self.tool("PostToolUse", "ledger_agents_note", got, {"error": "braked", "code": "braked"})
+        self.assertTrue(os.path.exists(ds.key_path("beta")))
+        self.assertFalse(any(c[1] == ds.UNINSTALL_CONFIRM_PATH for c in self.calls if len(c) > 1))
 
 
 class Commands(unittest.TestCase):

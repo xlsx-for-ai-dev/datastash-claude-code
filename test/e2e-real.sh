@@ -14,7 +14,8 @@
 #      session so the rest of the matrix still runs.
 #   2  A: /datastash:install again in a new session: the same agent, no "agent-2" (pane and server).
 #   4  A: a third folder's session that is no agent (~/code/notes) types /datastash:uninstall web-app while A also holds
-#      "agent"'s key (the owner's case): web-app off on the server, its key gone here, "agent" untouched.
+#      "agent"'s key (the owner's case): web-app off on the server, its key gone here at once (1.0.14: not at its next
+#      start), "agent" untouched.
 #      (A's ~/code/web-app gets its agent first: /datastash:install there, "web-app".)
 #   3  A: /datastash:uninstall agent from agent's own session: off on the server, its key gone here.
 #   7  A: /datastash:install after that uninstall: "agent" again (no "-2"), on the server.
@@ -39,11 +40,13 @@
 #                    line). Missing: the steps that need a model turn (every /datastash:install and :uninstall) are
 #                    reported WAITING and everything else still runs.
 #   E2E_SELFTEST_SECRET_FILE  default /home/xpm/handover/selftest-oauth.secret (the bare secret, mode 600).
-# Note (run 11-25): an uninstalled agent stays switched off on the server under its name, and 1.0.13's install refuses
-#   that name (step 7). So until that is fixed a second run on the same E2E_ACCOUNT fails at step 1 (home folder agent
-#   "agent"): give each run a fresh label (the server allows 10 selftest accounts).
+# Note (run 11-25): before x-live's XLI-390 reinstall fix an uninstalled agent stayed switched off on the server under its
+#   name and the install refused that name (step 7); give each run a fresh label (the server allows 10 selftest accounts).
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
-#   E2E_PARTS ("core update", default both), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash).
+#   E2E_PARTS ("core update", default both), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
+#   E2E_CANDIDATE=<branch or tag, pushed to the plugin repo>: test that commit before it is released: the core steps
+#   install it from a local copy of the catalog pinned to it, and 6a updates to it; 6b (self-update moves only to a
+#   release tag) stays on the published pin.
 # Cleanup, pass or fail: every agent left on the test account is switched off, every app connection on it disconnected
 # (the read-back's own last), the tmux sessions end, processes from the throwaway HOMEs stop, the HOMEs go to ~/trash.
 # Exit 0 PASS, 1 FAIL, 2 can't run here, 3 no step failed but some are WAITING (no Claude login yet).
@@ -130,6 +133,27 @@ PY
 PUBLISHED_REF="$(python3 -I -c 'import json,sys; print(next(p for p in json.load(open(sys.argv[1]))["plugins"] if p["name"]=="datastash")["source"]["ref"])' "$REPO/.claude-plugin/marketplace.json")"
 PUBLISHED_VERSION="${PUBLISHED_REF#v}"
 say "published: $MARKETPLACE pins $PUBLISHED_REF"
+CORE_SRC="$MARKETPLACE" NEW_REF="$PUBLISHED_REF" NEW_VERSION="$PUBLISHED_VERSION"
+if [[ -n "${E2E_CANDIDATE:-}" ]]; then  # a pushed branch or tag: its commit, its own plugin version
+  git -C "$REPO" fetch -q "$(git -C "$REPO" remote | head -n 1)" "$E2E_CANDIDATE" 2>/dev/null
+  cand_sha="$(git -C "$REPO" rev-parse --verify --quiet FETCH_HEAD^{commit})" \
+    || { echo "CAN'T RUN: candidate $E2E_CANDIDATE is not on the plugin repo's remote"; exit 2; }
+  git -C "$REPO" tag -f "e2e-cand-$$" "$cand_sha" >/dev/null || exit 2
+  NEW_VERSION="$(git -C "$REPO" show "$cand_sha:plugins/datastash/.claude-plugin/plugin.json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+  NEW_REF="$E2E_CANDIDATE"
+  pinned_catalog "$WORK/cand/catalog" "e2e-cand-$$" || exit 2
+  python3 -I - "$WORK/cand/catalog/.claude-plugin/marketplace.json" "$E2E_CANDIDATE" <<'PY'
+import json, sys
+cat = json.load(open(sys.argv[1]))
+for p in cat["plugins"]:
+    if p["name"] == "datastash":
+        p["source"]["ref"] = sys.argv[2]
+json.dump(cat, open(sys.argv[1], "w"), indent=2)
+PY
+  git -C "$REPO" tag -d "e2e-cand-$$" >/dev/null
+  CORE_SRC="$WORK/cand/catalog"
+  say "candidate: $E2E_CANDIDATE at ${cand_sha:0:7} (plugin $NEW_VERSION): the core steps and 6a use it; 6b stays on $PUBLISHED_REF"
+fi
 
 # --- the launcher: a clean env per throwaway HOME; the Claude token (if any) is read and exported inside the session.
 mkdir -p "$WORK/bin"
@@ -399,7 +423,7 @@ core() {
   # --- computer A: steps 1 (home folder), 2, 4, 3, 7
   A="$(new_home A)"
   say "== computer A, home folder"
-  readme_steps "1 A home" "$A" "$A" "$MARKETPLACE" || return
+  readme_steps "1 A home" "$A" "$A" "$CORE_SRC" || return
   authenticate "1 A home" || { stop_claude; return; }
   ds_install "1 A home" "$A" agent
   stop_claude
@@ -412,12 +436,7 @@ core() {
   stop_claude
   say "== computer A, ~/code/notes: a session that is no agent"
   if first_then_second "4 non-agent session, uninstall web-app" "$A" "$A/code/notes" ds_uninstall web-app web-app; then
-    if [[ -e "$(key_file "$A" web-app)" ]]; then
-      say "    web-app's key is still here after the removal; its own next start must clean it up"
-      next_start_cleans "4" "$A" "$A/code/web-app" web-app
-    else
-      pass "4: \"web-app\"'s key file is gone on this computer"
-    fi
+    key_gone "4 (at once, 1.0.14)" "$A" web-app 10  # a removed agent set up on this computer goes at once
     key_here "4" "$A" agent
     has_agent agent && pass "4: server: \"agent\" is still on" || fail "4: server: \"agent\" was removed too"
   fi
@@ -440,7 +459,7 @@ core() {
   B="$(new_home B)"
   new_repo "$B/code/site"
   say "== computer B (same account), repo folder ~/code/site"
-  readme_steps "1/8 B repo" "$B" "$B/code/site" "$MARKETPLACE" || return
+  readme_steps "1/8 B repo" "$B" "$B/code/site" "$CORE_SRC" || return
   authenticate "8 B" || { stop_claude; return; }
   others="$(on_names site)"
   # shellcheck disable=SC2086
@@ -465,7 +484,8 @@ core() {
 }
 
 update_part() {  # update_part a|b
-  local how="$1" h dir cat_dir name v
+  local how="$1" h dir cat_dir name v to_ref="$NEW_REF" to_version="$NEW_VERSION"
+  [[ "$1" == b ]] && to_ref="$PUBLISHED_REF" to_version="$PUBLISHED_VERSION"  # self-update moves only to a release tag
   h="$(new_home "U$how")"; name="upd-$how"; dir="$h/code/$name"; new_repo "$dir"
   cat_dir="$WORK/U$how/catalog"
   pinned_catalog "$cat_dir" "$OLD_TAG" || { fail "6$how: no tag $OLD_TAG here"; return; }
@@ -477,7 +497,11 @@ update_part() {  # update_part a|b
   readme_steps "6$how $OLD_TAG" "$h" "$dir" "$cat_dir" || return
   v="$(installed_version "$h")"
   [[ "$v" == "${OLD_TAG#v}" ]] || { fail "6$how: installed $v, wanted ${OLD_TAG#v}"; stop_claude; return; }
-  pinned_catalog "$cat_dir" "$PUBLISHED_REF"  # the release: the catalog now pins the published tag
+  if [[ "$to_ref" == "$PUBLISHED_REF" ]]; then
+    pinned_catalog "$cat_dir" "$PUBLISHED_REF"  # the release: the catalog now pins the published tag
+  else
+    cp "$WORK/cand/catalog/.claude-plugin/marketplace.json" "$cat_dir/.claude-plugin/marketplace.json"  # the candidate
+  fi
   if [[ "$how" == a ]]; then
     type_line "/plugin marketplace update datastash"
     wait_for "[Uu]pdated|up to date|Successfully" 120 || { fail "6a: /plugin marketplace update did not finish"; show_tail; }
@@ -486,8 +510,8 @@ update_part() {  # update_part a|b
     wait_for "[Rr]eloaded|[Rr]eload" 60
     sleep 3
     v="$(installed_version "$h")"
-    [[ "$v" == "$PUBLISHED_VERSION" ]] && pass "6a: marketplace update + /reload-plugins: $OLD_TAG -> $v" \
-      || { fail "6a: after marketplace update + /reload-plugins the installed version is $v, wanted $PUBLISHED_VERSION"; show_tail; }
+    [[ "$v" == "$to_version" ]] && pass "6a: marketplace update + /reload-plugins: $OLD_TAG -> $v" \
+      || { fail "6a: after marketplace update + /reload-plugins the installed version is $v, wanted $to_version"; show_tail; }
     stop_claude; start_claude "$h" "$dir"
   else
     stop_claude
@@ -522,7 +546,7 @@ for p in $PARTS; do
   esac
 done
 
-say "---- results (${E2E_ACCOUNT}; published $PUBLISHED_REF; old $OLD_TAG)"
+say "---- results (${E2E_ACCOUNT}; published $PUBLISHED_REF${E2E_CANDIDATE:+; candidate $E2E_CANDIDATE}; old $OLD_TAG)"
 printf '  %s\n' "${RESULTS[@]}"
 if ((FAILS > 0)); then say "RESULT: FAIL, $FAILS step(s); $WAITS waiting"; exit 1; fi
 if ((WAITS > 0)); then say "RESULT: NOT COMPLETE, $WAITS step(s) WAITING (no Claude login); nothing failed"; exit 3; fi
