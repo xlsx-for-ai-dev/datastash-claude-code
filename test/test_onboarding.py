@@ -3,9 +3,10 @@
 - "datastash sync" typed by the person (checked in the transcript) turns keeping on and opens ONE connector sync start;
   the model can never turn it on (no typed phrase: refused). The old long keep phrase still works.
 - After sync: held up to the pad while the hours counter runs, then the "Synced" line, relayed word for word.
-- After the status: the feature list (one table, bold names) and the chats ask; "save my chats" (typed) opens one
-  start_chatstash; then the hours line (only from the counter's totals, never made up) and how to see the list again.
-  No transcripts: no hours line. A counter still running: the line comes at the next turn.
+- owner 11-25 (opt-out, not an ask): "datastash sync" also opens one start_chatstash and turns timers on. After the
+  status: the feature list (one table, bold names), the sessions line, the hours line (only from the counter's totals,
+  never made up) and how to see the list again, last. No transcripts: no hours line. A counter still running: the line
+  comes at the next turn. "do not save my sessions" / "save my sessions"; "turn off timers" / "turn on timers".
 - "datastash functions" shows the list again. The clean-sessions guard lets the agent's own skills run.
 No network; a throwaway HOME and config folder, enforced by test/harness.py.
 Run: python3 -I test/test_onboarding.py"""
@@ -103,6 +104,18 @@ class SyncOff(OnboardBase):
         self.assertEqual(ds.onboard_state("s1")["stage"], "status")
         # used once: a second start is the model's own
         self.assertEqual(self.sync_call("PreToolUse")["hookSpecificOutput"]["permissionDecision"], "deny")
+        # owner 11-25: datastash sync also saves the person's sessions: the one start_chatstash call, then the Synced
+        # reply stands (no second relay)
+        self.assertIn('"start_chatstash"', ai.split("----")[0])
+        self.assertIsNone(self.sync_call("PreToolUse", "start_chatstash"))
+        self.assertIsNone(self.sync_call("PostToolUse", "start_chatstash", {"chatstash": "on"}))
+        self.assertTrue(ds.sessions_on())
+        self.assertEqual(self.sync_call("PreToolUse", "start_chatstash")["hookSpecificOutput"]["permissionDecision"],
+                         "deny")
+        # and timers (owner 11-25): the AI's rule says so; the server is not told until it says it takes timers
+        self.assertTrue(ds.timers_choice()["on"])
+        self.assertEqual(ds.timers_rule(), ds.TIMERS_ON_RULE)
+        self.assertFalse(ds.server_takes_timers())
 
     def test_a_queued_prompt_under_another_id_still_counts_once(self):
         """Real e2e 11-25: typed while Claude Code was busy, the entry is "queued" under another prompt id."""
@@ -121,8 +134,9 @@ class SyncOff(OnboardBase):
         self.assertIsNone(self.sync_call("PreToolUse"))
         # a typed (not queued) entry under another id never counts
         ds.grant_use("sync", "s1")
+        ds.grant_use("chats", "s1")  # datastash sync opened one start_chatstash too
         start = len(self.spawned)
-        self.prompt("save my chats", entry="save my chats")
+        self.prompt("save my sessions", entry="save my sessions")
         rows = [json.loads(x) for x in open(tp)]
         rows[-1]["promptId"] = "00000000-0000-4000-8000-000000000002"
         with open(tp, "w") as f:
@@ -167,31 +181,47 @@ class SyncOn(OnboardBase):
         self.assertNotIn("datastash sync**", text)
         self.assertEqual(ds.onboard_state("s1")["stage"], "status")
 
-    def test_status_then_list_and_chats_ask_then_hours_last(self):
+    def test_status_then_list_sessions_line_then_hours_last(self):
         self.turn_on()
+        ds.record_sessions(True)
         self.install()
+        self.hours(33.04)
         out, _ = self.prompt("status of all my agents")
         ai = out["hookSpecificOutput"]["additionalContext"]
-        self.assertIn(ds.features_post() + "\n\n" + ds.ONBOARD_LAST_ASK, ai)
-        self.assertEqual(ds.ONBOARD_LAST_ASK, "Want all your AI chats in one searchable place? Say **save my chats**.")
-        self.assertEqual(ds.onboard_state("s1")["stage"], "chats")
-        # only one ask at a time: no hours line, no install question yet
-        self.assertNotIn("Last week", ai)
-        self.assertNotIn(ds.INSTALL_QUESTION, ai)
+        want = (ds.features_post() + "\n\nWe turned on saving your sessions. Type **do not save my sessions** if you "
+                "don't want an easy and fast way to see what you've done before.\n\nLast week, we estimate you would "
+                "have gotten **33** more hours of coding done using datastash. This week will be great!\n\nEverything "
+                "in that list is already turned on for you. To see it again any time, type **datastash functions**.")
+        self.assertIn(want, ai)
+        self.assertTrue(ai.rstrip().endswith("**datastash functions**.\n----"))  # the last prompt
+        self.assertNotIn("save my chats", ai)  # no ask any more
+        self.assertNotIn("standing yes", ai)  # owner 11-25: no house rules at the end
+        self.assertEqual(ds.onboard_state("s1")["stage"], "done")
         # a second status is a plain status
         out2, _ = self.prompt("status of all my agents")
         self.assertNotIn("Seeing your agents", json.dumps(out2 or {}))
-        # save my chats, typed
-        self.typed_phrase("save my chats")
+
+    def test_sessions_off_no_sessions_line(self):
+        self.turn_on()
+        ds.record_sessions(False)
+        self.install()
+        out, _ = self.prompt("status of all my agents")
+        self.assertNotIn("We turned on saving", out["hookSpecificOutput"]["additionalContext"])
+
+    def test_do_not_save_my_sessions_and_save_my_sessions(self):
+        ds.record_sessions(True)
+        for phrase in ("do not save my sessions", "Don't save my sessions."):
+            out = self.typed_phrase(phrase)
+            ai = out["hookSpecificOutput"]["additionalContext"]
+            self.assertIn('"stop_chatstash"', ai)
+            self.assertIn(ds.SESSIONS_OFF_LINE, ai)
+            self.assertFalse(ds.sessions_on())
+        self.assertEqual(ds.SESSIONS_OFF_LINE, "Session saving is off. To turn it back on, type **save my sessions**.")
+        self.typed_phrase("save my sessions")
         self.assertIsNone(self.sync_call("PreToolUse", "start_chatstash"))
-        self.hours(33.04)
-        post = self.sync_call("PostToolUse", "start_chatstash", {"chatstash": "on", "say_to_user": "Chats are on."})
-        ai = post["hookSpecificOutput"]["additionalContext"]
-        want = ("Chats are on.\n\nLast week, we estimate you would have gotten **33** more hours of coding done using "
-                "datastash. This week will be great!\n\nEverything in that list is already turned on for you. To see it "
-                "again any time, type **datastash functions**.")
-        self.assertIn("----\n" + want + "\n----", ai)
-        self.assertNotIn("standing yes", ai)  # owner 11-25: no house rules at the end
+        post = self.sync_call("PostToolUse", "start_chatstash", {"chatstash": "on"})
+        self.assertIn("----\n" + ds.SESSIONS_ON_LINE + "\n----", post["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(ds.sessions_on())
 
     def test_the_shown_status_goes_through_the_model_so_the_bold_renders(self):
         ds.onboard_set("s1", "status")
@@ -200,7 +230,7 @@ class SyncOn(OnboardBase):
         self.assertIsInstance(got, str)
         self.assertIn("----\nYour agents:\n- api: working\n\n" + ds.features_post(), got)
 
-    def test_save_my_chats_untyped_is_refused(self):
+    def test_save_my_sessions_untyped_is_refused(self):
         out = self.sync_call("PreToolUse", "start_chatstash")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertEqual(out["systemMessage"], ds.CHATS_NOT_TYPED_LINE)
@@ -209,7 +239,7 @@ class SyncOn(OnboardBase):
         self.turn_on()
         self.install()
         self.prompt("status of all my agents")
-        self.assertEqual(ds.onboard_state("s1")["stage"], "chats")
+        self.assertEqual(ds.onboard_state("s1")["stage"], "done")
         text = self.install()
         self.assertTrue(text.endswith("\n" + ds.SYNCED_LINE))
         self.assertEqual(ds.onboard_state("s1")["stage"], "status")
@@ -240,11 +270,9 @@ class Hours(OnboardBase):
         ds.record_keep_all(True, "typed")
         ds.record_sync_on()
         self.install()
-        self.prompt("status of all my agents")
-        self.typed_phrase("save my chats")
         ds.write_private(ds.HOURS_RUN_PATH, json.dumps({"at": time.time()}))  # running past the pad
-        post = self.sync_call("PostToolUse", "start_chatstash", {"chatstash": "on"})
-        ai = post["hookSpecificOutput"]["additionalContext"]
+        out, _ = self.prompt("status of all my agents")
+        ai = out["hookSpecificOutput"]["additionalContext"]
         self.assertNotIn("Last week", ai)
         self.assertNotIn("datastash functions", ai)
         self.assertTrue(ds.onboard_state("s1")["hours_pending"])
@@ -266,6 +294,50 @@ class Hours(OnboardBase):
         ds.write_private(ds.HOURS_RUN_PATH, json.dumps({"at": time.time()}))
         ds.hours_kick()
         self.assertFalse(self.spawned)
+
+
+class Timers(OnboardBase):
+    def test_never_chosen_no_rule(self):
+        self.assertEqual(ds.timers_rule(), "")
+
+    def test_turn_off_then_turn_on_timers(self):
+        ds.set_timers(True, "sync")
+        out = self.typed_phrase("turn off timers")
+        ai = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(ds.TIMERS_OFF_LINE, ai)
+        self.assertNotIn("timers_off", ai)  # the server does not take timers yet: nothing new is sent
+        self.assertEqual(ds.timers_rule(), ds.TIMERS_OFF_RULE)
+        out = self.typed_phrase("Turn on timers.")
+        self.assertIn(ds.TIMERS_ON_LINE, out["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(ds.timers_rule(), ds.TIMERS_ON_RULE)
+        self.assertIn("**turn off timers**", ds.TIMERS_ON_LINE)
+
+    def test_turn_on_timers_untyped_does_nothing(self):
+        ds.set_timers(False, "typed")
+        self.prompt("turn on timers", source="sdk")
+        self.run_checks()
+        self.assertEqual(ds.timers_rule(), ds.TIMERS_OFF_RULE)
+        out = self.sync_call("PreToolUse", "timers_on")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(out["systemMessage"], ds.TIMERS_NOT_TYPED_LINE)
+
+    def test_server_that_says_timers_gets_the_calls(self):
+        ds.set_timers(True, "sync")
+        ds.timers_server_said({"timers": "on"})
+        self.assertTrue(ds.server_takes_timers())
+        out = self.typed_phrase("turn off timers")
+        self.assertIn('action "timers_off"', out["hookSpecificOutput"]["additionalContext"])
+        out = self.typed_phrase("turn on timers")
+        self.assertIn('action "timers_on"', out["hookSpecificOutput"]["additionalContext"])
+        self.assertIsNone(self.sync_call("PreToolUse", "timers_on"))
+        self.assertIsNone(self.sync_call("PostToolUse", "timers_on", {"timers": "on"}))
+        self.assertEqual(self.sync_call("PreToolUse", "timers_on")["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_an_answer_without_the_field_never_opens_it(self):
+        ds.set_timers(True, "sync")
+        for body in ({}, {"timers": "yes"}, {"timers": True}, None):
+            ds.timers_server_said(body)
+        self.assertFalse(ds.server_takes_timers())
 
 
 class Functions(OnboardBase):

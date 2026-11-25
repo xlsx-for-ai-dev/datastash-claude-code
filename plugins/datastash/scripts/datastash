@@ -69,7 +69,7 @@ Subcommands (run `datastash help`):
                             card and Prices; an older workbook keeps its Cards cost tab): at each subagent stop and session end the plugin reads this session's own Claude
                             Code transcripts here and sends minutes, tool calls and token counts per card, activity and
                             model; only counts, model names, activity labels and card ids, never prompt, code or command
-                            text. Past 10,000 Burn rows it folds finished cards into their per-card row
+                            text
   heartbeat [STEP [--tab T] [--column C] | off]  XLI-392 N2: while this folder's agent uses tools, touch STEP's row
                             (tab T, default "Card steps"; column C, default last_seen) at most once a minute, in the
                             background; a touch never adds a row. DATASTASH_STEP / DATASTASH_STEP_TAB name it too
@@ -2765,7 +2765,7 @@ def cmd_check(_args):
             agent = dict(fb, via="only-agent")
     try:  # XLI-386: the clean sessions rules, only for the person's choices that are on; never in their main session
         if not (agent is not None and is_person(agent)) and main_root(project) is None and not is_main_session(me):
-            rules = clean_session_text()
+            rules = " ".join(r for r in (clean_session_text(), timers_rule()) if r)
             tail = " " + rules if rules else ""
     except Exception:
         tail = ""
@@ -6198,6 +6198,7 @@ def cmd_prompt(_args):
     if not is_main_phrase(prompt):
         try:
             ctx = (clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
+                   or timers_prompt_context(inp)  # 1.0.18: "turn off timers" / "turn on timers"
                    or self_update_prompt_context(inp) or onboard_prompt_context(inp) or status_prompt_context(inp))
             ctx = onboard_after_status(inp, ctx)  # 1.0.18: the feature list and the chats ask, after the status
         except Exception as e:  # never in the person's way
@@ -8095,8 +8096,10 @@ def clean_tool_ok(inp, no_code=False):
     # the person renamed); another server's tool may write, so it is refused
     if not server or not (name.startswith("ledger_") or "datastash" in server.lower() or _trusted_connector(inp, tool)):
         return False
-    if name == "sync" and isinstance(ti, dict) and ti.get("action") in ("start", "start_chatstash"):
-        return True  # 1.0.18: only after the person's own typed "datastash sync" / "save my chats" (onboard_tool checks)
+    if name == "sync" and isinstance(ti, dict) and ti.get("action") in ("start", "start_chatstash", "timers_on"):
+        return True  # 1.0.18: only after the person's own typed "datastash sync" / "save my sessions" / "turn on timers"
+    if name == "sync" and isinstance(ti, dict) and ti.get("action") in ("stop_chatstash", "timers_off") and len(ti) == 1:
+        return True  # 1.0.18: the person's "do not save my sessions" / "turn off timers" (only narrows)
     return name in CLEAN_DS_READ_TOOLS or name in CLEAN_DS_STEP_TOOLS
 
 
@@ -8255,6 +8258,110 @@ def standing_prompt_context(inp):
            "The standing yes is off: your agents ask you before acting on any message from your other agents.")
     return (f"{STANDING_NOTE}: the person changed their standing yes; it is saved for all their agents. From now on: "
             f'{standing_rule()} Confirm it to the person in one line, as it is: "{say}"')
+
+
+# --- 1.0.18 (owner 11-25): "datastash sync" also turns on timers. After the person's own typed "datastash sync", agents
+# set and move timers and check-backs (ledger_timer_set, check back) with no per-timer OK and no daily re-ask; the
+# person's typed "turn off timers" takes it back, "turn on timers" (checked as typed) gives it again. Kept here in
+# CONSENT_PATH["timers"] = {"on", "at", "how"}; never chosen: no rule at all.
+# The server half (a separate x-live card) is behind one check, server_takes_timers(): it is true only once the server
+# itself said so in a sync answer (the field "timers"). Until then the plugin sends nothing new, so an older server never
+# sees an argument or action it would refuse. What the server must accept (TIMERS_SERVER_CONTRACT):
+TIMERS_SERVER_CONTRACT = (
+    'sync action "start" (no new argument) records a standing yes for timers on the account and the calling agent, '
+    'which the reach gate honors once the computer is unlocked at sign-in, and answers with the field timers: "on"; '
+    'two new sync actions with no other argument, "timers_off" and "timers_on", clear and set that standing yes and '
+    'answer timers: "off" / "on"; any other value or a missing field means the server does not take it.')
+TIMERS_NOTE = "datastash note (timers; the person's own choice)"
+TIMERS_ON_RULE = ("Timers are on (the person's own choice): set and move timers and check-backs (ledger_timer_set, check "
+                  "back) without asking the person first, each time; a recurring timer needs no new OK each day.")
+TIMERS_OFF_RULE = ("Timers are off (the person's own choice): ask the person before you set or move a timer or "
+                   "check-back.")
+TIMERS_ON_LINE = ("Timers are on: your agents set and move their timers and check-backs without asking you. To stop that, "
+                  "type **turn off timers**.")
+TIMERS_OFF_LINE = ("Timers are off: your agents ask you before they set or move a timer or check-back. To turn them back "
+                   "on, type **turn on timers**.")
+TIMERS_PHRASES = (
+    ("off", re.compile(r"turn off (the |my )?timers|(the )?timers off")),
+    ("on", re.compile(r"turn on (the |my )?timers|(the )?timers on")),
+)
+
+
+def timers_choice():
+    """The person's timers choice here: {"on": bool, ...}, or None when never chosen."""
+    v = read_json(CONSENT_PATH, {})
+    v = v.get("timers") if isinstance(v, dict) else None
+    return v if isinstance(v, dict) and isinstance(v.get("on"), bool) else None
+
+
+def set_timers(on, how):
+    whole = read_json(CONSENT_PATH, {})
+    whole = whole if isinstance(whole, dict) else {}
+    old = whole.get("timers") if isinstance(whole.get("timers"), dict) else {}
+    whole["timers"] = dict(old, on=bool(on), at=int(time.time()), how=how)
+    ensure_dirs()
+    write_private(CONSENT_PATH, json.dumps(whole))
+    return bool(on)
+
+
+def server_takes_timers():
+    """True only once the server's own sync answer carried the field "timers" (TIMERS_SERVER_CONTRACT)."""
+    c = timers_choice()
+    return bool(c and c.get("server") in ("on", "off"))
+
+
+def timers_server_said(body):
+    """Record the server's own timers answer (a sync answer's "timers" field), when it gave one."""
+    said = body.get("timers") if isinstance(body, dict) else None
+    if said not in ("on", "off") or timers_choice() is None:
+        return
+    whole = read_json(CONSENT_PATH, {})
+    whole["timers"] = dict(whole["timers"], server=said, server_at=int(time.time()))
+    write_private(CONSENT_PATH, json.dumps(whole))
+
+
+def timers_rule():
+    """The AI's timers rule for the person's choice here ("" when never chosen)."""
+    try:
+        c = timers_choice()
+    except Exception:  # noqa: BLE001
+        return ""
+    return "" if c is None else (TIMERS_ON_RULE if c["on"] else TIMERS_OFF_RULE)
+
+
+def timers_phrase(text):
+    """"off", "on" or None: only the person's whole short prompt counts."""
+    if not isinstance(text, str) or len(text) > 200:
+        return None
+    t = _phrase(text)
+    return next((k for k, r in TIMERS_PHRASES if r.fullmatch(t)), None)
+
+
+def timers_prompt_context(inp):
+    """The UserPromptSubmit note for the person's typed "turn off timers" / "turn on timers", or None. Off is saved at
+    once (it only makes agents ask more); on waits for the checker to see it typed by the person."""
+    kind = timers_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
+    shape = hook_shape(inp) if kind is not None else None
+    if shape is None:
+        return None
+    server = server_takes_timers()
+    if kind == "on":
+        if not start_check(shape, "timers_on", inp.get("prompt"), {}):
+            return None
+        call = ('Then call the datastash connector\'s `sync` tool once with action "timers_on" and nothing else. '
+                if server else "")
+        return (f"{TIMERS_NOTE}: the person asked to turn timers on; datastash turns them on once it has checked that "
+                f"they typed it (a few seconds). Until then, ask before setting a timer. {call}Your whole reply is "
+                f"exactly this line, word for word (keep its bold): \"{TIMERS_ON_LINE}\"")
+    try:
+        set_timers(False, "typed")
+    except OSError:
+        return (f"{TIMERS_NOTE}: the choice could not be saved (the datastash config folder is not writable); nothing "
+                "changed. Tell the person so in one line.")
+    call = 'Call the datastash connector\'s `sync` tool once with action "timers_off" and nothing else. ' if server else ""
+    return (f"{TIMERS_NOTE}: the person turned timers off; it is saved for all their agents. From now on: "
+            f"{TIMERS_OFF_RULE} {call}Your whole reply is exactly this line, word for word (keep its bold): "
+            f"\"{TIMERS_OFF_LINE}\"")
 
 
 def linked_folder(agent, here):
@@ -9788,11 +9895,14 @@ def cmd_status_verify(args):
         if rec.get("kind") == "keep":
             record_keep_all(True, "typed")
         elif rec.get("kind") in ("sync", "chats"):
-            onboard_verified(rec["kind"], sid)  # 1.0.18: only on the person's own typed "datastash sync" / "save my chats"
+            onboard_verified(rec["kind"], sid)  # 1.0.18: only on the person's own typed "datastash sync" / "save my sessions"
         elif rec.get("kind") == "lookup":
             lookup_setup(rec.get("data") or {}, sid)  # XLI-308: only on the person's own typed "do K"
         elif rec.get("kind") == "standing_on":
             set_standing_yes(True)  # XLI-375 P2: only on the person's own typed "turn on the standing yes"
+        elif rec.get("kind") == "timers_on":
+            set_timers(True, "typed")  # 1.0.18: only on the person's own typed "turn on timers"
+            grant_typed("timers", sid)  # opens the one sync timers_on call (sent only when the server takes it)
         elif rec.get("kind") in ("add", "back_on"):
             for line in install_answer(rec.get("kind"), rec.get("data") or {}):  # XLI-328: the person's own typed words
                 add_outcome(sid, line)
@@ -13044,7 +13154,7 @@ def install_text(inp, rec, lst):
 # After EVERY /datastash:install, one step at a time, each waiting for the person: the Done line and the agent list, then
 # (while sync is off) the sync line; the person's typed "datastash sync" turns on keeping AND the connector's sync (held
 # up to ONBOARD_PAD s while the hours counter finishes); "Synced..." and the status ask; their status; the feature list
-# and the chats ask; the person's typed "save my chats" turns chat saving on; their own hours line (from the local
+# (owner 11-25: the typed "datastash sync" also turned session saving on, so the sessions line, no ask); their own hours line (from the local
 # counter, never made up) and how to see the list again. The plugin writes every line; the model relays them word for word, or the
 # plugin shows them itself. Phrases the person types are **bold**; where the plugin shows text itself (no markdown
 # there) they are in quotes instead.
@@ -13094,18 +13204,24 @@ def features_post():
     return "\n\n".join(head + "\n" + "\n".join(f"  - **{n}:** {t}" for n, t in items) for head, items in FEATURES)
 
 
-# The one ask after the feature list (owner's wording); change only this line to change the ask.
-ONBOARD_LAST_ASK = "Want all your AI chats in one searchable place? Say **save my chats**."
+# owner 11-25 ("Chats: opt-out, not an ask"): the typed "datastash sync" also turns on saving the person's sessions
+# (chatstash); after the feature list the plugin says so (verbatim), then the hours line and the functions line, last.
+SESSIONS_ON_ONBOARD = ("We turned on saving your sessions. Type **do not save my sessions** if you don't want an easy and "
+                       "fast way to see what you've done before.")
+SESSIONS_ON_LINE = "Session saving is on. To stop it, type **do not save my sessions**."
+SESSIONS_OFF_LINE = "Session saving is off. To turn it back on, type **save my sessions**."
 FUNCTIONS_AGAIN_LINE = ("Everything in that list is already turned on for you. To see it again any time, type "
                         "**datastash functions**.")
 FUNCTIONS_PHRASE_RE = re.compile(r"(?:datastash functions|functions datastash)")
 HOURS_LINE = ("Last week, we estimate you would have gotten **{x}** more hours of coding done using datastash. This week "
               "will be great!")
-CHATS_DONE_LINE = "Chat saving is on."  # only when the connector's answer has no confirm of its own
 SYNC_NOT_TYPED_LINE = ("Not done: sync turns on only when you type datastash sync yourself. Nothing changed.")
-CHATS_NOT_TYPED_LINE = ("Not done: chat saving turns on only when you type save my chats yourself. Nothing changed.")
+TIMERS_NOT_TYPED_LINE = "Not done: timers turn on only when you type turn on timers yourself. Nothing changed."
+CHATS_NOT_TYPED_LINE = ("Not done: session saving turns on only when you type save my sessions yourself. Nothing "
+                        "changed.")
 SYNC_PHRASE_RE = re.compile(r"(?:datastash sync|sync datastash)")
-CHATS_PHRASE_RE = re.compile(r"(?:save my chats|sync chatstash|chatstash sync)")
+CHATS_PHRASE_RE = re.compile(r"(?:save my sessions|save my chats|sync chatstash|chatstash sync)")
+SESSIONS_OFF_RE = re.compile(r"(?:do not|don t|dont) save my (?:sessions|chats)")
 ONBOARD_NOTE = "datastash note (onboarding; the plugin's own lines)"
 ONBOARD_PAD = float(os.environ.get("DATASTASH_ONBOARD_PAD", "15"))  # owner 11-25: hold up to this long for the counter
 GRANT_FRESH = 900  # a checked typed phrase opens its one connector call for this long
@@ -13117,9 +13233,15 @@ HOURS_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hours_
 SYNC_TYPED_AI = (f"{ONBOARD_NOTE}: the person typed \"datastash sync\". The plugin checks it was typed by them and turns on "
                  "keeping. Call the datastash connector's `sync` tool once now with action \"start\" and nothing else. Do "
                  "not say its say_to_user, do_now lines or any offer: the plugin gives your whole reply after the call.")
-CHATS_TYPED_AI = (f"{ONBOARD_NOTE}: the person typed \"save my chats\". The plugin checks it was typed by them. Call the "
+CHATS_TYPED_AI = (f"{ONBOARD_NOTE}: the person typed \"save my sessions\". The plugin checks it was typed by them. Call the "
                   "datastash connector's `sync` tool once now with action \"start_chatstash\" and nothing else. Do not say "
                   "its say_to_user: the plugin gives your whole reply after the call.")
+SYNC_THEN_CHATS_AI = (f"{ONBOARD_NOTE}: first call the datastash connector's `sync` tool once more, with action "
+                      "\"start_chatstash\" and nothing else (the person's typed datastash sync turns on saving their "
+                      "sessions too); do not say its say_to_user. Then: ")
+SESSIONS_OFF_AI = (f"{ONBOARD_NOTE}: the person typed \"do not save my sessions\"; it is saved here. Call the datastash "
+                   "connector's `sync` tool once now with action \"stop_chatstash\" and nothing else. Do not say its "
+                   f"say_to_user: your whole reply is exactly this line, word for word (keep its bold): \"{SESSIONS_OFF_LINE}\"")
 ONBOARD_RELAY_AI = (f"{ONBOARD_NOTE}: your whole reply is exactly the text between the two lines below, word for word "
                     "(keep its bold), with nothing before or after it: no step narration, no summary. Then wait for the "
                     "person.\n----\n{text}\n----")
@@ -13160,6 +13282,21 @@ def sync_on():
         return False
     v = read_json(CONSENT_PATH, {}).get("sync")
     return isinstance(v, dict) and v.get("on") is True
+
+
+def sessions_on():
+    """The person's session saving (chatstash) as last turned on or off from this computer: True, False or None."""
+    v = read_json(CONSENT_PATH, {})
+    v = v.get("sessions") if isinstance(v, dict) else None
+    return v.get("on") if isinstance(v, dict) and isinstance(v.get("on"), bool) else None
+
+
+def record_sessions(on):
+    c = read_json(CONSENT_PATH, {})
+    c = c if isinstance(c, dict) else {}
+    c["sessions"] = {"on": bool(on), "at": int(time.time())}
+    ensure_dirs()
+    write_private(CONSENT_PATH, json.dumps(c))
 
 
 def record_sync_on():
@@ -13253,7 +13390,8 @@ def _phrase_text(text):
 
 
 def onboard_phrase(text):
-    """"sync" for the person's whole prompt "datastash sync" / "sync datastash", "chats" for "save my chats", else None."""
+    """"sync" for the person's whole prompt "datastash sync" / "sync datastash", "chats" for "save my sessions", "chats_off" for
+    "do not save my sessions", "functions", else None."""
     t = _phrase_text(text)
     if not t:
         return None
@@ -13261,6 +13399,8 @@ def onboard_phrase(text):
         return "sync"
     if CHATS_PHRASE_RE.fullmatch(t):
         return "chats"
+    if SESSIONS_OFF_RE.fullmatch(t):
+        return "chats_off"
     if FUNCTIONS_PHRASE_RE.fullmatch(t):
         return "functions"
     return None
@@ -13288,13 +13428,19 @@ def grant_use(kind, sid):
 
 
 def onboard_prompt_context(inp):
-    """The UserPromptSubmit note for the person's typed "datastash sync" or "save my chats", or None. Nothing is turned
+    """The UserPromptSubmit note for the person's typed "datastash sync" or "save my sessions", or None. Nothing is turned
     on here: the checker turns keeping on and opens the one connector call once the transcript shows the person typed it."""
     kind = onboard_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
     if kind is None:
         return None
     if kind == "functions":  # only shows the list: nothing turns on, so no check
         return ONBOARD_RELAY_AI.format(text=features_post())
+    if kind == "chats_off":  # only narrows: saved at once, no check
+        try:
+            record_sessions(False)
+        except OSError:
+            pass
+        return SESSIONS_OFF_AI
     shape = hook_shape(inp)
     if shape is None or not start_check(shape, "sync" if kind == "sync" else "chats", inp["prompt"], {}):
         return None
@@ -13305,6 +13451,8 @@ def onboard_verified(kind, sid):
     """The checker found the person's own typed phrase (cmd_status_verify)."""
     if kind == "sync":
         record_keep_all(True, "typed")
+        set_timers(True, "sync")  # owner 11-25: "the timers should be turned on with datastash sync"
+        grant_typed("chats", sid)  # owner 11-25: and saving their sessions (the one start_chatstash call after start)
     grant_typed(kind, sid)
 
 
@@ -13322,7 +13470,7 @@ def _sync_call(inp):
         return None
     ti = inp.get("tool_input") if isinstance(inp.get("tool_input"), dict) else {}
     act = ti.get("action")
-    return {"start": "sync", "start_chatstash": "chats"}.get(act if isinstance(act, str) else "")
+    return {"start": "sync", "start_chatstash": "chats", "timers_on": "timers"}.get(act if isinstance(act, str) else "")
 
 
 def onboard_tool(inp):
@@ -13337,7 +13485,7 @@ def onboard_tool(inp):
             time.sleep(0.2)
         if sid and grant_ok(kind, sid):
             return None  # the person's own typed phrase: the call goes out
-        line = SYNC_NOT_TYPED_LINE if kind == "sync" else CHATS_NOT_TYPED_LINE
+        line = {"sync": SYNC_NOT_TYPED_LINE, "chats": CHATS_NOT_TYPED_LINE}.get(kind, TIMERS_NOT_TYPED_LINE)
         return {"systemMessage": line, "hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": (
                 f"{ONBOARD_NOTE}: refused: the person did not type it. Never turn this on yourself. Say only: \"{line}\"")}}
@@ -13347,20 +13495,19 @@ def onboard_tool(inp):
     if not isinstance(body, dict) or body.get("error") or body.get("code"):
         return None  # the connector's own answer says what went wrong
     grant_use(kind, sid)
+    timers_server_said(body)  # the server's own word that it takes the timers standing yes (TIMERS_SERVER_CONTRACT)
+    if kind == "timers":
+        return None  # the model says TIMERS_ON_LINE, as its note asked
     if kind == "sync":
         record_sync_on()
         hours_wait()  # owner 11-25: up to 15 s, less when the counter is done; never longer
         onboard_set(sid, "status")
-        text = SYNCED_LINE
-    else:
-        hours_wait()
-        hours = hours_text()
-        said = body.get("say_to_user") if isinstance(body.get("say_to_user"), str) else CHATS_DONE_LINE
-        pending = hours is None and hours_status() == "running"
-        # owner 11-25: the hours line and the "datastash functions" line are onboarding's last prompt (no house rules)
-        text = "\n\n".join([_clean(said, 400)] + ([hours] if hours else []) + ([] if pending else [FUNCTIONS_AGAIN_LINE]))
-        onboard_set(sid, "done", hours_pending=pending)
-    return _post(None, ONBOARD_RELAY_AI.format(text=text))
+        then = SYNC_THEN_CHATS_AI if grant_ok("chats", sid) else ""
+        return _post(None, then + ONBOARD_RELAY_AI.format(text=SYNCED_LINE))
+    record_sessions(True)
+    if onboard_state(sid).get("stage") == "status":
+        return None  # the call datastash sync opened: the reply is still the Synced line the plugin gave after start
+    return _post(None, ONBOARD_RELAY_AI.format(text=SESSIONS_ON_LINE))
 
 
 # --- after the status: the feature list and the chats ask; a late hours line at the next turn
@@ -13377,8 +13524,12 @@ def onboard_after_status(inp, ctx):
         return ctx
     if status_phrase(inp.get("prompt")) != ("all", None):
         return ctx
-    post = features_post() + "\n\n" + ONBOARD_LAST_ASK
-    onboard_set(sid, "chats")
+    hours = hours_text()
+    pending = hours is None and hours_status() == "running"
+    # owner 11-25: the sessions line, then the hours line and the "datastash functions" line, last (no house rules)
+    post = "\n\n".join([features_post()] + ([SESSIONS_ON_ONBOARD] if sessions_on() else []) + ([hours] if hours else [])
+                        + ([] if pending else [FUNCTIONS_AGAIN_LINE]))
+    onboard_set(sid, "done", hours_pending=pending)
     if isinstance(ctx, dict) and ctx.get("show"):
         # the plugin's own block shows no markdown, so this once the status goes through the model with the list after
         # it (both relayed word for word), and the bold renders

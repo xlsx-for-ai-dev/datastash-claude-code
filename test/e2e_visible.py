@@ -92,7 +92,8 @@ def main(argv):
             return 1
         return 0
     if mode == "clean":
-        bad = [norm(l) for l in reg if FAILURE.search(l)]
+        # the plugin's end-of-turn status reminder (shown once keeping is on) names "not run" as an example value
+        bad = [norm(l) for l in reg if FAILURE.search(l) and '"not run" (leave it out' not in l]
         if bad:
             print(" | ".join(b[:200] for b in bad[:4]))
             return 1

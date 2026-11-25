@@ -418,12 +418,7 @@ workbook) and **Prices** (your price per million tokens per model, so models can
   took it, and the read position moves only after that; a send that was cut short goes again with the same rows and
   keys, only its parts not yet taken. A send that failed at a session end is finished at the next session start or send
   in any session of that agent's workbook.
-- **Past 10,000 Burn rows** (the size the card totals read whole), finished cards are folded, oldest first, never a card
-  in the send: their Burn sums go into the card's `folded_*` cells and their Burn rows are removed, so each card's
-  totals read the same. Only a Cards cost tab with the `folded_*` columns is folded (an older one just keeps adding, so
-  no total drops). A card is folded once: a card whose `folded_*` cells are set is never written again, so a fold cut
-  short and finished later (even a day later) never counts twice; a Burn row that took more since keeps that part. The
-  totals and shares are always the engine's formula columns.
+- The totals and shares are always the engine's formula columns.
 
 ## Step heartbeat (plugin 1.0.5, XLI-392 N2)
 

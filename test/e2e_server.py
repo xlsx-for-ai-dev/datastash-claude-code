@@ -312,7 +312,7 @@ def cmd_disconnect_all(keep_mine=False):
 
 def cmd_chats(state):
     """1.0.18: the account's chat saving (chatstash), set by the person's own read-back connection: "off" before and
-    after the onboarding's "save my chats", so the other steps' sessions don't save every exchange."""
+    around the onboarding (its datastash sync turns it on), so the other steps' sessions don't save every exchange."""
     err, out = tool("sync", {"action": "stop_chatstash" if state == "off" else "start_chatstash"})
     if err:
         die(f"chatstash {state} refused ({out.get('code') if isinstance(out, dict) else 'no code'})")

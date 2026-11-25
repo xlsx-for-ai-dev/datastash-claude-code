@@ -18,8 +18,9 @@
 #      session so the rest of the matrix still runs.
 #      1.0.18: right after that install, the onboarding (onboard_flow), one ask at a time, every visible line verbatim
 #      with the bold rendered: the sync line; the typed "datastash sync" turns keep and sync on (the consent file) and
-#      shows "Synced..." and the status ask; the status, then the feature list and the chats ask; the typed "save my
-#      chats", then the hours line (when this computer's counter gave a number) and the "datastash functions" line.
+#      shows "Synced..." and the status ask, and also turns on session saving (chatstash) and timers (owner 11-25); the
+#      status, then the feature list, the sessions line, the hours line (when this computer's counter gave a number) and
+#      the "datastash functions" line, last. Then the typed "do not save my sessions" and "turn off timers".
 #   2  A: /datastash:install again in a new session: the same agent, no "agent-2" (pane and server); 1.0.18: the same
 #      onboarding again (sync already on: the install ends with "Synced..." and the status ask).
 #   4  A: a third folder's session that is no agent (~/code/notes) types /datastash:uninstall web-app while A also holds
@@ -123,6 +124,7 @@ say() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 pass() { say "PASS $*"; RESULTS+=("PASS  $*"); }
 fail() { say "FAIL $*"; RESULTS+=("FAIL  $*"); FAILS=$((FAILS + 1)); }
 waiting() { say "WAITING $*"; RESULTS+=("WAIT  $*"); WAITS=$((WAITS + 1)); }
+pending() { say "PENDING SERVER $*"; RESULTS+=("PEND  $*"); }  # 1.0.18: a step that waits on a named server change
 
 cleanup() {
   local s left
@@ -325,8 +327,13 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
   [[ -n "${E2E_MODEL:-}" ]] && model+=(--model "$E2E_MODEL")
   T="$RUN-$((++STARTS))"
   mkdir -p "$dir"
-  tmux new-session -d -s "$T" -x 250 -y 50 -c "$dir" \
+  # 1.0.18: a deep scrollback for this session only (the onboarding's lists made the default 2000 lines roll over, so a
+  # line count could stop growing): a holder window first, the option set on this session, then the real window
+  tmux new-session -d -s "$T" -n hold -x 250 -y 50 -c "$dir" "sleep 86400"
+  tmux set-option -t "$T" history-limit 100000
+  tmux new-window -t "$T" -c "$dir" \
     "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER='$E2E_USER' LOGNAME='$E2E_USER' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
+  tmux kill-window -t "$T:hold" 2>/dev/null
   if wait_for "trust this folder" 40; then
     # The dialog's default is "No, exit" and it shows its text before it takes keys: a Down sent too soon is dropped and
     # the Enter then picks No ("Claude Code didn't start because this folder isn't trusted"). A home folder's Yes lasts
@@ -542,9 +549,11 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
 # left in the pane). onboard_flow <tag> <HOME>: right after ds_install, in the same session. Sync off: the install's
 # last line is the sync line; the person's typed "datastash sync" turns on keep (this computer's consent file) and the
 # connector's sync, then "Synced..." and the status ask. Sync on (a second install): the install's last line is that
-# ask. Then "status of all my agents": the status, the feature list and the chats ask (and nothing after it); then
-# "save my chats": chat saving on, the hours line (only when this computer's counter gave a number) and the
-# "datastash functions" line, last.
+# ask. datastash sync also turns on session saving (one start_chatstash) and timers. Then "status of all my agents":
+# the status, the feature list, the sessions line (while session saving is on), the hours line (only when this
+# computer's counter gave a number) and the "datastash functions" line, last. Then "do not save my sessions" and
+# "turn off timers", each with its fixed line. The server half of timers (a standing yes the reach gate honors) is
+# "pending server" until the sync answer carries timers (TIMERS_SERVER_CONTRACT).
 ds_plugin() {  # ds_plugin <HOME> <python expr over m>: a value from the candidate's plugin script, with that HOME's config
   DATASTASH_CONFIG_DIR="$1/.config/datastash" HOME="$1" python3 -I -c 'import sys,types
 src = open(sys.argv[1]).read(); m = types.ModuleType("ds"); m.__file__ = sys.argv[1]; exec(compile(src, sys.argv[1], "exec"), m.__dict__)
@@ -564,10 +573,12 @@ inorder() { local t="$1"; shift; pane | python3 -I "$HERE/e2e_visible.py" inorde
 onboard_flow() {
   local tag="$1" h="$2" ok=1 got cmd="/datastash:install${DS_INSTALL_ARG:+ $DS_INSTALL_ARG}"
   ((LOGIN)) || { waiting "$tag onboarding (needs the Claude login)"; return 1; }
-  local sync_line synced ask fnline hours
+  local sync_line synced sessions fnline hours offline tline
   sync_line="$(ds_plugin "$h" 'm._plain_typed(m.SYNC_TYPE_LINE).replace("\"", "")')"
   synced="$(ds_plugin "$h" 'm._plain_typed(m.SYNCED_LINE).replace("\"", "")')"
-  ask="$(ds_plugin "$h" 'm._plain_typed(m.ONBOARD_LAST_ASK).replace("\"", "")')"
+  sessions="$(ds_plugin "$h" 'm._plain_typed(m.SESSIONS_ON_ONBOARD).replace("\"", "")')"
+  offline="$(ds_plugin "$h" 'm._plain_typed(m.SESSIONS_OFF_LINE).replace("\"", "")')"
+  tline="$(ds_plugin "$h" 'm._plain_typed(m.TIMERS_OFF_LINE).replace("\"", "")')"
   fnline="$(ds_plugin "$h" 'm._plain_typed(m.FUNCTIONS_AGAIN_LINE).replace("\"", "")')"
   "${SRV[@]}" chats off >/dev/null || say "    (could not turn chat saving off before the onboarding)"
   local -a features
@@ -584,30 +595,38 @@ onboard_flow() {
     if python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(0 if c["all"]["keep"] is True and c["sync"]["on"] is True else 1)' \
         "$h/.config/datastash/status-consent.json" 2>/dev/null; then pass "$tag onboarding: datastash sync turned on keep and sync on this computer"
     else fail "$tag onboarding: datastash sync did not turn keep on (consent file)"; ok=0; fi
+    if [[ "$(ds_plugin "$h" 'm.sessions_on()')" == True ]]; then pass "$tag onboarding: datastash sync turned session saving on (the server took start_chatstash)"
+    else fail "$tag onboarding: datastash sync did not turn session saving on"; ok=0; fi
+    if [[ "$(ds_plugin "$h" 'm.timers_rule() == m.TIMERS_ON_RULE')" == True ]]; then pass "$tag onboarding: datastash sync turned timers on here (the agents' rule)"
+    else fail "$tag onboarding: datastash sync did not turn timers on"; ok=0; fi
+    if [[ "$(ds_plugin "$h" 'm.server_takes_timers()')" == True ]]; then pass "$tag onboarding: the server recorded the timers standing yes"
+    else pending "$tag onboarding: the server's timers standing yes and reach at sign-in (pending server: $(ds_plugin "$h" 'm.TIMERS_SERVER_CONTRACT'))"; fi
   else
     if got="$(said "$cmd" "$synced")"; then pass "$tag onboarding: sync already on: the install ends with \"$synced\""
     else fail "$tag onboarding: the install shows neither the sync line nor the Synced line ($got)"; show_tail 12; return 1; fi
   fi
-  onboard_turn "status of all my agents"
-  if got="$(inorder "status of all my agents" "${features[@]}" "$ask")"; then
-    pass "$tag onboarding: status, then the feature list verbatim (${#features[@]} lines, bold rendered) and \"$ask\""
-  else fail "$tag onboarding: the feature list or the chats ask is not shown verbatim after the status ($got)"; show_tail 20; ok=0; fi
-  grep -qF "Last week, we estimate" <<<"$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "status of all my agents")" \
-    && { fail "$tag onboarding: the hours line came before save my chats"; ok=0; }
-  onboard_turn "save my chats"
+  local -a tail_lines=()
+  [[ "$(ds_plugin "$h" 'm.sessions_on()')" == True ]] && tail_lines+=("$sessions")
   hours="$(ds_plugin "$h" '(m._plain_typed(m.hours_text() or "")).replace("\"", "")')"
-  if [[ -n "$hours" ]]; then
-    if got="$(inorder "save my chats" "$hours" "$fnline")"; then pass "$tag onboarding: save my chats -> \"$hours\" then \"$fnline\""
-    else fail "$tag onboarding: after save my chats the hours line and the functions line are not shown in order ($got)"; show_tail 12; ok=0; fi
-  else
-    say "    the counter gave no number on this computer ($(cat "$h/.config/datastash/hours-estimate.json" 2>/dev/null | head -c 200)): no hours line expected"
-    if got="$(inorder "save my chats" "$fnline")"; then pass "$tag onboarding: save my chats -> \"$fnline\" (no hours line: no number)"
-    else fail "$tag onboarding: after save my chats the functions line is not shown ($got)"; show_tail 12; ok=0; fi
-    grep -qF "Last week, we estimate" <<<"$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "save my chats")" \
-      && { fail "$tag onboarding: an hours line was shown with no number from the counter"; ok=0; }
-  fi
-  grep -qF "standing yes" <<<"$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "save my chats")" \
-    && { fail "$tag onboarding: house rules were shown at the end (owner 11-25: dropped)"; ok=0; }
+  [[ -n "$hours" ]] && tail_lines+=("$hours") \
+    || say "    the counter gave no number on this computer ($(head -c 200 "$h/.config/datastash/hours-estimate.json" 2>/dev/null)): no hours line expected"
+  tail_lines+=("$fnline")
+  onboard_turn "status of all my agents"
+  if got="$(inorder "status of all my agents" "${features[@]}" "${tail_lines[@]}")"; then
+    pass "$tag onboarding: status, then the feature list verbatim (${#features[@]} lines, bold rendered), then $(printf '"%s" ' "${tail_lines[@]}")"
+  else fail "$tag onboarding: after the status, the feature list, the sessions, hours and functions lines are not shown verbatim in order ($got)"; show_tail 20; ok=0; fi
+  local after; after="$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "status of all my agents")"
+  [[ -z "$hours" ]] && grep -qF "Last week, we estimate" <<<"$after" && { fail "$tag onboarding: an hours line was shown with no number from the counter"; ok=0; }
+  grep -qF "save my chats" <<<"$after" && { fail "$tag onboarding: the old save my chats ask was shown (owner 11-25: opt-out, not an ask)"; ok=0; }
+  grep -qF "standing yes" <<<"$after" && { fail "$tag onboarding: house rules were shown at the end (owner 11-25: dropped)"; ok=0; }
+  onboard_turn "do not save my sessions"
+  if got="$(said "do not save my sessions" "$offline")" && [[ "$(ds_plugin "$h" 'm.sessions_on()')" == False ]]; then
+    pass "$tag onboarding: do not save my sessions -> \"$offline\""
+  else fail "$tag onboarding: do not save my sessions did not show its line or turn saving off here ($got)"; show_tail 12; ok=0; fi
+  onboard_turn "turn off timers"
+  if got="$(said "turn off timers" "$tline")" && [[ "$(ds_plugin "$h" 'm.timers_rule() == m.TIMERS_OFF_RULE')" == True ]]; then
+    pass "$tag onboarding: turn off timers -> \"$tline\""
+  else fail "$tag onboarding: turn off timers did not show its line or turn timers off here ($got)"; show_tail 12; ok=0; fi
   ((BADTOOL)) && { fail "$tag onboarding: the model asked for a tool that is not datastash's (refused)"; ok=0; }
   "${SRV[@]}" chats off >/dev/null || say "    (could not turn chat saving off after the onboarding)"
   ((ok)) && pass "$tag onboarding: every step, one ask at a time"
