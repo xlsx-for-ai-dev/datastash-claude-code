@@ -1195,6 +1195,8 @@ def _resolve(project_dir, me):
     for a in agents:  # agents first, so an agent keeps a folder the person also linked (equal length)
         for p in a.get("projects") or []:
             rp = os.path.realpath(p)
+            if _home_or_root(rp) and here != rp:
+                continue  # 1.0.18 real e2e: a link to the home folder or "/" never makes every folder under it that agent
             if _within(here, rp) and len(rp) > best_len:
                 best, best_len = a, len(rp)
     for p in (person or {}).get("projects") or []:
@@ -3609,6 +3611,9 @@ def cmd_link(args):
     if main_root(proj) is not None:
         die(f'{proj} is the person\'s "datastash main" folder or inside it; an agent is never linked there. '
             "Link the agent from its own project folder.")
+    if _home_or_root(proj):  # 1.0.18 real e2e: a home-folder link made every repo under it act as that agent
+        die(f"{proj} is the home folder or \"/\": an agent is never linked there (every folder under it would act as "
+            "that agent). The home folder's agent needs no link; nothing was changed.")
     projects = [p for p in (c.get("projects") or []) if p != proj] + [proj]
     c["projects"] = projects
     write_private(conf_path(s), json.dumps(c, indent=2))
@@ -9413,6 +9418,8 @@ def cmd_status_set(args):
     if main_root(here) is not None:
         die('this is the person\'s "datastash main" folder: it has no agent status')
     agent = agent_for(cur, me=me)
+    if agent is None and not opts.get("--project"):  # 1.0.18 real e2e: the home folder's agent (it has no link) or
+        agent = session_agent({"session_id": me["sid"], "cwd": cur})  # this session's own install's, so no link is made
     if agent is None or is_person(agent):
         die("no agent is linked to this folder (self-registration first: datastash auto-name)")
     if opts.get("--project"):

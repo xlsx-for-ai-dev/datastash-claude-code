@@ -755,7 +755,8 @@ class MainFolderIdentity(Base):
         self.assert_person_everywhere([self.main, self.sub])
         self.assertEqual(ds.resolve(self.main)[1], [])  # a parent link is not a link into main: no note
         self.assertEqual(ds.session_for(self.home)["slug"], "researcher")
-        self.assertEqual(ds.agent_for(self.elsewhere)["slug"], "researcher")
+        # 1.0.18 real e2e: a link to the home folder or "/" is that folder's only: never every folder under it
+        self.assertIsNone(ds.agent_for(self.elsewhere))
 
     def test_api_in_main_uses_no_agent_key(self):
         self.agent("researcher", "Researcher", [self.home])

@@ -81,7 +81,7 @@
 #   cleanup computer counts one more. E2E_BUDGET_WAIT=0: stop instead of waiting. A server refusal (HTTP 429) names
 #   its reason: rate_limited (the hourly limit) or too_many_accounts (no new label can be made).
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
-#   E2E_PARTS ("core update", default both; "step5" runs step 5 alone; "outbox" runs step 9 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
+#   E2E_PARTS ("core update", default both; "step5" runs step 5 alone; "step4" runs step 4 after its home setup; "outbox" runs step 9 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
 #   E2E_CANDIDATE=<branch or tag, pushed to the plugin repo>: test that commit before it is released: the core steps
 #   install it from a local copy of the catalog pinned to it, and 6a updates to it; 6b (self-update moves only to a
 #   release tag) stays on the published pin.
@@ -161,7 +161,7 @@ fi
 # --- the sign-in budget: what this run needs against the server's hourly limit, before anything signs in.
 NEED=1  # the read-back's own sign-in
 for p in $PARTS; do
-  case "$p" in core|step5|update) NEED=$((NEED + 2)) ;; outbox) NEED=$((NEED + 1)) ;; esac
+  case "$p" in core|step4|step5|update) NEED=$((NEED + 2)) ;; outbox) NEED=$((NEED + 1)) ;; esac
 done
 signins_last_hour() {
   python3 -I -c 'import sys, time
@@ -808,6 +808,24 @@ first_then_second() {  # first_then_second <tag> <HOME> <folder> <ds_install|ds_
   "$fn" "$tag (second session)" "$h" "$@"
 }
 
+step4_only() {  # E2E_PARTS=step4: step 4 alone, after what led to it: A home install, a second home session's install
+  # and onboarding (its status write, the 1.0.18 run's home link), then the first session in ~/code/web-app beside it
+  local A TA
+  A="$(new_home A)"
+  say "== step 4 only: computer A, home folder: the home agent"
+  readme_steps "4 setup A home" "$A" "$A" "$CORE_SRC" || return
+  authenticate "4 setup A home" || { stop_claude; return; }
+  ds_install "4 setup A home" "$A" "$HA" || { stop_claude; return; }
+  stop_claude
+  start_claude "$A" "$A" || { fail "4 setup: claude did not start"; return; }
+  ds_install "4 setup A home, second session" "$A" "$HA" && onboard_flow "4 setup A home, second session" "$A"
+  TA="$T"
+  say "== computer A, repo folder ~/code/web-app (a second agent on A)"
+  new_repo "$A/code/web-app"
+  first_then_second "4 setup: A repo" "$A" "$A/code/web-app" ds_install web-app "$HA"
+  stop_claude
+  T="$TA"; stop_claude
+}
 core() {
   local A B TA others
   # --- computer A: steps 1 (home folder), 2, 4, 3, 7
@@ -1075,6 +1093,7 @@ for p in $PARTS; do
   case "$p" in
     core) core ;;
     step5) step5_only ;;
+    step4) step4_only ;;
     outbox) outbox_only ;;
     update) update_part a; update_part b ;;
     *) echo "unknown part: $p"; exit 2 ;;

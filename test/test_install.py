@@ -1895,6 +1895,48 @@ class HomeFolderInstall(Base):
         self.install("s4")  # a later session in the home folder: the home agent (the one with no folder)
         self.assertEqual(self.agents(), {"home-user": [], "web-app": ["web-app"]})
 
+    def cli(self, fn, args, stdin=None):
+        """A datastash command run in self.folder (CLAUDE_PROJECT_DIR): (exit code, stdout)."""
+        orig, env = sys.stdin, os.environ.get("CLAUDE_PROJECT_DIR")
+        sys.stdin = io.StringIO(stdin or "")
+        os.environ["CLAUDE_PROJECT_DIR"] = self.folder
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                try:
+                    rc = fn(args)
+                except SystemExit as e:
+                    rc = e.code
+        finally:
+            sys.stdin = orig
+            if env is None:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)
+            else:
+                os.environ["CLAUDE_PROJECT_DIR"] = env
+        return rc, out.getvalue()
+
+    def test_a_repo_under_home_never_takes_the_home_agent(self):
+        """1.0.18 real e2e step 4: in the home folder a status write found no linked agent, so the AI ran `datastash link`
+        there; every repo under the home folder (~/code/web-app) then started as the home agent and its install
+        registered nothing. Now the home link is refused, an old one never covers a subfolder, and the status write
+        finds the home folder's own agent without a link."""
+        self.install("s1", register="home-user")
+        home = self.folder
+        rc, _ = self.cli(ds.cmd_link, ["home-user", "--workbook", WB])
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(self.agents(), {"home-user": []})  # nothing was linked
+        rc, out = self.cli(ds.cmd_status_set, ["-"], stdin=json.dumps({"doing": "Installed datastash."}))
+        self.assertEqual(rc, 0, out)
+        self.assertIn('status saved for "home-user"', out)
+        c = ds.read_json(ds.conf_path("home-user"), {})  # a home link already on this computer (an earlier build)
+        c["projects"] = [home]
+        ds.write_private(ds.conf_path("home-user"), json.dumps(c))
+        self.folder = os.path.join(home, "code", "web-app")
+        os.makedirs(self.folder)
+        self.assertIsNone(ds.session_for(self.folder))  # never the home agent
+        self.install("s2", register="web-app", own=ALPHA)  # its own agent, as a repo beside home would get
+        self.assertEqual(self.agents(), {"home-user": ["home-user"], "web-app": ["web-app"]})
+        self.assertEqual(ds.session_for(home)["name"], "home-user")  # the home folder itself keeps its agent
+
     def test_folder_install_then_home_makes_a_home_agent(self):
         self.go("web-app")
         self.install("s1", register="web-app")
