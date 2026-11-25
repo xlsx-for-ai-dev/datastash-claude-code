@@ -297,15 +297,16 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
   local base_on base_fail ok=1 n f
   ((LOGIN)) || { waiting "$tag: /datastash:install (needs the Claude login)"; return 1; }
   BADTOOL=0 NOANSWER=0
+  local base_done; base_done="$(count " · done ")"  # the turn's own end line ("✻ Worked for 7s · done 12:27 AM")
   base_on="$(count "datastash is on for your agents:")"; base_fail="$(count "Not done")$(count "could not finish the install")$(count "datastash did not answer")"
   type_line "/datastash:install"
-  drive_until '(( $(count "datastash is on for your agents:") > base_on )) || [[ "$(count "Not done")$(count "could not finish the install")$(count "datastash did not answer")" != "$base_fail" ]]' 300
+  drive_until '(( $(count "datastash is on for your agents:") > base_on )) || [[ "$(count "Not done")$(count "could not finish the install")$(count "datastash did not answer")" != "$base_fail" ]] || (( $(count " · done ") > base_done ))' 300
   wait_idle 120
   f="$(flat)"
   ((BADTOOL)) && { fail "$tag: the model asked for a tool that is not datastash's (refused)"; ok=0; }
   if (( $(count "datastash is on for your agents:") <= base_on )); then
     if grep -qF "datastash did not answer" <<<"$f"; then NOANSWER=1; fail "$tag: \"datastash did not answer\" (the plugin's prompt hook gave no note)"; show_tail 8; return 1; fi
-    fail "$tag: /datastash:install showed no install list"; show_tail 20; return 1
+    fail "$tag: /datastash:install showed no install list"; show_tail 14; return 1
   fi
   grep -qF -- "- $name (" <<<"${f##*datastash is on for your agents:}" || { fail "$tag: the install list has no \"$name\""; ok=0; }
   grep -qE -- "- $name-[0-9]+ \(" <<<"${f##*datastash is on for your agents:}" && { fail "$tag: the install list has a \"$name-N\""; ok=0; }
@@ -324,9 +325,10 @@ ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server:
   local base_off base_no ok=1 n f m
   ((LOGIN)) || { waiting "$tag: /datastash:uninstall $args (needs the Claude login)"; return 1; }
   BADTOOL=0 NOANSWER=0
+  local base_done; base_done="$(count " · done ")"
   base_off="$(count "datastash is off for")"; base_no="$(count "Not done")/$(count "Datastash isn't installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")"
   type_line "/datastash:uninstall${args:+ $args}"
-  local cond='(( $(count "datastash is off for") > base_off )) || [[ "$(count "Not done")/$(count "Datastash isn'"'"'t installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")" != "$base_no" ]]'
+  local cond='(( $(count "datastash is off for") > base_off )) || [[ "$(count "Not done")/$(count "Datastash isn'"'"'t installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")" != "$base_no" ]] || (( $(count " · done ") > base_done ))'
   drive_until "$cond" 300
   wait_idle 120
   f="$(flat)"
@@ -334,12 +336,14 @@ ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server:
     m="${m#To go ahead, type exactly: }"; m="${m%.}"
     pass "$tag: \"all\" listed every agent and asked for the typed confirm (\"$m\")"
     base_no="$(count "Not done")/$(count "Datastash isn't installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")"
+    base_done="$(count " · done ")"
     type_line "$m"
     drive_until "$cond" 300
     wait_idle 120
     f="$(flat)"
   elif [[ -z "$args" ]] && grep -qF "Type the names to remove" <<<"$f"; then
     base_no="$(count "Not done")/$(count "Datastash isn't installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")"
+    base_done="$(count " · done ")"
     type_line "$*"
     drive_until "$cond" 300
     wait_idle 120
