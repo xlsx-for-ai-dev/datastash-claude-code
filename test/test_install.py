@@ -626,12 +626,25 @@ class StrictNames(Base):
         self.assertIn("Nothing was changed.", out["systemMessage"])
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
 
-    def test_no_real_handle_in_code_readme_or_tests(self):
-        bad = "robert" + "senoff"
-        root = os.path.join(HERE, "..")
-        for rel in ("plugins/datastash/scripts/datastash", "README.md", "test/test_install.py"):
-            with open(os.path.join(root, rel), encoding="utf-8") as f:
-                self.assertNotIn(bad, f.read().casefold(), rel)
+    def test_no_real_handle_in_any_tracked_file(self):
+        # only a hash of the handle lives here, so the guard itself never holds the name
+        bad = "789c1b07ed0d59b33beadb403abb2f3468c45fc87aa63043a68c3b0ee39ea1b3"
+        root = os.path.realpath(os.path.join(HERE, ".."))
+        try:
+            rels = subprocess.run(["git", "-C", root, "ls-files", "-z"], capture_output=True, check=True).stdout.decode().split("\0")
+        except (OSError, subprocess.CalledProcessError):
+            rels = [os.path.relpath(os.path.join(d, n), root) for d, _, ns in os.walk(root) if "/.git" not in d for n in ns]
+        seen = 0
+        for rel in filter(None, rels):
+            try:
+                with open(os.path.join(root, rel), encoding="utf-8") as f:
+                    text = f.read().casefold()
+            except (OSError, UnicodeDecodeError):
+                continue
+            seen += 1
+            for word in set(re.findall(r"[a-z0-9]+", text)):
+                self.assertNotEqual(hashlib.sha256(word.encode()).hexdigest(), bad, rel)
+        self.assertGreater(seen, 10)
 
 
 KEPT, X, Y = (str(uuid.UUID(int=i)) for i in (0x81, 0x82, 0x83))
@@ -2348,6 +2361,8 @@ class ReinstallKeepsTheName(Base):
         for f in (ds.conf_path("robin"),):
             ds._drop(f)
         ds._drop(ds.key_path("robin"))
+        home_saved = ds.HOME
+        self.addCleanup(setattr, ds, "HOME", home_saved)
         ds.HOME = self.folder  # the home folder: its own name is never the agent's
         with mock.patch.object(ds, "user_name", return_value=""), mock.patch.object(ds, "_folder_name", return_value=""):
             v, _ = self.prompt("/datastash:install", sid="s7")

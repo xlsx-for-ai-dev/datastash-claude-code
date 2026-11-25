@@ -88,7 +88,7 @@ CLAUDE_ENV="${E2E_CLAUDE_ENV:-/home/xpm/handover/claude-e2e.env}"
 export E2E_SELFTEST_SECRET_FILE="${E2E_SELFTEST_SECRET_FILE:-/home/xpm/handover/selftest-oauth.secret}"
 export E2E_ACCOUNT="${E2E_ACCOUNT:-plugin-e2e}"
 # 1.0.16: the throwaway computers' user name (USER/LOGNAME in every session): a home folder's agent is named after it,
-# never "agent" (the owner's Mac: "robertsenoff").
+# never "agent" (a tester's Mac: "tester-one").
 E2E_USER="${E2E_USER:-e2e-home}"
 HA="$E2E_USER"
 PARTS="${E2E_PARTS:-core update}"
