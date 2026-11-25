@@ -398,6 +398,29 @@ class Refresh(MapBase):
         self.assertEqual(os.stat(ds.map_local_path(self.folder)).st_mode & 0o777, 0o600)
 
 
+class MapPaging(MapBase):
+    """XLI-407: the map tab is read to its last page; no page count stops it."""
+    def test_more_than_10000_pages_are_all_read(self):
+        n = 10_005
+
+        def http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
+            q = dict(urllib.parse.parse_qsl(path.split("?", 1)[1]))
+            page = int(q.get("after", "0"))
+            rows = [{"row_id": page + 1, "cells": {"key": f"k{page}", "v": page}, "row_version": 1}]
+            return 200, "application/json", json.dumps({"rows": rows, "cursor": str(page + 1), "more": page + 1 < n})
+        ds.http = http
+        out = ds.map_read_tab(self.agent, "ldgr_ag_test", "Map")
+        self.assertEqual(len(out), n)
+        self.assertEqual(out[f"k{n - 1}"]["v"], n - 1)
+
+    def test_a_cursor_the_server_already_gave_raises_instead_of_looping(self):
+        def http(method, path, key=None, body=None, form=None, timeout=40, accept="application/json"):
+            return 200, "application/json", json.dumps({"rows": [], "cursor": "7", "more": True})
+        ds.http = http
+        with self.assertRaises(ds.ApiError):
+            ds.map_read_tab(self.agent, "ldgr_ag_test", "Map")
+
+
 class Where(MapBase):
     def setUp(self):
         super().setUp()

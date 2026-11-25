@@ -882,6 +882,36 @@ class Paging(Base):
         c = ds.fetch_status({"slug": "web-app", "workbook_id": WB})
         self.assertEqual(len(c["agents"]), 4)  # no row twice
 
+    def test_more_than_10000_pages_are_all_walked(self):
+        """XLI-407: no page count stops the walk: 10,005 pages of one row each all come back."""
+        n = 10_005
+        made = [row(f"agent-{i:05d}", f"Part {i}.", ago=60, project="p") for i in range(3)]
+
+        def http(method, path, key=None, body=None, form=None, timeout=40):
+            q = dict(urllib.parse.parse_qsl(path.split("?", 1)[1]))
+            page = int(q.get("cursor", "c0")[1:])
+            r = dict(made[page % 3])
+            r["agent"] = f"agent-{page:05d}"
+            out = {"workbook_id": WB, "seq": 99, "statuses": [r]}
+            if page + 1 < n:
+                out["next_cursor"] = f"c{page + 1}"
+            return 200, "application/json", json.dumps(out)
+        ds.http = http
+        c = ds.fetch_status({"slug": "web-app", "workbook_id": WB})
+        self.assertEqual(len(c["agents"]), n)
+        self.assertEqual({r["agent"] for r in c["agents"]}, {f"agent-{i:05d}" for i in range(n)})
+
+    def test_a_cursor_the_server_already_gave_stops_the_walk_without_a_half_copy(self):
+        ds.save_status_cache(WB, [ds.norm_status_row(EXAMPLE[0])], time.time() - 300, merge=False)
+
+        def http(method, path, key=None, body=None, form=None, timeout=40):
+            return 200, "application/json", json.dumps({"statuses": [dict(EXAMPLE[1])], "next_cursor": "same"})
+        ds.http = http
+        with self.assertRaises(ds.ApiError) as e:
+            ds.fetch_status({"slug": "web-app", "workbook_id": WB})
+        self.assertEqual(e.exception.body.get("error"), "cursor_loop")
+        self.assertEqual([r["agent"] for r in ds.read_status_cache(WB)["agents"]], ["docs"])
+
     def test_the_copy_is_private_and_a_link_is_refused(self):
         ds.fetch_status({"slug": "web-app", "workbook_id": WB})
         path = ds.status_cache_path(WB)

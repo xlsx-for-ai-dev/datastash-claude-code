@@ -6893,7 +6893,8 @@ def _status_cred(sess):
     return read_key(sess["slug"]), STATUS_PATH
 
 
-STATUS_MAX_PAGES = 10000  # a guard against a server that never stops answering next_cursor (not a data limit)
+# XLI-407 (owner 11-24, "zero 10k limits"): no page count stops a status walk. It follows next_cursor to the end; the only
+# stop is a cursor the server already gave in this walk (it would loop forever), answered as cursor_loop.
 
 
 def _utc_offset_minutes():
@@ -6934,8 +6935,9 @@ def fetch_status(sess, timeout=10, asked=False):
     changed = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
     listening = _KEEP_MORNING if path != PERSON_STATUS_PATH else None
     person_asks = _KEEP_MORNING
+    seen = set()
     try:
-        for _ in range(STATUS_MAX_PAGES):
+        while True:
             body = _status_page(path, key, wb, cursor, timeout, asked)
             if cursor is None and path == PERSON_STATUS_PATH:
                 morning = body.get("morning")
@@ -6945,7 +6947,7 @@ def fetch_status(sess, timeout=10, asked=False):
                 person_asks = [] if person_asks is None else person_asks  # the person's read: none now means none
             if cursor is not None and body.get("note") and not restarted:
                 # the server could not read our cursor and served page 1 again: start the walk over, once
-                restarted, rows, cursor = True, [], None
+                restarted, rows, cursor, seen = True, [], None, set()
                 body = _status_page(path, key, wb, None, timeout, asked)
             elif cursor is not None and body.get("note"):
                 raise ApiError(200, {"error": "cursor_restart"})
@@ -6955,9 +6957,10 @@ def fetch_status(sess, timeout=10, asked=False):
             nxt = body.get("next_cursor")
             if not isinstance(nxt, str) or not nxt:
                 break
+            if nxt in seen:
+                raise ApiError(200, {"error": "cursor_loop"})
+            seen.add(nxt)
             cursor = nxt
-        else:
-            raise ApiError(200, {"error": "too_many_pages"})
     except ApiError as e:
         if e.status == 404:
             note_door(False)
@@ -11253,9 +11256,10 @@ def map_root(folder):
 
 
 def map_read_tab(agent, key, tab):
-    """The map tab's rows by key ({} when there is no such tab, or this agent does not reach it)."""
-    out, cursor = {}, None
-    for _ in range(10000):
+    """The map tab's rows by key ({} when there is no such tab, or this agent does not reach it). XLI-407: every page, to
+    the end; no page count stops it (only a cursor the server already gave, which would loop forever, raises)."""
+    out, cursor, seen = {}, None, set()
+    while True:
         q = {"workbook_id": agent["workbook_id"], "tab": tab, "limit": MAP_PAGE}
         if cursor:
             q["after"] = cursor
@@ -11272,7 +11276,9 @@ def map_read_tab(agent, key, tab):
         cursor = body.get("cursor")
         if not body.get("more") or not cursor:
             return out
-    return out
+        if cursor in seen:
+            raise ApiError(200, {"error": "cursor_loop"})
+        seen.add(cursor)
 
 
 def _map_tool(key, name, args):
