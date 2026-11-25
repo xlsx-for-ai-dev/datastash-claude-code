@@ -562,6 +562,9 @@ print(eval(sys.argv[2], {"m": m}))' "$HERE/../plugins/datastash/scripts/datastas
 onboard_turn() {  # onboard_turn <typed>: type it, answer datastash's dialogs (and the status save), wait for the turn's end
   local base_done i
   for ((i = 0; i < 120; i++)); do screen | grep -qE "background agents? to finish|esc to interrupt" || break; sleep 1; done
+  # 1.0.18: once datastash sync turns session saving on, a turn's end can start one more (the chat save's Stop hook
+  # feedback) a few seconds later; a line typed into that turn is lost, so wait until a second quiet spell holds too
+  wait_idle 120; sleep 5; wait_idle 120
   base_done="$(count " · done ")"
   ONBOARD_BASH=1
   type_line "$1"
