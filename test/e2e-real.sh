@@ -416,7 +416,7 @@ au_recorded() {  # au_recorded <HOME>: the plugin's own record lists something i
   python3 -I -c 'import json,sys
 try: r = json.load(open(sys.argv[1]))
 except (OSError, ValueError): sys.exit(1)
-sys.exit(0 if isinstance(r, dict) and r.get("changes") else 1)' "$1/.config/datastash/state/autoupdate.json"
+sys.exit(0 if isinstance(r, dict) and r.get("changes") else 1)' "$1/.config/datastash-autoupdate.json"
 }
 local_agents() {  # local_agents <HOME>: how many agents are set up on this computer (the plugin's own records)
   python3 -I - "$1/.config/datastash" <<'PY2'

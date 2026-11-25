@@ -12471,8 +12471,8 @@ def cmd_self_update(_args):
 # settings (.claude/settings.local.json, the datastash entry only) and the line says "in this folder only"; when nothing
 # can be written it says so, and the install still finishes. While the person's settings turn Claude Code's updates off
 # (DISABLE_UPDATES, DISABLE_AUTOUPDATER, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, unless FORCE_AUTOUPDATE_PLUGINS) the
-# plugin writes nothing and says so. The install records what it changed (state/autoupdate.json: files, entries and the
-# values before, nothing secret); the /datastash:uninstall that removes the last agent on this computer puts back exactly
+# plugin writes nothing and says so. The install records what it changed (datastash-autoupdate.json beside the plugin's
+# folder: files, entries and the values before, nothing secret); the /datastash:uninstall that removes the last agent on this computer puts back exactly
 # that: a value the person had already set is left alone, a key or entry install added is taken out, a folder file it
 # made is moved aside. With no record (an install before 1.0.17) the setting is left as it is, and the line says so.
 # The once-a-day self-update at session start stays as the backstop.
@@ -12648,8 +12648,11 @@ def marketplace_autoupdate():
     return False if found else None
 
 
-AUTOUPDATE_STATE = os.path.join(STATE, "autoupdate.json")  # what install changed (paths and prior values, no secrets)
-AUTOUPDATE_ASIDE = os.path.join(STATE, "autoupdate-removed")  # files install made, moved here (never deleted) at uninstall
+# What install changed (paths and prior values, no secrets): beside the plugin's own folder, not in it, because the
+# uninstall of the last agent takes that folder away (remove_box) before the setting is put back. Files install made go
+# to the -removed folder beside it at uninstall (never deleted).
+AUTOUPDATE_STATE = CONF.rstrip(os.sep) + "-autoupdate.json"
+AUTOUPDATE_ASIDE = CONF.rstrip(os.sep) + "-removed"
 AUTOUPDATE_LEFT_LINE = "Auto-update for datastash left as it was."
 AUTOUPDATE_RESTORE_FAILED_LINE = "Couldn't put auto-update for datastash back as it was before the install."
 
@@ -12753,7 +12756,6 @@ def _au_record():
 
 
 def _au_save(changes):
-    ensure_dirs()
     os.makedirs(os.path.dirname(AUTOUPDATE_STATE), mode=0o700, exist_ok=True)
     write_private(AUTOUPDATE_STATE, json.dumps({"v": 2, "changes": changes}, indent=1) + "\n")
 
@@ -12828,7 +12830,7 @@ def set_marketplace_autoupdate(on, folder=None):
 
 
 def _au_aside(path):
-    """Move a file datastash made out of the way (never deleted): into the plugin's own state folder."""
+    """Move a file datastash made out of the way (never deleted): into the -removed folder beside the plugin's own."""
     os.makedirs(AUTOUPDATE_ASIDE, mode=0o700, exist_ok=True)
     tag = hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:12]
     shutil.move(path, os.path.join(AUTOUPDATE_ASIDE, f"{time.strftime('%Y%m%d%H%M%S')}-{tag}-{os.path.basename(path)}"))
@@ -12890,7 +12892,10 @@ def restore_marketplace_autoupdate():
             keep.append(c)
         did = did or r is True
     try:
-        _au_save(keep)
+        if keep:
+            _au_save(keep)
+        else:
+            _drop(AUTOUPDATE_STATE)  # all put back: the record install made goes too
     except OSError:
         pass
     if keep:

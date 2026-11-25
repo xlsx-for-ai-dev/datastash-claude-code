@@ -19,6 +19,8 @@ sys.path.insert(0, HERE)
 from test_status import ds, TMP  # noqa: E402  (the same harness and plugin copy)
 import harness  # noqa: E402
 
+DEFAULT_RECORD, DEFAULT_ASIDE = ds.AUTOUPDATE_STATE, ds.AUTOUPDATE_ASIDE
+
 ENVS = ("DISABLE_UPDATES", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "FORCE_AUTOUPDATE_PLUGINS",
         "CLAUDE_CODE_PLUGIN_CACHE_DIR")
 SOURCE = {"source": "github", "repo": "xlsx-for-ai-dev/datastash-claude-code"}
@@ -411,6 +413,19 @@ class Restore(Base):
         os.makedirs(os.path.dirname(ds.AUTOUPDATE_STATE), exist_ok=True)
         self.write(ds.AUTOUPDATE_STATE, {"folders": ["/somewhere"]})  # the unreleased 1.0.17 candidate's shape
         self.assertEqual(ds.restore_marketplace_autoupdate(), "norecord")
+
+    def test_the_record_outlives_the_plugin_folder_the_last_uninstall_takes_away(self):
+        conf = os.path.realpath(ds.CONF) + os.sep
+        for p in (DEFAULT_RECORD, DEFAULT_ASIDE):
+            self.assertFalse(os.path.realpath(p).startswith(conf), p)
+            self.assertEqual(os.path.dirname(os.path.realpath(p)), os.path.dirname(conf.rstrip(os.sep)))
+
+    def test_the_record_goes_once_everything_is_put_back(self):
+        self.write(self.known, known())
+        ds.set_marketplace_autoupdate(True)
+        self.assertTrue(os.path.exists(ds.AUTOUPDATE_STATE))
+        self.assertEqual(ds.restore_marketplace_autoupdate(), "off")
+        self.assertFalse(os.path.exists(ds.AUTOUPDATE_STATE))
 
     def test_the_record_holds_no_secret_and_is_private(self):
         self.write(self.known, known())
