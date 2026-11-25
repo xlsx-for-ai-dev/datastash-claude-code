@@ -39,6 +39,9 @@
 #                    line). Missing: the steps that need a model turn (every /datastash:install and :uninstall) are
 #                    reported WAITING and everything else still runs.
 #   E2E_SELFTEST_SECRET_FILE  default /home/xpm/handover/selftest-oauth.secret (the bare secret, mode 600).
+# Note (run 11-25): an uninstalled agent stays switched off on the server under its name, and 1.0.13's install refuses
+#   that name (step 7). So until that is fixed a second run on the same E2E_ACCOUNT fails at step 1 (home folder agent
+#   "agent"): give each run a fresh label (the server allows 10 selftest accounts).
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
 #   E2E_PARTS ("core update", default both), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash).
 # Cleanup, pass or fail: every agent left on the test account is switched off, every app connection on it disconnected
@@ -367,6 +370,14 @@ key_gone() {  # key_gone <tag> <HOME> <name> [seconds]
   for ((i = 0; i < ${4:-5}; i++)); do [[ -e "$(key_file "$2" "$3")" ]] || { pass "$1: \"$3\"'s key file is gone on this computer"; return 0; }; sleep 1; done
   fail "$1: \"$3\"'s key file is still on this computer"
 }
+next_start_cleans() {  # next_start_cleans <tag> <HOME> <folder> <name>: that agent's own next session start (in its own
+  # folder) cleans it up here: its key file goes ("they clean up when they next start")
+  local keep="$T"
+  start_claude "$2" "$3" || { fail "$1: claude did not start in ${3#"$2/"}"; T="$keep"; return 1; }
+  key_gone "$1 (its next start, in ${3#"$2/"})" "$2" "$4" 120
+  stop_claude
+  T="$keep"
+}
 key_here() { [[ -s "$(key_file "$2" "$3")" ]] && pass "$1: \"$3\"'s key file is still here" || fail "$1: \"$3\"'s key file is gone"; }
 
 on_names() { python3 -I -c 'import json,sys; print(*[n for n in json.load(sys.stdin) if n not in sys.argv[1:]])' "$@" <<<"$(agents)"; }
@@ -401,7 +412,12 @@ core() {
   stop_claude
   say "== computer A, ~/code/notes: a session that is no agent"
   if first_then_second "4 non-agent session, uninstall web-app" "$A" "$A/code/notes" ds_uninstall web-app web-app; then
-    key_gone "4" "$A" web-app 10
+    if [[ -e "$(key_file "$A" web-app)" ]]; then
+      say "    web-app's key is still here after the removal; its own next start must clean it up"
+      next_start_cleans "4" "$A" "$A/code/web-app" web-app
+    else
+      pass "4: \"web-app\"'s key file is gone on this computer"
+    fi
     key_here "4" "$A" agent
     has_agent agent && pass "4: server: \"agent\" is still on" || fail "4: server: \"agent\" was removed too"
   fi
@@ -435,13 +451,14 @@ core() {
   ds_uninstall "5 B uninstall all" "$B" all $all_on && key_gone "5 B" "$B" site 10
   [[ "$(agents)" == "[]" ]] && pass "5: server: no agent on" || fail "5: server: agents still on: $(agents)"
   stop_claude
-  local n a_keys=()
+  local n a_keys=() dir
   for n in $others; do [[ -e "$(key_file "$A" "$n")" ]] && a_keys+=("$n"); done
   if ((${#a_keys[@]})); then
-    say "== computer A again: its next start cleans ${a_keys[*]} up"
-    start_claude "$A" "$A" || { fail "5 A: claude did not start"; return; }
-    for n in "${a_keys[@]}"; do key_gone "5 A next start" "$A" "$n" 120; done
-    stop_claude
+    say "== computer A again: each removed agent's next start cleans it up (${a_keys[*]})"
+    for n in "${a_keys[@]}"; do
+      dir="$A/code/$n"; [[ "$n" == agent ]] && dir="$A"
+      next_start_cleans "5 A" "$A" "$dir" "$n"
+    done
   elif ((LOGIN)); then
     fail "5: A had no agent key when B removed all, so A's cleanup at its next start was not checked"
   fi
