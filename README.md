@@ -330,6 +330,38 @@ datastash xlsx-test out/invoice.xlsx --set invoice --sha "$GITHUB_SHA" --branch 
   `datastash xlsx-test: did not run: no engine key. Run: npx xlsx-for-ai login (a link and a code, about a minute; the
   free plan covers test runs). Then run this again.` and exits 2. A brake answered with `Retry-After: 0` is still paced: at least 1 second before the next try.
 
+## Offline outbox (plugin 1.0.15, XLI-408)
+
+If datastash can't be reached, nothing an agent writes is lost. This covers no connection, a timeout, a name that does
+not resolve, and a 5xx answer. The plugin keeps every write made through `datastash api POST ...`, and every message the
+person sends with `datastash send` or `reply`, on this computer. They go in order into `~/.config/datastash/state/outbox-<agent>/`.
+That folder is mode 700 and its files are mode 600, and the key-folder guard refuses any tool call that reads it. The
+caller sees "saved, will send when the server is back" instead of an error.
+
+- **Sent by itself.** The kept writes go out once datastash answers again: at the next `datastash api` or send, at
+  session start (in the background), and from the listener about every 20 seconds. They go in order. A write made
+  while others wait joins the end of the line.
+- **Once each.** Each kept write carries one `idempotency_key`, given when it was first tried, so the server answers a
+  repeat with the first copy (`replayed: true`). A hand-off send carries a `handoff_id` instead. The paths that take a key
+  are rows (inc ops included), inbox, watches, hook create and result save; x-live #506 adds inbox, watches, hooks and
+  result save on REST. A resend after a crash mid-send, or after an answer that never arrived, makes no second copy.
+  Only one sender works at a time, under a lock. A second session finds the lock held and leaves the sending to the first.
+- **The line keeps its order.** A send stops at the first write that can't go yet (not reached, a busy answer, or the
+  key not usable now) and tries again later. A write datastash refuses with a 4xx when it is finally sent leaves the
+  line, and the next call says which one, once.
+- **Reads are never kept.** A `datastash api GET ...` that can't reach datastash prints "datastash can't be reached
+  right now (...), so nothing was read. Try again shortly." Sign-in steps, pickups, uninstalls, job claims, heartbeats,
+  row touches and result checks are not kept either: they only count live. Nor is any call whose body carries a proof
+  or a one-time code (`agent_proof`, `typed_proof`, `code`, `code_verifier`, `code_challenge`, `sender_secret`, ...):
+  anything a person typed fails plainly now and never waits on disk. A kept write holds the call only, never the key;
+  the key is read again when it is sent.
+- **The person sees what waits.** While writes wait, each session start shows the person one line:
+  `datastash: 3 writes from "web-app" waiting on this computer (datastash could not be reached); sending in order once it answers.`
+- **A removed agent's line goes with it.** A 410 (agent removed) on resend keeps the line in place, and that agent's
+  cleanup (uninstall, or its own key's 410) removes its outbox folder with its other fixed paths.
+- **No caps.** The outbox keeps every write, however many. `datastash status` shows how many are waiting.
+- On Windows (no file locking) nothing is kept yet: a write that can't be sent says so and asks to try again shortly.
+
 ## Time per card (plugin 1.0.5; on by default from 1.0.12)
 
 Time per card is on. To turn it off, type: datastash time-per-card off
@@ -694,6 +726,7 @@ are kept there and not in a file at all.
 | `state/agent-<name>.chatkey` | each recent session's chat_key and the chatstash setting it was last told (plugin 1.0.1); never shown to the model or given to a tool call |
 | `state/session-agent-<session>.json` | the agent a session's own `/datastash:install` made, for a folder it can't link (home, `/`): its local name and id only, no key (plugin 1.0.2); removed when that agent is uninstalled |
 | `state/*.lock` | the one-listener-per-agent lock and the state lock |
+| `state/outbox-<name>/` | the offline outbox (plugin 1.0.15, XLI-408): one file per kept write (`<16 digits>.json`: method, path, body, when and why kept; never the key) and `next.json`; mode 700, files 600; `state/outbox-<name>.add.lock`, `.send.lock` and `.refused.json` (refused on resend, said once) beside it |
 | `state/notices.json` | the once-per-cause notices (key refused, key missing, no agent, folder not linked): the line and whether it was told; never a key |
 | `person.key` / `person.json` | the person's watch key (watch and send as the person only) and the linked agent workbook and folders |
 | `login.json` | where this computer's datastash login keeps its refresh token (`keychain` or `file`) and when it was made; never a token |
@@ -1063,6 +1096,12 @@ An agent can send datastash a capability request, an error report or anything el
   2 with one line per problem; 1.0.9: XFA_API_KEY wins over the key the engine login saved, which is used otherwise and
   never printed; with neither it prints the sign-in line and exits 2 with nothing sent; Retry-After 0 still pauses 1
   second.
+- `python3 -I test/test_outbox.py`: the offline outbox (plugin 1.0.15): writes kept while datastash is down, then each sent
+  exactly once and in order when it is back (at the next call, from the listener, from the session start); every way of
+  not reaching it (refused, DNS, timeouts, resets, 5xx); a crash mid-send and a process killed after the answer resend
+  with the same key and make one copy; four senders at once and a sender in another process send each write once;
+  a duplicate key datastash refuses leaves the line and is said once; a read fails plainly and is never kept; claims,
+  beats and sign-in steps are never kept; 300 writes kept and sent in order (no caps); the folder is guarded.
 - `python3 -I test/test_time_per_card.py`: time per card (plugin 1.0.5; 1.0.7 the saved `card_tab`; 1.0.12 on by default: a new
   install and a never-chose folder set the tabs up and are on, a typed off stays off, the off switch works), the
   hooks starting a background send; card ids from descriptions, `DATASTASH_CARD` and branches; the activities; a turn's

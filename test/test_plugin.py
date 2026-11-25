@@ -531,10 +531,12 @@ class PersonSession(Base):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(ds.cmd_reply(argv), 0)
             self.assertEqual(sent[-1][:3], ("POST", ds.PERSON_INBOX_PATH, "ldgr_pw_test"))
+            self.assertTrue(sent[-1][3].pop("idempotency_key").startswith("dso_"))  # XLI-408: one retry key per message
             self.assertEqual(sent[-1][3], dict(want, workbook_id=PERSON["workbook_id"]))
         _s.stdin = io.StringIO("hold off please")
         with redirect_stdout(io.StringIO()):
             self.assertEqual(ds.cmd_send(["Beta", "--subject", "pause", "-"]), 0)
+        self.assertTrue(sent[-1][3].pop("idempotency_key").startswith("dso_"))
         self.assertEqual(sent[-1][3], {"to": "Beta", "message": "hold off please", "subject": "pause", "workbook_id": PERSON["workbook_id"]})
         _s.stdin = io.StringIO("")
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -2113,6 +2115,7 @@ class ApiBody(Base):
         for arg, stdin, want in ((json.dumps({"a": 1}), None, {"a": 1}), ("-", raw, body), ("@" + f, None, body)):
             code, sent, err = self.call(["POST", "/api/v1/agent/rows", arg], stdin)
             self.assertEqual(code, 0, err)
+            self.assertTrue(all(x.pop("idempotency_key").startswith("dso_") for x in sent))  # XLI-408: the retry key
             self.assertEqual(sent, [want])
 
     def test_a_missing_or_bad_file_is_refused_and_nothing_is_sent(self):

@@ -29,6 +29,9 @@ Subcommands (run `datastash help`):
                             one call to the datastash REST door (/api/v1/agent/...) as the linked agent; the body
                             inline, from stdin (-) or from a file (@FILE): a big body always from stdin or a file.
                             The answer is printed between two marker lines as untrusted data
+                            (XLI-408: a POST datastash can't take now, no connection, a timeout or a 5xx, is kept
+                            on this computer and sent in order, once, when it answers: "saved, will send when the
+                            server is back"; a GET is never kept and says to try again shortly)
   lookups [steps SERVICE]   today's repeated outside lookups on this computer (shapes and counts only) and what
                             datastash keeps; steps github|linear|jira: that feed's setup steps, after the person's
                             "do N" on the status offer
@@ -2734,12 +2737,13 @@ def cmd_check(_args):
         if ai:
             ctx = ai + (" " + ctx if ctx else "")
         out = {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx.strip()}}
-        person = " ".join(x for x in (upd, person) if x)
+        person = " ".join(x for x in (upd, person, waiting.get("line")) if x)
         if person:
             out["systemMessage"] = person
         print(json.dumps(out))
         sys.stdout.flush()
 
+    waiting = {}  # XLI-408: the person's one short line about kept writes, set below
     me = this_session(inp)
     project = project_of(inp)
     agent, warn = resolve(project, me=me)
@@ -2785,6 +2789,15 @@ def cmd_check(_args):
     key = read_key(s)
     name = disp(agent["name"])
     ids = None
+    kept = 0
+    if key is not None:
+        try:  # XLI-408: writes kept while datastash could not be reached go out now, in the background, in order
+            kept = len(outbox_entries(s))
+            outbox_kick(s, project)
+        except Exception:  # noqa: BLE001 — the session start goes on whatever this hits
+            kept = 0
+        if kept:
+            waiting["line"] = outbox_waiting_line(name, kept)
     if key is None:
         told = []
         if not is_person(agent):
@@ -2806,6 +2819,9 @@ def cmd_check(_args):
             emit(ctx)
             os._exit(0)  # leave the stalled helper behind; nothing was marked, so the listener counts it later
         ctx, ids = out["ctx"], out.get("ids")
+    if kept:
+        ctx += (f" {NOTE}: {kept} write(s) kept on this computer while datastash could not be reached are being sent now "
+                "in the background, in order and once each; nothing to do.")
     ctx = pre + ctx + tail
     emit(ctx)
     if key is not None and out.get("chat_told") is not None and out.get("sid"):
@@ -3166,6 +3182,7 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
     status_wake = start_status_refresher(agent, live=None if is_person(agent) else live)
     # XLI-307: the project map of each linked git folder, mapped again only when HEAD moves (never for the person).
     start_map_refresher(agent, live)
+    start_outbox_sender(agent, live)  # XLI-408: the kept writes go out in the background once datastash answers
 
     def pause(seconds):
         _sleep(seconds, parent)
@@ -3633,6 +3650,7 @@ def cmd_status(args):
         print(f'"{a["name"]}": workbook {a["workbook_id"]}; {keyinfo}; folders: {", ".join(folders) or "none"}; '
               f'listener: {"running (pid " + str(info["pid"]) + ")" if running else "not running (it starts at session start and after each turn)"}; '
               f'new: {len(st["new"])}{"; KEY REFUSED" if st.get("key_refused") else ""}'
+              + (f"; kept writes waiting for datastash: {len(outbox_entries(s))}" if outbox_entries(s) else "")
               )
     return 0
 
@@ -4620,6 +4638,308 @@ def cmd_doctor(_args):
     return 0
 
 
+# ------------------------------------------------------------------ the offline outbox (XLI-408)
+# Owner 11-24: "we need this to be seamless. if the server goes down or can't be reached stuff needs to get kept at the
+# plugin side and sent once its up." While datastash can't be reached (no connection, a timeout, a name that does not
+# resolve, or a 5xx answer), every agent write through `datastash api POST` and every message the person sends with
+# `datastash send` or `reply` is kept on this computer, in order, in the plugin's own folder (state/outbox-<slug>/, which
+# the key-folder guard keeps from every tool call), and the caller is told "saved, will send when the server is back".
+# The outbox sends itself once datastash answers again: at the next call, at session start, and from the listener in
+# the background. It sends in order, one sender at a time (a lock; a second session finds it held and leaves the work to
+# it), and each kept write carries one idempotency_key (or handoff_id) from the moment it was first tried, so a resend
+# after a crash mid-send, or after an answer that never arrived, makes no second copy (datastash answers the first,
+# replayed: true). Reads are never kept: they say datastash can't be reached and to try again shortly. No caps: the
+# outbox keeps every write, however many.
+OUTBOX_EVERY = float(os.environ.get("DATASTASH_OUTBOX_SECONDS", "20"))  # the listener's background send: how often
+OUTBOX_SAVED = "saved, will send when the server is back"
+READ_UNREACHABLE = "datastash can't be reached right now ({why}), so nothing was read. Try again shortly."
+UNREACHABLE_STATUSES = range(500, 600)
+# Paths whose POST is a sign-in step, a claim on live work or a beat: kept writes would be stale or unsafe when sent later.
+# They fail as before (plainly), never kept. result/check is a read sent as a POST.
+OUTBOX_NEVER = re.compile(r"^/api/v1/agent/(pickup|collect|key|register|hello|wake|uninstall(/.*)?|join/.*|job(/.*)?"
+                          r"|heartbeat|rows/touch|result/check|handoff/pickup|hooks/pickup)$")
+# 1.0.15: a body that carries a sign-in or proof field (anything a person typed or a one-time code) is never kept either: it
+# fails plainly now, so a proof never sits on disk or goes out late.
+OUTBOX_PROOF_FIELDS = frozenset(("agent_proof", "typed_proof", "proof", "code", "pickup_code", "code_verifier",
+                                 "code_challenge", "sender_secret", "token", "refresh_token", "answer_key"))
+# Paths that take idempotency_key (x-live #502 and XLI-408): the plugin adds one when the caller sent none.
+OUTBOX_KEYED = re.compile(r"^/api/v1/(agent/(rows|inbox|watches|hooks|result)|person/inbox)$")
+OUTBOX_HANDOFF = "/api/v1/agent/handoff"  # a send takes the caller's own handoff_id (a UUID) the same way
+
+
+def _outbox_slug(s):
+    return PERSON_SLUG if person_slug(s) else s
+
+
+def outbox_dir(s):
+    return os.path.join(STATE, f"outbox-{_outbox_slug(s)}")
+
+
+def _outbox_lock_path(s, what):
+    return os.path.join(STATE, f"outbox-{_outbox_slug(s)}.{what}.lock")
+
+
+def _outbox_refused_path(s):
+    return os.path.join(STATE, f"outbox-{_outbox_slug(s)}.refused.json")
+
+
+def _bare_path(path):
+    return posixpath.normpath(urllib.parse.unquote(path.split("?", 1)[0])).rstrip("/").lower()
+
+
+def outbox_keeps(method, path, body=None):
+    """True for a write the outbox keeps when datastash can't be reached (a POST that is not a sign-in step, claim or beat,
+    and whose body carries no proof or one-time code)."""
+    if isinstance(body, dict) and OUTBOX_PROOF_FIELDS.intersection(body):
+        return False
+    return method == "POST" and fcntl is not None and not OUTBOX_NEVER.match(_bare_path(path))
+
+
+def replay_safe(path, body):
+    """The body with one retry key in it: idempotency_key on the paths that take it, handoff_id on a hand-off send (the
+    caller's own is kept). Any other kept write is safe to send again by itself (it sets a state, or names its row)."""
+    if not isinstance(body, dict):
+        return body
+    p = _bare_path(path)
+    if OUTBOX_KEYED.match(p) and body.get("idempotency_key") in (None, ""):
+        if p == "/api/v1/agent/hooks" and body.get("action") not in (None, "create"):
+            return body
+        return dict(body, idempotency_key="dso_" + uuid.uuid4().hex)
+    if p == OUTBOX_HANDOFF and body.get("handoff_id") in (None, ""):
+        return dict(body, handoff_id=str(uuid.uuid4()))
+    return body
+
+
+def unreachable(e):
+    """Why datastash can't be reached (a short word), or None when it answered. A 5xx counts as not reached."""
+    if isinstance(e, ApiError):
+        return f"HTTP {e.status}" if e.status in UNREACHABLE_STATUSES else None
+    if isinstance(e, urllib.error.URLError):
+        r = getattr(e, "reason", None)
+        return type(r).__name__ if isinstance(r, BaseException) else "no connection"
+    if isinstance(e, (httpclient.HTTPException, OSError)):  # a timeout, a reset, a closed connection
+        return type(e).__name__
+    return None
+
+
+class _OutboxLock:
+    """flock on one lock file. wait=False: None when another process (or thread) holds it."""
+
+    def __init__(self, s, what, wait=True):
+        self.path, self.wait, self.fd = _outbox_lock_path(s, what), wait, None
+
+    def __enter__(self):
+        ensure_dirs()
+        self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | (0 if self.wait else fcntl.LOCK_NB))
+        except OSError:
+            os.close(self.fd)
+            self.fd = None
+        return self if self.fd is not None else None
+
+    def __exit__(self, *a):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+
+
+def outbox_entries(s):
+    """The kept writes' file names, oldest first (each name is its place in line)."""
+    try:
+        names = os.listdir(outbox_dir(s))
+    except OSError:
+        return []
+    return sorted(n for n in names if re.fullmatch(r"\d{16}\.json", n))
+
+
+def outbox_put(s, method, path, body, why):
+    """Keep one write at the end of the line (fsynced before this returns). Answers its place (1 = next to go out)."""
+    ensure_dirs()
+    d = outbox_dir(s)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)  # this user only, whatever made it before
+    with _OutboxLock(s, "add"):
+        have = outbox_entries(s)
+        # The line number only grows: the next one after the newest kept or sent (a counter file survives an empty line).
+        last = read_json(os.path.join(d, "next.json"), {}).get("n")
+        n = max([int(have[-1][:16]) if have else 0, last if isinstance(last, int) else 0]) + 1
+        write_private(os.path.join(d, "next.json"), json.dumps({"n": n}))
+        rec = {"method": method, "path": path, "body": body, "kept_at": time.time(), "why": why}
+        write_private(os.path.join(d, f"{n:016d}.json"), json.dumps(rec))
+    log(_outbox_slug(s), f"outbox: kept {method} {path.split('?', 1)[0]} ({why}); {len(have) + 1} waiting")
+    return len(have) + 1, n
+
+
+def _outbox_refused(s, rec, status, body):
+    """A kept write datastash refused when it was sent (a 4xx other than a key or busy answer): out of the line, and said
+    once at the next call."""
+    p = _outbox_refused_path(s)
+    with _OutboxLock(s, "add"):
+        cur = read_json(p, {}).get("items")
+        items = cur if isinstance(cur, list) else []
+        items.append({"path": str(rec.get("path", "")).split("?", 1)[0], "kept_at": rec.get("kept_at"), "status": status,
+                      "code": str((body or {}).get("code") or (body or {}).get("error") or "")[:60],
+                      "message": _clean((body or {}).get("message"), 300)})
+        write_private(p, json.dumps({"items": items}))
+
+
+def outbox_take_refused(s):
+    """The refused kept writes not yet said, as plain lines (and forgets them)."""
+    p = _outbox_refused_path(s)
+    if fcntl is None or not os.path.exists(p):
+        return []
+    with _OutboxLock(s, "add"):
+        items = read_json(p, {}).get("items")
+        _drop(p)
+    out = []
+    for i in items if isinstance(items, list) else []:
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(i["kept_at"])) if isinstance(i.get("kept_at"), (int, float)) else "earlier"
+        out.append(f"datastash note: a write kept while datastash could not be reached (POST {i.get('path')}, kept {when}) "
+                   f"was refused when it was sent: HTTP {i.get('status')} {i.get('code') or ''}".rstrip()
+                   + (f" ({i['message']})" if i.get("message") else "") + ". Nothing else was lost; send it again if it is still needed.")
+    return out
+
+
+def outbox_send(s, want=None):
+    """Send the kept writes in order, as long as datastash answers. One sender at a time: when another process is
+    sending, this returns at once (sent nothing, it sends them). Stops at the first write that can't be sent yet (not
+    reached, busy, or the key not usable now), so the line keeps its order. Answers {"sent", "left", "busy", "answers"}:
+    answers holds (status, text) of the line numbers in `want` that went out."""
+    res = {"sent": 0, "left": len(outbox_entries(s)), "busy": False, "answers": {}, "why": None}
+    if fcntl is None or res["left"] == 0:
+        return res
+    with _OutboxLock(s, "send", wait=False) as held:
+        if held is None:
+            res["busy"] = True
+            return res
+        for name in outbox_entries(s):  # listed again under the lock: a sender before us may have sent some
+            path = os.path.join(outbox_dir(s), name)
+            try:
+                with open(path) as f:
+                    rec = json.load(f)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                log(_outbox_slug(s), f"outbox: kept write {name} unreadable; set aside")
+                _set_aside(path)
+                continue
+            key = read_key(s)
+            if key is None:
+                res["why"] = "no usable key now"
+                break
+            try:
+                status, _ct, text = http(rec["method"], rec["path"], key=key, body=rec.get("body"), timeout=30)
+            except ApiError as e:
+                why = unreachable(e)
+                if why is not None or e.status in (401, 403, 410, 429):
+                    res["why"] = why or f"HTTP {e.status}"
+                    break  # kept, in its place: sent again later (a new key or a quiet minute fixes these; a 410 is the
+                    # removed agent's own cleanup, which drops its line with it)
+                status, text = e.status, json.dumps({"http_status": e.status, **e.body})
+                _outbox_refused(s, rec, e.status, e.body)
+                log(_outbox_slug(s), f"outbox: {name} refused when sent (HTTP {e.status} {_code(e)}); out of the line")
+            except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+                res["why"] = unreachable(e)
+                break
+            else:
+                log(_outbox_slug(s), f"outbox: {name} sent (HTTP {status})")
+            _drop(path)  # only after datastash answered it: a crash before this sends it again, with the same key
+            res["sent"] += 1
+            n = int(name[:16])
+            if want is not None and n in want:
+                res["answers"][n] = (status, text)
+    res["left"] = len(outbox_entries(s))
+    return res
+
+
+def outbox_waiting_line(name, n):
+    """XLI-408: the person's one short line at session start while kept writes wait."""
+    return (f'datastash: {n} write{"" if n == 1 else "s"} from "{name}" waiting on this computer (datastash could not be '
+            "reached); sending in order once it answers.")
+
+
+def outbox_kick(s, cwd=None):
+    """Start one background send of the kept writes (session start), when there are any. Never waits."""
+    if fcntl is None or not outbox_entries(s):
+        return
+    try:
+        spawn_detached([sys.executable, os.path.abspath(__file__), "outbox-send", _outbox_slug(s)], cwd or HOME)
+    except OSError as e:
+        log(_outbox_slug(s), f"outbox: background send not started ({type(e).__name__})")
+
+
+def cmd_outbox_send(args):
+    """Internal (started at session start, detached): send the kept writes of one agent (or the person's)."""
+    if len(args) != 1 or not (re.fullmatch(r"[a-z0-9\-]{1,64}", args[0]) or args[0] == PERSON_SLUG):
+        return 1
+    outbox_send(args[0])
+    return 0
+
+
+def outbox_sender(s, live, stop=None):
+    """The listener's background send: every OUTBOX_EVERY seconds, while it polls with a key, the kept writes go out."""
+    stop = stop or threading.Event()
+    while not _hello_wait(stop, OUTBOX_EVERY * random.uniform(0.8, 1.2)):
+        if live.get("key") is None or not outbox_entries(s):
+            continue
+        try:
+            r = outbox_send(s)
+            if r["sent"]:
+                log(_outbox_slug(s), f"outbox: {r['sent']} kept write(s) sent in the background; {r['left']} left")
+        except Exception as e:  # noqa: BLE001 — the listener's own work goes on whatever this hits
+            log(_outbox_slug(s), f"outbox: background send stopped ({type(e).__name__})")
+
+
+def start_outbox_sender(agent, live, stop=None):
+    if fcntl is None:
+        return None
+    t = threading.Thread(target=outbox_sender, args=(agent["slug"], live, stop), daemon=True)
+    t.start()
+    return t
+
+
+def outbox_call(s, key, method, path, body):
+    """One write as the caller, kept when datastash can't be reached. Prints the answer framed as data (or the saved line)
+    and answers the exit code. A write behind kept ones waits its turn: it joins the end of the line, and the line is
+    sent now if datastash answers."""
+    for line in outbox_take_refused(s):
+        print(line, file=sys.stderr)
+    body = replay_safe(path, body)
+    if outbox_entries(s):
+        try:
+            _place, n = outbox_put(s, method, path, body, "behind kept writes")
+        except OSError as e:
+            die(f"datastash can't be reached and this write could not be kept on this computer ({type(e).__name__})")
+        r = outbox_send(s, want={n})
+        if n in r["answers"]:
+            st, text = r["answers"][n]
+            print(framed(method, path, st, text))
+            return 0 if 200 <= st < 300 else 1
+        waiting = r["left"]
+        print(f"{OUTBOX_SAVED} ({'another session is sending the kept writes now' if r['busy'] else 'datastash cannot be reached right now: ' + str(r['why'] or 'no answer')}; "
+              f"kept on this computer in order with {waiting - 1} earlier write(s), and sent once).")
+        return 0
+    try:
+        status, _ctype, text = http(method, path, key=key, body=body, timeout=60)
+        print(framed(method, path, status, text))
+        return 0
+    except ApiError as e:
+        why = unreachable(e)
+        if why is None:
+            print(framed(method, path, e.status, json.dumps({"http_status": e.status, **e.body})))
+            return 1
+    except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
+        why = unreachable(e)
+    try:
+        place, _n = outbox_put(s, method, path, body, why)
+    except OSError as e:
+        die(f"datastash can't be reached ({why}) and this write could not be kept on this computer ({type(e).__name__})")
+    print(f"{OUTBOX_SAVED} (datastash cannot be reached right now: {why}; kept on this computer"
+          + (f" in order behind {place - 1} earlier write(s)" if place > 1 else "") + ", and sent once).")
+    return 0
+
+
 API_USAGE = ("usage: datastash api METHOD /api/v1/agent/... [JSON_BODY | - | @FILE] (- reads the body from stdin, "
              "@FILE from a file: use one of them for a big body, never a long argument)")
 
@@ -4669,15 +4989,32 @@ def cmd_api(args):
     key = read_key(agent["slug"])
     if key is None:
         die(f"no usable key file for \"{agent['name']}\" ({key_path(agent['slug'])})")
+    if outbox_keeps(method, path, body):  # XLI-408: kept on this computer when datastash can't be reached, sent once later
+        return outbox_call(agent["slug"], key, method, path, body)
+    return plain_call(method, path, key, body)
+
+
+def plain_call(method, path, key, body):
+    """One call that is never kept (a read, a sign-in step, a claim or a beat): printed framed; when datastash can't be
+    reached it says so plainly (XLI-408: a read is never kept)."""
     try:
         status, _ctype, text = http(method, path, key=key, body=body, timeout=60)
         print(framed(method, path, status, text))
         return 0
     except ApiError as e:
-        print(framed(method, path, e.status, json.dumps({"http_status": e.status, **e.body})))
-        return 1
+        why = unreachable(e)
+        if why is None:
+            print(framed(method, path, e.status, json.dumps({"http_status": e.status, **e.body})))
+            return 1
     except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
-        die(f"could not reach datastash ({type(e).__name__})")
+        why = unreachable(e)
+    if method == "GET":
+        die(READ_UNREACHABLE.format(why=why))
+    if fcntl is None:
+        die(f"datastash can't be reached right now ({why}). This computer can't keep writes (no file locking), so "
+            "nothing was sent: try again shortly.")
+    die(f"datastash can't be reached right now ({why}). This call was not kept (a sign-in step, a proof, a claim "
+        "or a beat only counts live): try again shortly.")
 
 
 def path_ok(path):
@@ -6086,15 +6423,9 @@ def _person_call(method, path, body=None, need_main=False, query=None):
         path = path + "?" + urllib.parse.urlencode(dict(query, workbook_id=person["workbook_id"]))
     if body is not None:
         body = dict(body, workbook_id=person["workbook_id"]) if person is not None else body
-    try:
-        status, _ctype, text = http(method, path, key=key, body=body, timeout=60)
-        print(framed(method, path, status, text))
-        return 0
-    except ApiError as e:
-        print(framed(method, path, e.status, json.dumps({"http_status": e.status, **e.body})))
-        return 1
-    except (urllib.error.URLError, httpclient.HTTPException, OSError) as e:
-        die(f"could not reach datastash ({type(e).__name__})")
+    if path == PERSON_INBOX_PATH and outbox_keeps(method, path, body):  # XLI-408: the person's message is kept the same way
+        return outbox_call(PERSON_SLUG, key, method, path, body)
+    return plain_call(method, path, key, body)
 
 
 def _person_post(body):
@@ -12235,7 +12566,9 @@ AGENT_FILES = (
     "{st}/agent-{s}.listener.lock", "{st}/agent-{s}.state.lock", "{st}/agent-{s}.mint.lock", "{st}/agent-{s}.log",
     "{st}/agent-{s}.log.1",
     "{p}/agent-{s}.verifier", "{st}/status-sent-{s}.json", "{st}/status-written-{s}", "{st}/status-out-{s}.json",
-    "{st}/status-snap-{s}.json", "{st}/status-reminded-{s}", "{st}/agent-{s}.chatkey")
+    "{st}/status-snap-{s}.json", "{st}/status-reminded-{s}", "{st}/agent-{s}.chatkey",
+    "{st}/outbox-{s}.add.lock", "{st}/outbox-{s}.send.lock", "{st}/outbox-{s}.refused.json")
+# Plus its offline outbox folder (XLI-408): {st}/outbox-{s}/ with its kept writes (<16 digits>.json) and next.json (_drop_outbox).
 # Plus each session's standby lock for the agent (XLI-374): {st}/agent-{s}.standby-<16 hex>.listener.lock (standby_path).
 AGENT_STANDBY_RE = r"agent-{s}\.standby-[0-9a-f]{{16}}\.listener\.lock"
 AGENT_KEYCHAIN = ("agent-answer-{s}",)
@@ -12402,6 +12735,7 @@ def remove_agent_here(s):
         _drop(_fill(t, s))
     _drop_standby_locks(s)
     _drop_session_agents(s)
+    _drop_outbox(s)
     left = [a for a in all_agents() if not is_person(a)]
     wb = c.get("workbook_id")
     if isinstance(wb, str) and wb and not any(a.get("workbook_id") == wb for a in left):
@@ -12411,6 +12745,23 @@ def remove_agent_here(s):
         return False
     remove_box()
     return True
+
+
+def _drop_outbox(s):
+    """XLI-408: a removed agent's kept writes can never go out (its key is gone): its outbox folder's own files, then the
+    folder. Only the fixed names; anything else in it stays (and so does the folder)."""
+    d = os.path.join(STATE, f"outbox-{s}")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        if re.fullmatch(r"\d{16}\.json|next\.json|\.(\d{16}\.json|next\.json)\.\d+\.tmp", n):
+            _drop(os.path.join(d, n))
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
 
 
 def _gone_path():
@@ -15899,7 +16250,7 @@ def main():
              "status-verify": cmd_status_verify, "keep": cmd_keep, "lookups": cmd_lookups, "week": cmd_week,
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
-             "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat}
+             "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

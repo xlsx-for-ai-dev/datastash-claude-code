@@ -19,6 +19,11 @@
 #      (A's ~/code/web-app gets its agent first: /datastash:install there, "web-app".)
 #   3  A: /datastash:uninstall agent from agent's own session: off on the server, its key gone here.
 #   7  A: /datastash:install after that uninstall: "agent" again (no "-2"), on the server.
+#   9  A (XLI-408, the offline outbox): datastash blocked for "agent" in A's home folder (its own datastash command with
+#      HTTPS_PROXY at a closed local port, so every call fails to connect; no listener of A runs meanwhile): three inbox
+#      writes answer "saved, will send when the server is back" and wait on disk (mode 700/600); a read fails plainly and
+#      is not kept; server: none of them there. Then unblocked: A's next session start shows the person the waiting line
+#      and sends them; server: each exactly once, in order; the outbox empty. E2E_PARTS=outbox runs 1, 9 and a cleanup.
 #   8  computer B (second throwaway HOME, same account), repo folder: README steps, its own sign-in, /datastash:install:
 #      "site"; the install list also shows A's agents that are on; server: all on. (When step 7 left A with none, A
 #      gets one first in ~/code/api, so step 5 has a cross-computer half.)
@@ -43,7 +48,7 @@
 # Note (run 11-25): before x-live's XLI-390 reinstall fix an uninstalled agent stayed switched off on the server under its
 #   name and the install refused that name (step 7); give each run a fresh label (the server allows 10 selftest accounts).
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
-#   E2E_PARTS ("core update", default both; "step5" runs step 5 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
+#   E2E_PARTS ("core update", default both; "step5" runs step 5 alone; "outbox" runs step 9 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
 #   E2E_CANDIDATE=<branch or tag, pushed to the plugin repo>: test that commit before it is released: the core steps
 #   install it from a local copy of the catalog pinned to it, and 6a updates to it; 6b (self-update moves only to a
 #   release tag) stays on the published pin.
@@ -411,6 +416,67 @@ next_start_cleans() {  # next_start_cleans <tag> <HOME> <folder> <name>: that ag
   stop_claude
   T="$keep"
 }
+ds_cli() {  # ds_cli <HOME> <folder> <proxy or ""> <args...>: the installed plugin's own datastash command in that folder, as
+  # a person's terminal would run it (no session); a proxy blocks datastash for this one run
+  local h="$1" dir="$2" proxy="$3" script; shift 3
+  script="$(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["plugins"]["datastash@datastash"][0]["installPath"])' \
+    "$h/.claude/plugins/installed_plugins.json" 2>/dev/null)/scripts/datastash"
+  [[ -x "$script" || -r "$script" ]] || { echo "no installed datastash command"; return 9; }
+  (cd "$dir" && env -i PATH="$WORK/bin:/usr/local/bin:/usr/bin:/bin" HOME="$h" LANG=C.UTF-8 CLAUDE_PROJECT_DIR="$dir" \
+    ${proxy:+HTTPS_PROXY=$proxy} ${proxy:+https_proxy=$proxy} python3 "$script" "$@")
+}
+
+step9_outbox() {  # step9_outbox <HOME> <folder> <agent>: XLI-408, server blocked, three writes, unblocked, each once in order
+  local h="$1" dir="$2" name="$3" dead="http://127.0.0.1:9" wb mark out i n got ok=1 ob
+  ob="$h/.config/datastash/state/outbox-$name"
+  wb="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["workbook_id"])' "$h/.config/datastash/agent-$name.json" 2>/dev/null)"
+  [[ -n "$wb" ]] || { fail "9: no workbook for \"$name\" on this computer"; return 1; }
+  mark="e2e-outbox-$RUN-$(date +%s)"
+  pkill -f "$h/.claude/plugins/" 2>/dev/null; sleep 2  # no listener of this computer sends while datastash is "down"
+  for i in 1 2 3; do
+    out="$(ds_cli "$h" "$dir" "$dead" api POST /api/v1/agent/inbox "{\"workbook_id\":\"$wb\",\"to\":\"$name\",\"message\":\"$mark #$i\"}" 2>&1)"
+    grep -qF "saved, will send when the server is back" <<<"$out" || { fail "9: write $i while blocked was not kept: $(head -c 300 <<<"$out")"; ok=0; }
+  done
+  out="$(ds_cli "$h" "$dir" "$dead" api GET "/api/v1/agent/inbox?workbook_id=$wb" 2>&1)"
+  grep -qF "nothing was read. Try again shortly." <<<"$out" || { fail "9: a read while blocked did not fail plainly: $(head -c 300 <<<"$out")"; ok=0; }
+  n="$(find "$ob" -maxdepth 1 -regextype posix-extended -regex '.*/[0-9]{16}\.json' 2>/dev/null | wc -l)"
+  ((n == 3)) || { fail "9: $n write(s) kept on disk, wanted 3 (the read is never kept)"; ok=0; }
+  [[ "$(stat -c %a "$ob" 2>/dev/null)" == 700 ]] || { fail "9: the outbox folder is not mode 700"; ok=0; }
+  [[ -z "$(find "$ob" -maxdepth 1 -type f ! -perm 600 2>/dev/null)" ]] || { fail "9: a kept write is not mode 600"; ok=0; }
+  got="$("${SRV[@]}" inbox-marks "$wb" "$name" "$mark")" || { fail "9: the read-back could not read \"$name\"'s inbox"; return 1; }
+  [[ "$got" == "[]" ]] || { fail "9: server: writes arrived while datastash was blocked: $got"; ok=0; }
+  ((ok)) && pass "9: blocked: 3 writes kept (\"saved, will send when the server is back\", mode 700/600), the read failed plainly, server: none yet"
+  say "== computer A: unblocked; the next session start sends the kept writes"
+  start_claude "$h" "$dir" || { fail "9: claude did not start"; return 1; }
+  if wait_for "writes? from \"$name\" waiting on this computer" 20; then pass "9: the session start told the person what is waiting"
+  else fail "9: the session start showed no waiting line"; show_tail 8; fi
+  for ((i = 0; i < 120; i++)); do
+    got="$("${SRV[@]}" inbox-marks "$wb" "$name" "$mark")"
+    [[ "$got" == "[1, 2, 3]" ]] && break
+    sleep 2
+  done
+  sleep 10  # anything sent twice would show by now
+  got="$("${SRV[@]}" inbox-marks "$wb" "$name" "$mark")"
+  n="$(find "$ob" -maxdepth 1 -regextype posix-extended -regex '.*/[0-9]{16}\.json' 2>/dev/null | wc -l)"
+  if [[ "$got" == "[1, 2, 3]" ]] && ((n == 0)); then pass "9: unblocked: server has each write exactly once, in order ($got); the outbox is empty"
+  else fail "9: unblocked: server has $got (wanted [1, 2, 3]); $n write(s) still kept"; fi
+  stop_claude
+}
+
+outbox_only() {  # E2E_PARTS=outbox: step 1 (A home), step 9, then the agent's own uninstall
+  local A
+  A="$(new_home A)"
+  say "== outbox only: computer A, home folder: one agent"
+  readme_steps "9 setup A home" "$A" "$A" "$CORE_SRC" || return
+  authenticate "9 setup A home" || { stop_claude; return; }
+  ds_install "9 setup A home" "$A" agent || { stop_claude; return; }
+  stop_claude
+  step9_outbox "$A" "$A" agent
+  start_claude "$A" "$A" || { fail "9 cleanup: claude did not start"; return; }
+  ds_uninstall "9 cleanup" "$A" agent agent
+  stop_claude
+}
+
 key_here() { [[ -s "$(key_file "$2" "$3")" ]] && pass "$1: \"$3\"'s key file is still here" || fail "$1: \"$3\"'s key file is gone"; }
 
 on_names() { python3 -I -c 'import json,sys; print(*[n for n in json.load(sys.stdin) if n not in sys.argv[1:]])' "$@" <<<"$(agents)"; }
@@ -457,6 +523,10 @@ core() {
   start_claude "$A" "$A" || { fail "7: claude did not start"; return; }
   ds_install "7 reinstall after uninstall" "$A" agent
   stop_claude
+  if ((LOGIN)) && has_agent agent; then
+    say "== computer A, home folder: the offline outbox (XLI-408)"
+    step9_outbox "$A" "$A" agent
+  fi
   if ((LOGIN)) && [[ "$(agents)" == "[]" ]]; then  # step 5 needs an agent on A for its cross-computer half
     say "== computer A, ~/code/api: an agent on A for step 5 (A has none on)"
     new_repo "$A/code/api"
@@ -567,6 +637,7 @@ for p in $PARTS; do
   case "$p" in
     core) core ;;
     step5) step5_only ;;
+    outbox) outbox_only ;;
     update) update_part a; update_part b ;;
     *) echo "unknown part: $p"; exit 2 ;;
   esac

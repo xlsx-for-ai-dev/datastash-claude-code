@@ -13,6 +13,8 @@ Run with python3 -I. Never prints a secret, a code or a token.
   other-apps               the names of the account's app connections other than this script's own, as JSON (Claude
                            Code's sign-ins share one client, so they show as one app)
   disconnect-all           disconnect every app connection on the account, this script's own last (cleanup)
+  inbox-marks WB INBOX MARK  (XLI-408 step 9) every message in that inbox of workbook WB whose text holds "MARK #<n>",
+                           as a JSON list of the n's in the order datastash added them (a repeat shows twice)
 
 Env: E2E_SELFTEST_SECRET_FILE (the bare secret, mode 600), E2E_ACCOUNT (the selftest label), E2E_SERVER_TOKEN_FILE.
 Exit 0 ok, 1 refused or failed (one line on stderr), 2 can't run.
@@ -262,6 +264,27 @@ def cmd_disconnect_all():
         sys.exit(1)
 
 
+def cmd_inbox_marks(wb, inbox, mark):
+    """XLI-408: the read-back of the offline outbox step: the person's connection reads the agent's inbox from the start."""
+    import re
+    found, after, seen_ids = [], 0, set()
+    for _page in range(200):
+        err, out = tool("ledger_inbox_read", {"workbook_id": wb, "inbox": inbox, "after": after, "limit": 100})
+        if err or not isinstance(out, dict) or not isinstance(out.get("messages"), list):
+            die(f"ledger_inbox_read refused ({out.get('code') if isinstance(out, dict) else 'no code'})")
+        for m in out["messages"]:
+            mid = m.get("message_id") if isinstance(m, dict) else None
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            for n in set(re.findall(re.escape(mark) + r" #(\d+)\b", json.dumps(m))):  # once per message
+                found.append((mid if isinstance(mid, int) else 0, int(n)))
+        if not out.get("more") or str(out.get("cursor")) == str(after):
+            break
+        after = out.get("cursor")
+    print(json.dumps([n for _mid, n in sorted(found)]))
+
+
 def main(argv):
     if not argv:
         die(__doc__.strip().splitlines()[0], 2)
@@ -282,6 +305,8 @@ def main(argv):
         return None
     if c == "disconnect-all":
         return cmd_disconnect_all()
+    if c == "inbox-marks" and len(argv) == 4:
+        return cmd_inbox_marks(argv[1], argv[2], argv[3])
     die("unknown command", 2)
 
 
