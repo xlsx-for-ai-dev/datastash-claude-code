@@ -564,6 +564,19 @@ class StopHook(Base):
         self.ten_minutes_pass()
         self.assertEqual(self.stop()["decision"], "block")
 
+    def test_never_after_the_persons_install_or_uninstall(self):
+        """1.0.18 real e2e step 4: the install's turn ends with the plugin's own line; a status reminder after it showed
+        the person a block of instructions."""
+        self.turn()
+        ds.save_cmd("sess1", {"sid": "sess1", "prompt": "/datastash:install", "at": time.time(), "kind": "install"})
+        self.tool()
+        self.assertIsNone(self.stop())
+        self.turn()  # the next turn of the session is an ordinary one again
+        self.tool()
+        rec = ds.read_json(ds._cmd_path("sess1"), {})
+        ds.save_cmd("sess1", dict(rec, at=time.time() - 60))
+        self.assertEqual(self.stop()["decision"], "block")
+
     def test_quiet_without_a_material_change(self):
         self.turn()
         self.tool()
