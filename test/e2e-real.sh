@@ -43,7 +43,7 @@
 # Note (run 11-25): before x-live's XLI-390 reinstall fix an uninstalled agent stayed switched off on the server under its
 #   name and the install refused that name (step 7); give each run a fresh label (the server allows 10 selftest accounts).
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
-#   E2E_PARTS ("core update", default both), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
+#   E2E_PARTS ("core update", default both; "step5" runs step 5 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
 #   E2E_CANDIDATE=<branch or tag, pushed to the plugin repo>: test that commit before it is released: the core steps
 #   install it from a local copy of the catalog pinned to it, and 6a updates to it; 6b (self-update moves only to a
 #   release tag) stays on the published pin.
@@ -243,7 +243,16 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
   tmux new-session -d -s "$T" -x 250 -y 50 -c "$dir" \
     "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
   if wait_for "trust this folder" 40; then
-    tmux send-keys -t "$T" Down; sleep 0.5; tmux send-keys -t "$T" Enter
+    # The dialog's default is "No, exit" and it shows its text before it takes keys: a Down sent too soon is dropped and
+    # the Enter then picks No ("Claude Code didn't start because this folder isn't trusted"). A home folder's Yes lasts
+    # one session, so every start in a home folder meets this. Press Down until Yes is the selected choice, then Enter.
+    local i
+    for ((i = 0; i < 20; i++)); do
+      screen | grep -qE "❯ +(1\. |2\. )?Yes, I trust this folder" && break
+      tmux send-keys -t "$T" Down; sleep 0.5
+    done
+    screen | grep -qE "❯ +(1\. |2\. )?Yes, I trust this folder" || return 1
+    tmux send-keys -t "$T" Enter
   fi
   wait_for "shift\+tab to cycle|for shortcuts|Not logged in|\? for" 40 || return 1
   sleep 3  # the session-start hooks
@@ -397,7 +406,7 @@ key_gone() {  # key_gone <tag> <HOME> <name> [seconds]
 next_start_cleans() {  # next_start_cleans <tag> <HOME> <folder> <name>: that agent's own next session start (in its own
   # folder) cleans it up here: its key file goes ("they clean up when they next start")
   local keep="$T"
-  start_claude "$2" "$3" || { fail "$1: claude did not start in ${3#"$2/"}"; T="$keep"; return 1; }
+  start_claude "$2" "$3" || { fail "$1: claude did not start in ${3#"$2/"}"; show_tail; T="$keep"; return 1; }
   key_gone "$1 (its next start, in ${3#"$2/"})" "$2" "$4" 120
   stop_claude
   T="$keep"
@@ -455,7 +464,12 @@ core() {
     stop_claude
   fi
 
-  # --- computer B: step 1 from a repo folder, 8, 5 (folder "site": a name no earlier step switched off)
+  step5_from_b "$A"
+}
+
+step5_from_b() {  # step5_from_b <A's HOME>: computer B: step 1 from a repo folder, 8, 5 (folder "site": a name no
+  # earlier step switched off); then A's next start cleans up each agent B removed
+  local A="$1" B others
   B="$(new_home B)"
   new_repo "$B/code/site"
   say "== computer B (same account), repo folder ~/code/site"
@@ -481,6 +495,17 @@ core() {
   elif ((LOGIN)); then
     fail "5: A had no agent key when B removed all, so A's cleanup at its next start was not checked"
   fi
+}
+
+step5_only() {  # E2E_PARTS=step5: step 5 alone: A (home folder) gets "agent", then step5_from_b
+  local A
+  A="$(new_home A)"
+  say "== step 5 only: computer A, home folder: one agent"
+  readme_steps "5 setup A home" "$A" "$A" "$CORE_SRC" || return
+  authenticate "5 setup A home" || { stop_claude; return; }
+  ds_install "5 setup A home" "$A" agent || { stop_claude; return; }
+  stop_claude
+  step5_from_b "$A"
 }
 
 update_part() {  # update_part a|b
@@ -541,6 +566,7 @@ update_part() {  # update_part a|b
 for p in $PARTS; do
   case "$p" in
     core) core ;;
+    step5) step5_only ;;
     update) update_part a; update_part b ;;
     *) echo "unknown part: $p"; exit 2 ;;
   esac
