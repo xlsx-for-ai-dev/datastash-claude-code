@@ -9669,7 +9669,7 @@ def _said_turns(entries, end, most=4):
     return turns
 
 
-def find_typed(tp, pid, prompt):
+def find_typed(tp, pid, prompt, at=None):
     """(entry, the assistant's last turns before it) when the session transcript holds the person's typed entry for
     this prompt id with exactly this text, else None; "not person" when that entry is there but Claude Code did not mark
     it as typed by a person (N1: `claude -p`, a notification, or no origin fields). Claude Code writes the entry right
@@ -9684,6 +9684,20 @@ def find_typed(tp, pid, prompt):
             return None
         if not _person_origin(v):
             return "not person"
+        return v, _said_turns(entries, i)
+    if at is None:
+        return None
+    # 1.0.18 (real e2e, 11-25): a prompt the person typed while Claude Code was busy (a task notification's turn) is
+    # written as "queued" under another prompt id than the hook was given. Only such an entry, with exactly this text,
+    # the person's own origin, written within seconds of the hook, and never used before, counts for it.
+    for i in range(len(entries) - 1, -1, -1):
+        v = entries[i]
+        t = _typed_text(v)
+        if t is None or t.strip() != prompt.strip() or v.get("promptSource") != "queued" or not _person_origin(v):
+            continue
+        w = _when(v.get("timestamp"))
+        if w is None or not (-5 <= w - at <= 30):
+            continue
         return v, _said_turns(entries, i)
     return None
 
@@ -9748,7 +9762,7 @@ def cmd_status_verify(args):
     found = None
     while found is None and time.time() < deadline:
         if os.path.exists(rec["tp"]) and _transcript_ok(rec["tp"], rec["sid"]):
-            found = find_typed(rec["tp"], rec["pid"], rec["prompt"])
+            found = find_typed(rec["tp"], rec["pid"], rec["prompt"], at=rec.get("at"))
         if found is None:
             time.sleep(0.2)
     _drop(path)
@@ -9762,11 +9776,12 @@ def cmd_status_verify(args):
     t = _when(v.get("timestamp"))
     used = read_json(_typed_used_path(sid), {}).get("ids")
     used = used if isinstance(used, list) else []
-    if t is None or not (-60 <= t - rec["at"] <= TYPED_FRESH) or rec["pid"] in used:
+    own_pid = v.get("promptId") if isinstance(v.get("promptId"), str) else rec["pid"]
+    if t is None or not (-60 <= t - rec["at"] <= TYPED_FRESH) or rec["pid"] in used or own_pid in used:
         log("status", "verify: stale or used entry")
         return 0
     try:
-        write_private(_typed_used_path(sid), json.dumps({"ids": (used + [rec["pid"]])[-50:]}))
+        write_private(_typed_used_path(sid), json.dumps({"ids": (used + sorted({rec["pid"], own_pid}))[-50:]}))
     except OSError:
         return 0
     try:
@@ -13317,7 +13332,7 @@ def onboard_tool(inp):
         return None
     event, sid = inp.get("hook_event_name"), _sid(inp)
     if event == "PreToolUse":
-        deadline = time.time() + 10
+        deadline = time.time() + 6  # well inside the hook's timeout: a timed-out hook would let the call through
         while sid and _checks_pending(sid, (kind,)) and time.time() < deadline:
             time.sleep(0.2)
         if sid and grant_ok(kind, sid):
@@ -14336,7 +14351,7 @@ def _final(text, event="PostToolUse"):
     """1.0.16: an install or uninstall's final result, shown as success: the person's line (systemMessage), the MCP
     tool's own result replaced by that text (so the call reads as the result, never as denied or an error), and the
     model told to reply with exactly that text."""
-    out = _post(text, RELAY_AI.format(text=text), event)
+    out = _post(_plain_typed(text), RELAY_AI.format(text=text), event)  # 1.0.18: the plain line shows no markdown
     if event == "PostToolUse":
         out["hookSpecificOutput"]["updatedMCPToolOutput"] = [{"type": "text", "text": text}]
     return out

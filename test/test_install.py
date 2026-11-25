@@ -211,12 +211,12 @@ class Install(Base):
         self.assertTrue(proof_ok(got["typed_proof"], "install", [ALPHA, BETA], pid, "/datastash:install"))
         done = self.tool("PostToolUse", "ledger_agents_note", got, {"run_id": RUN, "kind": "install", "targets": 2,
                                                                      "status_path": "/api/v1/agent/uninstall/" + RUN})["systemMessage"]
-        self.assertEqual(done, "Done. Datastash is on for web-app. Time per card is on. To turn it off, type: datastash "
+        self.assertEqual(done, ds._plain_typed("Done. Datastash is on for web-app. Time per card is on. To turn it off, type: datastash "
                                "time-per-card off\n"
                                "datastash is on for your agents:\n- web-app (public)\n- alpha (private)\n- beta (public)\n"
                                "To remove one or many: /datastash:uninstall and we'll show you the list of agents.\n"
                                "To make one private: say make <name> private.\n"
-                               "To make one public: say make <name> public.\n" + ds.SYNC_TYPE_LINE)
+                               "To make one public: say make <name> public.\n" + ds.SYNC_TYPE_LINE))
 
     def test_the_only_agent_gets_the_list_with_no_note(self):
         self.installed()
@@ -224,7 +224,8 @@ class Install(Base):
         out = self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:1]))
         text = ("Done. Datastash is on for web-app. " + ds.TPC_ON_LINE + "\ndatastash is on for your agents:\n- web-app "
                 "(public)\n" + ds.REMOVE_LINE + "\n" + ds.PRIVATE_LINE + "\n" + ds.PUBLIC_LINE + "\n" + ds.SYNC_TYPE_LINE)
-        self.assertEqual(out["systemMessage"], text)
+        self.assertEqual(out["systemMessage"], ds._plain_typed(text))
+        self.assertIn('Type "datastash sync" to keep', out["systemMessage"])  # 1.0.18: no markdown on that surface
         self.assertEqual(out["hookSpecificOutput"]["updatedMCPToolOutput"], [{"type": "text", "text": text}])
         self.assertIn(text, out["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"], "deny")
@@ -2376,7 +2377,8 @@ class ReinstallKeepsTheName(Base):
         self.prompt("/datastash:install")
         out = self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=[
             {"agent_id": OWN, "name": "robin", "visibility": "public"}]))
-        text = out["systemMessage"]
+        text = out["hookSpecificOutput"]["updatedMCPToolOutput"][0]["text"]
+        self.assertEqual(out["systemMessage"], ds._plain_typed(text))  # 1.0.18: the plain line shows no markdown
         self.assertTrue(text.startswith("Done. Datastash is on for robin. Time per card is on."), text)
         self.assertIn("\ndatastash is on for your agents:\n- robin (public)\n", text)
         self.assertEqual(out["hookSpecificOutput"]["updatedMCPToolOutput"], [{"type": "text", "text": text}])

@@ -551,7 +551,9 @@ src = open(sys.argv[1]).read(); m = types.ModuleType("ds"); m.__file__ = sys.arg
 print(eval(sys.argv[2], {"m": m}))' "$HERE/../plugins/datastash/scripts/datastash" "$2"
 }
 onboard_turn() {  # onboard_turn <typed>: type it, answer datastash's dialogs (and the status save), wait for the turn's end
-  local base_done; base_done="$(count " · done ")"
+  local base_done i
+  for ((i = 0; i < 120; i++)); do screen | grep -qE "background agents? to finish|esc to interrupt" || break; sleep 1; done
+  base_done="$(count " · done ")"
   ONBOARD_BASH=1
   type_line "$1"
   drive_until '(( $(count " · done ") > base_done ))' 240

@@ -50,7 +50,11 @@ class OnboardBase(Base):
     def install(self):
         self.installed()
         self.slash("/datastash:install")
-        return self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:1]))["systemMessage"]
+        out = self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:1]))
+        text = out["hookSpecificOutput"]["updatedMCPToolOutput"][0]["text"]  # what the model relays (markdown)
+        self.assertEqual(out["systemMessage"], ds._plain_typed(text))  # the plain line: no "**" there
+        self.assertNotIn("**", out["systemMessage"])
+        return text
 
     def hours(self, h=33.04, **more):
         ds.write_private(ds.HOURS_PATH, json.dumps(dict({"hours": h, "plans": 1, "agents": 2, "subagents": 9}, **more)))
@@ -99,6 +103,37 @@ class SyncOff(OnboardBase):
         self.assertEqual(ds.onboard_state("s1")["stage"], "status")
         # used once: a second start is the model's own
         self.assertEqual(self.sync_call("PreToolUse")["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_a_queued_prompt_under_another_id_still_counts_once(self):
+        """Real e2e 11-25: typed while Claude Code was busy, the entry is "queued" under another prompt id."""
+        self.install()
+        start = len(self.spawned)
+        self.prompt("datastash sync", entry="datastash sync", source="queued")
+        # rewrite the entry's prompt id, as Claude Code did
+        tp = self.transcript("s1")
+        rows = [json.loads(x) for x in open(tp)]
+        rows[-1]["promptId"] = "00000000-0000-4000-8000-000000000001"
+        rows[-1]["origin"] = {"kind": "human"}
+        with open(tp, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+        self.run_checks(start)
+        self.assertEqual(ds.keep_state(), "yes")
+        self.assertIsNone(self.sync_call("PreToolUse"))
+        # a typed (not queued) entry under another id never counts
+        ds.grant_use("sync", "s1")
+        start = len(self.spawned)
+        self.prompt("save my chats", entry="save my chats")
+        rows = [json.loads(x) for x in open(tp)]
+        rows[-1]["promptId"] = "00000000-0000-4000-8000-000000000002"
+        with open(tp, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+        old = ds.VERIFY_WAIT
+        ds.VERIFY_WAIT = 0.5
+        try:
+            self.run_checks(start)
+        finally:
+            ds.VERIFY_WAIT = old
+        self.assertFalse(ds.grant_ok("chats", "s1"))
 
     def test_sync_datastash_word_order_too(self):
         self.assertEqual(ds.onboard_phrase("sync datastash"), "sync")
