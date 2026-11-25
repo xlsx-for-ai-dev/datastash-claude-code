@@ -8,7 +8,10 @@ Run with python3 -I. Never prints a secret, a code or a token.
   signin                   this script's own connection to the same account (a native throwaway app); its tokens go to
                            E2E_SERVER_TOKEN_FILE (mode 600)
   agents                   the account's agents that are on, as a JSON list of names (ledger_agents_list)
-  off NAME                 switch that agent off (ledger_agent_switch_off, the person's connection): cleanup only
+  on NAME                  switch that agent back on (ledger_agent_switch_off action "on", the person's own switch-on):
+                           only to recover a name a plain switch-off left off (an older harness did that), so the typed
+                           uninstall can remove it and the name installs again (x-live #510). This script never switches
+                           an agent off: a plain switch-off is not an uninstall, and a reinstall does not bring it back.
   apps                     how many app connections the account has (sync apps), as a number
   other-apps               the names of the account's app connections other than this script's own, as JSON (Claude
                            Code's sign-ins share one client, so they show as one app)
@@ -275,11 +278,15 @@ def cmd_agents():
     print(json.dumps(sorted(a.get("name") for a in out["agents"])))
 
 
-def cmd_off(name):
-    err, out = tool("ledger_agent_switch_off", {"name": name, "action": "off"})
+def cmd_on(name):
+    err, out = tool("ledger_agent_switch_off", {"name": name, "action": "on"})
+    code = out.get("code") if isinstance(out, dict) else None
+    if err and code in ("agent_already_on", "agent_not_found"):
+        print(f"{name}: {'already on' if code == 'agent_already_on' else 'no such agent'} (nothing switched on)")
+        return
     if err:
-        die(f"switch off {name!r} refused ({out.get('code') if isinstance(out, dict) else 'no code'})")
-    print(f"switched off {name}")
+        die(f"switch on {name!r} refused ({code or 'no code'})")
+    print(f"switched on {', '.join(out.get('switched_on') or [name])} (the person's switch-on)")
 
 
 def apps():
@@ -334,8 +341,8 @@ def main(argv):
         return cmd_signin()
     if c == "agents":
         return cmd_agents()
-    if c == "off" and len(argv) == 2:
-        return cmd_off(argv[1])
+    if c == "on" and len(argv) == 2:
+        return cmd_on(argv[1])
     if c == "apps":
         print(len(apps()))
         return None

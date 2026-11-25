@@ -48,21 +48,29 @@
 #   E2E_SELFTEST_SECRET_FILE  default /home/xpm/handover/selftest-oauth.secret (the bare secret, mode 600).
 # The test account: one fixed label (E2E_ACCOUNT, default plugin-e2e), the same every run. The server allows at most 10
 #   selftest labels and 20 selftest sign-ins in a rolling hour (x-live src/auth/selftest-oauth.ts), so a run never makes a
-#   new label. Clean start: before the matrix the read-back (the person's own connection) switches off every agent left
-#   on and disconnects every app connection but its own (ledger_agent_switch_off, sync disconnect: the product's own
-#   paths); the run stops if any is left. The same cleanup runs at the end, pass or fail (trap). An agent once switched
-#   off is installed again under its own name (x-live #510), so the same label serves every run.
+#   new label. Agents are removed only by the person's typed uninstall (/datastash:uninstall all, then the typed
+#   "remove all N"), never by a plain switch-off: an uninstalled name installs again under its own name (x-live #510),
+#   a switched-off one is refused ("the name is switched off"), so a switch-off would break the next run.
+#   Clean start: when agents are left on (a run that was killed before its cleanup), a cleanup computer (its own HOME, its
+#   own sign-in, agent "e2e-clean" in ~/code/e2e-clean) installs and types /datastash:uninstall all; then the read-back
+#   disconnects every app connection but its own (sync disconnect); the run stops if anything is left.
+#   Recovery of a name an older harness switched off: E2E_SWITCH_ON="agent ..." first switches those back on through the
+#   person's own switch-on (ledger_agent_switch_off action "on"), so the clean start's typed uninstall removes them.
+# Every run tees its whole output to E2E_LOG (default ~/x/ops/proofs/plugin-e2e-real-<UTC time>-<pid>.md).
 # Sign-in budget: a run counts the selftest sign-ins it needs (the read-back 1; core 2, step5 2, outbox 1, update 2) and
-#   stops before it starts when those plus this harness's own sign-ins of the last hour (E2E_SIGNIN_LEDGER, default
-#   ~/.local/state/datastash-e2e/selftest-signins: one time per line) would pass 20. A server refusal (HTTP 429) names
+#   waits (one sleep, until enough of the oldest free) when those plus this harness's own sign-ins of the last hour
+#   (E2E_SIGNIN_LEDGER, default ~/.local/state/datastash-e2e/selftest-signins: one time per line) would pass 20; a
+#   cleanup computer counts one more. E2E_BUDGET_WAIT=0: stop instead of waiting. A server refusal (HTTP 429) names
 #   its reason: rate_limited (the hourly limit) or too_many_accounts (no new label can be made).
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
 #   E2E_PARTS ("core update", default both; "step5" runs step 5 alone; "outbox" runs step 9 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
 #   E2E_CANDIDATE=<branch or tag, pushed to the plugin repo>: test that commit before it is released: the core steps
 #   install it from a local copy of the catalog pinned to it, and 6a updates to it; 6b (self-update moves only to a
 #   release tag) stays on the published pin.
-# Cleanup, pass or fail: every agent left on the test account is switched off, every app connection on it disconnected
-# (the read-back's own last), the tmux sessions end, processes from the throwaway HOMEs stop, the HOMEs go to ~/trash.
+# Cleanup, pass or fail (its last step, or the trap when a run stops early): every agent left on the test account is
+# removed by the typed uninstall from a computer of this run that holds one of their keys (else a cleanup computer),
+# every app connection on it is disconnected (the read-back's own last), the tmux sessions end, processes from the
+# throwaway HOMEs stop, the HOMEs go to ~/trash.
 # Exit 0 PASS, 1 FAIL, 2 can't run here, 3 no step failed but some are WAITING (no Claude login yet).
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -81,8 +89,13 @@ RUN="dsreal-$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ds-e2e-real.XXXXXX")"
 export E2E_SERVER_TOKEN_FILE="$WORK/server.tok"
 SRV=(python3 -I "$HERE/e2e_server.py")
-FAILS=0 WAITS=0 STARTS=0 T="" LOGIN=0 BADTOOL=0 NOANSWER=0
+FAILS=0 WAITS=0 STARTS=0 T="" LOGIN=0 BADTOOL=0 NOANSWER=0 IN_CLEANUP=0 END_CLEAN=0 CLEAN_N=0 CLEAN_HOME=""
 RESULTS=()
+
+# --- the log: every run leaves its whole output under ~/x/ops/proofs (no secret is ever printed).
+E2E_LOG="${E2E_LOG:-$REAL_HOME/x/ops/proofs/plugin-e2e-real-$(date -u +%Y%m%d-%H%M%SZ)-$$.md}"
+mkdir -p "$(dirname "$E2E_LOG")" && touch "$E2E_LOG" || { echo "CAN'T RUN: the log $E2E_LOG can't be written"; exit 2; }
+exec > >(tee -a "$E2E_LOG") 2>&1
 
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 pass() { say "PASS $*"; RESULTS+=("PASS  $*"); }
@@ -90,12 +103,12 @@ fail() { say "FAIL $*"; RESULTS+=("FAIL  $*"); FAILS=$((FAILS + 1)); }
 waiting() { say "WAITING $*"; RESULTS+=("WAIT  $*"); WAITS=$((WAITS + 1)); }
 
 cleanup() {
-  local s n
+  local s left
   trap - EXIT
+  IN_CLEANUP=1
   if [[ -s "$E2E_SERVER_TOKEN_FILE" ]]; then
-    for n in $("${SRV[@]}" agents 2>/dev/null | python3 -I -c 'import json,sys; print(*json.load(sys.stdin))' 2>/dev/null); do
-      "${SRV[@]}" off "$n" >/dev/null 2>&1 && say "cleanup: switched off leftover agent \"$n\""
-    done
+    # The run stopped before its own cleanup step: the typed uninstall now (never a plain switch-off).
+    ((END_CLEAN)) || ! declare -F typed_cleanup >/dev/null || typed_cleanup "cleanup (the run stopped early)" || true
     left="$("${SRV[@]}" agents 2>/dev/null)"
     [[ "$left" == "[]" ]] && say "cleanup: no agent left on the test account" || say "cleanup: WARNING agents left on the test account: ${left:-unknown}"
     "${SRV[@]}" disconnect-all 2>&1 | sed 's/^/cleanup: /'
@@ -105,6 +118,7 @@ cleanup() {
   pkill -f "$WORK/" 2>/dev/null; sleep 1; pkill -9 -f "$WORK/" 2>/dev/null
   mkdir -p "$REAL_HOME/trash"
   mv "$WORK" "$REAL_HOME/trash/" 2>/dev/null && [[ "${E2E_KEEP:-0}" == 1 ]] && say "throwaway HOMEs kept in $REAL_HOME/trash/$(basename "$WORK")"
+  say "log: $E2E_LOG"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
@@ -125,40 +139,42 @@ NEED=1  # the read-back's own sign-in
 for p in $PARTS; do
   case "$p" in core|step5|update) NEED=$((NEED + 2)) ;; outbox) NEED=$((NEED + 1)) ;; esac
 done
-read -r USED FREE_AT < <(python3 -I - "$E2E_SIGNIN_LEDGER" <<'PY'
-import sys, time
-now = time.time()
+signins_last_hour() {
+  python3 -I -c 'import sys, time
+n = time.time()
+try:
+    print(sum(1 for l in open(sys.argv[1]) if l.strip().isdigit() and n - int(l) < 3600))
+except OSError:
+    print(0)' "$E2E_SIGNIN_LEDGER"
+}
+budget_wait() {  # budget_wait <sign-ins still to make>: one wait when the last hour's sign-ins plus these would pass 20
+  local need="$1" used wait_s
+  read -r used wait_s < <(python3 -I -c 'import sys, time
+now, need, cap = time.time(), int(sys.argv[2]), int(sys.argv[3])
 try:
     ts = sorted(int(l) for l in open(sys.argv[1]) if l.strip().isdigit() and now - int(l) < 3600)
 except OSError:
     ts = []
-print(len(ts), time.strftime("%H:%M:%SZ", time.gmtime(ts[0] + 3600)) if ts else "-")
-PY
-)
-if ((USED + NEED > SIGNIN_MAX_PER_HOUR)); then
-  echo "CAN'T RUN: this run needs $NEED selftest sign-ins; $USED were used in the last hour (the server allows $SIGNIN_MAX_PER_HOUR an hour). The oldest frees at $FREE_AT; run again then."
-  exit 2
-fi
-say "sign-in budget: this run needs $NEED selftest sign-ins; $USED used in the last hour by this harness (limit $SIGNIN_MAX_PER_HOUR)"
+over = len(ts) + need - cap
+print(len(ts), -1 if need > cap else (max(0, int(ts[over - 1] + 3600 - now)) + 10 if over > 0 else 0))' \
+    "$E2E_SIGNIN_LEDGER" "$need" "$SIGNIN_MAX_PER_HOUR")
+  ((wait_s < 0)) && { say "sign-in budget: $need sign-ins can never fit in $SIGNIN_MAX_PER_HOUR an hour"; return 1; }
+  if ((wait_s > 0)); then
+    [[ "${E2E_BUDGET_WAIT:-1}" == 1 ]] || { say "sign-in budget: $need more needed, $used used in the last hour (limit $SIGNIN_MAX_PER_HOUR); E2E_BUDGET_WAIT=0, so no wait"; return 1; }
+    say "sign-in budget: $need more needed, $used used in the last hour (limit $SIGNIN_MAX_PER_HOUR): waiting ${wait_s}s, until $(date -u -d "@$(($(date +%s) + wait_s))" +%H:%M:%SZ)"
+    sleep "$wait_s"
+    used="$(signins_last_hour)"
+  fi
+  say "sign-in budget: $need more needed; $used used in the last hour by this harness (limit $SIGNIN_MAX_PER_HOUR)"
+}
+NEED_START=$NEED
+[[ -n "${E2E_SWITCH_ON:-}" ]] && NEED_START=$((NEED + 1))  # the recovery's cleanup computer
+budget_wait "$NEED_START" || { echo "CAN'T RUN: the sign-in budget (above)"; exit 2; }
 
-# --- the server read-back: its own connection to the selftest account; the account starts clean: no agent on, no app
-# connection but the read-back's own.
+# --- the server read-back: its own connection to the selftest account (the clean start is below, before the matrix).
 "${SRV[@]}" signin || { echo "CAN'T RUN: the read-back could not sign in to the selftest account \"$E2E_ACCOUNT\" (reason above)"; exit 2; }
 agents() { "${SRV[@]}" agents; }
 has_agent() { agents | python3 -I -c 'import json,sys; sys.exit(0 if sys.argv[1] in json.load(sys.stdin) else 1)' "$1"; }
-START_AGENTS="$(agents)" || { echo "CAN'T RUN: ledger_agents_list refused on the read-back"; exit 2; }
-if [[ "$START_AGENTS" != "[]" ]]; then
-  say "the test account has agents left from an earlier run: $START_AGENTS; switching them off first"
-  for n in $(python3 -I -c 'import json,sys; print(*json.loads(sys.argv[1]))' "$START_AGENTS"); do "${SRV[@]}" off "$n"; done
-  [[ "$(agents)" == "[]" ]] || { echo "CAN'T RUN: the test account still has agents on"; exit 2; }
-fi
-START_APPS="$("${SRV[@]}" other-apps)" || { echo "CAN'T RUN: sync apps refused on the read-back"; exit 2; }
-if [[ "$START_APPS" != "[]" ]]; then
-  say "the test account has app connections left from an earlier run: $START_APPS; disconnecting them first"
-  "${SRV[@]}" disconnect-others | sed 's/^/  /'
-  [[ "$("${SRV[@]}" other-apps)" == "[]" ]] || { echo "CAN'T RUN: the test account still has other app connections"; exit 2; }
-fi
-say "server: test account \"$E2E_ACCOUNT\" signed in for read-back; clean: no agent on, no other app connection"
 
 # --- catalogs: the published one (as the README says), or a local copy pinned to a tag (for the update steps).
 pinned_catalog() {  # pinned_catalog <dir> <tag>: the repo's catalog with datastash pinned to <tag>'s commit
@@ -251,6 +267,7 @@ drive_until() {  # drive_until <shell condition> [seconds]: answer dialogs until
     eval "$1" && return 0
     if screen | grep -qE "API Error: 40[13]|Please run /login|OAuth access token is invalid"; then
       fail "the Claude login was refused in the session (the token in $CLAUDE_ENV); the run stops here"; show_tail 6
+      ((IN_CLEANUP)) && return 1
       exit 1
     fi
     answer_dialog || sleep 1
@@ -673,6 +690,74 @@ update_part() {  # update_part a|b
   stop_claude
 }
 
+clean_computer() {  # clean_computer <tag> <sign-ins still to make after it>: a fresh computer whose own agent "e2e-clean"
+  # (removed by the uninstall that follows, so it installs again next time) can sign the person's typed names
+  local tag="$1" h dir
+  budget_wait $((1 + $2)) || return 1
+  h="$(new_home "C$((++CLEAN_N))")"; dir="$h/code/e2e-clean"; new_repo "$dir"
+  say "== $tag: a cleanup computer, repo folder ~/code/e2e-clean"
+  readme_steps "$tag: cleanup computer" "$h" "$dir" "$CORE_SRC" || return 1
+  authenticate "$tag: cleanup computer" || { stop_claude; return 1; }
+  # shellcheck disable=SC2046
+  ds_install "$tag: cleanup computer" "$h" e2e-clean $(on_names e2e-clean) || { stop_claude; return 1; }
+  CLEAN_HOME="$h"
+}
+
+typed_cleanup() {  # typed_cleanup <tag> [<sign-ins still to make after it>]: every agent left on goes the person's way:
+  # /datastash:uninstall all, then the typed "remove all N", from a computer of this run that holds one of their keys
+  # (else a cleanup computer). Never a plain switch-off. True when no agent is left on.
+  local tag="$1" on k n h="" dir keep="$T"
+  on="$(on_names)" || { say "$tag: WARNING the read-back could not list the agents"; return 1; }
+  [[ -z "$on" ]] && { say "$tag: no agent on the test account"; return 0; }
+  ((LOGIN)) || { say "$tag: WARNING agents left on ($on) and no Claude login to uninstall them"; return 1; }
+  say "$tag: agents on: $on; removing them with the typed uninstall"
+  for k in "$WORK"/*/person/.config/datastash/agent-*.key; do
+    [[ -s "$k" ]] || continue
+    n="${k##*/agent-}"; n="${n%.key}"
+    [[ " $on " == *" $n "* ]] || continue
+    h="${k%/.config/datastash/*}"
+    break
+  done
+  if [[ -n "$h" ]]; then
+    dir="$h/code/$n"; [[ "$n" == agent || ! -d "$dir" ]] && dir="$h"
+    say "== $tag: ${h#"$WORK/"}, \"$n\"'s own folder (its key signs the typed names)"
+    start_claude "$h" "$dir" || { say "$tag: WARNING claude did not start"; T="$keep"; return 1; }
+  else
+    clean_computer "$tag" "${2:-0}" || { say "$tag: WARNING the cleanup computer could not install"; T="$keep"; return 1; }
+    h="$CLEAN_HOME"
+  fi
+  # shellcheck disable=SC2046
+  ds_uninstall "$tag" "$h" all $(on_names)
+  stop_claude
+  T="$keep"
+  [[ "$(agents)" == "[]" ]] && { say "$tag: no agent left on the test account"; return 0; }
+  say "$tag: WARNING agents still on: $(agents)"
+  return 1
+}
+
+# --- the clean start: no agent on (removed by the typed uninstall), no app connection but the read-back's own.
+if [[ -n "${E2E_SWITCH_ON:-}" ]]; then
+  say "recovery: switching on $E2E_SWITCH_ON (the person's own switch-on), so the typed uninstall removes it and its name installs again"
+  for n in $E2E_SWITCH_ON; do
+    "${SRV[@]}" on "$n" | sed 's/^/  /'
+    ((PIPESTATUS[0] == 0)) || { echo "CAN'T RUN: the switch-on of \"$n\" was refused (reason above)"; exit 2; }
+  done
+fi
+START_AGENTS="$(agents)" || { echo "CAN'T RUN: ledger_agents_list refused on the read-back"; exit 2; }
+if [[ "$START_AGENTS" != "[]" ]]; then
+  say "the test account has agents on from an earlier run: $START_AGENTS"
+  IN_CLEANUP=1
+  typed_cleanup "clean start" $((NEED - 1)) || { END_CLEAN=1; echo "CAN'T RUN: the test account still has agents on: $(agents)"; exit 2; }
+  IN_CLEANUP=0
+fi
+START_APPS="$("${SRV[@]}" other-apps)" || { echo "CAN'T RUN: sync apps refused on the read-back"; exit 2; }
+if [[ "$START_APPS" != "[]" ]]; then
+  say "the test account has app connections left from an earlier run: $START_APPS; disconnecting them first"
+  "${SRV[@]}" disconnect-others | sed 's/^/  /'
+  [[ "$("${SRV[@]}" other-apps)" == "[]" ]] || { echo "CAN'T RUN: the test account still has other app connections"; exit 2; }
+fi
+say "server: test account \"$E2E_ACCOUNT\" signed in for read-back; clean: no agent on, no other app connection"
+
 for p in $PARTS; do
   case "$p" in
     core) core ;;
@@ -682,6 +767,11 @@ for p in $PARTS; do
     *) echo "unknown part: $p"; exit 2 ;;
   esac
 done
+
+IN_CLEANUP=1
+if typed_cleanup "cleanup"; then pass "cleanup: no agent left on the test account (typed uninstall only)"
+else fail "cleanup: agents left on the test account: $(agents)"; fi
+END_CLEAN=1 IN_CLEANUP=0
 
 say "---- results (${E2E_ACCOUNT}; published $PUBLISHED_REF${E2E_CANDIDATE:+; candidate $E2E_CANDIDATE}; old $OLD_TAG)"
 printf '  %s\n' "${RESULTS[@]}"
