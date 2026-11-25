@@ -13756,11 +13756,20 @@ def command_tool(inp):
                 _drop(_cmd_path(sid))
                 tpc_install_kick(inp)
                 return _final(install_text(inp, rec, lst))
+        elif rec.get("confirm") is not None:
+            # 1.0.16 (real e2e): the model listed again while "all" waits for its confirm: the step stays open, bound to
+            # this newest list (the one the note will be checked against), and the person sees the same lines again
+            # only while it lists exactly the same agents; else the old confirm stays and is refused (1.0.11 rule)
+            same = all_confirm(lst)["ids"] == (rec["confirm"] or {}).get("ids")
+            save_cmd(sid, dict(rec, confirm=all_confirm(lst)) if same else rec)
+            shown = all_confirm_lines(lst)
+            return _post(shown, ALL_CONFIRM_AI + " " + RELAY_AI.format(text=shown))
         elif rec.get("picks"):
             got = resolve_picks(rec["picks"], lst, mine)
             if got == "confirm":  # 1.0.11 stored-name HIGH: "/datastash:uninstall all" asks to confirm first
                 save_cmd(sid, dict(rec, picks="", confirm=all_confirm(lst)))
-                return _post(all_confirm_lines(lst), ALL_CONFIRM_AI)
+                shown = all_confirm_lines(lst)  # 1.0.16: relayed word for word, then wait
+                return _post(shown, ALL_CONFIRM_AI + " " + RELAY_AI.format(text=shown))
             if not isinstance(got, list):
                 _drop(_cmd_path(sid))
                 return _post(pick_refused_line(rec["picks"], lst, mine), PICK_REFUSED_AI)

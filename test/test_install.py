@@ -363,7 +363,7 @@ class Uninstall(Base):
         shown = self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
         self.assertEqual(shown["systemMessage"], "This removes all 3 of your datastash agents:\n- web-app (public)\n"
                          "- alpha (private)\n- beta (public)\n" + ds.ALL_CONFIRM_LINE.format(n=3))
-        self.assertEqual(shown["hookSpecificOutput"]["additionalContext"], ds.ALL_CONFIRM_AI)
+        self.assertTrue(shown["hookSpecificOutput"]["additionalContext"].startswith(ds.ALL_CONFIRM_AI))
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"],
                          "deny")  # "all" alone removes nothing yet
         v, pid = self.prompt("remove all 3")
@@ -1349,11 +1349,15 @@ class AllConfirm(Base):
     def test_the_confirm_is_bound_to_the_list_shown(self):
         self.open_step()
         other = dict(LIST, list_id=str(uuid.UUID(int=0xA2)))
-        self.tool("PostToolUse", "ledger_agents_list", {}, other)  # a list fetched again while the step is open
-        v, _ = self.prompt("remove all 3")
-        self.assertEqual(v["reason"], ds.ALL_NOT_CONFIRMED_LINE)
+        # 1.0.16 (real e2e): a list fetched again with exactly the same agents keeps the step open on that newest list
+        again = self.tool("PostToolUse", "ledger_agents_list", {}, other)
+        self.assertTrue(again["systemMessage"].startswith("This removes all 3 of your datastash agents:"))
+        v, pid = self.prompt("remove all 3")
+        self.assertNotIn("reason", v)
+        got = self.note()["updatedInput"]
+        self.assertEqual(got["list_id"], other["list_id"])
         self.open_step()
-        self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:2]))
+        self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:2]))  # other agents
         self.assertEqual(self.prompt("remove all 2")[0]["reason"], ds.ALL_NOT_CONFIRMED_LINE)
         self.assertEqual(self.note()["permissionDecision"], "deny")
 
