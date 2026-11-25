@@ -735,6 +735,7 @@ step11_hands_free() {  # step11_hands_free <A's HOME>: 1.0.17: a new release arr
   want="$(git -C "$REPO" show "$sha:plugins/datastash/.claude-plugin/plugin.json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
   [[ "$(autoupdate_state "$h")" == true ]] || { fail "11: auto-update is not on for datastash after step 1"; return; }
   say "== 11 hands-free release: catalog moved to $E2E_NEXT_REF at ${sha:0:7} (plugin $want); installed $(installed_version "$h")"
+  cp "$cat" "$cat.candidate"
   python3 -I - "$cat" "$E2E_NEXT_REF" "$sha" <<'PY2'
 import json, sys
 cat = json.load(open(sys.argv[1]))
@@ -761,7 +762,8 @@ PY2
     fail "11: hands-free release: installed $v after ${i}s (wanted $want; self-update \"$r\")"; show_tail 10
   fi
   stop_claude
-  say "11: the catalog stays on $E2E_NEXT_REF (the candidate's code at version $want) for the rest of the run"
+  mv -f "$cat.candidate" "$cat"  # the rest of the run (B, 6a) installs the candidate itself again
+  say "11: the catalog is back on the candidate $E2E_CANDIDATE for the rest of the run"
 }
 
 step5_from_b() {  # step5_from_b <A's HOME>: computer B: step 1 from a repo folder, 8, 5 (folder "site": a name no
