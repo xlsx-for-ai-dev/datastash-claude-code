@@ -15,8 +15,9 @@
 #   5. /datastash:install: the plugin's own prompt hook takes the typed command and picks the agent's name: "agent" in
 #      the home folder (1.0.1: the computer user's name), "web-app" in the repo.
 #   6. /datastash:uninstall in that same session, which has no agent key on this computer (1.0.12 refused it there
-#      with "Type /datastash:install again"): the plugin's prompt hook must take it and open the uninstall step. The
-#      key-less signing that follows is covered offline (test/test_install.py UninstallNoKey, UninstallNoKeyRealHooks).
+#      with "Type /datastash:install again"): 1.0.16's prompt hook answers it with its own line, "Datastash isn't
+#      installed on this agent. Nothing was removed." The key-less signing by another agent on this computer is covered
+#      offline (test/test_install.py UninstallNoKey, UninstallNoKeyRealHooks).
 # PASS only when every step passes in every folder. Exit 0 PASS, 1 FAIL, 2 can't run here (no tmux, claude, network).
 #
 # NOT covered here (said as NOT RUN at the end of every run): finishing Authenticate's sign-in, and what follows it
@@ -99,7 +100,7 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
   local h="$1" dir="$2"
   T="$RUN-$((++STARTS))"
   tmux new-session -d -s "$T" -x 200 -y 50 -c "$dir" \
-    "env -i PATH='$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER=person LOGNAME=person TERM=xterm-256color LANG=C.UTF-8 '$CLAUDE_BIN'"
+    "env -i PATH='$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER=sam LOGNAME=sam TERM=xterm-256color LANG=C.UTF-8 '$CLAUDE_BIN'"
   if wait_for "trust this folder" 40; then
     tmux send-keys -t "$T" Down; sleep 0.5; tmux send-keys -t "$T" Enter
   fi
@@ -124,7 +125,8 @@ PY
 
 run_folder() {  # run_folder home|repo
   local where="$1" h dir want
-  h="$WORK/$where/person"  # the HOME's own name is the computer user's ("person", USER in the session)
+  h="$WORK/$where/sam"  # the HOME's own name is the computer user's ("sam", USER in the session; "person" is a
+  # name datastash keeps, so a user named that gets "person-2")
   mkdir -p "$h"
   # A brand-new computer, past Claude Code's first-run theme screen (the person picks a theme), with no Claude login.
   printf '{"hasCompletedOnboarding": true, "theme": "dark"}\n' > "$h/.claude.json"
@@ -133,7 +135,7 @@ run_folder() {  # run_folder home|repo
     mkdir -p "$dir" && git -C "$dir" init -q && git -C "$dir" -c user.name=Test -c user.email=test@example.invalid \
       commit -q --allow-empty -m init
   else
-    dir="$h"; want="person"  # 1.0.16: the home folder's agent is the computer's user, never "agent"
+    dir="$h"; want="sam"  # 1.0.16: the home folder's agent is the computer's user, never "agent"
   fi
   say "== $where folder (claude started in ${dir#"$WORK/"})"
 
@@ -216,17 +218,15 @@ check_install_hook() {  # step 5, the plugin's half: the typed /datastash:instal
     fail "$where step 5: /datastash:install: wanted agent name \"$want\", the plugin has: ${got:-nothing}"
   fi
   tmux send-keys -t "$T" Escape; sleep 1
-  # Step 6 (1.0.13): uninstall from this key-less session reaches the plugin (no agent key here, no install first).
+  # Step 6 (1.0.16): uninstall from this key-less session (no agent key on this computer, the install never finished)
+  # is answered by the plugin's own prompt hook, before any step runs: the person sees its one line, and no other.
+  local none_line="Datastash isn't installed on this agent. Nothing was removed."
   type_line "/datastash:uninstall"
-  for ((i = 0; i < 30; i++)); do
-    got="$(command_record "$h" 2>/dev/null)"
-    [[ "$got" == uninstall* ]] && break
-    sleep 1
-  done
-  if [[ "$got" == uninstall* ]] && ! pane | grep -q "Type /datastash:install again. Nothing changed"; then
-    pass "$where step 6: /datastash:uninstall from a session with no agent key reached the plugin"
+  wait_for "$none_line" 30
+  if pane | grep -qF -- "$none_line" && ! pane | grep -q "Type /datastash:install again. Nothing changed"; then
+    pass "$where step 6: /datastash:uninstall from a session with no agent key shows \"$none_line\""
   else
-    fail "$where step 6: /datastash:uninstall from a key-less session: the plugin has: ${got:-nothing}"
+    fail "$where step 6: /datastash:uninstall from a key-less session did not show \"$none_line\""; show_tail
   fi
   tmux send-keys -t "$T" Escape; sleep 1
 }
