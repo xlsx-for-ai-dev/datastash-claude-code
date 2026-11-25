@@ -9643,8 +9643,8 @@ def _status_remind(inp, sid):
     asked = _mtime(_turn_path(sid, ".asked"))
     if asked is not None and asked >= start:
         return None
-    cmd = load_cmd(sid)  # 1.0.18 real e2e: the person's install or uninstall turn ends with the plugin's line, word for
-    if cmd is not None and cmd["at"] >= start - 5:  # word: never a status reminder shown after it
+    cmd = _mtime(_turn_path(sid, ".cmd"))  # 1.0.18 real e2e: the person's install or uninstall turn ends with the
+    if cmd is not None and cmd >= start - 5:  # plugin's line, word for word: never a status reminder shown after it
         return None
     if door_missing():
         return None  # the status would go nowhere yet
@@ -14369,6 +14369,7 @@ def load_cmd(sid):
 def save_cmd(sid, rec):
     ensure_dirs()
     write_private(_cmd_path(sid), json.dumps(rec))
+    write_private(_turn_path(sid, ".cmd"), "1")  # this turn is the person's datastash command (no status reminder)
 
 
 def _own(inp):

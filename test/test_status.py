@@ -569,12 +569,12 @@ class StopHook(Base):
         the person a block of instructions."""
         self.turn()
         ds.save_cmd("sess1", {"sid": "sess1", "prompt": "/datastash:install", "at": time.time(), "kind": "install"})
+        ds._drop(ds._cmd_path("sess1"))  # the finished install drops its record before the turn ends
         self.tool()
         self.assertIsNone(self.stop())
+        os.utime(ds._turn_path("sess1", ".cmd"), (time.time() - 60, time.time() - 60))
         self.turn()  # the next turn of the session is an ordinary one again
         self.tool()
-        rec = ds.read_json(ds._cmd_path("sess1"), {})
-        ds.save_cmd("sess1", dict(rec, at=time.time() - 60))
         self.assertEqual(self.stop()["decision"], "block")
 
     def test_quiet_without_a_material_change(self):
