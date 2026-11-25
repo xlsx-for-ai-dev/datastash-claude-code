@@ -310,6 +310,15 @@ def cmd_disconnect_all(keep_mine=False):
         sys.exit(1)
 
 
+def cmd_chats(state):
+    """1.0.18: the account's chat saving (chatstash), set by the person's own read-back connection: "off" before and
+    after the onboarding's "save my chats", so the other steps' sessions don't save every exchange."""
+    err, out = tool("sync", {"action": "stop_chatstash" if state == "off" else "start_chatstash"})
+    if err:
+        die(f"chatstash {state} refused ({out.get('code') if isinstance(out, dict) else 'no code'})")
+    print(f"chat saving is {state} for the test account")
+
+
 def cmd_inbox_marks(wb, inbox, mark):
     """XLI-408: the read-back of the offline outbox step: the person's connection reads the agent's inbox from the start."""
     import re
@@ -353,6 +362,8 @@ def main(argv):
         return cmd_disconnect_all()
     if c == "disconnect-others":
         return cmd_disconnect_all(keep_mine=True)
+    if c == "chats" and len(argv) == 2 and argv[1] in ("on", "off"):
+        return cmd_chats(argv[1])
     if c == "inbox-marks" and len(argv) == 4:
         return cmd_inbox_marks(argv[1], argv[2], argv[3])
     die("unknown command", 2)

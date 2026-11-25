@@ -569,6 +569,7 @@ onboard_flow() {
   synced="$(ds_plugin "$h" 'm._plain_typed(m.SYNCED_LINE).replace("\"", "")')"
   ask="$(ds_plugin "$h" 'm._plain_typed(m.ONBOARD_LAST_ASK).replace("\"", "")')"
   fnline="$(ds_plugin "$h" 'm._plain_typed(m.FUNCTIONS_AGAIN_LINE).replace("\"", "")')"
+  "${SRV[@]}" chats off >/dev/null || say "    (could not turn chat saving off before the onboarding)"
   local -a features
   mapfile -t features < <(ds_plugin "$h" '"\n".join(x for head, items in m.FEATURES for x in [head] + [n + ": " + t for n, t in items])')
   if grep -qF "$sync_line" <<<"$(flat)"; then
@@ -608,6 +609,7 @@ onboard_flow() {
   grep -qF "standing yes" <<<"$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "save my chats")" \
     && { fail "$tag onboarding: house rules were shown at the end (owner 11-25: dropped)"; ok=0; }
   ((BADTOOL)) && { fail "$tag onboarding: the model asked for a tool that is not datastash's (refused)"; ok=0; }
+  "${SRV[@]}" chats off >/dev/null || say "    (could not turn chat saving off after the onboarding)"
   ((ok)) && pass "$tag onboarding: every step, one ask at a time"
   ((ok))
 }
