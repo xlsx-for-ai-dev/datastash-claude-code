@@ -117,6 +117,18 @@ class SyncOff(OnboardBase):
         self.assertEqual(ds.timers_rule(), ds.TIMERS_ON_RULE)
         self.assertFalse(ds.server_takes_timers())
 
+    def test_the_real_sync_answer_two_text_blocks(self):
+        """Real e2e 11-25: the connector answers with its JSON block and then a plain-text line."""
+        self.install()
+        self.typed_phrase("datastash sync")
+        self.assertIsNone(self.sync_call("PreToolUse"))
+        resp = [{"type": "text", "text": json.dumps({"sync": "on", "chatstash": "off", "say_to_user": "Sync is on."})},
+                {"type": "text", "text": "This person has datastash settings on (their own); checkin lists them."}]
+        post = self.hook(ds.cmd_agent_tool, {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": TOOL + "sync",
+                                             "tool_input": {"action": "start"}, "cwd": self.folder, "tool_response": resp})
+        self.assertIn("----\n" + ds.SYNCED_LINE + "\n----", post["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(ds.sync_on())
+
     def test_a_queued_prompt_under_another_id_still_counts_once(self):
         """Real e2e 11-25: typed while Claude Code was busy, the entry is "queued" under another prompt id."""
         self.install()

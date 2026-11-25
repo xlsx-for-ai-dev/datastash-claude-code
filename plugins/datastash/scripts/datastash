@@ -14434,8 +14434,10 @@ def tool_answer(resp):
     if isinstance(resp, dict) and not ({"content", "type", "text"} & set(resp)):
         return resp
     texts = [t for t in _strings(resp, []) if t != "text"]
+    # 1.0.18 real e2e: the sync answer comes as the JSON block plus a plain-text line ("This person has datastash
+    # settings on..."), so the answer is the first block, when it is one JSON object
     try:
-        body = json.loads(texts[0]) if len(texts) == 1 else None
+        body = json.loads(texts[0]) if texts else None
     except ValueError:
         return None
     return body if isinstance(body, dict) else None
