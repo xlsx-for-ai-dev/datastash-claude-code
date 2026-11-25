@@ -531,98 +531,11 @@ class Sending(Base):
 
 
 class Fold(Base):
+    """1.0.18: Burn rows are never folded any more (no row limit on the engine side); only a fold an older plugin cut short
+    (its journal on disk, its folded_* cells already written) is finished, so each card reads the same totals."""
     def setUp(self):
         super().setUp()
-        self.old_at = ds.TPC_FOLD_AT
-        ds.TPC_FOLD_AT = 4
         self.journal = os.path.join(ds.STATE, f"tpc-fold-{WB}.json")
-
-    def tearDown(self):
-        ds.TPC_FOLD_AT = self.old_at
-        super().tearDown()
-
-    def seed(self, card, last, rows):
-        for act, minutes, toks, cost in rows:
-            self.fake.apply("Burn", {"key": f"{card} / - / {act} / seed-model", "card": card, "activity": act, "model": "seed-model",
-                                     "minutes": minutes, "calls": 1, "tokens": toks, "tokens_in": toks, "est_cost": cost})
-        self.fake.apply("Cards cost", {"card": card, "last_seen": last})
-
-    def test_past_the_limit_the_oldest_finished_cards_fold_and_read_the_same(self):
-        self.seed("OLD-1", "2026-11-01T00:00:00.000Z", [("coding", 3, 100, 0.5), ("reviewing", 2, 50, {"cant_calculate": "x"})])
-        self.seed("OLD-2", "2026-11-02T00:00:00.000Z", [("testing", 1, 10, 0.1)])
-        self.seed("NEW-3", "2026-11-03T00:00:00.000Z", [("coding", 1, 1, 0)])
-        log = Log(self.main, branch="old-1")  # this report's card is OLD-1: never folded now
-        log.prompt(0)
-        log.turn(5, [("Edit", {"file_path": "/a"})])
-        r = self.run_once()  # Burn: 4 seeded + 1 new = 5 rows > 4
-        self.assertEqual(r["folded"], ["OLD-2"])
-        self.assertNotIn("OLD-2 / - / testing / seed-model", self.burn())
-        self.assertEqual(self.cards()["OLD-2"], {"card": "OLD-2", "last_seen": "2026-11-02T00:00:00.000Z", "folded_minutes": 1,
-                                                 "folded_calls": 1, "folded_tokens": 10, "folded_progress_tokens": 10,
-                                                 "folded_est_cost": 0.1})
-        self.assertIn("OLD-1 / - / coding / seed-model", self.burn())
-        self.assertFalse(os.path.exists(self.journal))
-        # next report on another card: OLD-1 is the oldest unfolded one now
-        os.environ["DATASTASH_CARD"] = "NEW-3"
-        self.addCleanup(os.environ.pop, "DATASTASH_CARD", None)
-        log.turn(9, [("Edit", {"file_path": "/a"})])
-        self.fake.apply("Burn", {"key": "NEW-3 / - / testing / x", "card": "NEW-3", "activity": "testing", "model": "x", "minutes": 1})
-        r = self.run_once()
-        self.assertEqual(r["folded"], ["OLD-1"])
-        old1 = self.cards()["OLD-1"]
-        # the seeded rows (tokens from the engine's column; a can't-calculate est_cost left out) plus the reported row
-        # (no tokens column in this fake: its four counts, 10 + 20 + 300 + 40); its 5 s are still in this session's carry
-        self.assertEqual((old1["folded_calls"], old1["folded_tokens"], old1["folded_progress_tokens"], old1["folded_est_cost"]),
-                         (3, 100 + 50 + 370, 100 + 370, 0.5))
-        self.assertAlmostEqual(old1["folded_minutes"], 3 + 2, places=3)
-        self.assertFalse([k for k in self.burn() if k.startswith("OLD-1 /")])
-
-    def test_under_the_limit_nothing_folds(self):
-        self.seed("OLD-1", "2026-11-01T00:00:00.000Z", [("coding", 3, 100, 0.5)])
-        log = Log(self.main)
-        log.prompt(0)
-        log.turn(5, [("Edit", {"file_path": "/a"})])
-        self.assertEqual(self.run_once()["folded"], [])
-        self.assertIn("OLD-1 / - / coding / seed-model", self.burn())
-
-    def test_a_fold_cut_short_is_finished_once(self):
-        for i in range(4):
-            self.seed(f"OLD-{i}", f"2026-11-0{i + 1}T00:00:00.000Z", [("coding", 1, 10, 0)])
-        log = Log(self.main)
-        log.prompt(0)
-        log.turn(5, [("Edit", {"file_path": "/a"})])
-        # the send's two upserts and the count, the oldest list and the card's rows go through; its upsert too; the delete fails
-        boom = (True, {"code": "refused", "message": "down"})
-        orig = self.fake.mcp_tool
-
-        def flaky(key, name, args, timeout=60):
-            if name == "ledger_rows_delete" and not getattr(flaky, "done", False):
-                flaky.done = True
-                return boom
-            return orig(key, name, args, timeout)
-        ds.mcp_tool = flaky
-        r = self.run_once()
-        self.assertTrue(r["fold_problem"])
-        self.assertTrue(os.path.exists(self.journal))
-        self.assertEqual(self.cards()["OLD-0"]["folded_tokens"], 10)
-        self.assertIn("OLD-0 / - / coding / seed-model", self.burn())  # the rows sent are kept; the fold waits
-        log.turn(9, [("Edit", {"file_path": "/a"})])
-        self.run_once()
-        self.assertEqual(self.cards()["OLD-0"]["folded_tokens"], 10)  # not twice
-        self.assertNotIn("OLD-0 / - / coding / seed-model", self.burn())
-        self.assertFalse(os.path.exists(self.journal))
-
-
-class FoldSafety(Base):
-    def setUp(self):
-        super().setUp()
-        self.old_at = ds.TPC_FOLD_AT
-        ds.TPC_FOLD_AT = 4
-        self.journal = os.path.join(ds.STATE, f"tpc-fold-{WB}.json")
-
-    def tearDown(self):
-        ds.TPC_FOLD_AT = self.old_at
-        super().tearDown()
 
     def seed(self, n):
         for i in range(n):
@@ -635,63 +548,66 @@ class FoldSafety(Base):
         log.turn(5, [("Edit", {"file_path": "/a"})])
         return log
 
-    def test_an_older_cards_cost_tab_without_folded_columns_is_never_folded(self):
-        self.fake.cols["Cards cost"] = {"card", "last_seen", "first_seen", "sessions", "subagents", "wakes", "retries"}
-        log = self.seed(4)
+    def older_plugin_cut_short(self, write_cells=True):
+        """What an older plugin left when its delete failed: the card's folded_* cells written, its rows still in Burn."""
+        if write_cells:
+            self.fake.apply("Cards cost", {"card": "OLD-0", "folded_minutes": 1, "folded_calls": 1, "folded_tokens": 10,
+                                           "folded_progress_tokens": 10, "folded_est_cost": 0})
+        ds.write_private(self.journal, json.dumps({
+            "row": {"card": "OLD-0", "folded_minutes": 1, "folded_calls": 1, "folded_tokens": 10,
+                    "folded_progress_tokens": 10, "folded_est_cost": 0},
+            "keys": ["OLD-0 / - / coding / m"], "snap": {"OLD-0 / - / coding / m": {"minutes": 1, "calls": 1, "tokens_in": 10}},
+            "done": [], "idem": "tpc-fold-x"}))
+
+    def test_many_rows_never_fold_and_every_row_stays(self):
+        log = self.seed(30)
         r = self.run_once()
         self.assertEqual(r["folded"], [])
         self.assertIsNone(r["fold_problem"])
-        self.assertEqual(len([k for k in self.burn() if k.startswith("OLD-")]), 4)  # every row kept: totals never drop
+        self.assertEqual(len([k for k in self.burn() if k.startswith("OLD-")]), 30)
         self.assertFalse([n for n, a in self.fake.calls if n == "ledger_rows_delete"])
         self.assertFalse([a for n, a in self.fake.calls if n == "ledger_rows_upsert" and any(
             k.startswith("folded_") for r in a["rows"] for k in r)])
         log.turn(9, [("Edit", {"file_path": "/a"})])
         self.run_once()  # and it keeps appending
         self.assertEqual(self.burn()[f"XLI-378 / - / coding / {MODEL}"]["calls"], 2)
+        self.assertFalse(os.path.exists(self.journal))
 
-    def cut_short(self):
-        log = self.seed(4)
-        orig = self.fake.mcp_tool
-
-        def flaky(key, name, args, timeout=60):
-            if name == "ledger_rows_delete" and not getattr(flaky, "done", False):
-                flaky.done = True
-                return True, {"code": "refused", "message": "down"}
-            return orig(key, name, args, timeout)
-        ds.mcp_tool = flaky
-        self.assertTrue(self.run_once()["fold_problem"])
-        self.assertTrue(os.path.exists(self.journal))
-        self.assertEqual(self.cards()["OLD-0"]["folded_tokens"], 10)
-        return log
-
-    def test_a_fold_replayed_after_a_day_never_counts_twice(self):
-        log = self.cut_short()
-        self.fake.seen_idem.clear()  # past the idempotency window
+    def test_a_fold_an_older_plugin_cut_short_is_finished_once(self):
+        log = self.seed(2)
+        self.older_plugin_cut_short()
+        r = self.run_once()
+        self.assertEqual(r["folded"], ["OLD-0"])
+        self.assertEqual(self.cards()["OLD-0"]["folded_tokens"], 10)  # not twice
+        self.assertNotIn("OLD-0 / - / coding / m", self.burn())
+        self.assertIn("OLD-1 / - / coding / m", self.burn())  # nothing else folds
+        self.assertFalse(os.path.exists(self.journal))
         log.turn(9, [("Edit", {"file_path": "/a"})])
+        self.assertEqual(self.run_once()["folded"], [])
+
+    def test_a_cut_short_fold_without_its_cells_writes_them_once(self):
+        self.seed(2)
+        self.older_plugin_cut_short(write_cells=False)
         self.run_once()
         self.assertEqual((self.cards()["OLD-0"]["folded_tokens"], self.cards()["OLD-0"]["folded_calls"]), (10, 1))
         self.assertNotIn("OLD-0 / - / coding / m", self.burn())
-        self.assertFalse(os.path.exists(self.journal))
 
-    def test_a_row_that_took_more_before_the_replay_keeps_only_the_new_part(self):
-        log = self.cut_short()
+    def test_a_row_that_took_more_before_the_finish_keeps_only_the_new_part(self):
+        self.seed(2)
+        self.older_plugin_cut_short()
         self.fake.apply("Burn", {"key": "OLD-0 / - / coding / m", "calls": {"inc": 2}, "minutes": {"inc": 3}})
-        log.turn(9, [("Edit", {"file_path": "/a"})])
         self.run_once()
         row = self.burn()["OLD-0 / - / coding / m"]
         self.assertEqual((row["calls"], row["minutes"], row["tokens_in"]), (2, 3, 0))
         self.assertEqual(self.cards()["OLD-0"]["folded_calls"], 1)
 
-    def test_a_card_already_folded_is_never_written_again(self):
-        log = self.seed(4)
-        self.fake.apply("Cards cost", {"card": "OLD-0", "folded_tokens": 10})  # folded before, its rows still listed
-        ds.write_private(self.journal, json.dumps({"row": {"card": "OLD-0", "folded_tokens": 10, "folded_calls": 1},
-                                                   "keys": ["OLD-0 / - / coding / m"], "idem": "tpc-fold-x"}))
-        self.run_once()
-        self.assertFalse([a for n, a in self.fake.calls if n == "ledger_rows_upsert" and a["tab"] == "Cards cost"
-                          and a.get("idempotency_key") == "tpc-fold-x"])
-        self.assertEqual(self.cards()["OLD-0"]["folded_tokens"], 10)
-        self.assertNotIn("OLD-0 / - / coding / m", self.burn())
+    def test_an_older_cards_cost_tab_without_folded_columns_is_never_touched(self):
+        self.fake.cols["Cards cost"] = {"card", "last_seen", "first_seen", "sessions", "subagents", "wakes", "retries"}
+        self.seed(2)
+        self.older_plugin_cut_short(write_cells=False)
+        self.assertEqual(self.run_once()["folded"], [])
+        self.assertIn("OLD-0 / - / coding / m", self.burn())
+        self.assertFalse([n for n, a in self.fake.calls if n == "ledger_rows_delete"])
 
 
 class OptIn(Base):

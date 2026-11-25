@@ -16,7 +16,12 @@
 #      Also: the first session in a folder Claude Code never ran in (A's ~/code/web-app, ~/code/notes) must work; when the
 #      plugin gives no note there ("datastash did not answer") that FAILs, and the step is tried once more in a second
 #      session so the rest of the matrix still runs.
-#   2  A: /datastash:install again in a new session: the same agent, no "agent-2" (pane and server).
+#      1.0.18: right after that install, the onboarding (onboard_flow), one ask at a time, every visible line verbatim
+#      with the bold rendered: the sync line; the typed "datastash sync" turns keep and sync on (the consent file) and
+#      shows "Synced..." and the status ask; the status, then the feature list and the chats ask; the typed "save my
+#      chats", then the hours line (when this computer's counter gave a number) and the "datastash functions" line.
+#   2  A: /datastash:install again in a new session: the same agent, no "agent-2" (pane and server); 1.0.18: the same
+#      onboarding again (sync already on: the install ends with "Synced..." and the status ask).
 #   4  A: a third folder's session that is no agent (~/code/notes) types /datastash:uninstall web-app while A also holds
 #      "agent"'s key (the owner's case): web-app off on the server, its key gone here at once (1.0.14: not at its next
 #      start), "agent" untouched.
@@ -113,6 +118,7 @@ E2E_LOG="${E2E_LOG:-$REAL_HOME/x/ops/proofs/plugin-e2e-real-$(date -u +%Y%m%d-%H
 mkdir -p "$(dirname "$E2E_LOG")" && touch "$E2E_LOG" || { echo "CAN'T RUN: the log $E2E_LOG can't be written"; exit 2; }
 exec > >(tee -a "$E2E_LOG") 2>&1
 
+ONBOARD_BASH=0
 say() { printf '[%s] %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
 pass() { say "PASS $*"; RESULTS+=("PASS  $*"); }
 fail() { say "FAIL $*"; RESULTS+=("FAIL  $*"); FAILS=$((FAILS + 1)); }
@@ -271,6 +277,8 @@ answer_dialog() {  # a permission dialog on screen: Yes for a datastash connecto
   grep -qE "Do you want to (proceed|make this edit|create|allow)" <<<"$s" || return 1
   if grep -qiE "claude[._]ai" <<<"$s"; then BADTOOL=1; tmux send-keys -t "$T" Escape
   elif grep -qE "ledger_(agent|agents)_[a-z_]+|plugin[:_]datastash[:_]datastash" <<<"$s"; then tmux send-keys -t "$T" Enter
+  elif ((ONBOARD_BASH)) && grep -qE "datastash[\"']? status(-set -| --all)" <<<"$s" && grep -qE "Bash command" <<<"$s"; then
+    tmux send-keys -t "$T" Enter  # 1.0.18 onboarding: the agent saves its own status and shows the list (SEED_NOTE)
   else BADTOOL=1; say "    refused a non-datastash tool:"; grep -vE "^[[:space:]]*$" <<<"$s" | tail -n 8 | sed 's/^/    | /'; tmux send-keys -t "$T" Escape
   fi
   sleep 2
@@ -530,6 +538,78 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
   ((ok))
 }
 
+# 1.0.18: the install onboarding (owner 11-25), one ask at a time, every visible line verbatim (bold rendered: no "**"
+# left in the pane). onboard_flow <tag> <HOME>: right after ds_install, in the same session. Sync off: the install's
+# last line is the sync line; the person's typed "datastash sync" turns on keep (this computer's consent file) and the
+# connector's sync, then "Synced..." and the status ask. Sync on (a second install): the install's last line is that
+# ask. Then "status of all my agents": the status, the feature list and the chats ask (and nothing after it); then
+# "save my chats": chat saving on, the hours line (only when this computer's counter gave a number) and the
+# "datastash functions" line, last.
+ds_plugin() {  # ds_plugin <HOME> <python expr over m>: a value from the candidate's plugin script, with that HOME's config
+  DATASTASH_CONFIG_DIR="$1/.config/datastash" HOME="$1" python3 -I -c 'import sys,types
+src = open(sys.argv[1]).read(); m = types.ModuleType("ds"); m.__file__ = sys.argv[1]; exec(compile(src, sys.argv[1], "exec"), m.__dict__)
+print(eval(sys.argv[2], {"m": m}))' "$HERE/../plugins/datastash/scripts/datastash" "$2"
+}
+onboard_turn() {  # onboard_turn <typed>: type it, answer datastash's dialogs (and the status save), wait for the turn's end
+  local base_done; base_done="$(count " · done ")"
+  ONBOARD_BASH=1
+  type_line "$1"
+  drive_until '(( $(count " · done ") > base_done ))' 240
+  wait_idle 120
+  ONBOARD_BASH=0
+}
+inorder() { local t="$1"; shift; pane | python3 -I "$HERE/e2e_visible.py" inorder "$t" "$@"; }
+onboard_flow() {
+  local tag="$1" h="$2" ok=1 got cmd="/datastash:install${DS_INSTALL_ARG:+ $DS_INSTALL_ARG}"
+  ((LOGIN)) || { waiting "$tag onboarding (needs the Claude login)"; return 1; }
+  local sync_line synced ask fnline hours
+  sync_line="$(ds_plugin "$h" 'm._plain_typed(m.SYNC_TYPE_LINE).replace("\"", "")')"
+  synced="$(ds_plugin "$h" 'm._plain_typed(m.SYNCED_LINE).replace("\"", "")')"
+  ask="$(ds_plugin "$h" 'm._plain_typed(m.ONBOARD_LAST_ASK).replace("\"", "")')"
+  fnline="$(ds_plugin "$h" 'm._plain_typed(m.FUNCTIONS_AGAIN_LINE).replace("\"", "")')"
+  local -a features
+  mapfile -t features < <(ds_plugin "$h" '"\n".join(x for head, items in m.FEATURES for x in [head] + [n + ": " + t for n, t in items])')
+  if grep -qF "$sync_line" <<<"$(flat)"; then
+    if got="$(inorder "$cmd" "$sync_line")"; then pass "$tag onboarding: the install ends with the sync line (bold rendered)"
+    else fail "$tag onboarding: the sync line is not shown as the plugin wrote it ($got)"; ok=0; fi
+    grep -qF "$synced" <<<"$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "$cmd")" \
+      && { fail "$tag onboarding: \"Synced\" was shown before the person typed datastash sync"; ok=0; }
+    onboard_turn "datastash sync"
+    if got="$(said "datastash sync" "$synced")"; then pass "$tag onboarding: datastash sync -> \"$synced\""
+    else fail "$tag onboarding: after datastash sync the reply is not the Synced line ($got)"; show_tail 12; ok=0; fi
+    inorder "datastash sync" "${features[1]}" >/dev/null && { fail "$tag onboarding: the feature list came before the status (two asks at once)"; ok=0; }
+    if python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(0 if c["all"]["keep"] is True and c["sync"]["on"] is True else 1)' \
+        "$h/.config/datastash/status-consent.json" 2>/dev/null; then pass "$tag onboarding: datastash sync turned on keep and sync on this computer"
+    else fail "$tag onboarding: datastash sync did not turn keep on (consent file)"; ok=0; fi
+  else
+    if got="$(said "$cmd" "$synced")"; then pass "$tag onboarding: sync already on: the install ends with \"$synced\""
+    else fail "$tag onboarding: the install shows neither the sync line nor the Synced line ($got)"; show_tail 12; return 1; fi
+  fi
+  onboard_turn "status of all my agents"
+  if got="$(inorder "status of all my agents" "${features[@]}" "$ask")"; then
+    pass "$tag onboarding: status, then the feature list verbatim (${#features[@]} lines, bold rendered) and \"$ask\""
+  else fail "$tag onboarding: the feature list or the chats ask is not shown verbatim after the status ($got)"; show_tail 20; ok=0; fi
+  grep -qF "Last week, we estimate" <<<"$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "status of all my agents")" \
+    && { fail "$tag onboarding: the hours line came before save my chats"; ok=0; }
+  onboard_turn "save my chats"
+  hours="$(ds_plugin "$h" '(m._plain_typed(m.hours_text() or "")).replace("\"", "")')"
+  if [[ -n "$hours" ]]; then
+    if got="$(inorder "save my chats" "$hours" "$fnline")"; then pass "$tag onboarding: save my chats -> \"$hours\" then \"$fnline\""
+    else fail "$tag onboarding: after save my chats the hours line and the functions line are not shown in order ($got)"; show_tail 12; ok=0; fi
+  else
+    say "    the counter gave no number on this computer ($(cat "$h/.config/datastash/hours-estimate.json" 2>/dev/null | head -c 200)): no hours line expected"
+    if got="$(inorder "save my chats" "$fnline")"; then pass "$tag onboarding: save my chats -> \"$fnline\" (no hours line: no number)"
+    else fail "$tag onboarding: after save my chats the functions line is not shown ($got)"; show_tail 12; ok=0; fi
+    grep -qF "Last week, we estimate" <<<"$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "save my chats")" \
+      && { fail "$tag onboarding: an hours line was shown with no number from the counter"; ok=0; }
+  fi
+  grep -qF "standing yes" <<<"$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "save my chats")" \
+    && { fail "$tag onboarding: house rules were shown at the end (owner 11-25: dropped)"; ok=0; }
+  ((BADTOOL)) && { fail "$tag onboarding: the model asked for a tool that is not datastash's (refused)"; ok=0; }
+  ((ok)) && pass "$tag onboarding: every step, one ask at a time"
+  ((ok))
+}
+
 ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server: those off; their key files gone here
   local tag="$1" h="$2" args="$3"; shift 3
   local base_off base_no ok=1 n f m offtxt="Datastash is uninstalled from"
@@ -707,11 +787,11 @@ core() {
   say "== computer A, home folder"
   readme_steps "1 A home" "$A" "$A" "$CORE_SRC" || return
   authenticate "1 A home" || { stop_claude; return; }
-  ds_install "1 A home" "$A" "$HA"  # 1.0.16: the computer's user name, never "agent"
+  ds_install "1 A home" "$A" "$HA" && onboard_flow "1 A home" "$A"  # 1.0.16: the computer's user name, never "agent"
   stop_claude
   [[ -n "${E2E_NEXT_REF:-}" ]] && step11_hands_free "$A"
   start_claude "$A" "$A" || { fail "2: claude did not start"; return; }
-  ds_install "2 A home retry (no -2)" "$A" "$HA"
+  ds_install "2 A home retry (no -2)" "$A" "$HA" && onboard_flow "2 A home, second install" "$A"
   TA="$T"  # the home agent's own session, kept for step 3
   say "== computer A, repo folder ~/code/web-app (a second agent on A)"
   new_repo "$A/code/web-app"

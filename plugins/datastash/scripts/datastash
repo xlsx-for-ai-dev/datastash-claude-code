@@ -6198,20 +6198,27 @@ def cmd_prompt(_args):
     if not is_main_phrase(prompt):
         try:
             ctx = (clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
-                   or self_update_prompt_context(inp) or status_prompt_context(inp))
+                   or self_update_prompt_context(inp) or onboard_prompt_context(inp) or status_prompt_context(inp))
+            ctx = onboard_after_status(inp, ctx)  # 1.0.18: the feature list and the chats ask, after the status
         except Exception as e:  # never in the person's way
             log("status", f"prompt: {type(e).__name__}")
             ctx = None
+        try:
+            late = onboard_late_hours(inp)  # 1.0.18: the hours line the counter finished after its step
+        except Exception:  # noqa: BLE001
+            late = None
         if isinstance(ctx, dict) and ctx.get("show"):
             # XLI-337: the status answer itself, from the local copy, shown by plain code with no model turn (fast).
             # The "signed in now, reconnect" line still shows when it is due (file checks only: no network here).
             person, _ai = _safe_followup(inp, False)
-            shown = ctx["show"] + (f"\n\n{person}" if person else "")
+            shown = (f"{late}\n\n" if late else "") + ctx["show"] + (f"\n\n{person}" if person else "")
             print(json.dumps({"decision": "block", "reason": shown,
                               "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                                      "suppressOriginalPrompt": True}}))
             return 0
         person, ai = _safe_followup(inp, isinstance(prompt, str) and "datastash" in prompt.lower())
+        if late:
+            person = late + (f"\n\n{person}" if person else "")
         try:  # XLI-375 P2: a cause the listener found since (the network), told once
             told = take_notices([k for k in _read_notices() if k.startswith("blocked:")])
         except Exception:  # noqa: BLE001
@@ -6859,10 +6866,8 @@ INSTALL_TAIL = ("Ask any of them about the others, from any project.",
                 # XLI-375 P2: the standing yes, stated at install
                 "Your agents answer each other and take hand-offs without asking you; they still ask you first before "
                 "running code they were sent, sending private data out of your account, or giving personal data to "
-                'another agent. To be asked about everything, type "turn off the standing yes".',
-                # XLI-390 P2: self-update, the person's own off switch
-                'datastash updates itself to each reviewed release; to stop that, type "turn off self-update" '
-                '("turn on self-update" turns it back on).')
+                'another agent. To be asked about everything, type "turn off the standing yes".')
+# 1.0.18 (owner 11-25): the self-update line is no longer said at install (the "turn off self-update" phrase still works)
 KEEP_PHRASE = "Keep my agents' status and what I tell them to remember in datastash"  # owner's words (11-20)
 TEST_CMD_RE = re.compile(r"(?:^|[\s;&|(/])(?:pytest|vitest|jest|mocha|rspec|phpunit|tox|xpm-vitest|go test|cargo test|"
                          r"(?:npm|pnpm|yarn|bun)(?: run)? test|make test|python3? (?:-\w+ )*-m (?:pytest|unittest)|"
@@ -7366,7 +7371,7 @@ def keep_state():
     return None
 
 
-KEPT_KEYS = ("all", "server", "clean")  # the per-person keys every consent write keeps (XLI-386: "clean")
+KEPT_KEYS = ("all", "server", "clean", "sync")  # the per-person keys every consent write keeps (XLI-386: "clean")
 
 
 def record_keep_all(keep, how):
@@ -7867,7 +7872,7 @@ CLEAN_ALLOWED_TOOLS = frozenset((
     # to-do and task lists (Claude Code's own list state, at a path it fixes; no path, file or command from the model);
     # read a background task's output; list MCP resources. Left out on purpose: ExitPlanMode (saves the model's plan
     # text to a plan file and changes the permission mode), Skill (a skill's !`command` lines run a shell command when
-    # it loads, outside this hook) and ReadMcpResourceTool (saves a binary resource to a file on disk, from any server).
+    # it loads, outside this hook; 1.0.18: the agent's own skills are let through by clean_own_skill) and ReadMcpResourceTool (saves a binary resource to a file on disk, from any server).
     "EnterPlanMode", "TodoWrite", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput",
     "ListMcpResourcesTool",
 ))
@@ -8081,6 +8086,8 @@ def clean_tool_ok(inp, no_code=False):
         return clean_command_ok(tool, ti, no_code, cwd=inp.get("cwd"))  # Bash, Monitor, PowerShell, any command
     if tool in CLEAN_ALLOWED_TOOLS:
         return True
+    if tool == "Skill":
+        return clean_own_skill(ti, inp.get("cwd"))
     if not tool.startswith("mcp__") or "__" not in tool[5:]:
         return False  # Edit, Write, MultiEdit, NotebookEdit, PowerShell, Skill, any unknown or future tool
     server, name = tool[5:].split("__", 1)
@@ -8088,7 +8095,26 @@ def clean_tool_ok(inp, no_code=False):
     # the person renamed); another server's tool may write, so it is refused
     if not server or not (name.startswith("ledger_") or "datastash" in server.lower() or _trusted_connector(inp, tool)):
         return False
+    if name == "sync" and isinstance(ti, dict) and ti.get("action") in ("start", "start_chatstash"):
+        return True  # 1.0.18: only after the person's own typed "datastash sync" / "save my chats" (onboard_tool checks)
     return name in CLEAN_DS_READ_TOOLS or name in CLEAN_DS_STEP_TOOLS
+
+
+def clean_own_skill(ti, cwd=None):
+    """1.0.18 (11-25: clean sessions blocked an agent's own rehydrate skill, and deadlocked against the gate that asked
+    for it): the agent's own skills always run. Own = a plain skill name (no plugin: prefix, no path) with a SKILL.md
+    the person keeps in their own ~/.claude/skills or in this project's .claude/skills. A plugin's or an unknown skill stays refused (its !`command` lines run outside this hook)."""
+    name = ti.get("skill") if isinstance(ti, dict) else None
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}", name.strip().lstrip("/")):
+        return False
+    name = name.strip().lstrip("/")
+    if ".." in name:
+        return False
+    roots = [os.path.join(HOME, ".claude")]
+    for proj in (os.environ.get("CLAUDE_PROJECT_DIR"), cwd):
+        if isinstance(proj, str) and proj:
+            roots.append(os.path.join(proj, ".claude"))
+    return any(os.path.isfile(os.path.join(r, "skills", name, "SKILL.md")) for r in roots)
 
 
 def clean_block(inp):
@@ -9746,6 +9772,8 @@ def cmd_status_verify(args):
     try:
         if rec.get("kind") == "keep":
             record_keep_all(True, "typed")
+        elif rec.get("kind") in ("sync", "chats"):
+            onboard_verified(rec["kind"], sid)  # 1.0.18: only on the person's own typed "datastash sync" / "save my chats"
         elif rec.get("kind") == "lookup":
             lookup_setup(rec.get("data") or {}, sid)  # XLI-308: only on the person's own typed "do K"
         elif rec.get("kind") == "standing_on":
@@ -10225,7 +10253,7 @@ def status_prompt_context(inp):
         _sess, wb = _status_where(here, me)
         if wb is None or read_status_cache(wb) is None:
             return None
-    install = kind == "all" and not os.path.exists(INSTALL_ASKED_PATH)
+    install = kind == "all" and not os.path.exists(INSTALL_ASKED_PATH) and not onboard_status_due(inp)
     lines = render_status_all(here, me, install=install, only=arg if kind == "more" else None, for_person=True)
     if not lines:
         return None  # "status of <name>" with no agent of that name: an ordinary prompt
@@ -12994,7 +13022,366 @@ def install_text(inp, rec, lst):
     wait = waiting_lines(rec)
     if wait:
         lines += [WAITING_HEAD] + wait
-    return "\n".join(lines + [x for x in after if x != TPC_ON_LINE])
+    return "\n".join(lines + [x for x in after if x != TPC_ON_LINE] + onboard_install_lines(inp))
+
+
+# ------------------------------------------------------------------ 1.0.18: the install onboarding (owner 11-25, verbatim)
+# After EVERY /datastash:install, one step at a time, each waiting for the person: the Done line and the agent list, then
+# (while sync is off) the sync line; the person's typed "datastash sync" turns on keeping AND the connector's sync (held
+# up to ONBOARD_PAD s while the hours counter finishes); "Synced..." and the status ask; their status; the feature list
+# and the chats ask; the person's typed "save my chats" turns chat saving on; their own hours line (from the local
+# counter, never made up) and how to see the list again. The plugin writes every line; the model relays them word for word, or the
+# plugin shows them itself. Phrases the person types are **bold**; where the plugin shows text itself (no markdown
+# there) they are in quotes instead.
+SYNC_TYPE_LINE = ("Type **datastash sync** to keep your agents' status, what you tell them to remember, and your data as "
+                  "you go.")
+SYNCED_LINE = "Synced. Want to see what all your agents are doing right now? Say **status of all my agents**."
+# The feature list (owner 11-25, verbatim; ONE place: add a group or a line here and every surface shows it). Each line
+# is (name, what it does); the name is shown bold.
+FEATURES = (
+    ("Seeing your agents", (
+        ("Datastash main", "one main session that sees and answers all your agents."),
+        ("Status of all my agents", "every agent's progress in half a second."),
+        ("Who's online", "which agents are working, waiting or gone."),
+        ("Morning update", "what's waiting on you, in one place."))),
+    ("Agents working together", (
+        ("Answer my agents", "one reply, from anywhere, unblocks an agent."),
+        ("Hand-offs", "one agent passes its work to another."),
+        ("Private or public agents", "keep an agent's work to itself, or share it."),
+        ("Claims", "two agents never take the same job."),
+        ("Shared tabs", "agents working together set up a shared space."),
+        ("Check back", "agents come back on time, without you chasing."),
+        ("Stuck and wait detection", "no agent waits forever, and loops get flagged."))),
+    ("Memory and answers", (
+        ("Remember this", "tell one agent, and every agent knows."),
+        ("Most-asked questions", "common answers are kept ready and fresh."),
+        ("Instant answers", "formulas over your data, computed for you."),
+        ("Lists", "\"keep a list of\u2026\", for leads, contacts, anything."),
+        ("Alerts", "\"tell me when\u2026\", a watch on your data."))),
+    ("Your stuff in one place", (
+        ("Skills (skillstash)", "your Claude skills on every agent and every computer."),
+        ("Chats (chatstash)", "all your AI chats in one searchable place."),
+        ("Data", "anything you give your agents, kept and queryable, with export to spreadsheets."),
+        ("Export feed", "a live feed of your data into other tools."))),
+        # ("Files", "kept files, on paid plans.") waits: not live on the server yet (11-25)
+    ("Staying safe and quiet", (
+        ("Typed proof", "agents can't fake your yes."),
+        ("Clean sessions", "commands run in helpers, so your session stays readable."),
+        ("Offline outbox", "nothing is lost if our server is down."),
+        ("Auto-update", "always current, with nothing to type."))),
+    ("Cost", (
+        ("Time per card", "time and tokens for each piece of work."),)),
+)
+
+
+def features_post():
+    """The feature list as the person reads it: a header, then one "- **Name:** what it does" bullet per line."""
+    return "\n\n".join(head + "\n" + "\n".join(f"  - **{n}:** {t}" for n, t in items) for head, items in FEATURES)
+
+
+# The one ask after the feature list (owner's wording); change only this line to change the ask.
+ONBOARD_LAST_ASK = "Want all your AI chats in one searchable place? Say **save my chats**."
+FUNCTIONS_AGAIN_LINE = ("Everything in that list is already turned on for you. To see it again any time, type "
+                        "**datastash functions**.")
+FUNCTIONS_PHRASE_RE = re.compile(r"(?:datastash functions|functions datastash)")
+HOURS_LINE = ("Last week, we estimate you would have gotten **{x}** more hours of coding done using datastash. This week "
+              "will be great!")
+CHATS_DONE_LINE = "Chat saving is on."  # only when the connector's answer has no confirm of its own
+SYNC_NOT_TYPED_LINE = ("Not done: sync turns on only when you type datastash sync yourself. Nothing changed.")
+CHATS_NOT_TYPED_LINE = ("Not done: chat saving turns on only when you type save my chats yourself. Nothing changed.")
+SYNC_PHRASE_RE = re.compile(r"(?:datastash sync|sync datastash)")
+CHATS_PHRASE_RE = re.compile(r"(?:save my chats|sync chatstash|chatstash sync)")
+ONBOARD_NOTE = "datastash note (onboarding; the plugin's own lines)"
+ONBOARD_PAD = float(os.environ.get("DATASTASH_ONBOARD_PAD", "15"))  # owner 11-25: hold up to this long for the counter
+GRANT_FRESH = 900  # a checked typed phrase opens its one connector call for this long
+HOURS_PATH = os.path.join(CONF, "hours-estimate.json")  # totals only: {"hours", "plans", "agents", ...} or {"none": true}
+HOURS_RUN_PATH = os.path.join(STATE, "hours-run.json")  # {"at": kick time}
+HOURS_RUN_MAX = 300  # a run older than this without a result is taken as dead
+HOURS_REUSE = 3600  # a result this recent is used again instead of counting again
+HOURS_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hours_count.py")
+SYNC_TYPED_AI = (f"{ONBOARD_NOTE}: the person typed \"datastash sync\". The plugin checks it was typed by them and turns on "
+                 "keeping. Call the datastash connector's `sync` tool once now with action \"start\" and nothing else. Do "
+                 "not say its say_to_user, do_now lines or any offer: the plugin gives your whole reply after the call.")
+CHATS_TYPED_AI = (f"{ONBOARD_NOTE}: the person typed \"save my chats\". The plugin checks it was typed by them. Call the "
+                  "datastash connector's `sync` tool once now with action \"start_chatstash\" and nothing else. Do not say "
+                  "its say_to_user: the plugin gives your whole reply after the call.")
+ONBOARD_RELAY_AI = (f"{ONBOARD_NOTE}: your whole reply is exactly the text between the two lines below, word for word "
+                    "(keep its bold), with nothing before or after it: no step narration, no summary. Then wait for the "
+                    "person.\n----\n{text}\n----")
+ONBOARD_AFTER_STATUS_AI = (f"{ONBOARD_NOTE}: after the status answer, end your reply with this text, word for word (keep "
+                           "its bold), after a blank line, and nothing after it; then wait for the person:\n----\n{text}\n----")
+
+
+def _plain_typed(text):
+    """Text for a surface that shows no markdown (the plugin's own block): **phrase to type** becomes "phrase"; a bold
+    number is just the number."""
+    return re.sub(r"\*\*([^*]+)\*\*", lambda m: m.group(1) if re.fullmatch(r"[\d.,]+", m.group(1)) else f'"{m.group(1)}"',
+                  text)
+
+
+def _onboard_path(sid):
+    return os.path.join(STATE, f"onboard-{sid}.json")
+
+
+def onboard_state(sid):
+    v = read_json(_onboard_path(sid), {}) if sid else {}
+    return v if isinstance(v, dict) else {}
+
+
+def onboard_set(sid, stage, **extra):
+    if not sid:
+        return
+    try:
+        ensure_dirs()
+        write_private(_onboard_path(sid), json.dumps(dict(extra, stage=stage, at=int(time.time()))))
+    except OSError:
+        pass
+
+
+def sync_on():
+    """This computer's sync: the person's typed keep (Addendum 6 N2: never a server value) and the connector's sync,
+    turned on from here after their typed "datastash sync"."""
+    if keep_state() != "yes":
+        return False
+    v = read_json(CONSENT_PATH, {}).get("sync")
+    return isinstance(v, dict) and v.get("on") is True
+
+
+def record_sync_on():
+    c = read_json(CONSENT_PATH, {})
+    c = c if isinstance(c, dict) else {}
+    c["sync"] = {"on": True, "at": int(time.time())}
+    ensure_dirs()
+    write_private(CONSENT_PATH, json.dumps(c))
+
+
+def onboard_install_lines(inp):
+    """The install's last lines (every install): the sync line while sync is off, else the Synced line and its ask."""
+    sid = _sid(inp)
+    if sync_on():
+        onboard_set(sid, "status")
+        return [SYNCED_LINE]
+    onboard_set(sid, "sync")
+    return [SYNC_TYPE_LINE]
+
+
+# --- the person's own hours (the local counter, scripts/hours_count.py): transcripts are read on this computer only;
+# only its totals are kept (HOURS_PATH), never any text.
+
+def hours_kick():
+    """Start the counter in the background (at each install), unless a run is going or a result is recent."""
+    try:
+        now = time.time()
+        run = read_json(HOURS_RUN_PATH, {})
+        at = run.get("at") if isinstance(run, dict) else None
+        if isinstance(at, (int, float)) and now - at < HOURS_RUN_MAX and not _hours_done_since(at):
+            return
+        if os.path.exists(HOURS_PATH) and now - os.path.getmtime(HOURS_PATH) < HOURS_REUSE:
+            return
+        if not os.path.isfile(HOURS_SCRIPT):
+            return
+        ensure_dirs()
+        write_private(HOURS_RUN_PATH, json.dumps({"at": now}))
+        spawn_detached([sys.executable, "-I", HOURS_SCRIPT, "--out", HOURS_PATH], CONF)
+    except Exception:  # noqa: BLE001  never in the install's way
+        pass
+
+
+def _hours_done_since(at):
+    try:
+        return os.path.getmtime(HOURS_PATH) >= at - 1
+    except OSError:
+        return False
+
+
+def hours_running():
+    run = read_json(HOURS_RUN_PATH, {})
+    at = run.get("at") if isinstance(run, dict) else None
+    return isinstance(at, (int, float)) and time.time() - at < HOURS_RUN_MAX and not _hours_done_since(at)
+
+
+def hours_wait(most=None):
+    """Wait while the counter runs, up to `most` seconds (ONBOARD_PAD); never longer."""
+    end = time.time() + (ONBOARD_PAD if most is None else most)
+    while hours_running() and time.time() < end:
+        time.sleep(0.25)
+
+
+def hours_text():
+    """The hours line from the counter's totals, or None: no result yet, no transcripts, or nothing to count. Never a
+    made-up number."""
+    if hours_running():
+        return None
+    v = read_json(HOURS_PATH, None)
+    if not isinstance(v, dict) or v.get("none"):
+        return None
+    h = v.get("hours")
+    if not isinstance(h, (int, float)) or isinstance(h, bool) or h != h or h < 0.5:
+        return None
+    x = str(int(round(h))) if h >= 10 else (f"{h:.1f}".rstrip("0").rstrip("."))
+    return HOURS_LINE.format(x=x)
+
+
+def hours_status():
+    """"ready", "none" (finished: no line will ever show) or "running"."""
+    if hours_running():
+        return "running"
+    return "ready" if hours_text() else "none"
+
+
+# --- the typed phrases: checked by the checker (cmd_status_verify) like every typed yes; each opens ONE connector call
+
+def _phrase_text(text):
+    if not isinstance(text, str) or len(text) > 80 or "\n" in text.strip():
+        return None
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z ]", " ", text.lower())).strip()
+
+
+def onboard_phrase(text):
+    """"sync" for the person's whole prompt "datastash sync" / "sync datastash", "chats" for "save my chats", else None."""
+    t = _phrase_text(text)
+    if not t:
+        return None
+    if SYNC_PHRASE_RE.fullmatch(t):
+        return "sync"
+    if CHATS_PHRASE_RE.fullmatch(t):
+        return "chats"
+    if FUNCTIONS_PHRASE_RE.fullmatch(t):
+        return "functions"
+    return None
+
+
+def _grant_path(kind, sid):
+    return os.path.join(STATE, f"typed-grant-{kind}-{sid}.json")
+
+
+def grant_typed(kind, sid):
+    ensure_dirs()
+    write_private(_grant_path(kind, sid), json.dumps({"at": time.time()}))
+
+
+def grant_ok(kind, sid):
+    g = read_json(_grant_path(kind, sid), {}) if sid else {}
+    at = g.get("at") if isinstance(g, dict) else None
+    return isinstance(at, (int, float)) and 0 <= time.time() - at <= GRANT_FRESH and not g.get("used")
+
+
+def grant_use(kind, sid):
+    g = read_json(_grant_path(kind, sid), {})
+    if isinstance(g, dict) and g.get("at"):
+        write_private(_grant_path(kind, sid), json.dumps(dict(g, used=time.time())))
+
+
+def onboard_prompt_context(inp):
+    """The UserPromptSubmit note for the person's typed "datastash sync" or "save my chats", or None. Nothing is turned
+    on here: the checker turns keeping on and opens the one connector call once the transcript shows the person typed it."""
+    kind = onboard_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
+    if kind is None:
+        return None
+    if kind == "functions":  # only shows the list: nothing turns on, so no check
+        return ONBOARD_RELAY_AI.format(text=features_post())
+    shape = hook_shape(inp)
+    if shape is None or not start_check(shape, "sync" if kind == "sync" else "chats", inp["prompt"], {}):
+        return None
+    return SYNC_TYPED_AI if kind == "sync" else CHATS_TYPED_AI
+
+
+def onboard_verified(kind, sid):
+    """The checker found the person's own typed phrase (cmd_status_verify)."""
+    if kind == "sync":
+        record_keep_all(True, "typed")
+    grant_typed(kind, sid)
+
+
+# --- the connector's sync calls: start and start_chatstash run only after the person's own typed phrase
+
+SYNC_TOOL_RE = re.compile(r"mcp__(.+)__sync")
+
+
+def _sync_call(inp):
+    """("sync" | "chats", tool input) for a call of a datastash connector's sync tool with action start or
+    start_chatstash, else None."""
+    name = str(inp.get("tool_name") or "")
+    m = SYNC_TOOL_RE.fullmatch(name)
+    if not m or not ("datastash" in m.group(1).lower() or _trusted_connector(inp, name)):
+        return None
+    ti = inp.get("tool_input") if isinstance(inp.get("tool_input"), dict) else {}
+    act = ti.get("action")
+    return {"start": "sync", "start_chatstash": "chats"}.get(act if isinstance(act, str) else "")
+
+
+def onboard_tool(inp):
+    """PreToolUse / PostToolUse of the connector's sync start and start_chatstash (the hook output), else None."""
+    kind = _sync_call(inp)
+    if kind is None:
+        return None
+    event, sid = inp.get("hook_event_name"), _sid(inp)
+    if event == "PreToolUse":
+        deadline = time.time() + 10
+        while sid and _checks_pending(sid, (kind,)) and time.time() < deadline:
+            time.sleep(0.2)
+        if sid and grant_ok(kind, sid):
+            return None  # the person's own typed phrase: the call goes out
+        line = SYNC_NOT_TYPED_LINE if kind == "sync" else CHATS_NOT_TYPED_LINE
+        return {"systemMessage": line, "hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": (
+                f"{ONBOARD_NOTE}: refused: the person did not type it. Never turn this on yourself. Say only: \"{line}\"")}}
+    if event != "PostToolUse" or not sid or not grant_ok(kind, sid):
+        return None
+    body = tool_answer(inp.get("tool_response"))
+    if not isinstance(body, dict) or body.get("error") or body.get("code"):
+        return None  # the connector's own answer says what went wrong
+    grant_use(kind, sid)
+    if kind == "sync":
+        record_sync_on()
+        hours_wait()  # owner 11-25: up to 15 s, less when the counter is done; never longer
+        onboard_set(sid, "status")
+        text = SYNCED_LINE
+    else:
+        hours_wait()
+        hours = hours_text()
+        said = body.get("say_to_user") if isinstance(body.get("say_to_user"), str) else CHATS_DONE_LINE
+        pending = hours is None and hours_status() == "running"
+        # owner 11-25: the hours line and the "datastash functions" line are onboarding's last prompt (no house rules)
+        text = "\n\n".join([_clean(said, 400)] + ([hours] if hours else []) + ([] if pending else [FUNCTIONS_AGAIN_LINE]))
+        onboard_set(sid, "done", hours_pending=pending)
+    return _post(None, ONBOARD_RELAY_AI.format(text=text))
+
+
+# --- after the status: the feature list and the chats ask; a late hours line at the next turn
+
+def onboard_status_due(inp):
+    return onboard_state(_sid(inp)).get("stage") == "status"
+
+
+def onboard_after_status(inp, ctx):
+    """The status answer (ctx from status_prompt_context) with the feature list and the chats ask after it, while this
+    session's onboarding waits for its status; ctx unchanged otherwise."""
+    sid = _sid(inp)
+    if ctx is None or onboard_state(sid).get("stage") != "status":
+        return ctx
+    if status_phrase(inp.get("prompt")) != ("all", None):
+        return ctx
+    post = features_post() + "\n\n" + ONBOARD_LAST_ASK
+    onboard_set(sid, "chats")
+    if isinstance(ctx, dict) and ctx.get("show"):
+        # the plugin's own block shows no markdown, so this once the status goes through the model with the list after
+        # it (both relayed word for word), and the bold renders
+        return ONBOARD_RELAY_AI.format(text=ctx["show"] + "\n\n" + post)
+    return ctx + " " + ONBOARD_AFTER_STATUS_AI.format(text=post)
+
+
+def onboard_late_hours(inp):
+    """The hours line the counter finished after its step (shown once, at the person's next turn), or None."""
+    sid = _sid(inp)
+    st = onboard_state(sid)
+    if not st.get("hours_pending"):
+        return None
+    status = hours_status()
+    if status == "running":
+        return None
+    onboard_set(sid, st.get("stage") or "done")
+    return "\n".join(([_plain_typed(hours_text())] if status == "ready" else []) + [_plain_typed(FUNCTIONS_AGAIN_LINE)])
 
 
 def waiting_lines(rec):
@@ -13838,6 +14225,7 @@ def command_prompt(inp):
         elif kind == "ask":
             return ASK_NAME_LINE, None, True
         save_cmd(sid, dict(base, kind="install", name=name, here=here))
+        hours_kick()  # 1.0.18: the person's own hours, counted here in the background while the install runs
         steps = "" if own is not None and read_agent_answer(own["slug"]) else INSTALL_KEY_STEPS.format(name=name)
         return None, INSTALL_AI.format(steps=steps), False
     if m:
@@ -14191,6 +14579,12 @@ def command_tool(inp):
     """PreToolUse / PostToolUse of the install and uninstall calls, and any datastash answer's install note: the hook's
     output, or None (nothing to do)."""
     event, name = inp.get("hook_event_name"), str(inp.get("tool_name") or "")
+    try:
+        got = onboard_tool(inp)  # 1.0.18: the connector's sync start / start_chatstash, only after the person's typed yes
+    except Exception:  # noqa: BLE001  fail closed: can't tell, so the turn-on call does not go out
+        got = _deny(PLUGIN_ERROR_LINE) if event == "PreToolUse" and _sync_call(inp) else None
+    if got is not None:
+        return got
     m = CMD_TOOL_RE.fullmatch(name)
     sid = _sid(inp)
     rec = load_cmd(sid)
@@ -15820,11 +16214,9 @@ def cmd_xlsx_test(args):
 #
 # Each send has an idempotency key from where it was read, so a retry never counts twice; each part is marked taken and
 # the read offsets move only after datastash took the rows; a send left pending (a failed session-end send) is finished
-# by the next session start or send of any session of that workbook. Then, past TPC_FOLD_AT Burn rows (the range-sheet limit of the card totals; an existing
-# ruling, not a cap), finished cards (oldest last_seen first, never a card in this report) are folded: their Burn rows'
-# sums are written to the card's folded_* cells (once per card; only on a Cards cost tab that has them) and those rows
-# are deleted, so each card reads the same totals. The fold
-# only moves counts already sent; every total, share and price a person reads is the engine's formula column.
+# by the next session start or send of any session of that workbook. Burn rows are never folded or deleted now; a fold an
+# older plugin cut short is finished, so each card reads the same totals. Every total, share and price a person reads is
+# the engine's formula column.
 # Never fails or slows a session: the hook starts a background run and returns at once.
 TPC_USAGE = "usage: datastash time-per-card [on | off]   (time per card for this folder's agent; on by default)"
 # {"projects": {folder: {"on": bool, "at": time, "by"?: "default"}}, "card_tabs": {wb: tab}, "default_tried": {folder: time}}
@@ -15834,7 +16226,6 @@ TPC_PATH = os.path.join(CONF, "time-per-card.json")
 # "Cards cost" in an older one), saved per workbook; "Cards cost" when none was saved (x-live also maps that name to "Time
 # per card" in a newer workbook, so a send before the next `on` still lands).
 TPC_BURN, TPC_CARDS = "Burn", "Cards cost"
-TPC_FOLD_AT = 10_000  # x-live RANGE_SHEET_MAX_ROWS: past it the Cards cost totals can't be read (XLI-378 F review)
 TPC_PROGRESS = ("coding", "testing", "landing")
 TPC_WAIT_SECONDS = 300.0
 TPC_LOCK_SECONDS = 120.0
@@ -16224,67 +16615,24 @@ def _tpc_fold_ready(client):
 
 
 def tpc_fold(client, keep, journal_path):
-    """Past TPC_FOLD_AT Burn rows, fold finished cards (oldest last_seen first, never one in `keep`, only ones not folded
-    before) until Burn is back at the limit, and only on a Cards cost tab with the folded_* columns. A card's fold: its
-    Burn rows' sums written to its folded_* cells (plain values: a card is folded once, so a replay writes the same
-    numbers, and a card whose folded_* cells are already set is never written again), then those rows deleted. A fold cut
-    short is finished first on the next run (the journal), however late, so nothing counts twice. One fold per workbook
-    at a time (a lock beside the journal). Returns the cards folded."""
+    """No new fold is ever started. Only a fold an older plugin
+    cut short is finished (its journal: the folded_* cells are already written, so its Burn rows must go or that card
+    would count twice). One fold per workbook at a time (a lock beside the journal). Returns the cards folded."""
     lock = open(journal_path + ".lock", "a")
     try:
         if fcntl is not None:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                return []  # another send is folding this workbook now
-        ready = None
+                return []  # another send is finishing this workbook's fold now
         j = read_json(journal_path, None)
-        if isinstance(j, dict) and isinstance(j.get("row"), dict) and isinstance(j.get("keys"), list):
-            ready = _tpc_fold_ready(client)
-            if not ready:
-                return []
-            _tpc_fold_apply(client, j, journal_path)
-            _drop(journal_path)
-        body = client.tool("ledger_rows_filter", {"workbook_id": client.wb, "tab": TPC_BURN, "where": {"ne": ["key", ""]},
-                                                  "limit": 1}, "counting Burn", missing_ok=True)
-        n = int(_ci_num((body or {}).get("rows_matched")))
-        folded = []
-        if n <= TPC_FOLD_AT or not (ready if ready is not None else _tpc_fold_ready(client)):
-            return folded
-        oldest = client.filter(_tpc_cards(client), {"blank": ["folded_tokens"]}, order=[{"column": "last_seen", "dir": "asc"}], pages=1)
-        for c in oldest:
-            card = c.get("card")
-            if not isinstance(card, str) or not card or card in keep:
-                continue
-            rows = [r for r in client.filter(TPC_BURN, {"eq": ["card", card]}) if isinstance(r.get("key"), str)]
-            if not rows:
-                continue
-            tot = {k: 0.0 for k in TPC_FOLDED}
-            for r in rows:
-                toks = r.get("tokens")
-                toks = toks if isinstance(toks, (int, float)) and not isinstance(toks, bool) else sum(
-                    _ci_num(r.get(k)) for k in ("tokens_in", "tokens_out", "cache_read", "cache_write"))
-                tot["folded_minutes"] += _ci_num(r.get("minutes"))
-                tot["folded_calls"] += _ci_num(r.get("calls"))
-                tot["folded_tokens"] += toks
-                if r.get("activity") in TPC_PROGRESS:
-                    tot["folded_progress_tokens"] += toks
-                cost = r.get("est_cost")
-                if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-                    tot["folded_est_cost"] += cost  # the engine's value at fold time (no Prices row yet: none)
-            keys = sorted(r["key"] for r in rows)
-            snap = {r["key"]: {k: _ci_num(r.get(k)) for k in TPC_BURN_COUNTS} for r in rows}
-            row = {"card": card, **{k: round(v, 6) for k, v in tot.items()}}
-            j = {"row": row, "keys": keys, "snap": snap, "done": [],
-                 "idem": "tpc-fold-" + _tpc_hash(card, *keys, json.dumps(row, sort_keys=True))}
-            write_private(journal_path, json.dumps(j))
-            _tpc_fold_apply(client, j, journal_path)
-            _drop(journal_path)
-            folded.append(card)
-            n -= len(keys)
-            if n <= TPC_FOLD_AT:
-                break
-        return folded
+        if not (isinstance(j, dict) and isinstance(j.get("row"), dict) and isinstance(j.get("keys"), list)):
+            return []
+        if not _tpc_fold_ready(client):
+            return []
+        _tpc_fold_apply(client, j, journal_path)
+        _drop(journal_path)
+        return [j["row"].get("card")]
     finally:
         lock.close()
 

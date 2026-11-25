@@ -316,7 +316,8 @@ class Wiring(Base):
         self.assertEqual(ref[1:], newest, f"the catalog pins {ref}, not the newest release v{newest}")
 
     def test_the_menu_readme_and_hooks_name_the_off_switch(self):
-        self.assertTrue(any('"turn off self-update"' in x and '"turn on self-update"' in x for x in ds.INSTALL_TAIL))
+        # 1.0.18 (owner 11-25): install no longer says the self-update line; the phrases still work (below)
+        self.assertFalse(any("self-update" in x for x in ds.INSTALL_TAIL))
         with open(os.path.join(ROOT, "README.md")) as f:
             readme = f.read()
         with open(os.path.join(ROOT, "plugins", "datastash", "hooks", "hooks.json")) as f:

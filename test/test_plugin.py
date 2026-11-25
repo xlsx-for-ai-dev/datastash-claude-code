@@ -3028,12 +3028,24 @@ class Transition(Base):
                 seen += 1
                 low = text.lower()
                 for b in banned:
+                    if n == "hours_count.py" and b == "claude_config" + "_dir":
+                        # 1.0.18: the local hours counter finds each Claude config folder's projects/ transcripts (and
+                        # only them: test_the_counter_reads_only_transcripts); every other name stays banned there
+                        continue
                     self.assertNotIn(b, low, f"{n} references {b!r}")
                 for line in text.splitlines():
                     if re.search(r'"(security|secret-tool)"\s*,', line):
                         self.assertIn("KEYCHAIN_SERVICE", line, line.strip())
         self.assertGreater(seen, 2)
         self.assertEqual(ds.KEYCHAIN_SERVICE, "datastash")
+
+    def test_the_counter_reads_only_transcripts(self):
+        """1.0.18: hours_count.py opens only *.jsonl files under a config folder's projects/ (never a sign-in file)."""
+        with open(os.path.join(HERE, "..", "plugins", "datastash", "scripts", "hours_count.py")) as f:
+            src = f.read()
+        self.assertEqual(len(re.findall(r"\bopen\(", src)), 1)
+        self.assertEqual(src.count("os.path.join(d, 'projects')"), 2)
+        self.assertIn(".jsonl", src)
 
     def test_the_decision_never_opens_anything_in_claude_codes_folder(self):
         import builtins

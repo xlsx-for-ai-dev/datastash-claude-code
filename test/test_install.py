@@ -216,14 +216,14 @@ class Install(Base):
                                "datastash is on for your agents:\n- web-app (public)\n- alpha (private)\n- beta (public)\n"
                                "To remove one or many: /datastash:uninstall and we'll show you the list of agents.\n"
                                "To make one private: say make <name> private.\n"
-                               "To make one public: say make <name> public.")
+                               "To make one public: say make <name> public.\n" + ds.SYNC_TYPE_LINE)
 
     def test_the_only_agent_gets_the_list_with_no_note(self):
         self.installed()
         self.slash("/datastash:install")
         out = self.tool("PostToolUse", "ledger_agents_list", {}, dict(LIST, agents=LIST["agents"][:1]))
         text = ("Done. Datastash is on for web-app. " + ds.TPC_ON_LINE + "\ndatastash is on for your agents:\n- web-app "
-                "(public)\n" + ds.REMOVE_LINE + "\n" + ds.PRIVATE_LINE + "\n" + ds.PUBLIC_LINE)
+                "(public)\n" + ds.REMOVE_LINE + "\n" + ds.PRIVATE_LINE + "\n" + ds.PUBLIC_LINE + "\n" + ds.SYNC_TYPE_LINE)
         self.assertEqual(out["systemMessage"], text)
         self.assertEqual(out["hookSpecificOutput"]["updatedMCPToolOutput"], [{"type": "text", "text": text}])
         self.assertIn(text, out["hookSpecificOutput"]["additionalContext"])

@@ -8,6 +8,9 @@ Reads a pane capture on stdin. Usage:
   e2e_visible.py clean <typed command>                    exit 0 when nothing after that line reads as a failure:
                                                          "denied", "error" or "not run" (any case)
   e2e_visible.py shown <typed command> <expected text>   exit 0 when the expected text is anywhere after that line
+  e2e_visible.py inorder <typed command> <text>...        1.0.18: exit 0 when every text is after that line, in that
+                                                         order (list markers "- ", "• ", "* " dropped), and no "**"
+                                                         is left (the bold rendered)
 Prints the block it matched (or the region's tail) for the log. Whitespace is normalized (wrapped lines read as one).
 """
 import re
@@ -75,6 +78,19 @@ def main(argv):
     if mode == "shown":
         text = norm("\n".join(reg))
         return 0 if norm(argv[3]) in text else 1
+    if mode == "inorder":
+        text = norm(re.sub(r"(?m)^\s*[-•*]\s+", "", "\n".join(l.replace(BULLET, " ") for l in reg)))
+        at = 0
+        for want in argv[3:]:
+            i = text.find(norm(want), at)
+            if i < 0:
+                print("missing (in order): " + want[:200])
+                return 1
+            at = i + len(norm(want))
+        if "**" in text:
+            print("bold did not render: " + text[max(0, text.find("**") - 80):text.find("**") + 80])
+            return 1
+        return 0
     if mode == "clean":
         bad = [norm(l) for l in reg if FAILURE.search(l)]
         if bad:
