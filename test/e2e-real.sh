@@ -333,8 +333,9 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
   # line count could stop growing): a holder window first, the option set on this session, then the real window
   tmux new-session -d -s "$T" -n hold -x 250 -y 50 -c "$dir" "sleep 86400"
   tmux set-option -t "$T" history-limit 100000
+  # Claude Code 2.1.331+ draws in the terminal's alternate screen (no scrollback for the pane reads): kept off below
   tmux new-window -t "$T" -c "$dir" \
-    "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER='$E2E_USER' LOGNAME='$E2E_USER' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
+    "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER='$E2E_USER' LOGNAME='$E2E_USER' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CODE_NO_FLICKER=0 E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
   tmux kill-window -t "$T:hold" 2>/dev/null
   if wait_for "trust this folder" 40; then
     # The dialog's default is "No, exit" and it shows its text before it takes keys: a Down sent too soon is dropped and
@@ -677,7 +678,8 @@ chat_saved_once() {
   got="$("${SRV[@]}" chat-count "${q}" Paris)" || got='{"count": -1}'
   if [[ "$got" == *'"count": 1,'* && "$got" == *'"answered": true'* ]]; then
     pass "$tag chat save: the exchange is in the Chats tab exactly once, with its answer ($got)"
-  else fail "$tag chat save: the Chats tab read-back is not one answered exchange ($got)"; ok=0; fi
+  else fail "$tag chat save: the Chats tab read-back is not one answered exchange ($got)"; ok=0
+    grep -h "chat save" "$h"/.config/datastash/state/*.log 2>/dev/null | tail -n 8 | sed 's/^/    plugin log: /'; fi
   ((ok))
 }
 
