@@ -1705,8 +1705,12 @@ def notice_text(kind, agent=None, names=None):
                 f'key itself. {_fix(f"Get datastash agent {name} a new key on this computer.")} (A new key here stops '
                 "this agent's key on any other computer.)")
     if kind == "noagent":
+        try:  # XLI-417: nothing here is signed in yet: the sign-in comes first, and it finishes the setup by itself
+            first = not_signed_in_here(None)
+        except Exception:  # noqa: BLE001
+            first = False
         return (f"{NOTICE}: this computer has no datastash agent yet, so no session here gets messages. "
-                + "To set it up, the person types /datastash:install.")
+                + (f'Tell the person exactly: "{SIGN_IN_INSTALL_LINE}"' if first else "To set it up, the person types /datastash:install."))
     if kind == "oldlogin":  # release 1.0.0: an older (0.9.x) login no longer sets agents up by itself
         return (f"{NOTICE}: this folder has no datastash agent on this computer yet, so this session gets no messages. "
                 "Type /datastash:install in this session to set it up.")
@@ -2779,9 +2783,13 @@ def cmd_check(_args):
                 s_w = slug(w[1]["name"])
                 raise_notice(notice_cause("waiting", s_w), notice_text("waiting", agent={"name": w[1]["name"]}))
                 warn = warn + take_notices([notice_cause("waiting", s_w)])
-            warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. To set it up, the person types '
-                           "/datastash:install in this session (the plugin does it); never register an agent or get a "
-                           "key yourself."]
+            if not_signed_in_here(inp):  # XLI-417: never back to /datastash:install while nothing here is signed in
+                warn = warn + [f'{LINK_NOTE}: this computer is not signed in to datastash yet. Tell the person exactly: '
+                               f'"{SIGN_IN_INSTALL_LINE}" Never register an agent, get a key or run a sign-in yourself.']
+            else:
+                warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. To set it up, the person types '
+                               "/datastash:install in this session (the plugin does it); never register an agent or get a "
+                               "key yourself."]
         emit(" ".join(warn + _no_agent_notices(project, me)) + tail)
         return 0
     pre = "".join(w + " " for w in warn)
@@ -4184,7 +4192,7 @@ def session_sign_in(inp):
     session, or on a computer without file locking (no device code it could not keep alive; the connector's own sign-in
     stays). Not signed in: starts (or reuses) the device sign-in itself; no AI step. Never reads or prints a token."""
     if not hooks_offer_sign_in():
-        return None, None
+        return email_session_note(inp)  # XLI-417: the one sign-in, by an emailed code
     if login_present():
         return None, None
     if keyed_agent_here(project_of(inp), me=this_session(inp)):
@@ -6659,7 +6667,8 @@ def _login_poll():
     interval = p.get("interval") if _num_ok(p.get("interval")) else 5
     interval = max(5, min(int(interval), 30))
     until = p.get("until") if _num_ok(p.get("until")) else time.time() + 600
-    deadline = min(until, time.time() + LOGIN_POLL_MAX)
+    # XLI-417: a waiting request (kind "email") is polled for as long as it lives, slowly after the first half hour.
+    deadline = until if p.get("kind") == "email" else min(until, time.time() + LOGIN_POLL_MAX)
     lock = None
     if fcntl is not None:  # one poll per computer: wait for an earlier one (its code ended or changed) to stop
         while lock is None:
@@ -6677,7 +6686,10 @@ POLL_FINAL_ERRORS = ("access_denied", "expired_token", "invalid_grant")
 
 
 def _login_poll_loop(p, interval, deadline):
+    started, final = time.time(), False
     while time.time() < deadline:
+        if p.get("kind") == "email" and time.time() - started > LOGIN_POLL_MAX:
+            interval = max(interval, 60)
         time.sleep(interval)
         cur = _read_private_json(LOGIN_PENDING_FILE)
         if not cur or cur.get("device_code") != p["device_code"]:
@@ -6693,6 +6705,7 @@ def _login_poll_loop(p, interval, deadline):
                 interval = min(interval + 5, 30)
                 continue
             if err in POLL_FINAL_ERRORS:
+                final = True
                 break  # the person denied it, or the code ended
             # A 5xx, a 429 that is not slow_down, or anything else: back off and keep waiting until the code ends;
             # a waiting code is never dropped early (EPM L1).
@@ -6707,7 +6720,10 @@ def _login_poll_loop(p, interval, deadline):
             with _login_lock():  # never interleaved with a refresh of an older login on this computer
                 _save_login(rt, at, got.get("expires_in"), got.get("answer_key"), got.get("grant_id"))
             _change_signin(SIGNIN_DEVICE, "device sign-in")  # the person's own approval: legacy ends here, for good
+        final = True
         break
+    if p.get("kind") == "email" and not final:
+        return 0  # XLI-417: still waiting (its request lives on; the next session start refreshes it and polls again)
     lock = _try_lock(_start_lock_file(), wait=10)  # never between a hook's check and its new code
     try:
         cur = _read_private_json(LOGIN_PENDING_FILE)
@@ -10081,6 +10097,12 @@ def cmd_status_verify(args):
     try:
         if rec.get("kind") == "keep":
             record_keep_all(True, "typed")
+        elif rec.get("kind") == "sync_email" and isinstance((rec.get("data") or {}).get("email"), str):
+            for line in email_sign_in_start(sid, rec["data"]["email"]):  # XLI-417: only the person's own typed email
+                add_outcome(sid, line)
+        elif rec.get("kind") == "sync_code" and isinstance((rec.get("data") or {}).get("code"), str):
+            for line in email_sign_in_code(sid, rec["data"]["code"]):  # XLI-417: only the person's own typed code
+                add_outcome(sid, line)
         elif rec.get("kind") in ("sync", "chats"):
             onboard_verified(rec["kind"], sid, typed)  # 1.0.18: only on the person's own typed "datastash sync" / "save my sessions"
         elif rec.get("kind") == "lookup":
@@ -13805,6 +13827,9 @@ def grant_use(kind, sid):
 def onboard_prompt_context(inp):
     """The UserPromptSubmit note for the person's typed "datastash sync" or "save my sessions", or None. Nothing is turned
     on here: the checker turns keeping on and opens the one connector call once the transcript shows the person typed it."""
+    got = email_prompt_context(inp)  # XLI-417: `datastash sync <email>`, `datastash sync <code>`, or not signed in
+    if got is not None:
+        return got
     kind = onboard_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
     if kind is None:
         return None
@@ -13833,6 +13858,236 @@ def onboard_verified(kind, sid, typed=None):
         set_timers(True, "sync")  # owner 11-25: "the timers should be turned on with datastash sync"
         grant_typed("chats", sid, typed)  # owner 11-25: and saving their sessions (an older server's start_chatstash)
     grant_typed(kind, sid, typed)
+
+
+# --- XLI-417 (owner 11-26, "the one sign in plan"; the command is `datastash sync <email>`): every computer login signs
+# in by one emailed code. A login that is not signed in and has an email (the one the person last typed here in
+# `datastash sync <email>`, or one set up with the agent: `datastash sync --waiting-for <email>`) files a waiting request
+# at session start, by itself (filing approves nothing), and its background poll waits on it. The person's own typed
+# `datastash sync <email>`, in any session, sends one code to that email for every login waiting on it; their typed
+# `datastash sync <code>` in the SAME session signs them all in, each with its own key, picked up by its own poll, which
+# saves the login and registers this computer's agents as the device sign-in did. One sign-in per OS user (CONF and the
+# keychain, never the Claude settings folder). The email is kept here (mode 600) and only ever sent to datastash.
+EMAIL_WAIT_PATH = "/api/v1/device/email/wait"
+EMAIL_START_PATH = "/api/v1/device/email/start"
+EMAIL_CODE_PATH = "/api/v1/device/email/code"
+WAIT_EMAIL_FILE = os.path.join(CONF, "login.email.json")  # {"email", "by": "typed" | "agent", "at"}
+EMAIL_RE = r"[^\s@<>\"'`]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}"
+SYNC_EMAIL_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(" + EMAIL_RE + r")\s*[.!]?\s*", re.I)
+SYNC_CODE_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(\d{6})\s*[.!]?\s*", re.I)
+EMAIL_CODE_LIFE = 600
+SIGN_IN_TYPE_LINE = "Type **datastash sync you@email.com** to sign in this computer."
+SIGN_IN_INSTALL_LINE = ("This computer is not signed in to datastash yet. Type **datastash sync you@email.com**: datastash "
+                        "emails you a code, you type **datastash sync CODE** here, and setup finishes by itself.")
+WAITING_LINE = ("This computer is waiting to sign in to datastash. Type **datastash sync {email}** in any session for a "
+                "code that signs in every computer waiting on that email.")
+CHECK_EMAIL_LINE = "Check your email for a code. Then type **datastash sync CODE** here."
+SIGNED_IN_LINE = "Signed in: {n}. Setup finishes by itself; the datastash command works now."
+NO_CODE_ASKED_LINE = "Not done: no code was asked for in this session. Type **datastash sync you@email.com** first."
+CODE_FAILED_LINE = "Not done: datastash could not be reached. Type **datastash sync CODE** again in a minute."
+EMAIL_TYPED_AI = (f"{ONBOARD_NOTE}: the person typed \"datastash sync\" with their email. The plugin checks it was typed by "
+                  "them and asks datastash for the sign-in code itself. Make no datastash calls and run no command for "
+                  "it. Your whole reply is exactly this line, word for word (keep its bold): \"{line}\"")
+CODE_TYPED_AI = (f"{ONBOARD_NOTE}: the person typed \"datastash sync\" with the code from their email. The plugin checks it "
+                 "was typed by them and sends it itself. Make no datastash calls and run no command for it; never repeat "
+                 "the code. Your whole reply is exactly: \"Checking the code.\"")
+SIGN_IN_TYPE_AI = (f"{ONBOARD_NOTE}: this computer is not signed in to datastash. Make no datastash calls. Your whole "
+                   "reply is exactly this line, word for word (keep its bold): \"{line}\"")
+
+
+def sync_email_of(text):
+    """The email in the person's whole prompt `datastash sync <email>`, normalized, else None."""
+    m = SYNC_EMAIL_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 300 else None
+    return m.group(1).strip().lower() if m else None
+
+
+def sync_code_of(text):
+    m = SYNC_CODE_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 80 else None
+    return m.group(1) if m else None
+
+
+def waiting_email():
+    """The email this login waits on, or None."""
+    rec = _read_private_json(WAIT_EMAIL_FILE) or {}
+    e = rec.get("email") if isinstance(rec, dict) else None
+    return e if isinstance(e, str) and re.fullmatch(EMAIL_RE, e) else None
+
+
+def set_waiting_email(email, by):
+    """by "typed": the person's own typed email, always kept. by "agent": set up with the agent; never over a typed one."""
+    cur = _read_private_json(WAIT_EMAIL_FILE) or {}
+    if by == "agent" and isinstance(cur, dict) and cur.get("by") == "typed" and cur.get("email") != email:
+        return False
+    ensure_dirs()
+    write_private(WAIT_EMAIL_FILE, json.dumps({"email": email, "by": by, "at": int(time.time())}))
+    return True
+
+
+def _email_pending():
+    p = _read_private_json(LOGIN_PENDING_FILE)
+    return p if isinstance(p, dict) and p.get("kind") == "email" and isinstance(p.get("device_code"), str) else None
+
+
+def file_waiting(timeout=20):
+    """Files (or refreshes) this login's waiting request and makes sure its background poll runs. Answers the waiting
+    device code, or None (signed in already, no email, or datastash not reached). Never prints; the device code stays in
+    the private pending file."""
+    if signed_in():
+        return None
+    email = waiting_email()
+    if email is None:
+        return None
+    lock = _try_lock(_start_lock_file(), wait=5)
+    if lock is None and fcntl is not None:
+        p = _email_pending()
+        return p["device_code"] if p else None
+    try:
+        p = _email_pending()
+        body = {"email": email, "device_name": _device_name(), "os": _device_os(), "user": _os_user()}
+        if p:
+            body["device_code"] = p["device_code"]
+        try:
+            _st, _ct, text = http("POST", EMAIL_WAIT_PATH, body=body, timeout=timeout)
+            got = json.loads(text)
+        except (ApiError, ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+            return p["device_code"] if p else None
+        dev = got.get("device_code") if isinstance(got, dict) else None
+        if not isinstance(dev, str) or not dev.startswith("dsdc_"):
+            return p["device_code"] if p else None
+        try:
+            life = max(600, min(int(got.get("expires_in", 86400)), 86400))
+        except (TypeError, ValueError):
+            life = 86400
+        ensure_dirs()
+        write_private(LOGIN_PENDING_FILE, json.dumps({"kind": "email", "device_code": dev, "interval": got.get("interval", 5),
+                                                      "until": int(time.time()) + life, "opened": True}))
+    finally:
+        _unlock(lock)
+    _ensure_poller()
+    return dev
+
+
+def _os_user():
+    try:
+        import getpass
+        return re.sub(r"[^A-Za-z0-9._-]", "", getpass.getuser())[:60] or "user"
+    except Exception:  # noqa: BLE001
+        return "user"
+
+
+def _code_req_path(sid):
+    return os.path.join(STATE, f"email-code-{sid}.json")
+
+
+def email_sign_in_start(sid, email):
+    """After the checker found the person's own typed `datastash sync <email>`: keep the email, file this login's own
+    waiting request when it is not signed in, and ask datastash for one code, bound to this session. Lines for the
+    person when something went wrong, else []."""
+    if not signed_in():
+        set_waiting_email(email, "typed")
+    waiting = file_waiting() if not signed_in() else None
+    body = {"email": email, "device_name": _device_name(), "os": _device_os(), "user": _os_user()}
+    if waiting:
+        body["waiting_code"] = waiting
+    try:
+        _st, _ct, text = http("POST", EMAIL_START_PATH, body=body, timeout=30)
+        got = json.loads(text)
+    except ApiError as e:
+        return [server_refused(e.body, CODE_FAILED_LINE)]
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return [CODE_FAILED_LINE]
+    dev = got.get("device_code") if isinstance(got, dict) else None
+    if not isinstance(dev, str) or not dev.startswith("dsdc_"):
+        return [CODE_FAILED_LINE]
+    ensure_dirs()
+    write_private(_code_req_path(sid), json.dumps({"device_code": dev, "until": int(time.time()) + EMAIL_CODE_LIFE}))
+    return []
+
+
+def email_sign_in_code(sid, code):
+    """After the checker found the person's own typed `datastash sync <code>`: send it with THIS session's code request.
+    Lines for the person."""
+    req = _read_private_json(_code_req_path(sid))
+    if not isinstance(req, dict) or not isinstance(req.get("device_code"), str) or not _num_ok(req.get("until")) or req["until"] < time.time():
+        return [NO_CODE_ASKED_LINE]
+    try:
+        _st, _ct, text = http("POST", EMAIL_CODE_PATH, body={"device_code": req["device_code"], "code": code}, timeout=30)
+        got = json.loads(text)
+    except ApiError as e:
+        return [server_refused(e.body, CODE_FAILED_LINE)]
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return [CODE_FAILED_LINE]
+    _drop(_code_req_path(sid))
+    n = got.get("signed_in") if isinstance(got, dict) else None
+    n = n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
+    if _email_pending():
+        _ensure_poller()  # this login's own poll picks its key up now
+    return [SIGNED_IN_LINE.format(n=f"{n} computer login{'s' if n != 1 else ''}")]
+
+
+def email_prompt_context(inp):
+    """UserPromptSubmit: the person's typed `datastash sync <email>` or `datastash sync <code>` (handed to the checker,
+    which acts only once the transcript shows the person typed it), or a plain `datastash sync` on a login that is not
+    signed in (the one line). None for anything else."""
+    prompt = inp.get("prompt") if isinstance(inp, dict) else None
+    email, code = sync_email_of(prompt), sync_code_of(prompt)
+    if email or code:
+        shape = hook_shape(inp)
+        if shape is None:
+            return None
+        if email:
+            return EMAIL_TYPED_AI.format(line=CHECK_EMAIL_LINE) if start_check(shape, "sync_email", prompt, {"email": email}) else None
+        return CODE_TYPED_AI if start_check(shape, "sync_code", prompt, {"code": code}) else None
+    if onboard_phrase(prompt) == "sync" and not_signed_in_here(inp):
+        w = waiting_email()
+        return SIGN_IN_TYPE_AI.format(line=WAITING_LINE.format(email=w) if w else SIGN_IN_TYPE_LINE)
+    return None
+
+
+def not_signed_in_here(inp):
+    """No datastash login on this computer, no working agent key for this folder and not the older connector sign-in:
+    nothing here can reach datastash until the person signs in by email. Cheap file checks only."""
+    try:
+        if login_present() or effective_signin() in (SIGNIN_LEGACY, SIGNIN_OLD) or fcntl is None:
+            return False  # signed in, or the connector keeps its own sign-in here
+        return inp is None or not keyed_agent_here(project_of(inp), me=this_session(inp))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def email_session_note(inp):
+    """SessionStart: (line for the person, line for the AI) on a login that is not signed in, once per session: files the
+    waiting request when an email is kept, and says the one line. (None, None) otherwise."""
+    if not not_signed_in_here(inp):
+        return None, None
+    sid = _sid(inp)
+    if sid is not None:
+        mark = os.path.join(STATE, f"email-sign-in-sid-{sid}")
+        if os.path.exists(mark):
+            return None, None
+        ensure_dirs()
+        write_private(mark, json.dumps({"at": int(time.time())}))
+    w = waiting_email()
+    if w:
+        file_waiting(timeout=HOOK_START_SECONDS)
+    line = WAITING_LINE.format(email=w) if w else SIGN_IN_TYPE_LINE
+    return _plain_typed(line), (f"{SIGN_IN_NOTE}: this computer is not signed in to datastash. The plugin told the person: "
+                                f"\"{line}\" Never ask them for a code, an email or a token; never run a sign-in yourself.")
+
+
+def cmd_sync(args):
+    """`datastash sync --waiting-for EMAIL`: set up with the agent, the email this login waits on (never over the
+    person's own typed one), and file its waiting request. Filing approves nothing, so it needs no typed proof."""
+    if len(args) != 2 or args[0] != "--waiting-for" or not re.fullmatch(EMAIL_RE, args[1].strip()):
+        die("usage: datastash sync --waiting-for you@email.com   (the person types `datastash sync <email>` themselves)")
+    email = args[1].strip().lower()
+    if signed_in():
+        print("signed in: yes (nothing to wait for)")
+        return 0
+    if not set_waiting_email(email, "agent"):
+        print("waiting: kept the email the person typed here")
+    print("waiting: yes" if file_waiting() else "waiting: not filed yet (datastash not reached; the next session start files it)")
+    return 0
 
 
 # --- the connector's sync calls: start and start_chatstash run only after the person's own typed phrase
@@ -14855,7 +15110,14 @@ def command_prompt(inp):
         save_cmd(sid, dict(base, kind="install", name=name, here=here))
         hours_kick()  # 1.0.18: the person's own hours, counted here in the background while the install runs
         steps = "" if own is not None and read_agent_answer(own["slug"]) else INSTALL_KEY_STEPS.format(name=name)
-        return None, INSTALL_AI.format(steps=steps), False
+        ai = INSTALL_AI.format(steps=steps)
+        if own is None and not_signed_in_here(inp):
+            # XLI-417: nothing here is signed in, so without a connector tool the fallback is the sign-in line, never
+            # "type /datastash:install" again (a loop); the sign-in then finishes the setup by itself.
+            if waiting_email():
+                file_waiting(timeout=HOOK_START_SECONDS)
+            ai = ai.replace(NO_CONNECTOR_LINE, SIGN_IN_INSTALL_LINE)
+        return None, ai, False
     if m:
         save_cmd(sid, dict(base, kind="uninstall", picks=m.group(1) or ""))
         return None, UNINSTALL_LIST_AI, False
@@ -18172,7 +18434,7 @@ def main():
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
-             "chat-save": cmd_chat_save}
+             "chat-save": cmd_chat_save, "sync": cmd_sync}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1

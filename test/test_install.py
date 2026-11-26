@@ -2105,7 +2105,9 @@ class FreshHome(Base):
         v, pid = self.slash("/datastash:install")
         ai = v["hookSpecificOutput"]["additionalContext"]
         self.assertIn('ledger_agent_register with name "web-app"', ai)
-        self.assertIn(ds.NO_CONNECTOR_LINE, ai)  # the one fallback line, if the connector is still not there
+        # XLI-417: nothing here is signed in, so the fallback is the email sign-in line, never install again (a loop)
+        self.assertIn(ds.SIGN_IN_INSTALL_LINE, ai)
+        self.assertNotIn(ds.NO_CONNECTOR_LINE, ai)
         self.assertNotIn("datastash login", ai)
         for k in ("systemMessage",):
             self.assertNotIn(k, v or {})
