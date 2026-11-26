@@ -2286,7 +2286,8 @@ class SignInHint(Base):
         self.login_on_file()  # the background poll saved the login
         got = self.run_hook(ds.cmd_prompt, prompt)
         self.assertEqual(got["systemMessage"], ds.CONNECT_LINE)
-        self.assertIn("/mcp reconnect all", ds.CONNECT_LINE)
+        self.assertNotIn("/mcp", ds.CONNECT_LINE + ds.AI_CONNECT_NOTE)
+        self.assertIn("datastash command", ds.AI_CONNECT_NOTE)
         self.assertEqual(got["hookSpecificOutput"]["additionalContext"], ds.AI_CONNECT_NOTE)
         self.assertIsNone(self.run_hook(ds.cmd_prompt, prompt))  # once
         tool = {"session_id": "sess-R", "hook_event_name": "PreToolUse", "tool_name": "Bash",
@@ -2352,10 +2353,11 @@ class SignInHint(Base):
     def test_imported_connector_line_is_said_once_per_computer(self):
         self.login_on_file()
         first = self.check_ctx("sess-D")
-        self.assertIn('"/mcp, pick datastash, choose Authenticate"', first)
+        self.assertIn(ds.IMPORTED_HINT, first)
         self.assertIn("claude.ai datastash", first)
+        self.assertNotIn("/mcp", first)
         for sid in ("sess-D", "sess-E", "sess-F"):
-            self.assertNotIn("choose Authenticate", self.check_ctx(sid))
+            self.assertNotIn(ds.IMPORTED_HINT, self.check_ctx(sid))
 
     def test_agent_session_start_keeps_its_count(self):
         ds.hook_input = lambda: {"session_id": "sess-E"}

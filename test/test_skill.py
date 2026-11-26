@@ -95,5 +95,55 @@ class SkillText(unittest.TestCase):
             self.assertIn(needle, readme, needle)
 
 
+PLUGIN = os.path.join(HERE, "..", "plugins", "datastash")
+# "/mcp" as a step for the person or the agent (not the connector's URL path, e.g. getdatastash.com/mcp or ORIGIN + "/mcp")
+MCP_STEP_RE = re.compile(r"(?<![\w.\-])/mcp(?![\w/])")
+
+
+def _script_texts(path):
+    """Every string a script can show: its help text (the module docstring) and every string literal, f-strings included;
+    function and class docstrings are code notes, not shown text."""
+    import ast
+    with open(path) as f:
+        tree = ast.parse(f.read())
+    notes = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                notes.add(id(first.value))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in notes:
+            if node.value.strip() not in ("/mcp", "/mcp/"):
+                yield node.lineno, node.value
+
+
+class NoMcpStep(unittest.TestCase):
+    def test_no_user_facing_plugin_text_says_mcp(self):
+        """no-mcp-guide (owner): setup has no /mcp step. The connector signs in through its headersHelper and the
+        datastash command reaches datastash directly, so no skill, command, hook or shown string sends anyone to /mcp."""
+        hits = []
+        for root, dirs, files in os.walk(PLUGIN):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for name in files:
+                path = os.path.join(root, name)
+                rel = os.path.relpath(path, PLUGIN)
+                if rel == ".mcp.json":
+                    continue  # the connector's own config: its URL, not text anyone reads
+                with open(path, "rb") as f:
+                    head = f.read(200)
+                if name.endswith((".md", ".json")):
+                    with open(path) as f:
+                        texts = list(enumerate(f.read().splitlines(), 1))
+                elif head.startswith(b"#!") and b"python" in head.split(b"\n", 1)[0] or name.endswith(".py"):
+                    texts = list(_script_texts(path))
+                else:
+                    with open(path, errors="replace") as f:
+                        texts = list(enumerate(f.read().splitlines(), 1))
+                hits += [f"{rel}:{n}: {t.strip()[:100]}" for n, t in texts if MCP_STEP_RE.search(t)]
+                hits += [f"{rel}:{n}: {t.strip()[:100]}" for n, t in texts if "choose Authenticate" in t]
+        self.assertEqual(hits, [])
+
+
 if __name__ == "__main__":
     unittest.main()

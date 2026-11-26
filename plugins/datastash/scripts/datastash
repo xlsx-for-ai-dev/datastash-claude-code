@@ -106,8 +106,8 @@ This computer's datastash login (XLI-278; the person approves it once in their b
                             15-minute token only when run by Claude Code as the connector's helper, never to a terminal
                             or a tool call, which the hooks also deny); when there is none, the fixed placeholder
                             "signed-out" only when this computer has a datastash login on record (device sign-in mode,
-                            terminal Claude Code), else {}, a fresh computer included, so Claude Code's /mcp
-                            Authenticate sign-in for the connector shows and keeps working. Always exits 0.
+                            terminal Claude Code), else {}, a fresh computer included, so Claude Code's own
+                            sign-in for the connector shows and keeps working. Always exits 0.
 Hook entry points (run by Claude Code, not by hand): check, listen, end, prompt, agent-tool, status-check, time-per-card
 hook; map-refresh (started by where and file), time-per-card run (started by its hook), time-per-card setup (started by
 install).
@@ -3683,14 +3683,14 @@ LOGIN_HINT = "A datastash page opened in your browser. Type the code shown there
 # 0.2.0: the plugin starts the sign-in itself and shows the person the link and code (SessionStart systemMessage); once
 # approved, a session that started signed out needs one reconnect of the connector (Claude Code 2.1.329 never redials a
 # connector that failed at its start on its own; /mcp reconnect re-runs the headersHelper). New sessions connect alone.
-RESTART_LINE = "datastash is signed in. Type /mcp reconnect all to connect it in this session; new sessions connect by themselves."
+RESTART_LINE = "datastash is signed in. The datastash command works now; new sessions connect by themselves."
 CONNECT_LINE = RESTART_LINE
 AI_SHOWN_NOTE = (f"{SIGN_IN_NOTE}: this computer is not signed in to datastash yet, so the datastash connector is not "
                  "connected. The plugin itself has shown the person a sign-in link and code; there is nothing for you to "
                  "start. Run datastash login only if the person asks for the code again (it shows the same code, never a "
                  "second sign-in). Never ask the person for the code or any token. Once they approve, the datastash "
-                 "command works at once; the connector connects in new sessions, or in this one after the person types "
-                 "/mcp reconnect all.")
+                 "command works at once; the connector connects in new sessions, and in this one use the datastash "
+                 "command for the same work. Never ask the person to sign the connector in or reconnect it.")
 AI_FALLBACK_NOTE = (f"{SIGN_IN_NOTE}: this computer is not signed in to datastash and the plugin could not start the "
                     "sign-in just now. Before the first datastash use, run datastash login and tell the person, in plain "
                     "words, what it says to do. Never ask the person for the code or any token.")
@@ -3698,9 +3698,9 @@ AI_LEGACY_NOTE = (f"{SIGN_IN_NOTE}: this computer's datastash connector still us
                   "working for now. The plugin itself has shown the person a link and code for the new sign-in; there is "
                   "nothing for you to start or repeat. Never ask the person for the code or any token, and never open or "
                   "approve the sign-in page yourself.")
-AI_CONNECT_NOTE = (f"{SIGN_IN_NOTE}: this computer is now signed in to datastash. The plugin told the person to type "
-                   "/mcp reconnect all so the datastash connector connects in this session; until then use the datastash "
-                   "command.")
+AI_CONNECT_NOTE = (f"{SIGN_IN_NOTE}: this computer is now signed in to datastash. The datastash connector connects in "
+                   "new sessions; in this session use the datastash command for the same work. Never ask the person to "
+                   "sign the connector in or reconnect it.")
 HOOK_START_SECONDS = 4  # a session-start or first-use hook waits at most this long for datastash to start a sign-in
 START_FAIL_GAP = 60  # after a failed start, hooks wait this long before trying again (a typed datastash login doesn't)
 BROWSER_EVERY = 24 * 3600  # hooks open the browser by themselves at most once a day; the link is always shown
@@ -4248,7 +4248,7 @@ def _safe_followup(inp, uses, budget=HOOK_START_SECONDS + 1):
 
 
 IMPORTED_HINT_MARK = "imported-connector-hint"
-IMPORTED_HINT = "/mcp, pick datastash, choose Authenticate"
+IMPORTED_HINT = "this plugin's own connector and the datastash command do the work"
 
 
 def imported_connector_hint():
@@ -4260,8 +4260,8 @@ def imported_connector_hint():
             return None
         ensure_dirs()
         write_private(mark, json.dumps({"at": int(time.time())}))
-        return (f'{SIGN_IN_NOTE} (said once): if /mcp shows a "claude.ai datastash" connector as needing authentication, '
-                f'tell the person once, in plain words: "{IMPORTED_HINT}". Otherwise say nothing about it.')
+        return (f'{SIGN_IN_NOTE} (said once): a "claude.ai datastash" connector that shows as needing authentication is '
+                f'not needed: {IMPORTED_HINT}. Never ask the person to sign it in; say nothing about it unless asked.')
     except Exception:
         return None
 
@@ -6587,7 +6587,7 @@ def cmd_login(args):
         if signed_in():
             print("signed in: yes (this computer is signed in to datastash)")
             print('if the datastash connector\'s tools are not in this session, tell the person in plain words: '
-                  f'"{RESTART_LINE}" (Claude Code connects a connector when a session starts, or on /mcp reconnect)')
+                  f'"{RESTART_LINE}" (Claude Code connects a connector when a session starts; until then use the datastash command)')
         elif _pending_live():
             print("signed in: waiting (the person has not approved the code yet)")
         else:
@@ -13303,7 +13303,7 @@ NOTE_FIELD = "datastash_note"  # the one field of a datastash tool answer an ins
 AGENT_ANSWER_RE = r"[A-Za-z0-9_\-]{43}"
 CMD_TOOL_RE = re.compile(r"mcp__.+__(ledger_agent_register|ledger_agent_key|ledger_agents_list|ledger_agents_note)")
 CMD_NOTE = "datastash note (install and uninstall; the plugin's own steps)"
-NO_CONNECTOR_LINE = "Type **/mcp**, pick datastash, choose Authenticate, then run **/datastash:install** again."  # XLI-390: one line
+NO_CONNECTOR_LINE = "Type **/datastash:install**."  # no-mcp-guide: the one line when this computer has no agent key
 MINT_LINE = 'datastash made a key for "{name}" (this session). datastash is on for "{name}".'
 ON_HEAD = "datastash is on for your agents:"
 REMOVE_LINE = "To remove one or many: **/datastash:uninstall** and we'll show you the list of agents."
@@ -14089,7 +14089,9 @@ RELAY_AI = (f"{CMD_NOTE}: the plugin's final result. Make no more datastash call
             "no \"the plugin says\".\n----\n{text}\n----")
 INSTALL_AI = (f"{CMD_NOTE}: the person typed the datastash install command. In this turn make exactly these datastash "
               "connector calls, in order, and nothing else: {steps}ledger_agents_list; then ledger_agents_note with kind "
-              f'"install". {_SAY} If no datastash connector tool is there, tell the person exactly: "{NO_CONNECTOR_LINE}"')
+              f'"install". {_SAY} If no datastash connector tool is there, never ask the person to sign it in or reconnect it: '
+              f'run datastash check and say what it prints; if it says there is no agent key on this computer, tell the '
+              f'person exactly: "{NO_CONNECTOR_LINE}"')
 INSTALL_KEY_STEPS = ('ledger_agent_register with name "{name}"; then ledger_agent_key with that name, the agent_id it '
                      "answered and only_if_no_key true; then ")
 UNINSTALL_LIST_AI = (f"{CMD_NOTE}: the person typed the datastash uninstall command. Call the datastash connector's "
