@@ -361,7 +361,8 @@ def cmd_chat_count(text, must=None):
     Chats tab, one row per chat, each read with sync read_chat), and whether one of them carries an answer after it.
     Prints {"count": n, "answered": bool}."""
     err, out = tool("ledger_workbook_list", {})
-    wbs = out.get("workbooks") if isinstance(out, dict) else None
+    # ledger_workbook_list answers its page under "items" (x-live src/mcp/manifest.ts executeLedgerWorkbookList).
+    wbs = (out.get("items") or out.get("workbooks")) if isinstance(out, dict) else None
     wb = next((w.get("workbook_id") for w in wbs or [] if isinstance(w, dict) and w.get("kind") == "chats"), None)
     if err or wb is None:
         print(json.dumps({"count": 0, "answered": False, "why": "no Chats workbook"}))
