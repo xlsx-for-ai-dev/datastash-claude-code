@@ -100,7 +100,7 @@ pick datastash, choose Authenticate, then run /datastash:install again."
    looks). Then type:
 
    ```
-   Keep my agents' status and what I tell them to remember in datastash
+   datastash sync
    ```
 
    Ask for the status again: it comes back at once, from datastash. Then ask for the status once in each of your other
@@ -379,7 +379,7 @@ caller sees "saved, will send when the server is back" instead of an error.
 
 ## Time per card (plugin 1.0.5; on by default from 1.0.12)
 
-Time per card is on. To turn it off, type: datastash time-per-card off
+Time per card is on. To turn it off, type: **datastash time-per-card off**
 
 It sets up the agent workbook's tabs (`ledger_feeds_setup {services: ["burn"]}`): **Burn** (one row per card, activity
 and model: minutes, tool calls and token counts), **Time per card** (one total row per card; **Cards cost** in an older
@@ -497,17 +497,17 @@ session (`state/session-agent-<session>.json`: its local name and id only), and 
 with no folder of its own is used as the session's agent, so typing `/datastash:install` again reuses it and makes no
 "-2". In any other folder `/datastash:install` makes that folder's own agent (after a home-folder install too). Any refusal is one line
 that says why and who refused (the plugin here, before anything is sent, or datastash, with its code and message). With
-no datastash connector the line is "Type /mcp, pick datastash, choose Authenticate, then run /datastash:install again."
+no datastash connector the line is "Type **/mcp**, pick datastash, choose Authenticate, then run **/datastash:install** again."
 
 After `/datastash:install` the plugin shows its result as plain text, which the AI repeats word for word as its whole reply. First this agent's line, then the agents datastash is on (name, public or private), anything waiting for you (one line each, with how to answer), and:
 
 ```
-Done. Datastash is on for robin. Time per card is on. To turn it off, type: datastash time-per-card off
+Done. Datastash is on for robin. Time per card is on. To turn it off, type: **datastash time-per-card off**
 datastash is on for your agents:
 - robin (public)
-To remove one or many: /datastash:uninstall and we'll show you the list of agents.
-To make one private: say make <name> private.
-To make one public: say make <name> public.
+To remove one or many: **/datastash:uninstall** and we'll show you the list of agents.
+To make one private: say **make <name> private**.
+To make one public: say **make <name> public**.
 ```
 
 **Results you can't miss, names that come back (1.0.16).** The install and uninstall results come back as the connector

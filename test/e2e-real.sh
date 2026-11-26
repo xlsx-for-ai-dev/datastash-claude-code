@@ -551,11 +551,11 @@ ds_install() {  # ds_install <tag> <HOME> <expected agent name> [<also listed>..
 # left in the pane). onboard_flow <tag> <HOME>: right after ds_install, in the same session. Sync off: the install's
 # last line is the sync line; the person's typed "datastash sync" turns on keep (this computer's consent file) and the
 # connector's sync, then "Synced..." and the status ask. Sync on (a second install): the install's last line is that
-# ask. datastash sync also turns on session saving (one start_chatstash) and timers. Then "status of all my agents":
+# ask. datastash sync also turns on session saving and timers (the typed start, x-live #519). Then "status of all my agents":
 # the status, the feature list, the sessions line (while session saving is on), the hours line (only when this
 # computer's counter gave a number) and the "datastash functions" line, last. Then "do not save my sessions" and
-# "turn off timers", each with its fixed line. The server half of timers (a standing yes the reach gate honors) is
-# "pending server" until the sync answer carries timers (TIMERS_SERVER_CONTRACT).
+# "turn off timers", each with its fixed line. The server half is read from the sync
+# server's answer (x-live #519): timers "on" and sessions "on"; then a timer set with no confirm (timer_no_confirm).
 ds_plugin() {  # ds_plugin <HOME> <python expr over m>: a value from the candidate's plugin script, with that HOME's config
   DATASTASH_CONFIG_DIR="$1/.config/datastash" HOME="$1" python3 -I -c 'import sys,types
 src = open(sys.argv[1]).read(); m = types.ModuleType("ds"); m.__file__ = sys.argv[1]; exec(compile(src, sys.argv[1], "exec"), m.__dict__)
@@ -578,7 +578,7 @@ inorder() { local t="$1"; shift; pane | python3 -I "$HERE/e2e_visible.py" inorde
 onboard_flow() {
   local tag="$1" h="$2" ok=1 got cmd="/datastash:install${DS_INSTALL_ARG:+ $DS_INSTALL_ARG}"
   ((LOGIN)) || { waiting "$tag onboarding (needs the Claude login)"; return 1; }
-  local sync_line synced sessions fnline hours offline tline
+  local sync_line synced sessions fnline hours offline tline SYNC_TYPED=0
   sync_line="$(ds_plugin "$h" 'm._plain_typed(m.SYNC_TYPE_LINE).replace("\"", "")')"
   synced="$(ds_plugin "$h" 'm._plain_typed(m.SYNCED_LINE).replace("\"", "")')"
   sessions="$(ds_plugin "$h" 'm._plain_typed(m.SESSIONS_ON_ONBOARD).replace("\"", "")')"
@@ -587,7 +587,7 @@ onboard_flow() {
   fnline="$(ds_plugin "$h" 'm._plain_typed(m.FUNCTIONS_AGAIN_LINE).replace("\"", "")')"
   "${SRV[@]}" chats off >/dev/null || say "    (could not turn chat saving off before the onboarding)"
   local -a features
-  mapfile -t features < <(ds_plugin "$h" '"\n".join(x for head, items in m.FEATURES for x in [head] + [n + ": " + t for n, t in items])')
+  mapfile -t features < <(ds_plugin "$h" '"\n".join(x for head, items in m.features() for x in [head] + [n + ": " + t for n, t in items])')
   if grep -qF "$sync_line" <<<"$(flat)"; then
     if got="$(inorder "$cmd" "$sync_line")"; then pass "$tag onboarding: the install ends with the sync line (bold rendered)"
     else fail "$tag onboarding: the sync line is not shown as the plugin wrote it ($got)"; ok=0; fi
@@ -600,12 +600,14 @@ onboard_flow() {
     if python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); sys.exit(0 if c["all"]["keep"] is True and c["sync"]["on"] is True else 1)' \
         "$h/.config/datastash/status-consent.json" 2>/dev/null; then pass "$tag onboarding: datastash sync turned on keep and sync on this computer"
     else fail "$tag onboarding: datastash sync did not turn keep on (consent file)"; ok=0; fi
-    if [[ "$(ds_plugin "$h" 'm.sessions_on()')" == True ]]; then pass "$tag onboarding: datastash sync turned session saving on (the server took start_chatstash)"
+    if [[ "$(ds_plugin "$h" 'm.sessions_on()')" == True ]]; then pass "$tag onboarding: datastash sync turned session saving on (the server's typed start said sessions on)"
     else fail "$tag onboarding: datastash sync did not turn session saving on"; ok=0; fi
     if [[ "$(ds_plugin "$h" 'm.timers_rule() == m.TIMERS_ON_RULE')" == True ]]; then pass "$tag onboarding: datastash sync turned timers on here (the agents' rule)"
     else fail "$tag onboarding: datastash sync did not turn timers on"; ok=0; fi
-    if [[ "$(ds_plugin "$h" 'm.server_takes_timers()')" == True ]]; then pass "$tag onboarding: the server recorded the timers standing yes"
-    else pending "$tag onboarding: the server's timers standing yes and reach at sign-in (pending server: $(ds_plugin "$h" 'm.TIMERS_SERVER_CONTRACT'))"; fi
+    # x-live #519: the plugin's typed proof rides on sync start; the server records the standing yes and answers timers "on"
+    if [[ "$(ds_plugin "$h" '(m.timers_choice() or {}).get("server")')" == on ]]; then pass "$tag onboarding: the server recorded the timers standing yes (sync answered timers: on)"
+    else fail "$tag onboarding: the server did not record the timers standing yes (sync answer: timers $(ds_plugin "$h" '(m.timers_choice() or {}).get("server")'))"; ok=0; fi
+    SYNC_TYPED=1
   else
     if got="$(said "$cmd" "$synced")"; then pass "$tag onboarding: sync already on: the install ends with \"$synced\""
     else fail "$tag onboarding: the install shows neither the sync line nor the Synced line ($got)"; show_tail 12; return 1; fi
@@ -619,12 +621,15 @@ onboard_flow() {
   onboard_turn "status of all my agents"
   if got="$(inorder "status of all my agents" "${features[@]}" "${tail_lines[@]}")"; then
     pass "$tag onboarding: status, then the feature list verbatim (${#features[@]} lines, bold rendered), then $(printf '"%s" ' "${tail_lines[@]}")"
-  else fail "$tag onboarding: after the status, the feature list, the sessions, hours and functions lines are not shown verbatim in order ($got)"; show_tail 20; ok=0; fi
+  else fail "$tag onboarding: after the status, the feature list, the sessions, hours and functions lines are not shown verbatim in order ($got)"; show_tail 20; ok=0
+    pane > "$h/e2e-pane-onboarding-$(date +%s).txt" 2>/dev/null; fi  # the whole pane, kept with the HOME (E2E_KEEP=1)
   local after; after="$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "status of all my agents")"
   [[ -z "$hours" ]] && grep -qF "Last week, we estimate" <<<"$after" && { fail "$tag onboarding: an hours line was shown with no number from the counter"; ok=0; }
   grep -qF "save my chats" <<<"$after" && { fail "$tag onboarding: the old save my chats ask was shown (owner 11-25: opt-out, not an ask)"; ok=0; }
   grep -qF "standing yes" <<<"$after" && { fail "$tag onboarding: house rules were shown at the end (owner 11-25: dropped)"; ok=0; }
   if [[ "$(ds_plugin "$h" 'm.sessions_on()')" == True ]]; then chat_saved_once "$tag" "$h" || ok=0; fi
+  if ((SYNC_TYPED)); then timer_no_confirm "$tag" "$h" || ok=0; fi
+  SYNC_TYPED=0
   onboard_turn "do not save my sessions"
   if got="$(said "do not save my sessions" "$offline")" && [[ "$(ds_plugin "$h" 'm.sessions_on()')" == False ]]; then
     pass "$tag onboarding: do not save my sessions -> \"$offline\""
@@ -669,9 +674,36 @@ chat_saved_once() {
   done
   sleep 20  # a second save (the next prompt's hook, a retry) would land by now
   got="$("${SRV[@]}" chat-count "${q}")" || got='{"count": -1}'
+  got="$("${SRV[@]}" chat-count "${q}" Paris)" || got='{"count": -1}'
   if [[ "$got" == *'"count": 1,'* && "$got" == *'"answered": true'* ]]; then
     pass "$tag chat save: the exchange is in the Chats tab exactly once, with its answer ($got)"
   else fail "$tag chat save: the Chats tab read-back is not one answered exchange ($got)"; ok=0; fi
+  ((ok))
+}
+
+# 1.0.18 (x-live #519): after the typed datastash sync, an agent sets a timer with no confirm of any kind (no web step, no
+# "type datastash sync" refusal, no question to the person), and it is on the server. timer_no_confirm <tag> <HOME>.
+timer_no_confirm() {
+  local tag="$1" h="$2" ok=1 q note wb after got i base_done
+  note="e2e ${RUN}-$(date +%s) timer"
+  q="Set a datastash timer on yourself for 90 minutes with the note \"$note\"."
+  wb="$(ds_plugin "$h" 'next((m.read_json(m.conf_path(a["slug"]), {}).get("workbook_id") for a in m.all_agents() if not m.is_person(a) and m.read_json(m.conf_path(a["slug"]), {}).get("workbook_id")), "")')"
+  for ((i = 0; i < 120; i++)); do screen | grep -qE "background agents? to finish|esc to interrupt" || break; sleep 1; done
+  wait_idle 120; sleep 5; wait_idle 120
+  base_done="$(count " · done ")"
+  type_line "$q"
+  drive_until '(( $(count " · done ") > base_done ))' 240
+  wait_idle 120
+  after="$(pane | python3 -I -c 'import sys; print(sys.stdin.read().rsplit(sys.argv[1], 1)[-1])' "$note")"
+  if grep -qiE "datastash_sync_needed|type datastash sync|/confirm|not unlocked|Not done" <<<"$after"; then
+    fail "$tag timer: setting a timer after datastash sync asked for a confirm or was refused"; show_tail 12; ok=0
+  else pass "$tag timer: no confirm, no refusal after datastash sync"; fi
+  if [[ -z "$wb" ]]; then fail "$tag timer: no agent workbook on this computer to read the timer back"; ok=0
+  else
+    got="$("${SRV[@]}" timer-find "$wb" "$note")" || got='{"found": false}'
+    if [[ "$got" == *'"found": true'* ]]; then pass "$tag timer: the timer is set on the server ($got; cancelled after)"
+    else fail "$tag timer: the timer is not on the server ($got)"; show_tail 12; ok=0; fi
+  fi
   ((ok))
 }
 
@@ -689,8 +721,8 @@ ds_uninstall() {  # ds_uninstall <tag> <HOME> <args> <removed names...>: server:
   drive_until "$cond" 300
   wait_idle 120
   f="$(flat)"
-  if [[ "$args" == all ]] && m="$(grep -oE "To go ahead, type exactly: remove all [0-9]+\." <<<"$f" | tail -n 1)" && [[ -n "$m" ]]; then
-    m="${m#To go ahead, type exactly: }"; m="${m%.}"
+  if [[ "$args" == all ]] && m="$(grep -oE "To go ahead, type exactly: \"?remove all [0-9]+\"?\." <<<"$f" | tail -n 1)" && [[ -n "$m" ]]; then
+    m="${m#To go ahead, type exactly: }"; m="${m%.}"; m="${m//\"/}"  # 1.0.18: bold, or quotes on the plugin's own surface
     pass "$tag: \"all\" listed every agent and asked for the typed confirm (\"$m\")"
     base_no="$(count "Not done")/$(count "Datastash isn't installed")/$(count "To go ahead, type exactly:")/$(count "Type the names to remove")/$(count "datastash did not answer")"
     base_done="$(count " · done ")"

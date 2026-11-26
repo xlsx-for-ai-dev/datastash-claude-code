@@ -719,7 +719,7 @@ class OptIn(Base):
         self.assertEqual(ds.tpc_choice(self.folder), "on")
         self.assertEqual(self.settings()["projects"][self.folder]["by"], "default")
         self.assertIn(ds.TPC_ON_LINE, ds.after_install(inp))
-        self.assertEqual(ds.TPC_ON_LINE, "Time per card is on. To turn it off, type: datastash time-per-card off")
+        self.assertEqual(ds.TPC_ON_LINE, "Time per card is on. To turn it off, type: **datastash time-per-card off**")
         rc, out = self.say()
         self.assertIn("time per card is on for this folder", out)
         ds.tpc_install_kick(inp)  # set up once: a second install starts nothing

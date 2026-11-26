@@ -34,6 +34,7 @@ class AutoSave(ChatBase):
         super().setUp()
         self.answers[ds.MCP_PATH] = (200, {"jsonrpc": "2.0", "id": 1, "result": {
             "content": [{"type": "text", "text": json.dumps(SAVED)}]}})
+        ds._REMOVED_HERE.discard("web-app")  # an earlier test's uninstall in this process (shuffled runs) logs nothing more
         ds.record_sessions(True)  # "datastash sync" turned session saving on (here and on the account)
         self.setting = dict(ON)
 
@@ -86,6 +87,31 @@ class AutoSave(ChatBase):
         self.assertEqual(self.run_save(), "saved")
         self.assertEqual([b["params"]["arguments"]["turn"] for b in self.saves()], [1, 2])
         self.assertEqual({b["params"]["arguments"]["chat_key"] for b in self.saves()}, {CK})
+
+    def test_the_last_visible_text_of_the_turn_is_saved(self):
+        """EPM 11-25: the LAST visible assistant text of the turn: text shown before a tool call, with nothing after
+        it, is that text; text after the last tool call wins over text before it."""
+        pid = str(uuid.uuid4())
+        self.typed("s1", "q1", pid)
+        self.entry("s1", {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Here is the answer: 42."},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}})
+        self.entry("s1", {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "SECRET-OUTPUT"}]}})
+        self.assertEqual(ds.last_exchange(self.transcript("s1"))[2], "Here is the answer: 42.")
+        self.entry("s1", {"type": "assistant", "message": {"content": [{"type": "text", "text": "Final: 43."}]}})
+        self.assertEqual(ds.last_exchange(self.transcript("s1"))[2], "Final: 43.")
+
+    def test_a_turn_with_no_visible_text_saves_nothing(self):
+        self.typed("s1", "q1", str(uuid.uuid4()))
+        self.entry("s1", {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "SECRET-THOUGHT"},
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}})
+        self.entry("s1", {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "SECRET-OUTPUT"}]}})
+        self.assertIsNone(ds.last_exchange(self.transcript("s1")))
+        self.assertEqual(self.run_save(), "nothing new")
+        self.assertEqual(self.saves(), [])
 
     def test_a_typed_message_with_no_answer_yet_is_not_saved(self):
         self.typed("s1", "q1", str(uuid.uuid4()))

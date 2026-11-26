@@ -211,12 +211,12 @@ class Install(Base):
         self.assertTrue(proof_ok(got["typed_proof"], "install", [ALPHA, BETA], pid, "/datastash:install"))
         done = self.tool("PostToolUse", "ledger_agents_note", got, {"run_id": RUN, "kind": "install", "targets": 2,
                                                                      "status_path": "/api/v1/agent/uninstall/" + RUN})["systemMessage"]
-        self.assertEqual(done, ds._plain_typed("Done. Datastash is on for web-app. Time per card is on. To turn it off, type: datastash "
-                               "time-per-card off\n"
+        self.assertEqual(done, ds._plain_typed("Done. Datastash is on for web-app. Time per card is on. To turn it off, type: **datastash "
+                               "time-per-card off**\n"
                                "datastash is on for your agents:\n- web-app (public)\n- alpha (private)\n- beta (public)\n"
-                               "To remove one or many: /datastash:uninstall and we'll show you the list of agents.\n"
-                               "To make one private: say make <name> private.\n"
-                               "To make one public: say make <name> public.\n" + ds.SYNC_TYPE_LINE))
+                               "To remove one or many: **/datastash:uninstall** and we'll show you the list of agents.\n"
+                               "To make one private: say **make <name> private**.\n"
+                               "To make one public: say **make <name> public**.\n" + ds.SYNC_TYPE_LINE))
 
     def test_the_only_agent_gets_the_list_with_no_note(self):
         self.installed()
@@ -241,7 +241,7 @@ class Install(Base):
         self.prompt("/datastash:install")
         self.tool("PreToolUse", "ledger_agent_key", {"name": "web-app"})
         out = self.tool("PostToolUse", "ledger_agent_key", {"name": "web-app"}, {"collect": "ready", "mint_id": MINT})
-        self.assertEqual(out["systemMessage"], ds.INSTALL_FAILED_LINE)
+        self.assertEqual(out["systemMessage"], ds._plain_typed(ds.INSTALL_FAILED_LINE))
         self.assertFalse(os.path.exists(ds.key_path("web-app")))
 
     def result_entry(self, sid, tool, note, sidechain=False, tid=None):
@@ -348,7 +348,7 @@ class Uninstall(Base):
     def test_the_list_then_typed_names(self):
         shown = self.show_list()["systemMessage"]
         self.assertEqual(shown, "Your datastash agents:\n- web-app (public)\n- alpha (private)\n- beta (public)\n"
-                                + ds.PICK_LINE)
+                                + ds._plain_typed(ds.PICK_LINE))
         v, pid = self.prompt("Beta")
         self.assertIn('kind "uninstall"', v["hookSpecificOutput"]["additionalContext"])
         got = self.tool("PreToolUse", "ledger_agents_note", {"targets": [OWN, ALPHA]})["hookSpecificOutput"]["updatedInput"]
@@ -363,7 +363,7 @@ class Uninstall(Base):
         self.assertIsNone(v.get("decision"))
         shown = self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
         self.assertEqual(shown["systemMessage"], "This removes all 3 of your datastash agents:\n- web-app (public)\n"
-                         "- alpha (private)\n- beta (public)\n" + ds.ALL_CONFIRM_LINE.format(n=3))
+                         "- alpha (private)\n- beta (public)\n" + ds._plain_typed(ds.ALL_CONFIRM_LINE.format(n=3)))
         self.assertTrue(shown["hookSpecificOutput"]["additionalContext"].startswith(ds.ALL_CONFIRM_AI))
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["permissionDecision"],
                          "deny")  # "all" alone removes nothing yet
@@ -683,7 +683,7 @@ class ReservedWords(Base):
         self.assertIn("so that agent can't be picked by name", line)
         self.assertNotIn("agents page", line)  # stored-name HIGH: the agents page is gone (410)
         if line.startswith("Not done: "):
-            self.assertTrue(line.endswith(ds.OLD_STYLE_LINE), line)
+            self.assertTrue(line.endswith(ds._plain_typed(ds.OLD_STYLE_LINE)), line)
 
     def mkdir(self, name):
         d = os.path.join(os.path.dirname(self.folder), name)
@@ -759,14 +759,14 @@ class ReservedWords(Base):
         nothing until the person types "remove all 4"."""
         lst = plain("web-app", "alpha", "beta", "all", ids=[OWN, ALPHA, BETA, KEPT])
         out = self.picks("all", lst)
-        self.assertEqual(out["systemMessage"], ds.all_confirm_lines(ds.norm_list(lst)))
+        self.assertEqual(out["systemMessage"], ds._plain_typed(ds.all_confirm_lines(ds.norm_list(lst))))
         self.assertIn("- all (public)", out["systemMessage"])
         self.assertTrue(self.denied())
         self.prompt("/datastash:uninstall")
         self.tool("PostToolUse", "ledger_agents_list", {}, lst)
         v, _ = self.prompt("all")
         self.assertEqual(v["decision"], "block")
-        self.assertEqual(v["reason"], ds.all_confirm_lines(ds.norm_list(lst)))
+        self.assertEqual(v["reason"], ds._plain_typed(ds.all_confirm_lines(ds.norm_list(lst))))
         self.assertTrue(self.denied())
         self.prompt("remove all 4")
         self.assertEqual(self.tool("PreToolUse", "ledger_agents_note", {})["hookSpecificOutput"]["updatedInput"]["targets"],
@@ -1050,7 +1050,7 @@ class PlainNames(Base):
                 self.assertEqual(picks_of(word, lst, OWN), "confirm", (odd, word))
             self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), repr(odd))
             out = self.picks("all", lst)
-            self.assertEqual(out["systemMessage"], ds.all_confirm_lines(ds.norm_list(lst)), repr(odd))
+            self.assertEqual(out["systemMessage"], ds._plain_typed(ds.all_confirm_lines(ds.norm_list(lst))), repr(odd))
             self.assertTrue(self.denied())
             if "this" in words:
                 self.prompt("/datastash:uninstall")
@@ -1144,7 +1144,7 @@ class OldStyleNames(Base):
             self.assertEqual(line, f'Not done: your agent "{old}" can\'t be picked by name. Nothing was removed. '
                              + ds.OLD_STYLE_LINE, old)
             self.assertEqual(ds.OLD_STYLE_LINE, "That agent has an old-style name. To remove it, use "
-                             "/datastash:uninstall all and confirm.")
+                             "**/datastash:uninstall all** and confirm.")
             self.assertTrue(ds.vis_refused_line(f"vault {old}", ds.norm_list(lst)).endswith(
                 "Nothing was changed. " + ds.OLD_STYLE_LINE))
             self.assertEqual(sorted(picks_of("vault web-app", lst, OWN)), sorted([X, OWN]), old)
@@ -1159,14 +1159,14 @@ class OldStyleNames(Base):
                 self.assertIn(f"- {old} (public)", out["systemMessage"])
             else:
                 self.assertEqual(out["systemMessage"], f'Not done: your agent "{old}" can\'t be picked by name. Nothing '
-                                 "was removed. " + ds.OLD_STYLE_LINE, old)
+                                 "was removed. " + ds._plain_typed(ds.OLD_STYLE_LINE), old)
                 self.assertEqual(out["hookSpecificOutput"]["additionalContext"], ds.PICK_REFUSED_AI)
             self.assertTrue(self.denied(), old)
             self.prompt("/datastash:uninstall")
             self.tool("PostToolUse", "ledger_agents_list", {}, lst)
             v, _ = self.prompt(old)
             self.assertEqual(v["decision"], "block", old)
-            self.assertIn("This removes all 3" if alone else ds.OLD_STYLE_LINE, v["reason"])
+            self.assertIn("This removes all 3" if alone else ds._plain_typed(ds.OLD_STYLE_LINE), v["reason"])
             self.assertTrue(self.denied(), old)
 
     def test_this_comma_never_removes_this_sessions_agent(self):
@@ -1321,7 +1321,7 @@ class AllConfirm(Base):
         for slash in (False, True):
             shown = self.open_step(slash=slash)
             self.assertEqual(shown, "This removes all 3 of your datastash agents:\n- web-app (public)\n- alpha (private)\n"
-                             "- beta (public)\nTo go ahead, type exactly: remove all 3. Anything else removes nothing.")
+                             "- beta (public)\nTo go ahead, type exactly: \"remove all 3\". Anything else removes nothing.")
             self.assertEqual(self.note()["permissionDecision"], "deny")  # nothing is picked before the confirm
             v, pid = self.prompt("remove all 3")
             self.assertIn('kind "uninstall"', v["hookSpecificOutput"]["additionalContext"])
@@ -2028,7 +2028,7 @@ class HomeFolderInstall(Base):
         self.slash("/datastash:install")
         self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
         out = self.tool("PreToolUse", "ledger_agents_note", REAL_NOTE_1)  # no key collected on this computer
-        self.assertEqual(out["systemMessage"], ds.NO_OWN_AGENT_LINE)
+        self.assertEqual(out["systemMessage"], ds._plain_typed(ds.NO_OWN_AGENT_LINE))
         _, pid = self.slash("/datastash:install")
         self.mint("home-user")
         got = self.list_and_note(REAL_NOTE_1, pid)
@@ -2039,7 +2039,7 @@ class HomeFolderInstall(Base):
         self.assertEqual(out["systemMessage"].count("\n"), 0)
 
     def test_the_connector_line_is_the_mcp_authenticate_step(self):
-        self.assertEqual(ds.NO_CONNECTOR_LINE, "Type /mcp, pick datastash, choose Authenticate, then run /datastash:install again.")
+        self.assertEqual(ds.NO_CONNECTOR_LINE, "Type **/mcp**, pick datastash, choose Authenticate, then run **/datastash:install** again.")
         v, _ = self.slash("/datastash:install")
         self.assertIn(ds.NO_CONNECTOR_LINE, v["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("Settings, Connectors", v["hookSpecificOutput"]["additionalContext"])
@@ -2409,7 +2409,7 @@ class ReinstallKeepsTheName(Base):
         ds.HOME = self.folder  # the home folder: its own name is never the agent's
         with mock.patch.object(ds, "user_name", return_value=""), mock.patch.object(ds, "_folder_name", return_value=""):
             v, _ = self.prompt("/datastash:install", sid="s7")
-            self.assertEqual((v["decision"], v["reason"]), ("block", ds.ASK_NAME_LINE))
+            self.assertEqual((v["decision"], v["reason"]), ("block", ds._plain_typed(ds.ASK_NAME_LINE)))
             v, _ = self.prompt("/datastash:install my-agent", sid="s7")
             self.assertIn('ledger_agent_register with name "my-agent"', v["hookSpecificOutput"]["additionalContext"])
             v, _ = self.prompt("/datastash:install all", sid="s7")
@@ -2435,7 +2435,7 @@ class ReinstallKeepsTheName(Base):
                 mock.patch.object(ds, "_person_asks_of", return_value=[{"kind": "ask", "text": "Ship the fix?"}]):
             lines = ds.waiting_lines(rec)
         self.assertEqual(lines, ["- Not set up yet: beta. Type /datastash:install in its session.",
-                                 "- Ship the fix? To answer, type: status, then the number it shows."])
+                                 "- Ship the fix? To answer, type **status**, then the number it shows."])
 
 
 if __name__ == "__main__":

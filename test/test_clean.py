@@ -516,7 +516,8 @@ class Phrases(Base):
         self.assertEqual(ds.clean_phrase("Turn off clean sessions"), "off")
         self.assertEqual(ds.clean_phrase("turn on clean sessions!"), "on")
         self.assertEqual(ds.clean_phrase("code in sessions"), "code")
-        for t in ("please explain why there is no code in sessions here", "clean sessions", "", None, "x" * 500):
+        self.assertEqual(ds.clean_phrase("clean sessions"), "on")  # owner 11-25: the plain phrase turns it on
+        for t in ("please explain why there is no code in sessions here", "", None, "x" * 500):
             self.assertIsNone(ds.clean_phrase(t), t)
 
     def test_no_code_in_sessions_turns_on_the_second_choice_and_the_agent_confirms(self):

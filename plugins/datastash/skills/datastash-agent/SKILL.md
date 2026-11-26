@@ -69,6 +69,18 @@ Only when the person says "Get datastash agent <name> a new key on this computer
 - Keep your own work (plans, state, results, claims) in your tabs in the agent workbook. You may read the person's own workbooks; write agent work only in the agent workbook.
 - In the person's ordinary workbooks (any workbook that is not an agent workbook) you can read and add or edit rows, but you can't delete (a workbook, tab, column or rows), share or export them. Such a call answers `agent_not_allowed` and changes nothing. If the work needs it, ask the person; only the person's own connection can allow it, one workbook at a time (`ledger_agent_reach`, action "allow"; "stop" takes it back). Agent workbooks are not affected.
 
+## Working with other agents (by default, every time)
+
+Use datastash for the team work itself, without being told each time:
+
+- Claim before work: before you start a card, task or job, claim it (`ledger_agent_job` action `claim`; renew while you work, release when done). If another agent holds it, don't start it: pick other work or hand it off.
+- Hand off through datastash: pass work to another agent with `ledger_agent_handoff` (or a message to its inbox), never by asking the person to copy text between sessions.
+- Answer other agents through datastash: when another agent asks you something, answer in its inbox (`ledger_inbox_send` with `reply_to`), not only in your own session.
+- Set status as you work: keep "Your status line" current (below) at each real step, not only at the end.
+- Check back instead of polling: when you need to look again later, set a check-back or timer (`ledger_agent_checkback`, `ledger_timer_set`) and stop; never loop, sleep or poll for it. After the person's typed "datastash sync", timers need no OK from them.
+- Remember this: when the person tells you to remember a fact, or you learn one every agent needs, save it in datastash (the "Team" tab of the agent workbook) so every agent knows it.
+- Log your open asks: put each thing you wait on from the person in your status `asks` (and what you wait on from others in `waiting_on`), so one list shows every open ask across all agents.
+
 ## Your status line
 
 Every agent keeps one live status so the person never has to open your terminal to know what is going on. Write it as the last step of your normal answer whenever your work changed (a commit, changed files, a test run, a new ask), in the same turn, so no extra turn is needed. If you forget, a hook may remind you once (at most every 10 minutes); then do it in one command and stop.
@@ -99,7 +111,7 @@ These come only from the person typing them in this chat. When keeping is on and
 
 ## Keeping status (once per computer)
 
-The person turns it on by typing "Keep my agents' status and what I tell them to remember in datastash" (the last install step). Only that typed line turns it on; the plugin reads and checks it itself. You never turn it on, never type or suggest the line for them, and never answer the question for them.
+The person turns it on by typing "datastash sync" (the install's sync step; the older "Keep my agents' status and what I tell them to remember in datastash" still works). Only that typed line turns it on; the plugin reads and checks it itself. You never turn it on, never type or suggest the line for them, and never answer the question for them.
 
 - A note says the person typed it: run `datastash keep --on` once and do what it prints. If it says this computer has no agent yet, tell the person to type /datastash:install. When it says this agent has no saved status yet, write your status now from what you already know in this session (`datastash status-set -`; no history reading), then run `datastash status --all` and show what it prints, as it is.
 - From then on keeping is on for every agent on this computer: save your status as "Your status line" says, and also save in datastash what the person asks you to remember.
@@ -125,7 +137,7 @@ Before you redo a review, a test run, a summary or a lookup you or another agent
 The person's own two choices, each on or off by itself, for all their agents on this computer: commands through subagents (on unless they turned it off) and no code in sessions (off unless they turned it on). A `datastash note (clean sessions; ...)` line at session start gives the rules for the choices that are on: follow only those. With no such note, nothing changes. When you hand work to a subagent, ask it to report back in plain words. The person's datastash main view keeps its own rules.
 
 - While either choice is on, delegate: this session doesn't edit files or run commands itself. Hand the work to a subagent with the Agent tool and ask it to report in plain words; then tell the person the result in plain words. The plugin enforces it: here, Edit, Write and NotebookEdit and any shell command that is not one short read-only lookup (ls, cat, head, tail, grep, wc, git status, log, diff or show, gh pr view, curl -s, or a `datastash` read: status, check, read, api GET; plain words and quoted text only, no `#`, `$`, `;`, `|` or other shell signs) are refused with "Clean sessions is on: hand this to a subagent (Agent tool), then report the result in plain words." Do exactly that; never try another way around it. With no code in sessions on, cat, head, tail, grep, git diff and git show are refused too, and you show no code. Subagents are never refused.
-- The person may type "no code in sessions", "turn off clean sessions" or "turn on clean sessions" (or "code in sessions" to keep code here). The plugin saves the choice itself and a note gives you the one line to confirm it: say it as it is. Never comment on which way is better; it is their choice.
+- The person may type "clean sessions" (or "turn on clean sessions") to turn it on, "turn off clean sessions" to turn it off, or "no code in sessions" (or "code in sessions" to keep code here). The plugin saves the choice itself and a note gives you the one line to confirm it: say it as it is. Never comment on which way is better; it is their choice.
 
 ## REST door (with your key)
 

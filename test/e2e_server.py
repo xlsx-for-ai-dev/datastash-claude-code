@@ -17,8 +17,9 @@ Run with python3 -I. Never prints a secret, a code or a token.
                            Code's sign-ins share one client, so they show as one app)
   disconnect-all           disconnect every app connection on the account, this script's own last (cleanup)
   disconnect-others        disconnect every app connection but this script's own (the clean start of a run)
-  chat-count TEXT           (1.0.18) how many saved exchanges start "User: TEXT" across the account's saved chats, and
-                           whether one has an answer after it, as JSON {"count", "answered"}
+  chat-count TEXT [MUST]    (1.0.18) how many saved exchanges start "User: TEXT" across the account's saved chats, and
+                           whether one has an answer after it (holding MUST, when given), as JSON {"count", "answered"}
+  timer-find WB NOTE        (1.0.18) whether a timer with NOTE is set in agent workbook WB; then cancels it, as JSON
   inbox-marks WB INBOX MARK  (XLI-408 step 9) every message in that inbox of workbook WB whose text holds "MARK #<n>",
                            as a JSON list of the n's in the order datastash added them (a repeat shows twice)
 
@@ -342,7 +343,20 @@ def cmd_inbox_marks(wb, inbox, mark):
     print(json.dumps([n for _mid, n in sorted(found)]))
 
 
-def cmd_chat_count(text):
+def cmd_timer_find(wb, note):
+    """1.0.18 (x-live #519): the agent's timer with this note in its workbook (set with no confirm after datastash sync):
+    found or not, then cancelled so nothing fires later. Prints {"found": bool, "set_by": ...}."""
+    err, out = tool("ledger_timer_list", {"workbook_id": wb, "limit": 100})
+    if err or not isinstance(out, dict):
+        print(json.dumps({"found": False, "why": out.get("code") if isinstance(out, dict) else "no answer"}))
+        return
+    hit = [t for t in out.get("timers") or [] if isinstance(t, dict) and note in str(t.get("note") or "")]
+    for t in hit:
+        tool("ledger_timer_cancel", {"workbook_id": wb, "timer_id": t.get("timer_id")})
+    print(json.dumps({"found": bool(hit), "count": len(hit), "set_by": hit[0].get("set_by") if hit else None}))
+
+
+def cmd_chat_count(text, must=None):
     """1.0.18 (XLI-413): how many times the exchange line "User: <text>" is saved across the account's saved chats (the
     Chats tab, one row per chat, each read with sync read_chat), and whether one of them carries an answer after it.
     Prints {"count": n, "answered": bool}."""
@@ -374,7 +388,8 @@ def cmd_chat_count(text):
         n += whole.count(want)
         for piece in whole.split(want)[1:]:
             line = piece.split("\n", 1)[0]
-            answered = answered or len(line.split(": ", 1)[-1].strip()) > 0
+            reply = piece.split("\nUser: ", 1)[0]
+            answered = answered or (len(line.split(": ", 1)[-1].strip()) > 0 and (must is None or must in reply))
     print(json.dumps({"count": n, "answered": answered}))
 
 
@@ -402,8 +417,10 @@ def main(argv):
         return cmd_disconnect_all(keep_mine=True)
     if c == "chats" and len(argv) == 2 and argv[1] in ("on", "off"):
         return cmd_chats(argv[1])
-    if c == "chat-count" and len(argv) == 2:
-        return cmd_chat_count(argv[1])
+    if c == "chat-count" and len(argv) in (2, 3):
+        return cmd_chat_count(argv[1], argv[2] if len(argv) == 3 else None)
+    if c == "timer-find" and len(argv) == 3:
+        return cmd_timer_find(argv[1], argv[2])
     if c == "inbox-marks" and len(argv) == 4:
         return cmd_inbox_marks(argv[1], argv[2], argv[3])
     die("unknown command", 2)

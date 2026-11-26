@@ -330,9 +330,9 @@ class Visibility(Base):
         self.assertNotIn(ds.CMD_NOTE, json.dumps(v or {}))
 
     def test_after_install_lines_name_both_phrases(self):
-        self.assertEqual(ds.AFTER_INSTALL, ["To remove one or many: /datastash:uninstall and we'll show you the list of agents.",
-                                            "To make one private: say make <name> private.",
-                                            "To make one public: say make <name> public."])
+        self.assertEqual(ds.AFTER_INSTALL, ["To remove one or many: **/datastash:uninstall** and we'll show you the list of agents.",
+                                            "To make one private: say **make <name> private**.",
+                                            "To make one public: say **make <name> public**."])
         with open(os.path.join(HERE, "..", "README.md")) as f:
             readme = f.read()
         for line in ds.AFTER_INSTALL:

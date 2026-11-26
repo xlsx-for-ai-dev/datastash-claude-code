@@ -63,6 +63,14 @@ class OnboardBase(Base):
     def sync_call(self, event, action="start", answer=None):
         return self.tool(event, "sync", {"action": action}, answer)
 
+    def goes_out(self, out, action="start"):
+        """The call goes out: as sent, or with the plugin's typed_proof added (x-live #519), never denied."""
+        if out is not None:
+            hs = out["hookSpecificOutput"]
+            self.assertNotIn("permissionDecision", hs)
+            self.assertEqual(hs["updatedInput"]["action"], action)
+            self.assertIn("typed_proof", hs["updatedInput"])
+
 
 class SyncOff(OnboardBase):
     def test_install_ends_with_the_sync_line_and_starts_the_counter(self):
@@ -77,7 +85,7 @@ class SyncOff(OnboardBase):
         self.install()
         out = self.sync_call("PreToolUse")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertEqual(out["systemMessage"], ds.SYNC_NOT_TYPED_LINE)
+        self.assertEqual(out["systemMessage"], ds._plain_typed(ds.SYNC_NOT_TYPED_LINE))
         self.assertIsNone(self.sync_call("PostToolUse", answer={"sync": "on"}))  # no grant: nothing recorded
         self.assertFalse(ds.sync_on())
         self.assertNotEqual(ds.keep_state(), "yes")
@@ -91,7 +99,7 @@ class SyncOff(OnboardBase):
         out = self.typed_phrase("Datastash sync.")
         self.assertIn('action "start"', out["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(ds.keep_state(), "yes")
-        self.assertIsNone(self.sync_call("PreToolUse"))  # the call goes out
+        self.goes_out(self.sync_call("PreToolUse"))  # the call goes out
         self.hours()
         t0 = time.time()
         post = self.sync_call("PostToolUse", answer={"sync": "on", "say_to_user": "Sync is on: ..."})
@@ -107,21 +115,20 @@ class SyncOff(OnboardBase):
         # owner 11-25: datastash sync also saves the person's sessions: the one start_chatstash call, then the Synced
         # reply stands (no second relay)
         self.assertIn('"start_chatstash"', ai.split("----")[0])
-        self.assertIsNone(self.sync_call("PreToolUse", "start_chatstash"))
+        self.goes_out(self.sync_call("PreToolUse", "start_chatstash"), "start_chatstash")
         self.assertIsNone(self.sync_call("PostToolUse", "start_chatstash", {"chatstash": "on"}))
         self.assertTrue(ds.sessions_on())
         self.assertEqual(self.sync_call("PreToolUse", "start_chatstash")["hookSpecificOutput"]["permissionDecision"],
                          "deny")
-        # and timers (owner 11-25): the AI's rule says so; the server is not told until it says it takes timers
+        # and timers (owner 11-25): the AI's rule says so (the server's own yes rides on the typed start, x-live #519)
         self.assertTrue(ds.timers_choice()["on"])
         self.assertEqual(ds.timers_rule(), ds.TIMERS_ON_RULE)
-        self.assertFalse(ds.server_takes_timers())
 
     def test_the_real_sync_answer_two_text_blocks(self):
         """Real e2e 11-25: the connector answers with its JSON block and then a plain-text line."""
         self.install()
         self.typed_phrase("datastash sync")
-        self.assertIsNone(self.sync_call("PreToolUse"))
+        self.goes_out(self.sync_call("PreToolUse"))
         resp = [{"type": "text", "text": json.dumps({"sync": "on", "chatstash": "off", "say_to_user": "Sync is on."})},
                 {"type": "text", "text": "This person has datastash settings on (their own); checkin lists them."}]
         post = self.hook(ds.cmd_agent_tool, {"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": TOOL + "sync",
@@ -143,7 +150,7 @@ class SyncOff(OnboardBase):
             f.write("".join(json.dumps(r) + "\n" for r in rows))
         self.run_checks(start)
         self.assertEqual(ds.keep_state(), "yes")
-        self.assertIsNone(self.sync_call("PreToolUse"))
+        self.goes_out(self.sync_call("PreToolUse"))
         # a typed (not queued) entry under another id never counts
         ds.grant_use("sync", "s1")
         ds.grant_use("chats", "s1")  # datastash sync opened one start_chatstash too
@@ -230,7 +237,7 @@ class SyncOn(OnboardBase):
             self.assertFalse(ds.sessions_on())
         self.assertEqual(ds.SESSIONS_OFF_LINE, "Session saving is off. To turn it back on, type **save my sessions**.")
         self.typed_phrase("save my sessions")
-        self.assertIsNone(self.sync_call("PreToolUse", "start_chatstash"))
+        self.goes_out(self.sync_call("PreToolUse", "start_chatstash"), "start_chatstash")
         post = self.sync_call("PostToolUse", "start_chatstash", {"chatstash": "on"})
         self.assertIn("----\n" + ds.SESSIONS_ON_LINE + "\n----", post["hookSpecificOutput"]["additionalContext"])
         self.assertTrue(ds.sessions_on())
@@ -245,7 +252,7 @@ class SyncOn(OnboardBase):
     def test_save_my_sessions_untyped_is_refused(self):
         out = self.sync_call("PreToolUse", "start_chatstash")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertEqual(out["systemMessage"], ds.CHATS_NOT_TYPED_LINE)
+        self.assertEqual(out["systemMessage"], ds._plain_typed(ds.CHATS_NOT_TYPED_LINE))
 
     def test_a_second_install_runs_the_same_flow(self):
         self.turn_on()
@@ -317,7 +324,7 @@ class Timers(OnboardBase):
         out = self.typed_phrase("turn off timers")
         ai = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn(ds.TIMERS_OFF_LINE, ai)
-        self.assertNotIn("timers_off", ai)  # the server does not take timers yet: nothing new is sent
+        self.assertIn('action "timers_off"', ai)  # x-live #519: the server clears its timers yes too
         self.assertEqual(ds.timers_rule(), ds.TIMERS_OFF_RULE)
         out = self.typed_phrase("Turn on timers.")
         self.assertIn(ds.TIMERS_ON_LINE, out["hookSpecificOutput"]["additionalContext"])
@@ -331,7 +338,7 @@ class Timers(OnboardBase):
         self.assertEqual(ds.timers_rule(), ds.TIMERS_OFF_RULE)
         out = self.sync_call("PreToolUse", "timers_on")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertEqual(out["systemMessage"], ds.TIMERS_NOT_TYPED_LINE)
+        self.assertEqual(out["systemMessage"], ds._plain_typed(ds.TIMERS_NOT_TYPED_LINE))
 
     def test_server_that_says_timers_gets_the_calls(self):
         ds.set_timers(True, "sync")
@@ -341,7 +348,7 @@ class Timers(OnboardBase):
         self.assertIn('action "timers_off"', out["hookSpecificOutput"]["additionalContext"])
         out = self.typed_phrase("turn on timers")
         self.assertIn('action "timers_on"', out["hookSpecificOutput"]["additionalContext"])
-        self.assertIsNone(self.sync_call("PreToolUse", "timers_on"))
+        self.goes_out(self.sync_call("PreToolUse", "timers_on"), "timers_on")
         self.assertIsNone(self.sync_call("PostToolUse", "timers_on", {"timers": "on"}))
         self.assertEqual(self.sync_call("PreToolUse", "timers_on")["hookSpecificOutput"]["permissionDecision"], "deny")
 
@@ -349,10 +356,127 @@ class Timers(OnboardBase):
         ds.set_timers(True, "sync")
         for body in ({}, {"timers": "yes"}, {"timers": True}, None):
             ds.timers_server_said(body)
-        self.assertFalse(ds.server_takes_timers())
+        self.assertNotIn("server", ds.timers_choice())
+
+
+GRANT = "0b0c0d0e-1111-4222-8333-944445555666"
+LOGIN_KEY = "dsak_" + "k" * 43
+
+
+def server_mac(key, door, agent_id, action, pid, typed_text, typed_at, iat):
+    """x-live #519 src/agents/typed-sync.ts typedSyncInput, written out here on its own."""
+    import hashlib
+    import hmac
+    sha = hashlib.sha256(typed_text.encode()).hexdigest()
+    msg = "\n".join(["datastash-typed-sync/v1", door, agent_id.lower(), action, pid, sha, str(typed_at), str(iat)])
+    return hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+class TypedSync(OnboardBase):
+    """x-live #519: the person's typed datastash sync rides on the sync call as the plugin's typed_proof."""
+    def setUp(self):
+        super().setUp()
+        self.keep_keys = (ds.read_answer_key, ds.read_agent_answer)
+
+    def tearDown(self):
+        ds.read_answer_key, ds.read_agent_answer = self.keep_keys
+        super().tearDown()
+
+    def check_proof(self, out, action, door, key, typed="datastash sync"):
+        ti = out["hookSpecificOutput"]["updatedInput"]
+        proof = ti["typed_proof"]
+        self.assertEqual({k: v for k, v in ti.items() if k != "typed_proof"}, {"action": action})
+        self.assertEqual(sorted(proof), ["agent_id", "iat", "mac", "prompt_id", "typed_at", "typed_sha256", "v"])
+        own = ds._own({"session_id": "s1", "cwd": self.folder})
+        self.assertEqual(proof["agent_id"], own["agent_id"].lower())
+        self.assertLessEqual(0, proof["iat"] - proof["typed_at"])
+        self.assertEqual(proof["mac"], server_mac(key, door, own["agent_id"], action, proof["prompt_id"], typed,
+                                                  proof["typed_at"], proof["iat"]))
+        self.assertNotIn(key, json.dumps(out["hookSpecificOutput"].get("additionalContext") or ""))
+
+    def test_the_typed_start_carries_the_login_proof_and_turns_sessions_on(self):
+        ds.read_answer_key = lambda: (LOGIN_KEY, GRANT)
+        self.install()
+        self.typed_phrase("datastash sync")
+        self.check_proof(self.sync_call("PreToolUse"), "start", f"grant:{GRANT}", LOGIN_KEY)
+        post = self.sync_call("PostToolUse", answer={"sync": "on", "timers": "on", "sessions": "on"})
+        ai = post["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("start_chatstash", ai)  # the typed start turned session saving on: no second call
+        self.assertIn("----\n" + ds.SYNCED_LINE + "\n----", ai)
+        self.assertTrue(ds.sessions_on())
+        self.assertEqual(ds.timers_choice()["server"], "on")
+
+    def test_a_connector_sign_in_signs_with_the_agent_answer_key(self):
+        ds.read_answer_key = lambda: None
+        akey = "a" * 43
+        ds.read_agent_answer = lambda s: akey
+        self.install()
+        self.typed_phrase("datastash sync")
+        self.check_proof(self.sync_call("PreToolUse"), "start", "connector", akey)
+
+    def test_turn_on_timers_carries_its_own_proof(self):
+        ds.read_answer_key = lambda: (LOGIN_KEY, GRANT)
+        self.install()
+        ds.set_timers(False, "typed")
+        out = self.typed_phrase("turn on timers")
+        self.assertIn('action "timers_on"', out["hookSpecificOutput"]["additionalContext"])
+        self.check_proof(self.sync_call("PreToolUse", "timers_on"), "timers_on", f"grant:{GRANT}", LOGIN_KEY,
+                         typed="turn on timers")
+
+    def test_a_proof_the_model_sent_is_never_kept(self):
+        ds.read_answer_key = lambda: (LOGIN_KEY, GRANT)
+        self.install()
+        self.typed_phrase("datastash sync")
+        out = self.tool("PreToolUse", "sync", {"action": "start", "typed_proof": {"mac": "0" * 64}})
+        self.assertNotEqual(out["hookSpecificOutput"]["updatedInput"]["typed_proof"]["mac"], "0" * 64)
+
+    def test_the_model_alone_gets_no_proof(self):
+        ds.read_answer_key = lambda: (LOGIN_KEY, GRANT)
+        self.install()
+        out = self.sync_call("PreToolUse")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertNotIn("updatedInput", out["hookSpecificOutput"])
+
+
+class SecondInstallSeed(OnboardBase):
+    """Real e2e 11-25 (A home, second install): a new session after a re-install, with no status saved from this
+    computer yet: the status step must answer in its own turn (the plugin seeds the status), never by the seed note."""
+    def test_the_status_step_seeds_the_status_and_shows_the_list_in_the_same_turn(self):
+        ds.record_keep_all(True, "typed")
+        ds.record_sync_on()
+        self.install()
+        own = ds._own({"session_id": "s1", "cwd": self.folder})
+        ds._drop(ds._written_path(own["slug"]))
+        out, _ = self.prompt("status of all my agents")
+        ai = out["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn(ds.SEED_NOTE, ai)
+        self.assertIn(ds.features_post(), ai)
+        self.assertTrue(os.path.exists(ds._written_path(own["slug"])))
+        self.assertEqual(ds.onboard_state("s1")["stage"], "done")
 
 
 class Functions(OnboardBase):
+    def test_the_gated_lines_wait_for_their_cards(self):
+        names = [n for _h, items in ds.features() for n, _t in items]
+        self.assertNotIn("Show asks", names)
+        self.assertNotIn("Show DDS stats", names)
+        keep = ds.FEATURES_LIVE
+        try:
+            ds.FEATURES_LIVE = frozenset({"XLI-415", "card 8b"})
+            got = dict(ds.features())
+            seeing = [n for n, _t in got["Seeing your agents"]]
+            self.assertEqual(seeing[seeing.index("Morning update") + 1], "Show asks")
+            self.assertEqual([n for n, _t in got["Cost"]], ["Time per card", "Show DDS stats"])
+            self.assertIn("**Show asks:** every open ask across all your agents in one list.", ds.features_post())
+        finally:
+            ds.FEATURES_LIVE = keep
+
+    def test_plain_clean_sessions_turns_it_on(self):
+        self.assertEqual(ds.clean_phrase("clean sessions"), "on")
+        self.assertEqual(ds.clean_phrase("Clean sessions."), "on")
+        self.assertEqual(ds.clean_phrase("turn off clean sessions"), "off")
+        self.assertIsNone(ds.clean_phrase("quiet sessions"))
+
     def test_datastash_functions_shows_the_list(self):
         for phrase in ("datastash functions", "Functions datastash"):
             out, _ = self.prompt(phrase)
