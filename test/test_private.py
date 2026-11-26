@@ -108,7 +108,7 @@ class Recording(PrivateBase):
 
         def fake(method, path, key=None, body=None, form=None, timeout=40, **kw):
             self.calls.append((method, path, key, body))
-            if path.startswith(ds.AGENT_APPROVAL_PATH):
+            if path == ds.AGENT_REGISTER_PATH and (body or {}).get("agent_id"):  # the approval route is gone (XLI-390 X4)
                 return 200, "application/json", json.dumps(seq.pop(0) if len(seq) > 1 else seq[0])
             raise ds.ApiError(404, {})
         ds.http = fake

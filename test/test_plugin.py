@@ -4101,6 +4101,13 @@ class Server:
         base = path.split("?")[0]
         if base == ds.AGENT_REGISTER_PATH:
             name = body["name"]
+            if body.get("agent_id") is not None:  # the same agent again: the approval route is gone (XLI-390 X4)
+                if body["agent_id"] in self.unauthorized:
+                    raise ds.ApiError(401, {"code": "unauthorized"})
+                if body["agent_id"] not in self.agents.values():
+                    raise ds.ApiError(404, {"code": "agent_not_found"})
+                if self.approval == "switched_off":
+                    raise ds.ApiError(400, {"code": "agent_switched_off"})
             if name not in self.agents:
                 self.made += 1
                 self.agents[name] = "aaaaaaaa-0000-0000-0000-%012d" % self.made
@@ -4108,18 +4115,13 @@ class Server:
             if body.get("agent_id") not in (None, aid):
                 raise ds.ApiError(409, {"code": "agent_mismatch"})
             ans = {"agent_id": aid, "name": name}
-            if self.approval == "approved":
+            if self.approval in ("approved", "switched_off"):
                 ans["notes_tabs"] = [{"workbook_id": w, "tab_id": "t1", "name": "notes"} for w in self.workbooks]
             else:
                 ans.update(approval="waiting_for_person", approve_url=ds.AGENTS_URL)
             return 200, "application/json", json.dumps(ans)
         if base == ds.AGENT_APPROVAL_PATH:
-            aid = urllib.parse.parse_qs(path.split("?", 1)[1])["agent_id"][0]
-            if aid in self.unauthorized:
-                raise ds.ApiError(401, {"code": "unauthorized"})
-            if aid not in self.agents.values():
-                raise ds.ApiError(404, {"code": "agent_not_found"})
-            return 200, "application/json", json.dumps({"agent_id": aid, "approval": self.approval})
+            raise ds.ApiError(404, {})  # removed on the server (XLI-390 X4): never asked
         if base == ds.AGENT_KEY_PATH:
             assert body.get("only_if_no_key") is True
             if self.approval != "approved":
@@ -4226,7 +4228,7 @@ class Xli375(Base):
         self.assertEqual(self.key_calls(), [])  # waiting: never a key ask
         self.assertIsNone(ds.read_key("alpha"))
         self.assertEqual(ds.enroll(), 0)  # one agent per folder: nothing new
-        self.assertEqual(len(self.server.paths(ds.AGENT_REGISTER_PATH)), 2)
+        self.assertEqual(len([c for c in self.server.paths(ds.AGENT_REGISTER_PATH) if not (c[2] or {}).get("agent_id")]), 2)
         for c in self.server.calls:  # registered on the login, with this install's proof; no key, code or verifier
             self.assertEqual(c[4], "dsat_" + "t" * 30)
             self.assertNotIn("code_challenge", c[2] or {})
@@ -4329,6 +4331,37 @@ class Xli375(Base):
         self.assertIn('"Make my datastash agent workbook."', told[0])
         self.assertEqual(ds.take_notices([ds.notice_cause("noworkbook")]), [])
 
+    def test_the_removed_approval_route_never_forgets_a_live_agent(self):
+        # e2e run3: x-live removed GET /api/v1/agent/approval (XLI-390 X4); its 404 made every enrolled agent "gone"
+        # here while datastash kept it on (a "-2" at the next install). The same agent's register again says it now.
+        a = self.used(os.path.join(self.root, "alpha"))
+        ds.enroll()
+        self.assertEqual(ds.advance(a), "waiting")
+        self.assertIn(a, ds._enrolled())
+        self.server.approval = "approved"
+        self.assertEqual(ds.advance(a), "ready")
+        self.assertEqual(len(self.key_calls()), 1)
+        self.assertEqual(self.server.paths(ds.AGENT_APPROVAL_PATH), [])
+        self.assertEqual(self.server.made, 1)  # never a second agent
+
+    def test_a_refused_register_again_is_never_asked_again_and_never_forgotten(self):
+        a = self.used(os.path.join(self.root, "alpha"))
+        ds.enroll()
+        real = self.server.__call__
+        n = []
+
+        def bound(method, path, key=None, body=None, **kw):
+            if path == ds.AGENT_REGISTER_PATH and (body or {}).get("agent_id"):
+                n.append(1)
+                raise ds.ApiError(400, {"code": "agent_bound"})
+            return real(method, path, key=key, body=body, **kw)
+        ds.http = bound
+        self.assertEqual(ds.advance(a), "failed")
+        self.assertEqual(ds.advance(a), "failed")
+        self.assertEqual(len(n), 1)
+        self.assertIn(a, ds._enrolled())
+        self.assertEqual(self.key_calls(), [])
+
     def test_denied_or_gone_agents_are_never_asked_for_a_key(self):
         a = self.used(os.path.join(self.root, "alpha"))
         b = self.used(os.path.join(self.root, "beta"))
@@ -4355,8 +4388,8 @@ class Xli375(Base):
 
     def approval_401s(self):
         """Approval asks sent after the cut for an agent datastash answers 401 for."""
-        return [c for c in self.server.calls[self.cut_at:] if c[1].split("?")[0] == ds.AGENT_APPROVAL_PATH
-                and urllib.parse.parse_qs(c[1].split("?", 1)[1])["agent_id"][0] in self.server.unauthorized]
+        return [c for c in self.server.calls[self.cut_at:] if c[1] == ds.AGENT_REGISTER_PATH
+                and (c[2] or {}).get("agent_id") in self.server.unauthorized]
 
     def test_each_record_keeps_its_login_and_a_relogin_registers_again_with_no_401s(self):
         a = self.used(os.path.join(self.root, "alpha"))
@@ -4377,7 +4410,7 @@ class Xli375(Base):
             self.assertEqual(ds.advance(a), "waiting")
             ds.enroll()
         self.assertEqual(self.approval_401s(), [])
-        self.assertEqual(len(self.server.paths(ds.AGENT_REGISTER_PATH)), 2)
+        self.assertEqual(len([c for c in self.server.paths(ds.AGENT_REGISTER_PATH) if not (c[2] or {}).get("agent_id")]), 2)
 
     def test_a_401_on_a_live_login_forgets_the_record_once_and_the_folder_registers_again(self):
         a = self.used(os.path.join(self.root, "alpha"))
@@ -4489,7 +4522,9 @@ class Xli375(Base):
             self.listen(inp)  # told already: waits quietly, then listens
         self.assertTrue(all(8.5 <= s <= 11.5 for s in sleeps), sleeps)
         # one look by the 0.9.x enroll above (no listener start enrolls), then one per ~10 s wait until the Allow
-        self.assertEqual(len(self.server.paths(ds.AGENT_APPROVAL_PATH)), 1 + 4)
+        looks = [c for c in self.server.paths(ds.AGENT_REGISTER_PATH) if (c[2] or {}).get("agent_id")]
+        self.assertEqual(len(looks), 1 + 4 + 1)  # and the first key's own register again
+        self.assertEqual(self.server.paths(ds.AGENT_APPROVAL_PATH), [])  # the removed route is never asked
         self.assertEqual(len(self.key_calls()), 1)
         self.assertEqual(polls, [("alpha", "ldgr_ag_firstkey")] * 2)
         end = time.time() + 5

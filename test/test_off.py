@@ -54,7 +54,8 @@ class OffBase(Base):
                     raise out
                 return 200, "application/json", mcp_answer(out, err)
             if method == "POST" and path == ds.AGENT_REGISTER_PATH:
-                self.registered.append(body)
+                if not (body or {}).get("agent_id"):  # a new agent (the same one again is the waiting look)
+                    self.registered.append(body)
                 return 200, "application/json", json.dumps({"agent_id": AGENT_ID, "name": body["name"]})
             return 200, "application/json", json.dumps({"ok": True})
         ds.http = fake_http

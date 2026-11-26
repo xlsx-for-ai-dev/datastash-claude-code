@@ -2527,6 +2527,29 @@ class OnTheLogin(Base):
         self.assertEqual(ds._enrolled(), {})  # set up now: no longer waiting
         self.assertFalse(os.path.exists(ds.conf_path("web-app-2")))
 
+    def test_install_waits_for_the_sign_in_s_running_enroll_and_takes_its_agent(self):
+        # e2e run3 (computer B): right after the sign-in the login's own poll was registering this folder's agent while
+        # the person typed the install; the install registered the same name with another proof (agent_bound). It now
+        # waits for the enroll lock and takes the agent the enroll registered.
+        import threading
+        proof = "q" * 43
+        held = ds._try_lock(os.path.join(ds.STATE, "enroll.lock"))
+        self.assertIsNotNone(held)
+
+        def enroll_done():
+            time.sleep(0.5)
+            ds._set_enrolled(os.path.realpath(self.folder), {"name": "web-app", "agent_id": OWN, "proof": proof,
+                                                             "login": ds._login_id(), "at": int(time.time())})
+            ds._unlock(held)
+            os.close(held)
+        t = threading.Thread(target=enroll_done)
+        t.start()
+        self.slash("/datastash:install")
+        t.join()
+        regs = [c[3] for c in self.calls if c[1] == ds.AGENT_REGISTER_PATH]
+        self.assertEqual(regs, [{"name": "web-app", "agent_id": OWN, "agent_proof": proof}])
+        self.assertEqual(ds.read_key("web-app"), KEY)
+
     def test_a_second_install_in_the_session_registers_nothing(self):
         self.slash("/datastash:install")
         n = len(self.paths("POST"))

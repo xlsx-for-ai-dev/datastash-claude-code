@@ -2231,16 +2231,25 @@ def _mint_lock(s):
 
 
 def _approval(tok, rec):
-    """The approval route's answer for rec's agent: "approved" | "waiting_for_person" | "switched_off" | "not_found"."""
+    """rec's agent: "approved" | "waiting_for_person" | "switched_off" | "not_found" | "refused". XLI-390 X4 removed the
+    approval route (a GET there answers 404 for every agent, and an agent was then forgotten here while datastash kept
+    it on: a "-2" at the next install); the same agent's register again (name, agent_id, proof: never a second agent)
+    says it: waiting_for_person while it waits, switched off, or refused (another session's agent, a name taken)."""
     try:
-        ans = api_json("GET", AGENT_APPROVAL_PATH + "?agent_id=" + urllib.parse.quote(rec["agent_id"]), tok, timeout=20)
+        ans = api_json("POST", AGENT_REGISTER_PATH, tok, body={"name": rec["name"], "agent_id": rec["agent_id"],
+                                                                "agent_proof": rec["proof"]}, timeout=20)
     except ApiError as e:
-        if e.status == 404:
+        c = _body_code(e)
+        if c == "agent_switched_off":
+            return "switched_off"
+        if c == "agent_not_found":
             return "not_found"
+        if e.status < 500 and e.status not in (401, 429) and c in ("agent_bound", "agent_name_taken", "agent_lookalike"):
+            return "refused"
         raise
+    ans = ans if isinstance(ans, dict) else {}
     note_private(ans, rec["agent_id"], slug(rec["name"]))  # XLI-328 card 3: only an answer saying so changes it
-    st = ans.get("approval") if isinstance(ans, dict) else None
-    return st if st in ("approved", "waiting_for_person", "switched_off") else "waiting_for_person"
+    return "waiting_for_person" if ans.get("approval") == "waiting_for_person" else "approved"
 
 
 def _approval_on_fresh_token(rec):
@@ -2303,6 +2312,10 @@ def advance(folder, tok=None):
         _set_enrolled(folder, None)
         clear_notices([notice_cause("waiting", s)])
         return "gone"
+    if st == "refused":
+        _update_enrolled(folder, key_call=int(time.time()), state="failed")  # never asked again, never forgotten
+        log(s, "approval: register refused; never asked again")
+        return "failed"
     if rec.get("no_workbook_at") and time.time() - rec["no_workbook_at"] < NO_WORKBOOK_RECHECK_SECONDS:
         return "no_workbook"
     lock = _mint_lock(s)
@@ -15313,6 +15326,23 @@ def _code_of(body):
     return c if isinstance(c, str) else ""
 
 
+def _rest_key_after_enroll(inp, tok, name, here, typed):
+    """_rest_key_here once a running enroll is done. e2e run3: right after the sign-in, the login's own poll registers
+    this folder's agent (enroll) while the person types the install; the install waits for that (the enroll lock) and
+    takes the same agent, never a second register of the same name with another proof (agent_bound)."""
+    elock = _try_lock(os.path.join(STATE, "enroll.lock"), wait=ENROLL_WAIT)
+    try:
+        got = _own(inp)
+        if got is not None:  # the enroll just gave this folder's agent its key here
+            return read_json(conf_path(got["slug"]), {}) | {"slug": got["slug"]}
+        return _rest_key_here(inp, tok, name, here, typed)
+    finally:
+        _unlock(elock)
+
+
+ENROLL_WAIT = 15  # seconds the install waits for a running enroll (inside the prompt hook's 45)
+
+
 def _rest_key_here(inp, tok, name, here, typed):
     """Set this folder's agent up on the login: the agent the sign-in registered for this folder (or a folder holding it)
     when there is one, else `name`; register (on the login the person signed in by the typed code, datastash switches
@@ -15383,7 +15413,7 @@ def rest_install(inp, base, name, here, typed):
         return _relay(SIGNED_OUT_LINE)
     own = _own(inp)
     if own is None:
-        got = _rest_key_here(inp, tok, name, here, typed)
+        got = _rest_key_after_enroll(inp, tok, name, here, typed)
         if isinstance(got, str):
             return _relay(got)
         own = got
