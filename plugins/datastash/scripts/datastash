@@ -8096,7 +8096,150 @@ def clean_command_ok(tool, ti, no_code=False, cwd=None):
         return False
     if tool == "Monitor" and ti.get("ws") is not None:
         return False
-    return clean_lookup_ok(ti.get("command"), no_code, cwd=cwd, watch=tool == "Monitor")
+    if clean_lookup_ok(ti.get("command"), no_code, cwd=cwd, watch=tool == "Monitor"):
+        return True
+    if tool == "Monitor":  # 1.0.20 (card 8f): the listener as `datastash --agent NAME watch` too
+        return _clean_ds_watch(ti.get("command"))
+    return not ti.get("run_in_background") and clean_coord_ok(ti.get("command"))
+
+
+# 1.0.20 (card 8f, EPM 11-26: with clean sessions on, the main session could not mark its inbox, cancel a timer, send,
+# hand off or write its status; all of it had to go through a helper subagent). The main session also runs datastash's
+# own coordination writes: they change only the agent workbook's inbox, timers, hand-offs, status and presence, never a
+# file, a workbook's data or code. Data writes (rows upsert or delete, tabs, columns, imports, workbooks, jobs, results,
+# undo) stay refused. The person's own answers on ledger_agent_status (answer, undo, undo_default, delete) stay refused:
+# the plugin sends those itself after the person types them.
+CLEAN_DS_COORD_TOOLS = frozenset((
+    "ledger_inbox_send", "ledger_inbox_mark",  # send and reply; mark read or handled (ledger_inbox_read is a read)
+    "ledger_timer_set", "ledger_timer_cancel", "ledger_agent_checkback",  # timers and the agent's own check-back
+    "ledger_agent_handoff",  # send, list, pickup, done, decline
+    "ledger_agent_status", "ledger_agent_heartbeat",  # the agent's own status row (CLEAN_STATUS_ACTIONS) and presence
+))
+CLEAN_STATUS_ACTIONS = frozenset(("set", "list", "clear", "timeline", "default_taken"))
+# The same writes through the REST door (`datastash api POST PATH BODY`): exactly these paths, no query string.
+CLEAN_COORD_PATHS = frozenset(("/api/v1/agent/inbox", "/api/v1/agent/inbox/mark", "/api/v1/agent/timers",
+                               "/api/v1/agent/handoff", "/api/v1/agent/status", "/api/v1/agent/heartbeat"))
+CLEAN_OWN_PLUGIN_SKILLS = frozenset(("datastash:datastash-agent", "datastash-agent"))
+# A body or message on stdin, as the plugin's own commands take it: printf with one single-quoted literal (bash keeps
+# everything in single quotes literal), piped into the datastash command.
+_CLEAN_PIPE = re.compile(r"printf '%s(?:\\n)?' '([^']*)' \| (.+)")
+_CLEAN_AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def _clean_ds_words(cmd):
+    """The datastash command's own words, after an optional `--agent NAME`, or None: the command on PATH, the plugin's
+    one "${CLAUDE_PLUGIN_ROOT}" spelling, or this script by its path; plain words and quoted literals only."""
+    m = _CLEAN_DS_PREFIX.match(cmd)
+    if m:
+        rest = cmd[m.end():]
+        if any(c in rest for c in "#`$\\!"):
+            return None
+        words = _clean_words(rest)
+    else:
+        if any(c in cmd for c in "#`$\\!"):
+            return None
+        words = _clean_words(cmd)
+        if not words:
+            return None
+        ds = words[1:] if words[0] == "python3" else words
+        if not (ds and ds[0].startswith("/") and os.path.realpath(ds[0]) == os.path.realpath(__file__)):
+            return None
+        words = ds[1:]
+    if words is None:
+        return None
+    if words[:1] == ["--agent"]:
+        return words[2:] if len(words) > 1 and _CLEAN_AGENT_NAME.fullmatch(words[1]) else None
+    if words and words[0].startswith("--agent"):
+        name = words[0][len("--agent="):] if words[0].startswith("--agent=") else ""
+        return words[1:] if _CLEAN_AGENT_NAME.fullmatch(name) else None
+    return words
+
+
+def _clean_ds_watch(cmd):
+    try:
+        if not isinstance(cmd, str) or len(cmd) > 2000 or not re.fullmatch(r"[\x20-\x7e]+", cmd):
+            return False
+        return _clean_ds_words(cmd.strip(" ")) in (["watch"], ["watch", "--person"])
+    except Exception:  # noqa: BLE001  can't tell: refused
+        return False
+
+
+def _clean_coord_body_ok(path, text):
+    body = json.loads(text)
+    if not isinstance(body, dict):
+        return False
+    return path != "/api/v1/agent/status" or body.get("action", "set") in CLEAN_STATUS_ACTIONS
+
+
+def _clean_ds_coord(words, piped):
+    """Only the datastash command's coordination writes: api POST to a CLEAN_COORD_PATHS path (send, reply, inbox mark,
+    timer set, hand-off, status, presence), status-set and heartbeat (never `heartbeat run`). A "-" body comes only from
+    the printf pipe. `datastash send` and `reply` act as the person and run only in the person's datastash main session,
+    which clean sessions never refuses, so they are not here."""
+    if not words:
+        return False
+    c, a = words[0], words[1:]
+    if c == "api":
+        if len(a) != 3 or a[0].upper() != "POST" or a[1] not in CLEAN_COORD_PATHS:
+            return False
+        if a[2] == "-":
+            return piped is not None and _clean_coord_body_ok(a[1], piped)
+        return piped is None and not a[2].startswith("@") and _clean_coord_body_ok(a[1], a[2])
+    if c == "status-set":
+        rest, stdin = list(a), "-" in a
+        while rest:
+            if rest[0] in ("-", "--same"):
+                rest = rest[1:]
+            elif rest[0] == "--project" and len(rest) > 1 and not rest[1].startswith("-"):
+                rest = rest[2:]
+            else:
+                return False
+        return (piped is not None) == stdin and (stdin or "--same" in a)
+    if c == "heartbeat":
+        if piped is not None:
+            return False
+        if a in ([], ["off"]):
+            return True
+        if not a or a[0].startswith("-") or a[0] == "run":
+            return False
+        rest = a[1:]
+        while rest:
+            if rest[0] in ("--tab", "--column") and len(rest) > 1 and not rest[1].startswith("-"):
+                rest = rest[2:]
+            else:
+                return False
+        return True
+    return False
+
+
+def clean_coord_ok(cmd):
+    """True only for one of datastash's own coordination commands (1.0.20, card 8f), in the foreground: the command
+    alone, or a printf of one single-quoted literal piped into it. Anything it can't parse is refused."""
+    try:
+        if not isinstance(cmd, str) or len(cmd) > 60000 or not re.fullmatch(r"[\x20-\x7e]+", cmd):
+            return False
+        cmd, piped = cmd.strip(" "), None
+        m = _CLEAN_PIPE.fullmatch(cmd)
+        if m:
+            piped, cmd = m.group(1), m.group(2)
+        words = _clean_ds_words(cmd)
+        return words is not None and _clean_ds_coord(words, piped)
+    except Exception:  # noqa: BLE001  can't tell: refused
+        return False
+
+
+def clean_plugin_skill(ti):
+    """1.0.20 (card 8f): the plugin's own datastash-agent skill loads in the main session; it runs no command when it
+    loads (its SKILL.md has no !`command` line, checked here each time)."""
+    name = ti.get("skill") if isinstance(ti, dict) else None
+    if not isinstance(name, str) or name.strip().lstrip("/") not in CLEAN_OWN_PLUGIN_SKILLS:
+        return False
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "skills",
+                               "datastash-agent", "SKILL.md"), encoding="utf-8") as f:
+            return "!`" not in f.read()
+    except OSError:
+        return False
 
 
 def clean_tool_ok(inp, no_code=False):
@@ -8109,7 +8252,7 @@ def clean_tool_ok(inp, no_code=False):
     if tool in CLEAN_ALLOWED_TOOLS:
         return True
     if tool == "Skill":
-        return clean_own_skill(ti, inp.get("cwd"))
+        return clean_plugin_skill(ti) or clean_own_skill(ti, inp.get("cwd"))
     if not tool.startswith("mcp__") or "__" not in tool[5:]:
         return False  # Edit, Write, MultiEdit, NotebookEdit, PowerShell, Skill, any unknown or future tool
     server, name = tool[5:].split("__", 1)
@@ -8121,7 +8264,9 @@ def clean_tool_ok(inp, no_code=False):
         return True  # 1.0.18: only after the person's own typed "datastash sync" / "save my sessions" / "turn on timers"
     if name == "sync" and isinstance(ti, dict) and ti.get("action") in ("stop_chatstash", "timers_off") and len(ti) == 1:
         return True  # 1.0.18: the person's "do not save my sessions" / "turn off timers" (only narrows)
-    return name in CLEAN_DS_READ_TOOLS or name in CLEAN_DS_STEP_TOOLS
+    if name == "ledger_agent_status":  # 1.0.20: the agent's own status; the person's answers stay the plugin's
+        return isinstance(ti, dict) and ti.get("action") in CLEAN_STATUS_ACTIONS
+    return name in CLEAN_DS_READ_TOOLS or name in CLEAN_DS_STEP_TOOLS or name in CLEAN_DS_COORD_TOOLS
 
 
 def clean_own_skill(ti, cwd=None):
