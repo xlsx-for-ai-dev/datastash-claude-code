@@ -2040,8 +2040,15 @@ class HomeFolderInstall(Base):
 
     def test_the_connector_line_is_the_install_step(self):
         self.assertEqual(ds.NO_CONNECTOR_LINE, "Type **/datastash:install**.")
+        old = os.environ.get("CLAUDE_CODE_ENTRYPOINT")
+        self.addCleanup(lambda: os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None) if old is None
+                        else os.environ.__setitem__("CLAUDE_CODE_ENTRYPOINT", old))
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a terminal Claude Code
         v, _ = self.slash("/datastash:install")
-        self.assertIn(ds.NO_CONNECTOR_LINE, v["hookSpecificOutput"]["additionalContext"])
+        # 1.0.20 (e2e 6a): a computer that is not signed in (here: no login, no key) gets the sign-in line, never
+        # "type /datastash:install" again, also on a computer updated from an older plugin (the legacy mode).
+        self.assertEqual(ds.signin_state().get("mode"), ds.SIGNIN_LEGACY)
+        self.assertIn(ds.SIGN_IN_INSTALL_LINE, v["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("Settings, Connectors", v["hookSpecificOutput"]["additionalContext"])
         self.assertIn("run datastash check", v["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("/mcp", v["hookSpecificOutput"]["additionalContext"])

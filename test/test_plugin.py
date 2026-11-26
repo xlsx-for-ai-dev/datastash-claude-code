@@ -3247,6 +3247,17 @@ class Transition(Base):
             ds.cmd_check([])
         return json.loads(out.getvalue())
 
+    def test_an_updated_computer_not_signed_in_sees_the_sign_in_line(self):
+        """1.0.20 real e2e 6a: a computer updated from an older plugin (the legacy mode) with no login and no agent key
+        gets the email sign-in line at its first session start in a terminal Claude Code (owner 11-26: no /mcp step)."""
+        ds.HOOK_SIGN_IN = False  # as shipped: the hooks start no login
+        self.addCleanup(setattr, ds, "HOOK_SIGN_IN", True)
+        self.new_computer(updated=True)
+        self.assertEqual(ds.signin_state().get("mode"), ds.SIGNIN_LEGACY)
+        got = self.check("sess-6a")
+        self.assertIn(ds._plain_typed(ds.SIGN_IN_TYPE_LINE), got.get("systemMessage", ""))
+        self.assertEqual(ds._plain_typed(ds.SIGN_IN_TYPE_LINE), 'Type "datastash sync you@email.com" to sign in this computer.')
+
     def test_legacy_sees_the_device_link_at_session_start(self):
         self.new_computer(updated=True)
         got = self.check("sess-L")

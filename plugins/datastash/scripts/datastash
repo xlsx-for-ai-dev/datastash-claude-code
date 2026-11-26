@@ -14077,11 +14077,15 @@ def email_prompt_context(inp):
 
 
 def not_signed_in_here(inp):
-    """No datastash login on this computer, no working agent key for this folder and not the older connector sign-in:
-    nothing here can reach datastash until the person signs in by email. Cheap file checks only."""
+    """No datastash login on this computer and no working agent key for this folder: nothing here can reach datastash's
+    REST door until the person signs in by email. Cheap file checks only. 1.0.20 (e2e 6a): in a terminal Claude Code, a
+    computer updated from an older plugin (the legacy mode, which may still hold a connector sign-in) is asked too: the
+    plugin's own steps run on this computer's login (owner 11-26: no /mcp step). Other hosts in the legacy mode keep
+    their own sign-in door, and a computer without file locking (no login can live there) keeps the connector's."""
     try:
-        if login_present() or effective_signin() in (SIGNIN_LEGACY, SIGNIN_OLD) or fcntl is None:
-            return False  # signed in, or the connector keeps its own sign-in here
+        mode = effective_signin()
+        if login_present() or mode == SIGNIN_OLD or fcntl is None or (mode == SIGNIN_LEGACY and not device_host()):
+            return False  # signed in, or this host or computer keeps the connector's own sign-in
         return inp is None or not keyed_agent_here(project_of(inp), me=this_session(inp))
     except Exception:  # noqa: BLE001
         return False
