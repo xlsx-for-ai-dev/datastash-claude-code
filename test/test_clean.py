@@ -554,6 +554,12 @@ COORD_BASH_REFUSED = (
     "datastash send epm -", "printf '%s' 'hi' | datastash send epm -", "printf '%s' 'hi' | datastash reply 3 -",
     "datastash off epm", "datastash link a --workbook x", "./datastash api POST /api/v1/agent/inbox '{}'",
     "datastash listen", "datastash watch",
+    # 1.0.20 (XLI-417): the plugin's own install and uninstall steps on the login are never a tool call
+    "datastash api POST /api/v1/agent/agents/note '{\"kind\": \"uninstall\"}'",
+    "datastash api POST /api/v1/agent/register '{\"name\": \"x\"}'",
+    "datastash api POST /api/v1/agent/key '{\"name\": \"x\"}'",
+    "datastash api POST /api/v1/agent/pickup '{}'",
+    "datastash install", "datastash uninstall all",
 )
 
 
@@ -578,6 +584,14 @@ class Coordination(Base):
         for cmd in COORD_BASH_REFUSED:
             self.assertFalse(ds.clean_coord_ok(cmd), repr(cmd))
             self.assertTrue(denied(self.call("Bash", {"command": cmd})), repr(cmd))
+
+    def test_the_install_checker_is_never_a_tool_call_in_any_session(self):
+        """1.0.20 (XLI-417): the checker that signs the person's typed install or uninstall note is refused to every tool
+        call (the main session and a subagent alike), as the status checker is."""
+        for cmd in ("datastash command-verify s1", 'python3 "$CLAUDE_PLUGIN_ROOT/scripts/datastash" command-verify s1'):
+            for kw in ({}, {"agent_id": "a1b2c3"}):
+                hs = (self.call("Bash", {"command": cmd}, **kw) or {}).get("hookSpecificOutput") or {}
+                self.assertEqual(hs.get("permissionDecision"), "deny", (cmd, kw))
 
     def test_a_coordination_command_in_the_background_or_in_a_monitor_is_refused(self):
         for cmd in COORD_BASH[:3]:

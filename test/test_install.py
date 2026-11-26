@@ -2050,7 +2050,8 @@ class HomeFolderInstall(Base):
         self.assertEqual(ds.signin_state().get("mode"), ds.SIGNIN_LEGACY)
         self.assertIn(ds.SIGN_IN_INSTALL_LINE, v["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("Settings, Connectors", v["hookSpecificOutput"]["additionalContext"])
-        self.assertIn("run datastash check", v["hookSpecificOutput"]["additionalContext"])
+        self.assertNotIn("run datastash check", v["hookSpecificOutput"]["additionalContext"])  # 1.0.20: no shell step
+        self.assertIn("run no command", v["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("/mcp", v["hookSpecificOutput"]["additionalContext"])
 
 
@@ -2451,3 +2452,203 @@ class ReinstallKeepsTheName(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OnTheLogin(Base):
+    """1.0.20 (XLI-417 last mile, owner 11-26: no /mcp step): on a computer signed in to datastash, the person's typed
+    /datastash:install and /datastash:uninstall run on that login over REST, by the plugin itself: no connector tool,
+    no command for the model. Notes are signed and sent only once the transcript shows the person typed the command."""
+
+    def setUp(self):
+        super().setUp()
+        for k in ("login_present", "login_token", "_login_id", "CMD_RUN_WAIT", "CMD_RESULT_WAIT"):
+            self.saved[k] = getattr(ds, k)
+        ds.login_present = lambda: True
+        ds.login_token = lambda force=False: "dsat_" + "t" * 40
+        ds._login_id = lambda: "login-id-0123456789"
+        ds.CMD_RUN_WAIT, ds.CMD_RESULT_WAIT = 2, 3
+        self.answers[ds.AGENT_REGISTER_PATH] = (200, {"agent_id": OWN, "name": "web-app", "notes_tabs": [{"workbook_id": WB}]})
+        self.answers[ds.AGENT_KEY_PATH] = (200, {"pickup_code": "code-" + "c" * 20})
+        self.answers[ds.PICKUP_PATH] = (200, {"agent_id": OWN, "name": "web-app", "key": KEY, "answer_key": ANSWER})
+        self.answers[ds.LOGIN_AGENTS_PATH] = (200, LIST)
+
+    def paths(self, method=None):
+        return [c[1] for c in self.calls if method is None or c[0] == method]
+
+    def ai(self, v):
+        return v["hookSpecificOutput"]["additionalContext"]
+
+    def verify(self, sid="s1"):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(ds.cmd_command_verify([sid]), 0)
+
+    def stop(self, sid="s1"):
+        return self.hook(ds.cmd_status_check, {"session_id": sid, "hook_event_name": "Stop", "cwd": self.folder,
+                                               "transcript_path": self.transcript(sid)})
+
+    def test_install_is_done_by_the_plugin_and_the_model_only_relays_the_list(self):
+        v, pid = self.slash("/datastash:install")
+        ai = self.ai(v)
+        self.assertIn(ds.RELAY_AI.split("{text}")[0], ai)
+        self.assertIn("Done. Datastash is on for web-app.", ai)
+        self.assertIn("datastash is on for your agents:\n- web-app (public)\n- alpha (private)\n- beta (public)", ai)
+        for word in ("ledger_", "datastash check", "run "):
+            self.assertNotIn(word, ai.split("----")[0].replace("Make no more datastash calls", ""))
+        self.assertNotIn(KEY, json.dumps(v))
+        self.assertNotIn(ANSWER, json.dumps(v))
+        self.assertEqual(self.paths("POST")[:3], [ds.AGENT_REGISTER_PATH, ds.AGENT_KEY_PATH, ds.PICKUP_PATH])
+        key_ask = [c[3] for c in self.calls if c[1] == ds.AGENT_KEY_PATH][0]
+        self.assertTrue(key_ask["only_if_no_key"])
+        self.assertIn("code_challenge", key_ask)
+        self.assertEqual(ds.read_key("web-app"), KEY)
+        self.assertEqual(ds.read_agent_answer("web-app"), ANSWER)
+        for p in (ds.key_path("web-app"), ds._fill("{c}/agent-{s}.answer", "web-app")):
+            self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+        self.assertEqual(ds.read_json(ds.conf_path("web-app"), {})["projects"], [os.path.realpath(self.folder)])
+        self.assertEqual([a[2:] for a, _ in self.spawned if "command-verify" in a], [["command-verify", "s1"]])
+        # the checker: the typed entry is there now; the install note to the other two, signed by this agent
+        self.answers[ds.LOGIN_NOTE_PATH] = (200, {"run_id": RUN, "kind": "install", "targets": 2})
+        self.verify()
+        note = [c for c in self.calls if c[1] == ds.LOGIN_NOTE_PATH][0]
+        self.assertTrue(note[2].startswith("dsat_"))  # on the login, never an agent key
+        self.assertEqual(sorted(note[3]), ["kind", "list_id", "targets", "typed_proof"])
+        self.assertEqual((note[3]["kind"], note[3]["targets"]), ("install", sorted([ALPHA, BETA])))
+        self.assertTrue(proof_ok(note[3]["typed_proof"], "install", [ALPHA, BETA], pid, "/datastash:install"))
+        self.assertIsNone(self.stop())  # an install's result was already said: nothing to relay at the turn's end
+
+    def test_install_reuses_the_agent_the_sign_in_registered_for_this_folder(self):
+        proof = "p" * 43
+        ds._set_enrolled(os.path.realpath(self.folder), {"name": "web-app", "agent_id": OWN, "proof": proof,
+                                                         "login": ds._login_id(), "at": int(time.time())})
+        self.slash("/datastash:install")
+        regs = [c[3] for c in self.calls if c[1] == ds.AGENT_REGISTER_PATH]
+        self.assertEqual(regs, [{"name": "web-app", "agent_id": OWN, "agent_proof": proof}])  # the same agent, no new one
+        self.assertEqual(ds.read_json(ds.conf_path("web-app"), {})["agent_id"], OWN)
+        self.assertEqual(ds._enrolled(), {})  # set up now: no longer waiting
+        self.assertFalse(os.path.exists(ds.conf_path("web-app-2")))
+
+    def test_a_second_install_in_the_session_registers_nothing(self):
+        self.slash("/datastash:install")
+        n = len(self.paths("POST"))
+        _v, _pid = self.slash("/datastash:install")
+        self.assertEqual([p for p in self.paths("POST")[n:] if p in (ds.AGENT_REGISTER_PATH, ds.AGENT_KEY_PATH)], [])
+
+    def test_a_login_not_synced_yet_still_installs_this_agent_and_says_to_type_datastash_sync(self):
+        self.answers[ds.LOGIN_AGENTS_PATH] = (400, {"code": "datastash_sync_needed", "message": "x"})
+        v, _pid = self.slash("/datastash:install")
+        ai = self.ai(v)
+        self.assertIn("Done. Datastash is on for web-app.", ai)
+        self.assertIn(ds.SYNC_FIRST_LINE, ai)
+        self.assertNotIn("datastash is on for your agents:", ai)
+        self.assertEqual(ds.read_key("web-app"), KEY)
+        self.assertEqual([a for a, _ in self.spawned if "command-verify" in a], [])
+
+    def test_a_refused_register_saves_nothing_and_says_why(self):
+        self.answers[ds.AGENT_REGISTER_PATH] = (409, {"code": "agent_switched_off", "message": '"web-app" is switched off.'})
+        v, _pid = self.slash("/datastash:install")
+        self.assertIn("Not done: datastash refused it (agent_switched_off", self.ai(v))
+        self.assertFalse(os.path.exists(ds.key_path("web-app")))
+        self.assertNotIn(ds.AGENT_KEY_PATH, self.paths())
+
+    def test_uninstall_a_named_agent_the_checker_signs_and_the_stop_hook_relays(self):
+        self.installed()
+        v, pid = self.slash("/datastash:uninstall alpha")
+        self.assertIn(ds.REMOVING_LINE, self.ai(v))
+        self.assertNotIn(ds.LOGIN_NOTE_PATH, self.paths())  # nothing sent before the typed entry is checked
+        self.answers[ds.LOGIN_NOTE_PATH] = (200, {"run_id": RUN, "kind": "uninstall", "targets": 1, "removed": 1})
+        self.verify()
+        note = [c[3] for c in self.calls if c[1] == ds.LOGIN_NOTE_PATH][0]
+        self.assertEqual((note["kind"], note["targets"]), ("uninstall", [ALPHA]))
+        self.assertTrue(proof_ok(note["typed_proof"], "uninstall", [ALPHA], pid, "/datastash:uninstall alpha"))
+        out = self.stop()
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("Done. Datastash is uninstalled from alpha.", out["reason"])
+        self.assertIsNone(self.stop())  # told once
+        self.assertEqual(ds.read_key("web-app"), KEY)
+
+    def test_uninstall_all_confirms_then_removes_every_agent_this_one_last(self):
+        self.installed()
+        v, _pid = self.slash("/datastash:uninstall all")
+        self.assertEqual(v["decision"], "block")
+        self.assertIn("type exactly: remove all 3", ds._plain_typed(v["reason"]).replace('"', ""))
+        v, pid = self.prompt("remove all 3")
+        self.assertIn(ds.REMOVING_LINE, self.ai(v))
+        self.answers[ds.LOGIN_NOTE_PATH] = (200, {"run_id": RUN, "kind": "uninstall", "targets": 3})
+        self.answers[ds.UNINSTALL_SELF_PATH] = (200, {"removed": True})
+        self.verify()
+        note = [c[3] for c in self.calls if c[1] == ds.LOGIN_NOTE_PATH][0]
+        self.assertEqual(note["targets"], sorted([OWN, ALPHA, BETA]))
+        self.assertTrue(proof_ok(note["typed_proof"], "uninstall", [OWN, ALPHA, BETA], pid, "remove all 3"))
+        self.assertEqual([c[2] for c in self.calls if c[1] == ds.UNINSTALL_SELF_PATH], [KEY])  # last, on its own key
+        out = self.stop()
+        self.assertIn("Datastash is uninstalled from", out["reason"])
+        self.assertFalse(os.path.exists(ds.key_path("web-app")))
+
+    def test_uninstall_with_no_names_lists_then_takes_the_typed_names(self):
+        self.installed()
+        v, _pid = self.slash("/datastash:uninstall")
+        self.assertEqual(v["decision"], "block")
+        self.assertIn("- alpha (private)", v["reason"])
+        self.assertIn("Type the names to remove", v["reason"])
+        v, pid = self.prompt("beta")
+        self.assertIn(ds.REMOVING_LINE, self.ai(v))
+        self.answers[ds.LOGIN_NOTE_PATH] = (200, {"run_id": RUN, "kind": "uninstall", "targets": 1})
+        self.verify()
+        note = [c[3] for c in self.calls if c[1] == ds.LOGIN_NOTE_PATH][0]
+        self.assertTrue(proof_ok(note["typed_proof"], "uninstall", [BETA], pid, "beta"))
+        self.assertIn("uninstalled from beta", self.stop()["reason"])
+
+    def test_this_agent_alone_ends_itself_at_once_on_its_own_key(self):
+        self.installed()
+        self.answers[ds.UNINSTALL_SELF_PATH] = (200, {"removed": True})
+        v, _pid = self.slash("/datastash:uninstall web-app")
+        self.assertIn("Done. Datastash is uninstalled from web-app.", self.ai(v))
+        self.assertNotIn(ds.LOGIN_NOTE_PATH, self.paths())
+        self.assertFalse(os.path.exists(ds.key_path("web-app")))
+
+    def test_a_command_the_model_or_a_script_typed_sends_nothing(self):
+        self.installed()
+        _v, _pid = self.slash("/datastash:uninstall alpha", origin={"kind": "agent"})
+        self.answers[ds.LOGIN_NOTE_PATH] = (200, {"run_id": RUN})
+        self.verify()
+        self.assertNotIn(ds.LOGIN_NOTE_PATH, self.paths())
+        self.assertIn("Not done", self.stop()["reason"])
+        _v, _pid = self.prompt("/datastash:uninstall beta", source="sdk")
+        self.verify()
+        self.assertNotIn(ds.LOGIN_NOTE_PATH, self.paths())
+
+    def test_no_typed_entry_sends_nothing(self):
+        self.installed()
+        pid = str(uuid.uuid4())
+        self.hook(ds.cmd_prompt, {"session_id": "s1", "prompt": "/datastash:uninstall alpha", "cwd": self.folder,
+                                  "hook_event_name": "UserPromptSubmit", "prompt_id": pid,
+                                  "transcript_path": self.transcript("s1")})
+        self.verify()
+        self.assertNotIn(ds.LOGIN_NOTE_PATH, self.paths())
+        self.assertIn(ds.NOT_TYPED_LINE, self.stop()["reason"])
+
+    def test_the_pickup_asks_for_json_and_keeps_the_answer_key(self):
+        got = ds.login_pickup("code-" + "c" * 20, "v" * 43)
+        self.assertEqual(got, {"key": KEY, "answer_key": ANSWER})
+        self.answers[ds.PICKUP_PATH] = (200, {"key": KEY})
+        self.assertEqual(ds.login_pickup("code-" + "c" * 20, "v"), {"key": KEY, "answer_key": None})
+        self.answers[ds.PICKUP_PATH] = (200, {"key": "not-a-key"})
+        self.assertIsNone(ds.login_pickup("code-" + "c" * 20, "v"))
+
+    def test_without_a_login_the_connector_steps_stay(self):
+        ds.login_present = lambda: False
+        v, _pid = self.slash("/datastash:install")
+        self.assertIn('ledger_agent_register with name "web-app"', self.ai(v))
+        self.assertEqual(self.paths(), [p for p in self.paths() if p not in (ds.AGENT_REGISTER_PATH, ds.LOGIN_AGENTS_PATH)])
+
+    def test_on_a_login_not_synced_this_agent_by_name_still_ends_itself(self):
+        self.installed()
+        self.answers[ds.LOGIN_AGENTS_PATH] = (400, {"code": "datastash_sync_needed", "message": "type datastash sync"})
+        self.answers[ds.UNINSTALL_SELF_PATH] = (200, {"removed": True})
+        v, _pid = self.slash("/datastash:uninstall alpha")
+        self.assertEqual(v["decision"], "block")
+        self.assertIn("datastash_sync_needed", v["reason"])
+        self.assertTrue(os.path.exists(ds.key_path("web-app")))
+        v, _pid = self.slash("/datastash:uninstall web-app")
+        self.assertIn("Done. Datastash is uninstalled from web-app.", self.ai(v))
+        self.assertFalse(os.path.exists(ds.key_path("web-app")))

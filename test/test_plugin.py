@@ -1774,7 +1774,8 @@ class PickupBinding(MainBase):
         self.tool_hook("sess-F7", self.AGENT_KEY_TOOL, {"name": "Res Two"}, event="PreToolUse")
         v = ds.read_verifier("agent-res-two")
         forms = []
-        ds.http = lambda method, path, key=None, body=None, form=None, timeout=40: (forms.append(form) or (200, "text/plain", "ldgr_ag_" + "k" * 43 + "\n"))
+        ds.http = lambda method, path, key=None, body=None, form=None, timeout=40, accept=None: (
+            forms.append(form) or self.assertEqual(accept, "text/plain") or (200, "text/plain", "ldgr_ag_" + "k" * 43 + "\n"))
         with redirect_stdout(io.StringIO()) as out:
             self.assertEqual(ds.cmd_fetch(["Res Two", "dspk_code123"]), 0)
         self.assertEqual(forms, [{"code": "dspk_code123", "verifier": v}])
@@ -4427,15 +4428,17 @@ class Xli375(Base):
         self.assertIn(a, ds._enrolled())
 
     def test_the_only_key_ask_in_the_plugin_is_the_first_key(self):
-        """Nothing anywhere else asks for a key: AGENT_KEY_PATH is used by _first_key alone, with only_if_no_key."""
+        """Nothing anywhere else asks for a key: AGENT_KEY_PATH is used by _first_key and (1.0.20, XLI-417) the person's
+        typed /datastash:install on the login (_rest_key_here) alone, each with only_if_no_key."""
         import ast
         import inspect
         with open(BIN) as f:
             tree = ast.parse(f.read())
         users = sorted({fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
                         for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == "AGENT_KEY_PATH"})
-        self.assertEqual(users, ["_first_key"])
+        self.assertEqual(users, ["_first_key", "_rest_key_here"])
         self.assertIn('"only_if_no_key": True', inspect.getsource(ds._first_key))
+        self.assertIn('"only_if_no_key": True', inspect.getsource(ds._rest_key_here))
 
     # nothing the model can reach approves, registers or mints
     def test_approval_looking_prompt_or_stdin_does_nothing(self):
