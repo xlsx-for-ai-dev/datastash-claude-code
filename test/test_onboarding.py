@@ -458,13 +458,15 @@ class SecondInstallSeed(OnboardBase):
 class Functions(OnboardBase):
     def test_the_gated_lines_wait_for_their_cards(self):
         names = [n for _h, items in ds.features() for n, _t in items]
-        self.assertNotIn("Show asks", names)
+        self.assertIn("Show asks", names)  # XLI-415: its gate is open
         self.assertIn("Show DDS stats", names)  # card 8b: its gate is open (1.0.19)
         self.assertEqual([n for n, _t in dict(ds.features())["Cost"]], ["Time per card", "Show DDS stats"])
         self.assertIn("  - **Show DDS stats:** your agents, what they used, and the time datastash saved you, any time.",
                       ds.features_post())
         keep = ds.FEATURES_LIVE
         try:
+            ds.FEATURES_LIVE = frozenset({"card 8b"})
+            self.assertNotIn("Show asks", [n for _h, items in ds.features() for n, _t in items])
             ds.FEATURES_LIVE = frozenset({"XLI-415", "card 8b"})
             got = dict(ds.features())
             seeing = [n for n, _t in got["Seeing your agents"]]
@@ -500,6 +502,65 @@ USAGE = {"last_24_hours": {"calls": 9, "most_used": [{"tool": "ledger_rows_get",
          "last_7_days": {"calls": 40, "agents": 2, "most_used": [{"tool": "ledger_report", "calls": 20},
                                                                 {"tool": "ledger_rows_get", "calls": 17}, {"tool": "checkin", "calls": 3}]}}
 BY = {"missed": 2.0, "lookups": 1.5, "polling": 0.0, "lost": 0.5, "asks": 0.2, "watchers": 0.1}
+
+
+ASKS = {"open": 3, "note": "n", "items": [
+    {"n": 1, "agent": "Alpha", "of": "Beta", "ask": "Pick up this hand-off: Ship the report", "blocking": False, "kind": "handoff"},
+    {"n": 2, "agent": "Beta", "of": "Alpha", "ask": "the schema", "blocking": True, "kind": "wait"},
+    {"n": 3, "agent": "Gamma", "of": "you", "ask": "Which domain\ngoes live?", "blocking": True, "kind": "person",
+     "instance": "i-1"}]}
+
+
+class ShowAsks(OnboardBase):
+    """XLI-415 (owner 11-25): "show asks" lists every open ask across all agents from checkin's asks, word for word."""
+    def test_the_phrases(self):
+        for t in ("show asks", "Show asks.", "show my asks", "SHOW  ASKS!"):
+            self.assertEqual(ds.onboard_phrase(t), "asks", t)
+        for t in ("asks", "show asks for api please", "why does it show asks?", "show the asks"):
+            self.assertNotEqual(ds.onboard_phrase(t), "asks", t)
+
+    def test_the_lines(self):
+        self.assertEqual(ds.asks_text(ASKS), "\n".join([
+            "Open asks",
+            "  - **1. Alpha** (of Beta): Pick up this hand-off: Ship the report",
+            "  - **2. Beta** (of Alpha, blocking): the schema",
+            "  - **3. Gamma** (of you, blocking): Which domain goes live?"]))
+
+    def test_none_and_not_there_say_so(self):
+        self.assertEqual(ds.asks_text({"open": 0, "items": []}), "Open asks\n" + ds.ASKS_NONE)
+        self.assertEqual(ds.asks_text("not connected on this computer yet"),
+                         "Open asks\n  - **Asks:** not connected on this computer yet")
+
+    def test_the_asks_come_from_checkin(self):
+        calls = []
+        keep, keep_key = ds.mcp_tool, ds._dds_key
+        ds.mcp_tool = lambda key, name, args, timeout=60: calls.append((name, args, timeout)) or (False, {"asks": ASKS})
+        ds._dds_key = lambda: "ldgr_ag_test"
+        try:
+            out, _ = self.prompt("show asks")
+        finally:
+            ds.mcp_tool, ds._dds_key = keep, keep_key
+        ai = out["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(calls, [("checkin", {}, ds.DDS_TIMEOUT)])
+        self.assertIn("----\nOpen asks\n  - **1. Alpha** (of Beta): ", ai)
+        self.assertNotIn("ldgr_ag_test", ai)
+
+    def test_no_key_or_a_failed_read_never_fails_the_prompt(self):
+        keep, keep_key = ds.mcp_tool, ds._dds_key
+        calls = []
+        ds.mcp_tool = lambda *a, **k: calls.append(a) or (False, {})
+        try:
+            out, _ = self.prompt("show my asks")
+            self.assertIn("  - **Asks:** not connected on this computer yet", out["hookSpecificOutput"]["additionalContext"])
+            self.assertEqual(calls, [])
+
+            def boom(*_a, **_k):
+                raise OSError("down")
+            ds.mcp_tool, ds._dds_key = boom, (lambda: "ldgr_ag_test")
+            out, _ = self.prompt("show asks")
+            self.assertIn("  - **Asks:** datastash didn't answer just now", out["hookSpecificOutput"]["additionalContext"])
+        finally:
+            ds.mcp_tool, ds._dds_key = keep, keep_key
 
 
 class DdsStats(OnboardBase):

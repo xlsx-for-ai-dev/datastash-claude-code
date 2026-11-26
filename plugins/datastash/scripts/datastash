@@ -13251,7 +13251,7 @@ FEATURES_GATED = (
     ("Cost", "Time per card", "Show DDS stats", "your agents, what they used, and the time datastash saved you, any time.",
      "card 8b"),
 )
-FEATURES_LIVE = frozenset({"card 8b"})  # the gates that are live on prod; add one here when its card ships (card 8b: 1.0.19)
+FEATURES_LIVE = frozenset({"card 8b", "XLI-415"})  # the gates that are live on prod; add one here when its card ships (card 8b: 1.0.19; XLI-415 with it)
 
 
 def features():
@@ -13282,6 +13282,7 @@ FUNCTIONS_AGAIN_LINE = ("Everything in that list is already turned on for you. T
                         "**datastash functions**.")
 FUNCTIONS_PHRASE_RE = re.compile(r"(?:datastash functions|functions datastash)")
 DDS_STATS_PHRASE_RE = re.compile(r"(?:show )?dds stats|show datastash stats")  # card 8b (owner 11-25)
+ASKS_PHRASE_RE = re.compile(r"show (?:my )?asks")  # XLI-415 (owner 11-25)
 HOURS_LINE = ("Last week, we estimate you would have gotten **{x}** more hours of coding done using datastash. This week "
               "will be great!")
 SYNC_NOT_TYPED_LINE = ("Not done: sync turns on only when you type **datastash sync** yourself. Nothing changed.")
@@ -13474,6 +13475,8 @@ def onboard_phrase(text):
         return "functions"
     if DDS_STATS_PHRASE_RE.fullmatch(t):
         return "dds_stats"
+    if ASKS_PHRASE_RE.fullmatch(t):
+        return "asks"
     return None
 
 
@@ -13588,6 +13591,47 @@ def dds_stats_text(usage=None, est=None):
                       f"  - **Most used, last 7 days:** {week}", _dds_hours_line(est), DDS_CLOSING])
 
 
+# --- XLI-415 (owner 11-25): "show asks" ("show my asks"). Every open ask across all the person's agents, in one list, from
+# the server (checkin's asks): sorted by agent, blocking first, plain numbers 1, 2, 3. The asks are the agents' words, shown
+# on one line each (cleaned and cut); nothing is answered or changed here.
+ASKS_HEAD = "Open asks"
+ASKS_NONE = "  - **No open asks** across your agents."
+ASKS_TEXT_MAX = 200
+
+
+def _asks_read():
+    """checkin's asks (dict) on this computer's key, or a short reason it isn't there."""
+    key = _dds_key()
+    if key is None:
+        return "not connected on this computer yet"
+    try:
+        err, out = mcp_tool(key, "checkin", {}, timeout=DDS_TIMEOUT)
+    except Exception:  # noqa: BLE001  any network or answer problem: say so, never fail the prompt
+        return "datastash didn't answer just now"
+    a = out.get("asks") if not err and isinstance(out, dict) else None
+    if not isinstance(a, dict) or not isinstance(a.get("items"), list):
+        return "datastash didn't answer just now" if err else "not on this server yet"
+    return a
+
+
+def asks_text(asks=None):
+    """The "show asks" answer: one bullet per open ask, "N. Agent (of whom, blocking): the ask"."""
+    asks = _asks_read() if asks is None else asks
+    if not isinstance(asks, dict):
+        return "\n".join([ASKS_HEAD, f"  - **Asks:** {asks}"])
+    lines = [ASKS_HEAD]
+    for i in asks.get("items") or []:
+        if not isinstance(i, dict) or not isinstance(i.get("n"), int):
+            continue
+        of = _clean(i.get("of"), 64) or "you"
+        tags = f"of {of}" + (", blocking" if i.get("blocking") is True else "")
+        lines.append(f"  - **{i['n']}. {_clean(i.get('agent'), 64) or 'an agent'}** ({tags}): "
+                     f"{_clean(i.get('ask'), ASKS_TEXT_MAX)}")
+    if len(lines) == 1:
+        lines.append(ASKS_NONE)
+    return "\n".join(lines)
+
+
 def _grant_path(kind, sid):
     return os.path.join(STATE, f"typed-grant-{kind}-{sid}.json")
 
@@ -13621,6 +13665,8 @@ def onboard_prompt_context(inp):
         return ONBOARD_RELAY_AI.format(text=features_post())
     if kind == "dds_stats":  # card 8b: only reads (the local counter, the server's counts): nothing turns on, so no check
         return ONBOARD_RELAY_AI.format(text=dds_stats_text())
+    if kind == "asks":  # XLI-415: only reads the server's open asks: nothing turns on, so no check
+        return ONBOARD_RELAY_AI.format(text=asks_text())
     if kind == "chats_off":  # only narrows: saved at once, no check
         try:
             record_sessions(False)
