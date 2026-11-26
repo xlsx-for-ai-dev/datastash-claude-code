@@ -127,12 +127,12 @@ About `datastash login`:
   `~/.config/datastash/login.refresh` (mode 600) when there is none. It is never printed. Access tokens last 15 minutes.
 - Every refresh gives a new refresh token and retires the old one. If a retired one is ever used again (someone copied
   it), datastash signs that computer out at once. (datastash takes the one before it once, for about 30 seconds, so a dropped answer
-  doesn't sign you out.) A login also ends 30 days after its last use and 90 days after it
+  doesn't sign you out.) A login also ends a year after its last use and a year after it
   was made; run `datastash login` again then.
 - The keychain keeps the token away from other people and other user accounts, not from programs that run as you. The
   plugin reads it with the system's own `security` (macOS) or `secret-tool` (Linux) tool, so a keychain access list
   can't tell the plugin apart from any other shell command of yours, an AI's included; none is set. What protects you
-  instead: rotation (a copy is caught on its next use), the 30/90-day lifetimes, the new-network check below, and the
+  instead: rotation (a copy is caught on its next use), the one-year lifetimes, the new-network check below, and the
   person-only steps on the datastash site.
 - A new login can't register agents or get keys until you allow it: the plugin opens that datastash page in your
   browser and Claude asks you to approve the login there.
