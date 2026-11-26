@@ -459,7 +459,10 @@ class Functions(OnboardBase):
     def test_the_gated_lines_wait_for_their_cards(self):
         names = [n for _h, items in ds.features() for n, _t in items]
         self.assertNotIn("Show asks", names)
-        self.assertNotIn("Show DDS stats", names)
+        self.assertIn("Show DDS stats", names)  # card 8b: its gate is open (1.0.19)
+        self.assertEqual([n for n, _t in dict(ds.features())["Cost"]], ["Time per card", "Show DDS stats"])
+        self.assertIn("  - **Show DDS stats:** your agents, what they used, and the time datastash saved you, any time.",
+                      ds.features_post())
         keep = ds.FEATURES_LIVE
         try:
             ds.FEATURES_LIVE = frozenset({"XLI-415", "card 8b"})
@@ -489,8 +492,88 @@ class Functions(OnboardBase):
                                         "progress in half a second."))
         self.assertIn("  - **Time per card:** time and tokens for each piece of work.", post)
         self.assertIn('  - **Lists:** "keep a list of…", for leads, contacts, anything.', post)
-        n = sum(len(items) for _h, items in ds.FEATURES)
+        n = sum(len(items) for _h, items in ds.features())
         self.assertEqual(post.count("  - **"), n)
+
+
+USAGE = {"last_24_hours": {"calls": 9, "most_used": [{"tool": "ledger_rows_get", "calls": 6}, {"tool": "checkin", "calls": 3}]},
+         "last_7_days": {"calls": 40, "agents": 2, "most_used": [{"tool": "ledger_report", "calls": 20},
+                                                                {"tool": "ledger_rows_get", "calls": 17}, {"tool": "checkin", "calls": 3}]}}
+BY = {"missed": 2.0, "lookups": 1.5, "polling": 0.0, "lost": 0.5, "asks": 0.2, "watchers": 0.1}
+
+
+class DdsStats(OnboardBase):
+    """Card 8b (owner 11-25): "show dds stats" shows plain lines the model relays word for word."""
+    def test_the_phrases(self):
+        for t in ("show dds stats", "dds stats", "Show DDS stats.", "show datastash stats", "SHOW  dds  stats!"):
+            self.assertEqual(ds.onboard_phrase(t), "dds_stats", t)
+        for t in ("dds", "show stats", "show dds stats for api please", "how are the dds stats computed?"):
+            self.assertNotEqual(ds.onboard_phrase(t), "dds_stats", t)
+
+    def test_the_lines(self):
+        est = {"hours": 4.3, "plans": 1, "agents": 3, "subagents": 11, "by": BY}
+        got = ds.dds_stats_text(usage=USAGE, est=est)
+        self.assertEqual(got, "\n".join([
+            "DDS stats",
+            "  - **Agents:** 3, and subagents in the last 7 days: 11",
+            "  - **Most used today:** ledger_rows_get 6, checkin 3",
+            "  - **Most used, last 7 days:** ledger_report 20, ledger_rows_get 17, checkin 3",
+            "  - **Hours saved, last 7 days:** 4.3: missed events 2, repeated lookups 1.5, lost cards 0.5, "
+            "self-answerable asks 0.2, lapsed watchers 0.1",
+            "Waiting on the person never counts."]))
+
+    def test_what_is_not_there_says_so(self):
+        got = ds.dds_stats_text(usage=ds.DDS_NOT_TRACKED, est="running")
+        self.assertIn("  - **Agents:** not tracked yet", got)
+        self.assertIn("  - **Most used today:** not tracked yet", got)
+        self.assertIn("  - **Hours saved, last 7 days:** still counting. Type **show dds stats** again in a minute.", got)
+        self.assertTrue(got.endswith("\nWaiting on the person never counts."))
+        old = ds.dds_stats_text(usage={"last_24_hours": {"calls": 0, "most_used": []}}, est={"hours": 12.4, "agents": 1, "subagents": 0})
+        self.assertIn("  - **Most used today:** none yet", old)
+        self.assertIn("  - **Most used, last 7 days:** not tracked yet", old)
+        self.assertIn("  - **Hours saved, last 7 days:** 12 (the breakdown comes with the next count)", old)
+
+    def test_no_key_says_not_connected_and_sends_nothing(self):
+        calls = []
+        keep = ds.mcp_tool
+        ds.mcp_tool = lambda *a, **k: calls.append(a) or (False, {})
+        try:
+            self.hours(5.0, by=BY)
+            out, _ = self.prompt("show dds stats")
+        finally:
+            ds.mcp_tool = keep
+        ai = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("----\nDDS stats\n", ai)
+        self.assertIn("  - **Most used today:** not connected on this computer yet", ai)
+        self.assertIn("  - **Agents:** 2, and subagents in the last 7 days: 9", ai)
+        self.assertIn("Waiting on the person never counts.\n----", ai)
+        self.assertEqual(calls, [])
+
+    def test_the_counts_come_from_checkin_usage(self):
+        calls = []
+        keep, keep_key = ds.mcp_tool, ds._dds_key
+        ds.mcp_tool = lambda key, name, args, timeout=60: calls.append((name, args, timeout)) or (False, {"usage": USAGE})
+        ds._dds_key = lambda: "ldgr_ag_test"
+        try:
+            self.hours(5.0, by=BY)
+            out, _ = self.prompt("dds stats")
+        finally:
+            ds.mcp_tool, ds._dds_key = keep, keep_key
+        ai = out["hookSpecificOutput"]["additionalContext"]
+        self.assertEqual(calls, [("checkin", {}, ds.DDS_TIMEOUT)])
+        self.assertIn("  - **Most used today:** ledger_rows_get 6, checkin 3", ai)
+        self.assertNotIn("ldgr_ag_test", ai)
+
+    def test_a_failed_read_never_fails_the_prompt(self):
+        keep, keep_key = ds.mcp_tool, ds._dds_key
+        def boom(*_a, **_k):
+            raise OSError("down")
+        ds.mcp_tool, ds._dds_key = boom, (lambda: "ldgr_ag_test")
+        try:
+            out, _ = self.prompt("show datastash stats")
+        finally:
+            ds.mcp_tool, ds._dds_key = keep, keep_key
+        self.assertIn("  - **Most used today:** datastash didn't answer just now", out["hookSpecificOutput"]["additionalContext"])
 
 
 class CleanOwnSkills(OnboardBase):

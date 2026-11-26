@@ -164,8 +164,11 @@ class Tests(Base):
         lines.append(assistant(NOW - 80000, tool=("x1", "Bash", {"command": "curl https://%s.example.com/a/b" % SECRET.lower()})))
         self.write(self.cfg(), "a-" + SECRET + ".jsonl", lines)
         r = self.est([self.cfg()])
-        self.assertEqual(set(r), {"hours", "plans", "agents", "subagents", "files", "bytes", "seconds", "days"})
-        self.assertTrue(all(isinstance(v, (int, float)) for v in r.values()))
+        self.assertEqual(set(r), {"hours", "plans", "agents", "subagents", "files", "bytes", "seconds", "days", "by"})
+        self.assertEqual(set(r["by"]), {"missed", "lookups", "polling", "lost", "asks", "watchers"})  # card 8b
+        self.assertTrue(all(isinstance(v, (int, float)) for v in r["by"].values()))
+        self.assertAlmostEqual(sum(r["by"].values()), r["hours"], delta=0.35)
+        self.assertTrue(all(isinstance(v, (int, float)) for k, v in r.items() if k != "by"))
         blob = json.dumps(r).lower()
         self.assertNotIn(SECRET.lower(), blob)
         self.assertNotIn(self.home.lower(), blob)

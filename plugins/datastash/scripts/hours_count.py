@@ -736,7 +736,11 @@ def estimate(config_dirs=None, days=7, now=None, workers=None):
     total = missed_s + repeated + polling + lost + sum(asks) + lapses * FLOOR
     return {'hours': round(total / 3600.0, 1), 'plans': len(plans), 'agents': agents, 'subagents': subs,
             'files': len(parts), 'bytes': sum(p[0][1] for p in parts), 'seconds': round(time.time() - t0, 2),
-            'days': days}
+            'days': days,
+            # card 8b ("show dds stats"): the same total split by category, in hours (numbers only)
+            'by': {'missed': round(missed_s / 3600.0, 1), 'lookups': round(repeated / 3600.0, 1),
+                   'polling': round(polling / 3600.0, 1), 'lost': round(lost / 3600.0, 1),
+                   'asks': round(sum(asks) / 3600.0, 1), 'watchers': round(lapses * FLOOR / 3600.0, 1)}}
 
 
 # ---------------------------------------------------------------------------------------------

@@ -13251,7 +13251,7 @@ FEATURES_GATED = (
     ("Cost", "Time per card", "Show DDS stats", "your agents, what they used, and the time datastash saved you, any time.",
      "card 8b"),
 )
-FEATURES_LIVE = frozenset()  # the gates that are live on prod (none yet, 11-26); add one here when its card ships
+FEATURES_LIVE = frozenset({"card 8b"})  # the gates that are live on prod; add one here when its card ships (card 8b: 1.0.19)
 
 
 def features():
@@ -13281,6 +13281,7 @@ SESSIONS_OFF_LINE = "Session saving is off. To turn it back on, type **save my s
 FUNCTIONS_AGAIN_LINE = ("Everything in that list is already turned on for you. To see it again any time, type "
                         "**datastash functions**.")
 FUNCTIONS_PHRASE_RE = re.compile(r"(?:datastash functions|functions datastash)")
+DDS_STATS_PHRASE_RE = re.compile(r"(?:show )?dds stats|show datastash stats")  # card 8b (owner 11-25)
 HOURS_LINE = ("Last week, we estimate you would have gotten **{x}** more hours of coding done using datastash. This week "
               "will be great!")
 SYNC_NOT_TYPED_LINE = ("Not done: sync turns on only when you type **datastash sync** yourself. Nothing changed.")
@@ -13471,7 +13472,120 @@ def onboard_phrase(text):
         return "chats_off"
     if FUNCTIONS_PHRASE_RE.fullmatch(t):
         return "functions"
+    if DDS_STATS_PHRASE_RE.fullmatch(t):
+        return "dds_stats"
     return None
+
+
+# --- card 8b (owner 11-25): "show dds stats" ("dds stats", "show datastash stats"). "every time i ask you for a read i
+# want it. and so will all of our users." Plain lines the model relays word for word: the agents and subagents of the last
+# 7 days and the hours saved (the local hours counter, scripts/hours_count.py: totals only, never text), and the most-used
+# functions (the server's counter, checkin's usage: counts only). Nothing is made up: what isn't there yet says so.
+DDS_STATS_HEAD = "DDS stats"
+DDS_NOT_TRACKED = "not tracked yet"
+DDS_CLOSING = "Waiting on the person never counts."
+DDS_TOP = 5  # functions shown per line
+DDS_TIMEOUT = 5  # seconds for the one checkin read (the prompt hook has 10)
+DDS_HOURS_PARTS = (("missed", "missed events"), ("lookups", "repeated lookups"), ("polling", "subagent polling"),
+                   ("lost", "lost cards"), ("asks", "self-answerable asks"), ("watchers", "lapsed watchers"))
+
+
+def _dds_hours_fmt(h):
+    return str(int(round(h))) if h >= 10 else (f"{h:.1f}".rstrip("0").rstrip(".") or "0")
+
+
+def _dds_estimate():
+    """The local counter's totals (dict), "running" while it counts, or None (no result: it is started now)."""
+    if hours_running():
+        return "running"
+    v = read_json(HOURS_PATH, None)
+    if not isinstance(v, dict):
+        hours_kick()
+        return "running" if hours_running() else None
+    if os.path.exists(HOURS_PATH) and time.time() - os.path.getmtime(HOURS_PATH) >= HOURS_REUSE:
+        hours_kick()  # an older result is shown now and counted again for the next ask
+    return v
+
+
+def _dds_num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and v >= 0 else None
+
+
+def _dds_agents_line(est):
+    if isinstance(est, dict) and not est.get("none") and _dds_num(est.get("agents")) is not None \
+            and _dds_num(est.get("subagents")) is not None:
+        return f"  - **Agents:** {int(est['agents'])}, and subagents in the last 7 days: {int(est['subagents'])}"
+    if isinstance(est, dict) and est.get("none"):
+        return "  - **Agents:** 0, and subagents in the last 7 days: 0"
+    return f"  - **Agents:** {DDS_NOT_TRACKED}"
+
+
+def _dds_hours_line(est):
+    if est == "running":
+        return "  - **Hours saved, last 7 days:** still counting. Type **show dds stats** again in a minute."
+    if not isinstance(est, dict):
+        return "  - **Hours saved, last 7 days:** not ready yet. Type **show dds stats** again in a minute."
+    if est.get("none"):
+        return "  - **Hours saved, last 7 days:** 0 (no sessions on this computer in the last 7 days)"
+    h = _dds_num(est.get("hours"))
+    if h is None:
+        return "  - **Hours saved, last 7 days:** not ready yet. Type **show dds stats** again in a minute."
+    line = f"  - **Hours saved, last 7 days:** {_dds_hours_fmt(h)}"
+    by = est.get("by") if isinstance(est.get("by"), dict) else None
+    if by is None:
+        return line + " (the breakdown comes with the next count)"
+    parts = [f"{label} {_dds_hours_fmt(_dds_num(by.get(k)))}" for k, label in DDS_HOURS_PARTS if _dds_num(by.get(k))]
+    return line + (": " + ", ".join(parts) if parts else "")
+
+
+def _dds_key():
+    """The key the counts are read with: the person's own (datastash login, main or watch key), else an agent's."""
+    k = read_key(PERSON_SLUG)
+    if k:
+        return k
+    for a in all_agents():
+        if not is_person(a):
+            k = read_key(a["slug"])
+            if k:
+                return k
+    return None
+
+
+def _dds_usage():
+    """checkin's usage (dict) on this computer's key, or a short reason it isn't there."""
+    key = _dds_key()
+    if key is None:
+        return "not connected on this computer yet"
+    try:
+        err, out = mcp_tool(key, "checkin", {}, timeout=DDS_TIMEOUT)
+    except Exception:  # noqa: BLE001  any network or answer problem: say so, never fail the prompt
+        return "datastash didn't answer just now"
+    u = out.get("usage") if not err and isinstance(out, dict) else None
+    if not isinstance(u, dict):
+        return "datastash didn't answer just now" if err else DDS_NOT_TRACKED
+    return u
+
+
+def _dds_used(w):
+    if not isinstance(w, dict):
+        return DDS_NOT_TRACKED
+    items = [x for x in w.get("most_used") or [] if isinstance(x, dict) and isinstance(x.get("tool"), str)
+             and _dds_num(x.get("calls")) is not None]
+    if not items:
+        return "none yet"
+    return ", ".join(f"{_clean(x['tool'], 64)} {int(x['calls'])}" for x in items[:DDS_TOP])
+
+
+def dds_stats_text(usage=None, est=None):
+    """The "show dds stats" answer: plain grouped bullets, one closing line."""
+    est = _dds_estimate() if est is None else est
+    usage = _dds_usage() if usage is None else usage
+    if isinstance(usage, dict):
+        today, week = _dds_used(usage.get("last_24_hours")), _dds_used(usage.get("last_7_days"))
+    else:
+        today = week = usage
+    return "\n".join([DDS_STATS_HEAD, _dds_agents_line(est), f"  - **Most used today:** {today}",
+                      f"  - **Most used, last 7 days:** {week}", _dds_hours_line(est), DDS_CLOSING])
 
 
 def _grant_path(kind, sid):
@@ -13505,6 +13619,8 @@ def onboard_prompt_context(inp):
         return None
     if kind == "functions":  # only shows the list: nothing turns on, so no check
         return ONBOARD_RELAY_AI.format(text=features_post())
+    if kind == "dds_stats":  # card 8b: only reads (the local counter, the server's counts): nothing turns on, so no check
+        return ONBOARD_RELAY_AI.format(text=dds_stats_text())
     if kind == "chats_off":  # only narrows: saved at once, no check
         try:
             record_sessions(False)
