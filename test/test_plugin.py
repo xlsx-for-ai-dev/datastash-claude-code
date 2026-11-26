@@ -3846,7 +3846,8 @@ class Xli374(Base):
         ds.fetch_page = FakeInbox([(0.0, 5)], end_after=5).fetch_page
         rc, err = self.listen()
         self.assertEqual(rc, 2)
-        self.assertIn("DATASTASH_AGENT=free datastash api GET", err)
+        self.assertIn("datastash --agent free api GET", err)
+        self.assertNotIn("DATASTASH_AGENT=", err)  # 1.0.18 real e2e: an env prefix is outside Bash(datastash:*)
         me = ds.this_session({"session_id": "s374"})
         self.assertIsNone(ds.main_refusal(me))  # the session can still become the person's main
 
@@ -4568,6 +4569,80 @@ class P2Adds(Base):
         self.assertIsNone(ds.only_agent())
         for n in ("solo", "broken"):
             os.replace(ds.conf_path(n), os.path.join(TMP, f"oldp2-{n}-{time.time()}"))
+
+
+class AllowRules(unittest.TestCase):
+    """1.0.18 real e2e step 2: the one-agent wake line said `DATASTASH_AGENT=<name> datastash ...`; the model copied the
+    prefix and Claude Code asked the person, since only commands that start with `datastash` match Bash(datastash:*).
+    Every command the skill, the commands and the hook text give the model must match that rule."""
+    PLUGIN = os.path.join(HERE, "..", "plugins", "datastash")
+    ENV_OR_CD = re.compile(r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s|env\s|cd\s|\()")
+
+    @staticmethod
+    def allowed(segment):
+        rule = re.fullmatch(r"Bash\((.*):\*\)", ds.DATASTASH_FIX_RULE).group(1)  # Claude Code's prefix form
+        seg = segment.strip()
+        return seg == rule or seg.startswith(rule + " ")
+
+    def texts(self):
+        out = []
+        for rel in ("skills/datastash-agent/SKILL.md", "commands/install.md", "commands/uninstall.md",
+                    "hooks/hooks.json", "scripts/datastash"):
+            with open(os.path.join(self.PLUGIN, rel)) as f:
+                out.append((rel, f.read()))
+        agent = {"name": "Free", "slug": "free", "workbook_id": "w1"}
+        out.append(("wake line, one-agent fallback", ds.wake_text(dict(agent, via="only-agent"), 1, [1])))
+        out.append(("wake line, linked folder", ds.wake_text(agent, 1, [1])))
+        out.append(("seed note", ds.SEED_NOTE))
+        return out
+
+    PREFIX = re.compile(r"^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|env|cd \S+ &&)\s+)*")
+
+    def runs_datastash(self, piece):
+        """The piece's program, after any env assignment or env in front, is the datastash command."""
+        rest = self.PREFIX.sub("", piece)
+        return re.match(r"(?:\S*/)?datastash(?:\s|$)", rest) is not None
+
+    def commands(self, text):
+        """Model-run command strings: every `code span` whose pipeline runs datastash, and every "with <command> and
+        handle" the wake lines use."""
+        spans = re.findall(r"`([^`\n]{1,300})`", text)
+        spans += re.findall(r"\bwith ((?:[A-Za-z_][A-Za-z0-9_]*=\S+ )?datastash [^`]*?) and handle", text)
+        for span in spans:
+            if span.startswith(("datastash note", "datastash-")):
+                continue  # a hook line's own prefix, not a command
+            pieces = [p for p in re.split(r"\|\||&&|[|;]", span) if p.strip()]
+            if any(self.runs_datastash(p) for p in pieces):
+                yield span, pieces
+
+    def test_every_model_run_datastash_command_matches_the_allow_rule(self):
+        seen = 0
+        for where, text in self.texts():
+            for span, pieces in self.commands(text):
+                seen += 1
+                for p in pieces:
+                    self.assertIsNone(self.ENV_OR_CD.match(p), f"{where}: {span!r} has an env, cd or subshell")
+                    if self.runs_datastash(p):
+                        self.assertTrue(self.allowed(p), f"{where}: {span!r} runs datastash outside {ds.DATASTASH_FIX_RULE}")
+        self.assertGreater(seen, 50)
+
+    def test_the_agent_flag_names_the_agent_like_the_old_env_did(self):
+        saved = os.environ.pop("DATASTASH_AGENT", None)
+        try:
+            self.assertEqual(ds.take_agent_flag(["--agent", "free", "api", "GET", "/x"]), ["api", "GET", "/x"])
+            self.assertEqual(os.environ["DATASTASH_AGENT"], "free")
+            self.assertEqual(ds.take_agent_flag(["--agent=b", "status"]), ["status"])
+            self.assertEqual(os.environ["DATASTASH_AGENT"], "b")
+            os.environ.pop("DATASTASH_AGENT")
+            # only before the command: a command's own words are never read as the flag
+            self.assertEqual(ds.take_agent_flag(["send", "x", "--agent", "y"]), ["send", "x", "--agent", "y"])
+            self.assertNotIn("DATASTASH_AGENT", os.environ)
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ds.take_agent_flag(["--agent"])
+        finally:
+            os.environ.pop("DATASTASH_AGENT", None)
+            if saved is not None:
+                os.environ["DATASTASH_AGENT"] = saved
 
 
 if __name__ == "__main__":

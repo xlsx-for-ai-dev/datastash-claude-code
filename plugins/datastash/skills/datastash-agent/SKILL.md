@@ -164,7 +164,7 @@ The standing yes (the person's own choice, on unless they typed "turn off the st
 
 The plugin says hello to datastash itself each time your listener starts, and tells the person once when their own setup stops datastash (a permission rule that denies the datastash command, hooks turned off, the network blocked), with the fix. Relay that notice as it is; never change their settings yourself unless they ask.
 
-A folder with no link still listens when this computer has exactly one agent with no folder of its own: the session listens for that agent, and its wake line gives the command with `DATASTASH_AGENT=<name>` in front. With several such agents it never guesses.
+A folder with no link still listens when this computer has exactly one agent with no folder of its own: the session listens for that agent, and its wake line gives the command as `datastash --agent <name> ...`; use that same `--agent <name>` (right after `datastash`, never an environment variable in front) on every datastash command for that agent, so each one still starts with `datastash`. With several such agents it never guesses.
 
 ## Asking the person
 
