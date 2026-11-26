@@ -645,6 +645,44 @@ onboard_flow() {
   ((ok))
 }
 
+# 1.0.19: the two new typed commands, in the onboarded session (step 1). show_cmds <tag> <HOME>. "show dds stats" (card 8b):
+# its head, the most-used lines with function counts (name and number), the closing line, nothing denied or error.
+# "show asks" (XLI-415, read through the person's main key): its head, then "No open asks" or numbered asks; none of
+# the plugin's own can't-read reasons; nothing denied or error. The fixed lines are read from the candidate's script.
+show_cmds() {
+  local tag="$1" h="$2" got after ok=1
+  python3 -I -c 'import sys; v=tuple(int(x) for x in (sys.argv[1] or "0").split(".")[:3] if x.isdigit()); sys.exit(0 if v >= (1, 0, 19) else 1)' \
+    "$(installed_version "$h")" || return 0
+  local head close ahead anone
+  head="$(ds_plugin "$h" 'm.DDS_STATS_HEAD')"; close="$(ds_plugin "$h" 'm.DDS_CLOSING')"
+  ahead="$(ds_plugin "$h" 'm.ASKS_HEAD')"; anone="$(ds_plugin "$h" 'm._plain_typed(m.ASKS_NONE).replace("\"", "").strip(" -")')"
+  onboard_turn "show dds stats"
+  after="$(pane | python3 -I "$HERE/e2e_visible.py" inorder "show dds stats" "$head" "Most used today:" "Most used, last 7 days:" "$close")" \
+    && pass "$tag show dds stats: \"$head\", the most-used lines and \"$close\" are shown (bold rendered)" \
+    || { fail "$tag show dds stats: the answer is not shown as the plugin wrote it ($after)"; show_tail 14; ok=0; }
+  got="$(pane | python3 -I -c 'import re,sys
+L=sys.stdin.read().split("\n"); at=[k for k,l in enumerate(L) if l.strip().lstrip("❯>").strip()==sys.argv[1]]
+t=re.sub(r"\s+"," ","\n".join(L[at[-1]+1:]) if at else "")
+m=re.search(r"Most used today:(.*?)Most used, last 7 days:", t)
+print(m.group(1).strip()[:200] if m else "")
+sys.exit(0 if m and re.search(r"[A-Za-z_][\w.:-]* \d+", m.group(1)) else 1)' "show dds stats")" \
+    && pass "$tag show dds stats: function counts shown: \"$got\"" \
+    || { fail "$tag show dds stats: no function counts on the Most used today line (\"$got\")"; ok=0; }
+  if got="$(clean_out "show dds stats")"; then pass "$tag show dds stats: nothing visible says denied, error or not run"
+  else fail "$tag show dds stats: the visible output reads as a failure: $got"; ok=0; fi
+  onboard_turn "show asks"
+  after="$(pane | python3 -I -c 'import re,sys; L=sys.stdin.read().split("\n"); at=[k for k,l in enumerate(L) if l.strip().lstrip("❯>").strip()==sys.argv[1]]; print(re.sub(r"\s+", " ", "\n".join(L[at[-1]+1:]) if at else ""))' "show asks")"
+  if pane | python3 -I "$HERE/e2e_visible.py" inorder "show asks" "$ahead" >/dev/null \
+      && { grep -qF "$anone" <<<"$after" || grep -qE "1\. " <<<"$after"; }; then
+    pass "$tag show asks: \"$ahead\", then $(grep -qF "$anone" <<<"$after" && echo "\"$anone\"" || echo "numbered asks")"
+  else fail "$tag show asks: the answer is not the head and a list or \"$anone\""; show_tail 14; ok=0; fi
+  grep -qE "not connected on this computer yet|didn't answer just now|not on this server yet" <<<"$after" \
+    && { fail "$tag show asks: the plugin could not read the asks: $(grep -oE "not connected on this computer yet|didn't answer just now|not on this server yet" <<<"$after" | head -n 1)"; ok=0; }
+  if got="$(clean_out "show asks")"; then pass "$tag show asks: nothing visible says denied, error or not run"
+  else fail "$tag show asks: the visible output reads as a failure: $got"; ok=0; fi
+  ((ok))
+}
+
 # 1.0.18 MUST-FIX (XLI-413, owner 11-25): with session saving on, a normal question gets its full answer in the session
 # (no "Saved" line standing in for it), the plugin's own once-per-session line is shown once, and the exchange is in
 # the Chats tab exactly once (the plugin saves it in the background after the reply; read back by the person's own
@@ -904,7 +942,7 @@ core() {
   say "== computer A, home folder"
   readme_steps "1 A home" "$A" "$A" "$CORE_SRC" || return
   authenticate "1 A home" || { stop_claude; return; }
-  ds_install "1 A home" "$A" "$HA" && onboard_flow "1 A home" "$A"  # 1.0.16: the computer's user name, never "agent"
+  ds_install "1 A home" "$A" "$HA" && { onboard_flow "1 A home" "$A"; show_cmds "1 A home" "$A"; }  # 1.0.16: the computer's user name, never "agent"
   stop_claude
   [[ -n "${E2E_NEXT_REF:-}" ]] && step11_hands_free "$A"
   start_claude "$A" "$A" || { fail "2: claude did not start"; return; }
