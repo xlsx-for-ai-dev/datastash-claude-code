@@ -533,22 +533,23 @@ class ShowAsks(OnboardBase):
 
     def test_the_asks_come_from_checkin(self):
         calls = []
-        keep, keep_key = ds.mcp_tool, ds._dds_key
+        keep, keep_key = ds.mcp_tool, ds.read_main_key
         ds.mcp_tool = lambda key, name, args, timeout=60: calls.append((name, args, timeout)) or (False, {"asks": ASKS})
-        ds._dds_key = lambda: "ldgr_ag_test"
+        ds.read_main_key = lambda: "ldgr_main_test"
         try:
             out, _ = self.prompt("show asks")
         finally:
-            ds.mcp_tool, ds._dds_key = keep, keep_key
+            ds.mcp_tool, ds.read_main_key = keep, keep_key
         ai = out["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(calls, [("checkin", {}, ds.DDS_TIMEOUT)])
         self.assertIn("----\nOpen asks\n  - **1. Alpha** (of Beta): ", ai)
-        self.assertNotIn("ldgr_ag_test", ai)
+        self.assertNotIn("ldgr_main_test", ai)
 
     def test_no_key_or_a_failed_read_never_fails_the_prompt(self):
-        keep, keep_key = ds.mcp_tool, ds._dds_key
+        keep, keep_key = ds.mcp_tool, ds.read_main_key
         calls = []
         ds.mcp_tool = lambda *a, **k: calls.append(a) or (False, {})
+        ds.read_main_key = lambda: None  # no main key: never an agent's key instead
         try:
             out, _ = self.prompt("show my asks")
             self.assertIn("  - **Asks:** not connected on this computer yet", out["hookSpecificOutput"]["additionalContext"])
@@ -556,11 +557,11 @@ class ShowAsks(OnboardBase):
 
             def boom(*_a, **_k):
                 raise OSError("down")
-            ds.mcp_tool, ds._dds_key = boom, (lambda: "ldgr_ag_test")
+            ds.mcp_tool, ds.read_main_key = boom, (lambda: "ldgr_main_test")
             out, _ = self.prompt("show asks")
             self.assertIn("  - **Asks:** datastash didn't answer just now", out["hookSpecificOutput"]["additionalContext"])
         finally:
-            ds.mcp_tool, ds._dds_key = keep, keep_key
+            ds.mcp_tool, ds.read_main_key = keep, keep_key
 
 
 class DdsStats(OnboardBase):
