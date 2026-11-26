@@ -5683,10 +5683,14 @@ KEY_FOLDER_TEXT_RE = re.compile(r"/\.config/datastash(?!/state/agent-[a-z0-9@][a
 KEY_ENGINE_DIR = ".xlsx-for-ai"  # in HOME: the engine login's folder, all of it secret
 
 
-def _key_dot_skip(name, part):
+def _key_dot_skip(name, part, shell=False):
     """True when a wildcard part can't name the engine login's folder: like the shell (and Python's glob), a wildcard
     matches a leading dot only when the part itself starts with one (so a bare * in the home folder is not a read of it;
-    .* or .x* is). A command that turns on dotglob is refused before this (see _key_text_deny)."""
+    .* or .x* is). A command that turns on dotglob is refused before this (see _key_text_deny). XLI-422: in a shell
+    command (Bash, Monitor: shell True) the same holds for every dot folder (~/.config too), and ** is a plain * there
+    (globstar, like dotglob, is refused before this), so "/**" in a here-doc's comment names nothing."""
+    if shell:
+        return name.startswith(".") and not part.startswith(".")
     return name.lower() == KEY_ENGINE_DIR and not part.startswith(".") and "**" not in part
 KEY_MAX_WORDS = 20000
 KEY_MAX_GLOB = 5000
@@ -5756,8 +5760,9 @@ def _key_braces(word, n=0):
     return out
 
 
-def _key_glob(pattern):
-    """Every existing path an absolute glob pattern names, dot files and any letter case included (bounded)."""
+def _key_glob(pattern, shell=False):
+    """Every existing path an absolute glob pattern names, dot files and any letter case included (bounded). shell: as
+    a shell expands it (no dot names for a part that does not start with a dot; ** is *)."""
     parts = [x for x in pattern.split("/") if x]
     found, todo = [], [("/", 0)]
     while todo and len(found) + len(todo) < KEY_MAX_GLOB:
@@ -5775,22 +5780,39 @@ def _key_glob(pattern):
             continue
         pat = part.replace("**", "*").lower()
         for n in names:
-            if fnmatch.fnmatchcase(n.lower(), pat) and not _key_dot_skip(n, part):
+            if fnmatch.fnmatchcase(n.lower(), pat) and not _key_dot_skip(n, part, shell):
                 todo.append((os.path.join(base, n), i + 1))
     return found + [b for b, _i in todo]
 
 
-def _key_glob_class(pattern, roots):
+def _key_glob_class(pattern, roots, shell=False):
     """What a glob pattern could name, from its words alone (any letter case, existing or not): "secret", "holds" or
-    None. A pattern that can only name listener logs inside the datastash folder names none."""
+    None. A pattern that can only name listener logs inside the datastash folder names none. shell (XLI-422): as a
+    shell expands it (see _key_dot_skip), so "/**" in a here-doc's comment or "/home/me/*/ci.log" names nothing;
+    but a pattern that would name a key folder if its wildcards matched dot folders, and that spells out one of the key
+    folders' own names (".../*/datastash/*", "~/**/.xlsx-for-ai"), is still "secret" (a shell set to match dot files)."""
+    k = _key_glob_class1(pattern, roots, shell)
+    if not shell or k == "secret":
+        return k
+    strict = _key_glob_class1(pattern, roots, False)
+    if strict == "secret":
+        own = {r.rstrip("/").split("/")[-1] for r in list(roots[0]) + list(roots[1])} - {""}
+        if any(x in own for x in pattern.lower().split("/") if x and not any(c in x for c in KEY_GLOB_CHARS)):
+            return "secret"
+    return k
+
+
+def _key_glob_class1(pattern, roots, shell):
     pc = [x for x in pattern.lower().split("/") if x]
+    if shell:
+        pc = [x.replace("**", "*") for x in pc]
     worst = None
     for r in list(roots[0]) + list(roots[1]):
         rc = [x for x in r.split("/") if x]
         for i in range(min(len(pc), len(rc))):
             if pc[i] == "**" or "**" in pc[i]:
                 return "secret"
-            if not fnmatch.fnmatchcase(rc[i], pc[i]) or (pc[i] != rc[i] and _key_dot_skip(rc[i], pc[i])):
+            if not fnmatch.fnmatchcase(rc[i], pc[i]) or (pc[i] != rc[i] and _key_dot_skip(rc[i], pc[i], shell)):
                 break
         else:
             if len(pc) < len(rc):
@@ -5830,9 +5852,9 @@ def _key_expand(w):
     return os.path.expanduser(w) if w.startswith("~") else w
 
 
-def _key_forms(w, bases):
+def _key_forms(w, bases, shell=False):
     """The lowercased paths one word can name: as written and real (symlinks followed), from each base folder; a glob
-    word also gives every existing path it matches."""
+    word also gives every existing path it matches (shell: as a shell expands it)."""
     w = _key_expand(w)
     cands = [w] if os.path.isabs(w) else [os.path.join(b, w) for b in bases]
     out = set()
@@ -5844,13 +5866,21 @@ def _key_forms(w, bases):
             pass
         if any(ch in c for ch in KEY_GLOB_CHARS):
             out.add(("glob", os.path.normpath(c)))
-            for g in _key_glob(os.path.normpath(c)):
+            for g in _key_glob(os.path.normpath(c), shell):
                 out.add(os.path.normpath(g))
                 try:
                     out.add(os.path.realpath(g))
                 except (OSError, ValueError):
                     pass
     return out
+
+
+def _key_squash(text):
+    """The text with the pieces a path can be split into joined again (quotes, escapes, `+` and `,` joins, `$(`,
+    parentheses, backticks), lowercased. XLI-422: whitespace stays a word break, except around a `+` or `,` join, so
+    words far apart in a here-doc or a log grep ("agent-notes ... r.key") never read as one key file name."""
+    t = re.sub(r"\s*[+,]\s*", "", str(text))
+    return re.sub(r"['\"\\`]|\$\(|[()]", "", t).lower()
 
 
 def _key_text_deny(text, cwd, roots, recurse_tool=False, ancestors=True):
@@ -5860,14 +5890,15 @@ def _key_text_deny(text, cwd, roots, recurse_tool=False, ancestors=True):
     only refused normal repo work after a `cd`)."""
     t = _key_norm(text)
     low = t.lower()
-    squashed = re.sub(r"[\s'\"\\+,`]|\$\(|[()]", "", str(text)).lower()
+    shell = not ancestors  # XLI-422: Bash and Monitor: globs as the shell expands them
+    squashed = _key_squash(text)
     if KEY_NAME_RE.search(squashed) or KEY_NAME_RE.search(low):
         return True
     for r in list(roots[0]) + list(roots[1]) + ["/.config/datastash", "/" + KEY_ENGINE_DIR]:
         if squashed.count(r) > re.sub(r"\s", "", low).count(r):
             return True  # the folder's path split into pieces
-    if "dotglob" in low and any(c in t for c in KEY_GLOB_CHARS):
-        return True  # a wildcard that matches dot folders could name the engine login's folder
+    if re.search(r"dotglob|globstar|globignore|\bglob_dots\b|\bsetopt\b", low) and any(c in t for c in KEY_GLOB_CHARS):
+        return True  # a wildcard that matches dot folders (or crosses folders) could name a key folder
     if KEYCHAIN_READ_RE.search(low) and ("datastash" in low or re.search(r"dump-keychain|\bsearch\b", low)):
         return True
     if KEY_FUNC_RE.search(t) and KEY_RUN_RE.search(low):
@@ -5885,9 +5916,9 @@ def _key_text_deny(text, cwd, roots, recurse_tool=False, ancestors=True):
         words.append(HOME)
     named = False
     for w in words:
-        for f in _key_forms(w, bases):
+        for f in _key_forms(w, bases, shell):
             if isinstance(f, tuple):
-                k = _key_glob_class(f[1], roots)
+                k = _key_glob_class(f[1], roots, shell)
                 if k == "secret" or (k == "holds" and recursive):
                     return True
                 continue
