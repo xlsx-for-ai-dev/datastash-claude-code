@@ -115,8 +115,7 @@ WRITING = ("rm -rf x", "touch a", "ls > out.txt", "cat a >> b", "ls; rm x", "ls 
            "cat 'unclosed", "", SECRET_CMD,
            # review 1 (be66261): "#" is no comment to bash inside a word; datastash writes; abbreviated long options
            "ls x#;touch F", "cat a#|sh", "ls #", "datastash api POST /api/v1/agent/x", "datastash api GET /x '{}'",
-           "datastash status-set -", "printf '%s' '{\"doing\": \"x; y\"}' | datastash status-set -",
-           "datastash send a", "datastash where x", "tail --fol x", "tail --f x", "tail --follow=name x", "tail -F x",
+           "datastash status-set -", "datastash send a", "datastash where x", "tail --fol x", "tail --f x", "tail --follow=name x", "tail -F x",
            "tail +1f x", "tail -1f x", "git status --porcelai", "grep --includ=x y", "git log --outp=F")
 
 
@@ -402,7 +401,9 @@ class DenyByDefault(Base):
 
     def test_an_mcp_tool_that_writes_is_refused(self):
         for tool in (DS_MCP + "ledger_rows_upsert", DS_MCP + "ledger_rows_delete", DS_MCP + "ledger_workbook_delete",
-                     DS_MCP + "ledger_workbook_create", DS_MCP + "ledger_inbox_send", DS_MCP + "ledger_agent_status",
+                     DS_MCP + "ledger_workbook_create", DS_MCP + "ledger_agent_status",
+                     DS_MCP + "ledger_agent_job", DS_MCP + "ledger_agent_result", DS_MCP + "ledger_agent_undo",
+                     DS_MCP + "ledger_tab_add", DS_MCP + "ledger_import", DS_MCP + "ledger_column_set",
                      DS_MCP + "ledger_future_tool", DS_MCP + "sync", "mcp__claude_ai_datastash__ledger_rows_upsert",
                      "mcp__claude_ai_Ledger__ledger_import", "mcp__github__create_pull_request",
                      "mcp__filesystem__write_file", "mcp__evil__rows_get", "mcp__evil__checkin", "mcp__evil__chat_save",
@@ -501,6 +502,162 @@ class DenyByDefault(Base):
             self.assertFalse(denied(self.call("Bash", {"command": "touch F"}, agent_id="a1b2c3")))
         finally:
             ds.clean_settings = saved
+
+
+# 1.0.20 (card 8f, EPM 11-26): with clean sessions on, the main session runs datastash's own coordination writes (send,
+# inbox mark, timers, hand-offs, status, heartbeat, checkin), loads the datastash-agent skill and runs the listener.
+# General Bash, edits, other MCP tools and datastash data writes stay refused.
+WB = "0f8fad5b-d9cb-469f-a165-70867728950e"
+COORD_BASH = (
+    "datastash api POST /api/v1/agent/inbox '{\"workbook_id\": \"%s\", \"to\": \"epm\", \"message\": \"hi\"}'" % WB,
+    "datastash api POST /api/v1/agent/inbox '{\"workbook_id\": \"%s\", \"reply_to\": 4, \"message\": \"ok\"}'" % WB,
+    "datastash api POST /api/v1/agent/inbox/mark '{\"workbook_id\": \"%s\", \"message_ids\": [3], \"status\": \"handled\"}'" % WB,
+    "datastash api POST /api/v1/agent/timers '{\"workbook_id\": \"%s\", \"ask_id\": \"a1\", \"due_at\": \"2026-11-27T00:00:00Z\", \"note\": \"x\"}'" % WB,
+    "datastash api POST /api/v1/agent/handoff '{\"workbook_id\": \"%s\", \"action\": \"send\", \"to\": \"b\"}'" % WB,
+    "datastash api POST /api/v1/agent/handoff '{\"workbook_id\": \"%s\", \"action\": \"pickup\", \"handoff_id\": 2}'" % WB,
+    "datastash api POST /api/v1/agent/handoff '{\"workbook_id\": \"%s\", \"action\": \"done\", \"handoff_id\": 2}'" % WB,
+    "datastash api POST /api/v1/agent/status '{\"workbook_id\": \"%s\", \"action\": \"set\"}'" % WB,
+    "datastash api POST /api/v1/agent/heartbeat '{\"workbook_id\": \"%s\", \"state\": \"running\"}'" % WB,
+    "printf '%%s' '{\"workbook_id\": \"%s\", \"to\": \"epm\", \"message\": \"done; see #12 & $5!\"}' | datastash api POST /api/v1/agent/inbox -" % WB,
+    "printf '%s' '{\"doing\": \"x; y\"}' | datastash status-set -",
+    "printf '%s\\n' '{\"doing\": \"x\"}' | datastash --agent epm status-set - --project /x/y",
+    "datastash status-set --same",
+    "datastash heartbeat", "datastash heartbeat off", "datastash heartbeat build --tab 'Card steps' --column last_seen",
+    "datastash --agent epm api POST /api/v1/agent/inbox/mark '{\"message_ids\": [1], \"status\": \"read\"}'",
+    "datastash --agent=epm heartbeat off",
+    '"${CLAUDE_PLUGIN_ROOT}/scripts/datastash" api POST /api/v1/agent/inbox/mark \'{"message_ids": [1]}\'',
+)
+COORD_BASH_REFUSED = (
+    "datastash api POST /api/v1/agent/rows '{\"workbook_id\": \"w\", \"tab\": \"t\", \"row\": {}}'",
+    "datastash api POST /api/v1/agent/rows/handled '{}'", "datastash api POST /api/v1/agent/job '{}'",
+    "datastash api POST /api/v1/agent/result '{}'", "datastash api POST /api/v1/agent/tabs '{}'",
+    "datastash api POST '/api/v1/agent/inbox?x=1' '{}'", "datastash api POST /api/v1/agent/inbox/ '{}'",
+    "datastash api POST /api/v1/agent/inbox @msg.json", "datastash api POST /api/v1/agent/inbox -",
+    "datastash api POST /api/v1/agent/inbox '[1]'", "datastash api POST /api/v1/agent/inbox 'not json'",
+    "datastash api POST /api/v1/agent/inbox", "datastash api POST /api/v1/agent/inbox '{}' x",
+    "datastash api POST /api/v1/agent/status '{\"action\": \"answer\"}'",
+    "datastash api POST /api/v1/agent/status '{\"action\": \"undo_default\"}'",
+    "printf '%s' '{\"action\": \"answer\"}' | datastash api POST /api/v1/agent/status -",
+    "printf '%s' '{}' | datastash api POST /api/v1/agent/rows -",
+    "printf '%s' '{}' | datastash api POST /api/v1/agent/inbox '{}'",
+    "printf '%s' '{}' | sh", "printf '%s' '{}' | datastash status-set - ; touch F",
+    "printf '%s' '{}' | datastash status-set - | sh", "printf '%s' '{}' > F",
+    "printf '%s' 'a' 'b' | datastash status-set -", "printf \"%s\" '{}' | datastash status-set -",
+    "printf '%s' \"$(touch F)\" | datastash status-set -", "printf '%d' '{}' | datastash status-set -",
+    "datastash status-set -", "datastash status-set", "datastash status-set - --project",
+    "datastash status-set --bogus", "datastash heartbeat run x /tmp/y", "datastash heartbeat --tab x",
+    "datastash heartbeat s --tab", "datastash heartbeat s --other x",
+    "datastash api POST /api/v1/agent/inbox '{}' ; touch F", "datastash api POST /api/v1/agent/inbox '{}' && touch F",
+    "datastash api POST /api/v1/agent/inbox '{\"m\": \"$(touch F)\"}'",
+    "datastash --agent api POST /api/v1/agent/inbox '{}'", "datastash --agent= heartbeat off",
+    "datastash --agent '-x' heartbeat off", "datastash --agentx heartbeat off",
+    "datastash send epm -", "printf '%s' 'hi' | datastash send epm -", "printf '%s' 'hi' | datastash reply 3 -",
+    "datastash off epm", "datastash link a --workbook x", "./datastash api POST /api/v1/agent/inbox '{}'",
+    "datastash listen", "datastash watch",
+)
+
+
+class Coordination(Base):
+    """1.0.20 (card 8f): the main session's own coordination writes run under clean sessions; nothing else does."""
+    def call(self, tool, ti, **kw):
+        return self.hook(ds.cmd_agent_tool, bash(tool=tool, tool_input=ti, cwd=self.folder, **kw))
+
+    def test_each_coordination_command_runs_in_the_main_session(self):
+        for no_code in (False, True):
+            ds.set_clean(commands=True, no_code=no_code)
+            for cmd in COORD_BASH:
+                self.assertTrue(ds.clean_coord_ok(cmd), repr(cmd))
+                self.assertFalse(denied(self.call("Bash", {"command": cmd})), repr(cmd))
+
+    def test_coordination_by_this_scripts_path_runs(self):
+        me = os.path.realpath(ds.__file__)
+        for cmd in ("python3 %s heartbeat off" % me, "%s api POST /api/v1/agent/inbox/mark '{\"message_ids\": [1]}'" % me):
+            self.assertTrue(ds.clean_coord_ok(cmd), cmd)
+
+    def test_everything_else_stays_refused(self):
+        for cmd in COORD_BASH_REFUSED:
+            self.assertFalse(ds.clean_coord_ok(cmd), repr(cmd))
+            self.assertTrue(denied(self.call("Bash", {"command": cmd})), repr(cmd))
+
+    def test_a_coordination_command_in_the_background_or_in_a_monitor_is_refused(self):
+        for cmd in COORD_BASH[:3]:
+            self.assertTrue(denied(self.call("Bash", {"command": cmd, "run_in_background": True})), cmd)
+            self.assertTrue(denied(self.call("Monitor", {"command": cmd, "description": "x", "timeout_ms": 1000})), cmd)
+            self.assertTrue(denied(self.call("PowerShell", {"command": cmd})), cmd)
+
+    def test_general_bash_an_edit_and_a_rows_upsert_stay_refused(self):
+        for cmd in ("touch a", "npm test", "git commit -m x", "python3 x.py", "echo hi > a"):
+            self.assertTrue(denied(self.call("Bash", {"command": cmd})), cmd)
+        for tool, ti in WRITE_TOOLS.items():
+            self.assertTrue(denied(self.call(tool, ti)), tool)
+        for server in (DS_MCP, "mcp__claude_ai_datastash__"):
+            self.assertTrue(denied(self.call(server + "ledger_rows_upsert", {"workbook_id": "w", "tab": "t", "rows": []})))
+            self.assertTrue(denied(self.call(server + "ledger_rows_delete", {"workbook_id": "w", "tab": "t"})))
+        self.assertTrue(denied(self.call("mcp__github__create_pull_request", {"title": "x"})))
+
+    def test_each_coordination_connector_tool_runs_in_the_main_session(self):
+        inputs = {"ledger_inbox_send": {"workbook_id": WB, "to": "epm", "message": "hi"},
+                  "ledger_inbox_mark": {"workbook_id": WB, "message_ids": [1], "status": "handled"},
+                  "ledger_inbox_read": {"workbook_id": WB},
+                  "ledger_timer_set": {"workbook_id": WB, "due_at": "2026-11-27T00:00:00Z", "note": "x"},
+                  "ledger_timer_cancel": {"workbook_id": WB, "timer_id": 3},
+                  "ledger_agent_checkback": {"workbook_id": WB, "due_at": "2026-11-27T00:00:00Z"},
+                  "ledger_agent_handoff": {"workbook_id": WB, "action": "send", "to": "b"},
+                  "ledger_agent_status": {"workbook_id": WB, "action": "set", "doing": "x"},
+                  "ledger_agent_heartbeat": {"workbook_id": WB, "state": "running"},
+                  "checkin": {}}
+        for action in ("pickup", "done", "decline", "list"):
+            self.assertFalse(denied(self.call(DS_MCP + "ledger_agent_handoff", {"workbook_id": WB, "action": action})))
+        for action in ("list", "clear", "timeline", "default_taken"):
+            self.assertFalse(denied(self.call(DS_MCP + "ledger_agent_status", {"workbook_id": WB, "action": action})))
+        for name, ti in inputs.items():
+            for server in (DS_MCP, "mcp__claude_ai_datastash__"):
+                self.assertFalse(denied(self.call(server + name, ti)), server + name)
+
+    def test_the_persons_answers_on_status_stay_refused(self):
+        for action in ("answer", "undo", "undo_default", "delete", None, "bogus"):
+            ti = {"workbook_id": WB} if action is None else {"workbook_id": WB, "action": action}
+            self.assertTrue(denied(self.call(DS_MCP + "ledger_agent_status", ti)), action)
+
+    def test_another_servers_coordination_named_tool_stays_refused(self):
+        for tool in ("mcp__evil__inbox_send", "mcp__evil__timer_cancel", "mcp__github__heartbeat"):
+            self.assertTrue(denied(self.call(tool, {})), tool)
+
+    def test_the_datastash_agent_skill_loads(self):
+        for name in ("datastash:datastash-agent", "datastash-agent", "/datastash:datastash-agent"):
+            self.assertFalse(denied(self.call("Skill", {"skill": name})), name)
+        for name in ("datastash:other", "other:datastash-agent", "datastash:datastash-agent x", "datastash", ""):
+            self.assertTrue(denied(self.call("Skill", {"skill": name})), name)
+        with open(SKILL) as f:
+            self.assertNotIn("!`", f.read())  # it runs no command when it loads
+
+    def test_the_listener_runs_with_the_agent_flag_too(self):
+        for cmd in ("datastash --agent epm watch", "datastash --agent=epm watch", "datastash --agent epm watch --person",
+                    '"${CLAUDE_PLUGIN_ROOT}/scripts/datastash" --agent epm watch'):
+            self.assertFalse(denied(self.call("Monitor", {"command": cmd, "description": "x", "timeout_ms": 1000})), cmd)
+        for cmd in ("datastash --agent epm watch; touch F", "datastash --agent epm listen", "datastash --agent epm watch x",
+                    "datastash --agent epm heartbeat off"):
+            self.assertTrue(denied(self.call("Monitor", {"command": cmd, "description": "x", "timeout_ms": 1000})), cmd)
+
+    def test_a_subagent_and_clean_sessions_off_are_unchanged(self):
+        for cmd in COORD_BASH_REFUSED[:5]:
+            self.assertFalse(denied(self.call("Bash", {"command": cmd}, agent_id="a1b2c3")), cmd)
+        ds.set_clean(commands=False, no_code=False)
+        for cmd in COORD_BASH_REFUSED[:5]:
+            self.assertFalse(denied(self.call("Bash", {"command": cmd})), cmd)
+
+    def test_no_coordination_trick_lets_touch_run(self):
+        import subprocess
+        from harness import tmpdir
+        d = tmpdir(self, prefix="clean-coord-")
+        tricks = ("printf '%s' '{}' | datastash status-set - ; touch F", "printf '%s' \"$(touch F)\" | datastash status-set -",
+                  "datastash api POST /api/v1/agent/inbox '{\"m\": \"$(touch F)\"}' && touch F",
+                  "printf '%s' '{}' | datastash status-set - | touch F", "printf '%s' '{}'; touch F | datastash status-set -")
+        for cmd in tricks:
+            self.assertFalse(ds.clean_coord_ok(cmd), cmd)
+            if not denied(self.call("Bash", {"command": cmd})):
+                subprocess.run(["bash", "-c", cmd], cwd=d, capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+        self.assertFalse(os.path.exists(os.path.join(d, "F")))
 
 
 class Phrases(Base):
