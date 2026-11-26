@@ -13911,6 +13911,11 @@ def onboard_prompt_context(inp):
         except OSError:
             pass
         return SESSIONS_OFF_AI
+    if kind == "sync" and rest_mode() and sync_on():
+        # x-live #531: on this computer's login the typed code sign-in already was the typed sync (login_typed_sync);
+        # nothing turns on, so no check and no connector call (a session signed in here has no connector tools)
+        onboard_set(_sid(inp), "status")
+        return ONBOARD_RELAY_AI.format(text=SYNCED_LINE)
     shape = hook_shape(inp)
     if shape is None or not start_check(shape, "sync" if kind == "sync" else "chats", inp["prompt"], {}):
         return None
@@ -14086,9 +14091,30 @@ def email_sign_in_code(sid, code):
     _drop(_code_req_path(sid))
     n = got.get("signed_in") if isinstance(got, dict) else None
     n = n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
+    login_typed_sync()
     if _email_pending():
         _ensure_poller()  # this login's own poll picks its key up now
     return [SIGNED_IN_LINE.format(n=f"{n} computer login{'s' if n != 1 else ''}")]
+
+
+def login_typed_sync():
+    """x-live #531 (owner 11-26): the person's typed `datastash sync <email>` then `datastash sync <code>` IS their typed
+    datastash sync, the one yes: the server opens the new login's reach, turns session saving on and gives the agents
+    that login registers the standing yes. The same here, at once (the checker found their own typed code): keeping,
+    sync, timers and session saving on, so the install says "Synced..." and no connector call is asked for. A choice the
+    person made here before (a no to keeping, timers off, session saving off) is never changed."""
+    try:
+        if keep_state() is None:
+            record_keep_all(True, "typed")
+        if keep_state() != "yes":
+            return
+        record_sync_on()
+        if timers_choice() is None:
+            set_timers(True, "sync")
+        if sessions_on() is None:
+            record_sessions(True)
+    except OSError:
+        pass
 
 
 def email_prompt_context(inp):

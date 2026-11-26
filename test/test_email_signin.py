@@ -31,8 +31,8 @@ CODE_DC = "dsdc_" + "c" * 43
 class EmailBase(Base):
     def setUp(self):
         super().setUp()
-        self.keep = {k: getattr(ds, k) for k in FILES + ("_ensure_poller",)}
-        for k in FILES:
+        self.keep = {k: getattr(ds, k) for k in FILES + ("_ensure_poller", "CONSENT_PATH")}
+        for k in FILES + ("CONSENT_PATH",):
             setattr(ds, k, os.path.join(ds.CONF, os.path.basename(getattr(ds, k))))
         self.polls = []
         ds._ensure_poller = lambda: self.polls.append(1) or True
@@ -97,6 +97,45 @@ class NotSignedIn(EmailBase):
         self.assertEqual(sent, [{"device_code": CODE_DC, "code": "482913"}])
         self.assertEqual(self.outcomes(), ["Signed in: 3 computer logins. Setup finishes by itself; the datastash command works now."])
         self.assertIsNone(ds._read_private_json(ds._code_req_path("s1")))  # once
+
+    def test_the_typed_code_sign_in_is_the_typed_sync(self):
+        # x-live #531 (owner 11-26): the typed email then code IS the person's typed datastash sync: keeping, sync,
+        # timers and session saving on here, so the install says "Synced..." with no connector call
+        self.assertFalse(ds.sync_on())
+        self.person_types("datastash sync person@example.com")
+        self.assertFalse(ds.sync_on())  # the email alone turns nothing on
+        self.person_types("datastash sync 482913")
+        self.assertEqual(ds.keep_state(), "yes")
+        self.assertTrue(ds.sync_on())
+        self.assertIs(ds.timers_choice()["on"], True)
+        self.assertIs(ds.sessions_on(), True)
+        self.assertEqual(ds.onboard_install_lines({"session_id": "s1"}), [ds.SYNCED_LINE])
+
+    def test_the_code_sign_in_never_changes_a_choice_made_here(self):
+        ds.record_keep_all(False, "typed")
+        self.person_types("datastash sync person@example.com")
+        self.person_types("datastash sync 482913")
+        self.assertEqual(ds.keep_state(), "no")
+        self.assertFalse(ds.sync_on())
+        ds.record_keep_all(True, "typed")
+        ds.set_timers(False, "typed")
+        ds.record_sessions(False)
+        self.person_types("datastash sync person@example.com")
+        self.person_types("datastash sync 482914")
+        self.assertTrue(ds.sync_on())
+        self.assertIs(ds.timers_choice()["on"], False)
+        self.assertIs(ds.sessions_on(), False)
+
+    def test_a_refused_or_agent_typed_code_turns_nothing_on(self):
+        self.person_types("datastash sync person@example.com")
+        self.answers[ds.EMAIL_CODE_PATH] = (400, {"error": "invalid_code", "message": "That code did not sign in."})
+        self.person_types("datastash sync 000000")
+        self.assertIsNone(ds.keep_state())
+        self.assertFalse(ds.sync_on())
+        self.answers[ds.EMAIL_CODE_PATH] = (200, {"signed_in": 1})
+        self.person_types("datastash sync 482913", source="sdk")
+        self.assertIsNone(ds.keep_state())
+        self.assertIsNone(ds.sessions_on())
 
     def test_a_code_in_another_session_is_never_sent(self):
         self.person_types("datastash sync person@example.com", sid="s1")
@@ -172,6 +211,22 @@ class SignedIn(EmailBase):
         self.assertEqual(len(start), 1)
         self.assertNotIn("waiting_code", start[0])
         self.assertIsNone(ds.waiting_email())  # a signed-in login keeps no waiting email
+
+    def test_plain_sync_after_the_code_sign_in_says_synced_with_no_connector_call(self):
+        # x-live #531: on the login the code sign-in already was the typed sync; a session signed in here has no
+        # connector tools, so the plugin gives the Synced line itself and starts no check
+        ds.login_typed_sync()
+        start = len(self.spawned)
+        out, _pid = self.prompt("datastash sync", sid="s1")
+        ai = self.ctx(out)
+        self.assertIn(ds.SYNCED_LINE, ai)
+        self.assertNotIn("`sync` tool", ai)
+        self.assertEqual(self.spawned[start:], [])
+        self.assertEqual(ds.onboard_state("s1").get("stage"), "status")
+
+    def test_plain_sync_while_sync_is_off_here_still_goes_through_the_typed_check(self):
+        out, _pid = self.prompt("datastash sync", sid="s1")
+        self.assertEqual(self.ctx(out), ds.SYNC_TYPED_AI)
 
     def test_no_sign_in_line_at_session_start(self):
         self.assertEqual(ds.email_session_note({"session_id": "s1", "cwd": self.folder}), (None, None))
