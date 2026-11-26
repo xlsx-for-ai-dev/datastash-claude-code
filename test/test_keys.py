@@ -465,5 +465,67 @@ class EngineLoginFolder(KeyBase):
         self.assertEqual(ds.xt_engine_key(), (FAKE_ENGINE_KEY, "login"))
 
 
+class Xli422EpmCommands(KeyBase):
+    """XLI-422 (an EPM ask, 11-26): the guard refused three builder commands that touch neither key folder. Each shape
+    below was refused before the fix (a JSDoc "/**" read as a glob of every folder; "agent-..." and a later ".key" read
+    as one file name across the whole here-doc or command; a ** under the home folder read as crossing ~/.config). Bash
+    and Monitor now read globs as the shell expands them, and only a word, never a whole command, can be a key file name.
+    Every true block still holds."""
+
+    def setUp(self):
+        super().setUp()
+        self.wt = os.path.join(HOME, "e", "wt", "xls-10486")  # an engine worktree, like EPM's (made-up names)
+        put(os.path.join(self.wt, ".prepush", "pr8.log"), " Test Files  1 passed (1)\n")
+        self.scratch = os.path.join(HOME, "e", "scratch", "ci-times")
+        put(os.path.join(self.scratch, "ci-1.log"), " test/cases/a.test.ts (3 tests) 120ms\n")
+
+    def commands(self):
+        heredoc = (f"cat > {self.wt}/test/cases/agent-key-shape.test.ts <<'EOF'\n"
+                   "/** Made-up test: the key shape (xlsx-for-ai-server). */\n"
+                   "import {{ describe, it, expect }} from 'vitest';\n"
+                   "describe('agent-key shape', () => {{\n"
+                   "  it('reads the answer', () => {{ const r = load(); expect(r.key).toBe(1); expect(r.answer).toBe(2); }});\n"
+                   "}});\nEOF").replace("{{", "{").replace("}}", "}")
+        until = (f"cd {self.wt}/.prepush && until grep -qE 'agent-notes|Test Files .*(passed|failed)' pr8.log; do "
+                 "sleep 15; done; grep -c 'expect(r.key).toBe' pr8.log")
+        rank = ("grep -hoE '[^ ]+[.]test[.]ts [(][0-9]+ tests?[)] [0-9]+ms' ~/e/**/ci-*.log $HOME/**/ci-*.log "
+                "| sort -t' ' -k4 -rn | head -20")
+        return (("here-doc", heredoc, self.wt), ("until-grep", until, self.wt), ("rank", rank, self.scratch))
+
+    def test_epms_three_commands_pass(self):
+        for label, cmd, cwd in self.commands():
+            for name in ("Bash", "Monitor"):
+                with self.subTest(cmd=label, tool=name):
+                    self.assert_allowed(name, {"command": cmd}, cwd)
+
+    def test_they_pass_through_the_real_hook_in_a_subagent_and_the_main_session(self):
+        for label, cmd, cwd in self.commands():
+            for agent in (None, "agent-xli422"):
+                with self.subTest(cmd=label, agent=agent):
+                    out = ds.key_path_deny(self.call("Bash", {"command": cmd}, cwd, agent_id=agent))
+                    self.assertIsNone(out)
+
+    def test_globs_read_as_the_shell_expands_them(self):
+        for cmd in ("cat /** | head", "grep -rn foo /**/x", "ls ~/* ~/*/*"):
+            with self.subTest(cmd=cmd):
+                self.assert_allowed("Bash", {"command": cmd}, self.wt)
+
+    def test_the_real_blocks_still_hold(self):
+        k = "agent-web-app.key"
+        for cmd in (f"cat ~/.config/datastash/{k}", f"cat $HOME/.config/datastash/{k}", f"cat ${{HOME}}/.config/datastash/{k}",
+                    f"cat {DEFAULT}/{k}", "cp ~/.config/datastash/person.key /tmp/x", f"cp -r {DEFAULT} /tmp/copy",
+                    "grep -r dsak_ ~/.config/datastash", "grep -rn x $HOME/.config/datastash/", "ls ~/.config/datastash",
+                    "cat ~/.config/datastash/*", "cat ~/.config/data*/*", "cat ~/.c*/d?tastash/*", "cat ~/.*/*/*",
+                    "cat ~/.config/**", "cat ~/*/datastash/*", "cat ~/**/datastash/person.key", "grep dsak_ ~/.config/*/*",
+                    "cat ~/.xlsx-for-ai/config.json", "cat ~/.xlsx*/*", "cat ~/**/.xlsx-for-ai/config.json",
+                    "shopt -s globstar; cat ~/**", "shopt -s dotglob; cat ~/*/*/*", "setopt glob_dots; cat ~/*/*/*",
+                    "cat ~/.config/data''stash/main.json", "python3 -c \"open('~/.con' + 'fig/data' + 'stash/x')\"",
+                    f"cd {self.wt} && cat agent-web-app.key", f"cd {self.wt} && cat ../../../.config/datastash/main.json",
+                    "cat > /tmp/x.sh <<'EOF'\ncat ~/.config/datastash/person.key\nEOF"):
+            for name in ("Bash", "Monitor"):
+                with self.subTest(cmd=cmd, tool=name):
+                    self.assert_refused(name, {"command": cmd}, self.wt)
+
+
 if __name__ == "__main__":
     unittest.main()
