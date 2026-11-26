@@ -144,6 +144,17 @@ class NoMcpStep(unittest.TestCase):
                 hits += [f"{rel}:{n}: {t.strip()[:100]}" for n, t in texts if "choose Authenticate" in t]
         self.assertEqual(hits, [])
 
+    def test_readme_has_no_mcp_sign_in_step(self):
+        """Owner 11-26: no /mcp step anywhere a person reads. The README's intro and Install part never say /mcp or
+        Authenticate, and no line anywhere tells the person to choose Authenticate; the sign-in is datastash sync."""
+        with open(os.path.join(HERE, "..", "README.md")) as f:
+            readme = f.read()
+        top = readme.split("\n## Clean sessions", 1)[0]
+        hits = [t.strip()[:100] for t in top.splitlines() if MCP_STEP_RE.search(t) or "Authenticate" in t]
+        hits += [t.strip()[:100] for t in readme.splitlines() if "choose Authenticate" in t or "Type /mcp" in t or "type `/mcp`" in t]
+        self.assertEqual(hits, [])
+        self.assertIn("**datastash sync you@email.com**", top)
+
     def test_skill_never_sends_a_claude_code_user_to_connector_settings(self):
         """XLI-417 review: connector settings are only for app chat with no shell. In Claude Code the not-signed-in
         path is `datastash check` and the line it prints, never the connector settings (the /mcp Authenticate step)."""
