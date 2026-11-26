@@ -2080,11 +2080,12 @@ def _folder_has_agent(folder):
     return any(os.path.realpath(p) == rp for a in all_agents() for p in (a.get("projects") or []) if isinstance(p, str))
 
 
-def _free_name(folder, taken=None, prefer=None):
-    """The name for folder's new agent: the folder's name (or prefer: the name the person used), -2, -3 ... past any
-    agent on this computer (or a name datastash refused as taken)."""
-    mine = {a["slug"] for a in all_agents()} | {slug(r["name"]) for r in _enrolled().values()}
-    name = _next_name(taken) if taken else ((_folder_name(prefer) if prefer else _folder_name(folder)) or user_name())
+def _free_name(folder, prefer=None):
+    """The name for folder's new agent: the folder's name (or prefer: the name the person used), -2, -3 ... past a
+    reserved name or another agent on this computer only. A name datastash refuses is never re-tried with a suffix."""
+    here = os.path.realpath(folder) if folder else None
+    mine = {a["slug"] for a in all_agents()} | {slug(r["name"]) for f, r in _enrolled().items() if f != here}
+    name = (_folder_name(prefer) if prefer else _folder_name(folder)) or user_name()
     if not name:
         return None
     for _ in range(1000):
@@ -2111,30 +2112,25 @@ def _register_once(tok, folder, rec=None, prefer=None):
         return rec, (ans if isinstance(ans, dict) else {})
     proof = secrets.token_urlsafe(32)
     name = _free_name(folder, prefer=prefer)
-    for _ in range(20):
-        if name is None:
-            break
-        try:
-            ans = api_json("POST", AGENT_REGISTER_PATH, tok, body={"name": name, "agent_proof": proof}, timeout=30)
-        except ApiError as e:
-            if _body_code(e) == "agent_name_taken":
-                name = _free_name(folder, taken=name)
-                continue
-            raise
-        ans = ans if isinstance(ans, dict) else {}
-        agent_id = ans.get("agent_id")
-        if not isinstance(agent_id, str) or not re.fullmatch(AGENT_ID_RE, agent_id):
-            return None, ans
-        srv = ans.get("name").strip() if isinstance(ans.get("name"), str) else ""
-        if srv and slug(srv) == slug(name):
-            name = srv
-        lid = _login_id()
-        if lid is None:
-            return None, ans  # signed out meanwhile: nothing kept for a login that is gone
-        rec = {"name": name, "agent_id": agent_id, "proof": proof, "login": lid, "at": int(time.time())}
-        _set_enrolled(folder, rec)
-        return rec, ans
-    return None, {}
+    if name is None:
+        return None, {}
+    # 1.0.20 (e2e run4, x-live #532): datastash answers a name for the login as the connector does (a removed name comes
+    # back here, a live one of this person's moves here, one live on another computer is agent_bound). Its answer is
+    # final: a refusal (taken, bound, switched off) is raised for the caller to say, never retried as "-2", "-3".
+    ans = api_json("POST", AGENT_REGISTER_PATH, tok, body={"name": name, "agent_proof": proof}, timeout=30)
+    ans = ans if isinstance(ans, dict) else {}
+    agent_id = ans.get("agent_id")
+    if not isinstance(agent_id, str) or not re.fullmatch(AGENT_ID_RE, agent_id):
+        return None, ans
+    srv = ans.get("name").strip() if isinstance(ans.get("name"), str) else ""
+    if srv and plain_name(srv) and slug(srv) == slug(name):
+        name = srv  # the name datastash keeps for it (a reinstalled agent's own spelling)
+    lid = _login_id()
+    if lid is None:
+        return None, ans  # signed out meanwhile: nothing kept for a login that is gone
+    rec = {"name": name, "agent_id": agent_id, "proof": proof, "login": lid, "at": int(time.time())}
+    _set_enrolled(folder, rec)
+    return rec, ans
 
 
 def _body_code(e):

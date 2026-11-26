@@ -2573,6 +2573,41 @@ class OnTheLogin(Base):
         self.assertFalse(os.path.exists(ds.key_path("web-app")))
         self.assertNotIn(ds.AGENT_KEY_PATH, self.paths())
 
+    def test_a_name_taken_is_said_as_datastash_said_it_never_a_dash_2(self):
+        # e2e run3: every refused name got "-2" here. x-live #532 answers a login as the connector: the server's answer
+        # is final, so a refusal is said and no second name is ever tried.
+        for code in ("agent_name_taken", "agent_bound"):
+            self.calls.clear()
+            self.answers[ds.AGENT_REGISTER_PATH] = (409, {"code": code, "message": '"web-app" is not yours here.'})
+            v, _pid = self.slash("/datastash:install")
+            self.assertIn(f"Not done: datastash refused it ({code}", self.ai(v))
+            regs = [c[3]["name"] for c in self.calls if c[1] == ds.AGENT_REGISTER_PATH]
+            self.assertEqual(regs, ["web-app"], code)
+            self.assertNotIn(ds.AGENT_KEY_PATH, self.paths())
+            self.assertFalse(os.path.exists(ds.key_path("web-app")))
+            self.assertFalse(os.path.exists(ds.conf_path("web-app-2")))
+            self.assertEqual(ds._enrolled(), {})
+
+    def test_a_reinstalled_name_comes_back_under_its_own_name_and_id(self):
+        # x-live #532: a removed name is reinstalled on this login (the same agent_id, its own spelling): kept as is.
+        back = "f" * 8 + OWN[8:]
+        self.answers[ds.AGENT_REGISTER_PATH] = (200, {"agent_id": back, "name": "Web-App", "registered": True,
+                                                      "notes_tabs": [{"workbook_id": WB}]})
+        self.answers[ds.PICKUP_PATH] = (200, {"agent_id": back, "name": "Web-App", "key": KEY, "answer_key": ANSWER})
+        v, _pid = self.slash("/datastash:install")
+        self.assertIn("Done. Datastash is on for", self.ai(v))
+        key_ask = [c[3] for c in self.calls if c[1] == ds.AGENT_KEY_PATH][0]
+        self.assertEqual((key_ask["name"], key_ask["agent_id"]), ("Web-App", back))
+        self.assertEqual(ds.read_json(ds.conf_path("web-app"), {})["agent_id"], back)
+        self.assertEqual([c[3]["name"] for c in self.calls if c[1] == ds.AGENT_REGISTER_PATH], ["web-app"])
+
+    def test_the_sign_in_s_enroll_skips_a_refused_name_and_makes_no_dash_2(self):
+        self.answers[ds.AGENT_REGISTER_PATH] = (409, {"code": "agent_name_taken", "message": "taken"})
+        with self.assertRaises(ds.ApiError):
+            ds._register_once("tok", os.path.realpath(self.folder))
+        self.assertEqual([c[3]["name"] for c in self.calls if c[1] == ds.AGENT_REGISTER_PATH], ["web-app"])
+        self.assertEqual(ds._enrolled(), {})
+
     def test_uninstall_a_named_agent_the_checker_signs_and_the_stop_hook_relays(self):
         self.installed()
         v, pid = self.slash("/datastash:uninstall alpha")

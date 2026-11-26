@@ -271,7 +271,12 @@ if [[ -n "${E2E_CLAUDE_ENV_FILE:-}" && -r "$E2E_CLAUDE_ENV_FILE" ]]; then
   unset tok
 fi
 unset E2E_CLAUDE_ENV_FILE
-exec "$@"
+# 1.0.20 (e2e run4): Claude Code's exit status, kept for the harness (a session that ends by itself at its start is then
+# named with its status, not only "can't find pane").
+"$@"
+rc=$?
+[[ -n "${E2E_EXIT_FILE:-}" ]] && printf '%s\n' "$rc" > "$E2E_EXIT_FILE"
+exit "$rc"
 EOF
 chmod 700 "$WORK/launch.sh"
 
@@ -339,9 +344,46 @@ new_repo() {  # new_repo <dir>
   mkdir -p "$1" && git -C "$1" init -q && git -C "$1" -c user.name=Test -c user.email=test@example.invalid commit -q --allow-empty -m init
 }
 
-start_claude() {  # start_claude <HOME> <folder>: an interactive session, the folder trusted as a person does
+# 1.0.20 (e2e run4; run3's 6a: the session started right after the update's /exit was gone at once, "can't find pane",
+# with no hook run and no file written by it): every start first waits until no Claude Code process of that HOME is left
+# (the last one's exit can still be writing its files after its pane closed), and a session that ends by itself at its
+# start is said with its exit status and started once more.
+home_claude_pids() {  # home_claude_pids <HOME>: Claude Code processes running with that HOME
+  python3 -I - "$1" <<'PY2'
+import os, sys
+want = b"HOME=" + os.fsencode(sys.argv[1])
+for p in os.listdir("/proc"):
+    if not p.isdigit():
+        continue
+    try:
+        with open(f"/proc/{p}/environ", "rb") as f:
+            env = f.read().split(b"\0")
+        with open(f"/proc/{p}/cmdline", "rb") as f:
+            cmd = f.read().split(b"\0")
+    except OSError:
+        continue
+    if want in env and any(b"claude" in os.path.basename(c) for c in cmd[:2]):
+        print(p)
+PY2
+}
+home_settle() {  # home_settle <HOME>: up to 20 s for that HOME's Claude Code processes to end, then 2 s more
+  local i
+  for ((i = 0; i < 20; i++)); do [[ -z "$(home_claude_pids "$1")" ]] && break; sleep 1; done
+  sleep 2
+}
+start_claude() {  # start_claude <HOME> <folder>
+  local tries
+  for tries in 1 2; do
+    start_claude_once "$@" && return 0
+    tmux has-session -t "=$T" 2>/dev/null && return 1  # it runs but shows no prompt: the caller says what is on screen
+    say "    claude ended by itself at its start (exit status $(cat "$WORK/exit.$T" 2>/dev/null || echo unknown))$( ((tries == 1)) && echo "; starting it once more")"
+  done
+  return 1
+}
+start_claude_once() {  # start_claude_once <HOME> <folder>: an interactive session, the folder trusted as a person does
   local h="$1" dir="$2" model=(--permission-mode default)  # every tool call asks, so answer_dialog decides (never auto mode)
   [[ -n "${E2E_MODEL:-}" ]] && model+=(--model "$E2E_MODEL")
+  home_settle "$h"
   T="$RUN-$((++STARTS))"
   mkdir -p "$dir"
   # 1.0.18: a deep scrollback for this session only (the onboarding's lists made the default 2000 lines roll over, so a
@@ -350,7 +392,7 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
   tmux set-option -t "$T" history-limit 100000
   # Claude Code 2.1.331+ draws in the terminal's alternate screen (no scrollback for the pane reads): kept off below
   tmux new-window -t "$T" -c "$dir" \
-    "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER='$E2E_USER' LOGNAME='$E2E_USER' DATASTASH_DEVICE_NAME='e2e-$(basename "$(dirname "$h")")' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CODE_NO_FLICKER=0 E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
+    "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER='$E2E_USER' LOGNAME='$E2E_USER' DATASTASH_DEVICE_NAME='e2e-$(basename "$(dirname "$h")")' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CODE_NO_FLICKER=0 E2E_EXIT_FILE='$WORK/exit.$T' E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
   tmux kill-window -t "$T:hold" 2>/dev/null
   if wait_for "trust this folder" 40; then
     # The dialog's default is "No, exit" and it shows its text before it takes keys: a Down sent too soon is dropped and
@@ -370,10 +412,10 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
 
 stop_claude() {
   local i
-  tmux has-session -t "$T" 2>/dev/null || return 0
+  tmux has-session -t "=$T" 2>/dev/null || return 0
   tmux send-keys -t "$T" Escape; sleep 0.5
   type_line "/exit"
-  for ((i = 0; i < 15; i++)); do tmux has-session -t "$T" 2>/dev/null || return 0; sleep 1; done
+  for ((i = 0; i < 15; i++)); do tmux has-session -t "=$T" 2>/dev/null || return 0; sleep 1; done
   tmux kill-session -t "$T" 2>/dev/null
 }
 
@@ -1204,7 +1246,8 @@ update_part() {  # update_part a|b
     v="$(installed_version "$h")"
     [[ "$v" == "$to_version" ]] && pass "6a: marketplace update + /reload-plugins: $OLD_TAG -> $v" \
       || { fail "6a: after marketplace update + /reload-plugins the installed version is $v, wanted $to_version"; show_tail; }
-    stop_claude; start_claude "$h" "$dir"
+    stop_claude
+    start_claude "$h" "$dir" || { fail "6a: claude did not start after the update"; show_tail; stop_claude; return; }
   else
     stop_claude
     printf '{"checked_at": 0}\n' > "$h/.config/datastash/state/self-update.json"  # a day has passed
