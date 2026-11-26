@@ -4256,7 +4256,8 @@ def _safe_followup(inp, uses, budget=HOOK_START_SECONDS + 1):
 
 
 IMPORTED_HINT_MARK = "imported-connector-hint"
-IMPORTED_HINT = "this plugin's own connector and the datastash command do the work"
+IMPORTED_HINT = ("the datastash command does the work once this computer is signed in; until then the one step is the "
+                 "person typing datastash sync you@email.com")
 
 
 def imported_connector_hint():

@@ -144,6 +144,24 @@ class NoMcpStep(unittest.TestCase):
                 hits += [f"{rel}:{n}: {t.strip()[:100]}" for n, t in texts if "choose Authenticate" in t]
         self.assertEqual(hits, [])
 
+    def test_skill_never_sends_a_claude_code_user_to_connector_settings(self):
+        """XLI-417 review: connector settings are only for app chat with no shell. In Claude Code the not-signed-in
+        path is `datastash check` and the line it prints, never the connector settings (the /mcp Authenticate step)."""
+        path = os.path.join(PLUGIN, "skills", "datastash-agent", "SKILL.md")
+        with open(path) as f:
+            lines = f.read().splitlines()
+        bad = []
+        for n, t in enumerate(lines, 1):
+            low = t.lower()
+            if "in claude code, see" in low:
+                bad.append(f"{n}: {t.strip()[:100]}")
+            if "connector settings" in low and ("no shell" not in low or "never send the person to connector settings" not in low):
+                bad.append(f"{n}: {t.strip()[:100]}")
+            if "one step is `/datastash:install`" in t:
+                bad.append(f"{n}: {t.strip()[:100]}")
+        self.assertEqual(bad, [])
+        self.assertTrue(any("datastash check" in t and "connector settings" in t for t in lines))
+
 
 if __name__ == "__main__":
     unittest.main()
