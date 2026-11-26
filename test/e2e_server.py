@@ -20,6 +20,10 @@ Run with python3 -I. Never prints a secret, a code or a token.
   chat-count TEXT [MUST]    (1.0.18) how many saved exchanges start "User: TEXT" across the account's saved chats, and
                            whether one has an answer after it (holding MUST, when given), as JSON {"count", "answered"}
   timer-find WB NOTE        (1.0.18) whether a timer with NOTE is set in agent workbook WB; then cancels it, as JSON
+  email-code OUTFILE [SECS]  (1.0.20, XLI-417) the sign-in code datastash made for the test account's typed
+                           `datastash sync <email>`, read once through the selftest door (x-live
+                           POST /api/v1/selftest/email-code: the secret, from the build box, selftest accounts only), into
+                           OUTFILE (mode 600); waits up to SECS (default 90) for it. The code is never printed.
   inbox-marks WB INBOX MARK  (XLI-408 step 9) every message in that inbox of workbook WB whose text holds "MARK #<n>",
                            as a JSON list of the n's in the order datastash added them (a repeat shows twice)
 
@@ -394,6 +398,35 @@ def cmd_chat_count(text, must=None):
     print(json.dumps({"count": n, "answered": answered}))
 
 
+EMAIL_CODE_URL = ORIGIN + "/api/v1/selftest/email-code"
+
+
+def cmd_email_code(out, secs=90):
+    """1.0.20: the test account's emailed sign-in code, read once through the selftest door, into OUT (mode 600)."""
+    headers = {"x-datastash-selftest-secret": secret(), "x-datastash-selftest-account": LABEL,
+               "Content-Type": "application/json"}
+    until = time.time() + secs
+    while True:
+        status, _, body = call("POST /api/v1/selftest/email-code", "POST", EMAIL_CODE_URL, headers, b"{}")
+        if status == 404:
+            die("the selftest code door answered 404 (off, not deployed, or not from the build box)")
+        if status != 200:
+            die(f"the selftest code door answered HTTP {status}")
+        try:
+            code = json.loads(body).get("code")
+        except ValueError:
+            die("the selftest code door answered no JSON")
+        if isinstance(code, str) and code.isdigit() and len(code) == 6:
+            fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(code)
+            print("sign-in code read (not shown)")
+            return None
+        if time.time() > until:
+            die(f"no sign-in code for the test account within {secs}s (was the typed datastash sync <email> sent?)")
+        time.sleep(3)
+
+
 def main(argv):
     if not argv:
         die(__doc__.strip().splitlines()[0], 2)
@@ -422,6 +455,8 @@ def main(argv):
         return cmd_chat_count(argv[1], argv[2] if len(argv) == 3 else None)
     if c == "timer-find" and len(argv) == 3:
         return cmd_timer_find(argv[1], argv[2])
+    if c == "email-code" and len(argv) in (2, 3) and (len(argv) == 2 or argv[2].isdigit()):
+        return cmd_email_code(argv[1], int(argv[2]) if len(argv) == 3 else 90)
     if c == "inbox-marks" and len(argv) == 4:
         return cmd_inbox_marks(argv[1], argv[2], argv[3])
     die("unknown command", 2)

@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # e2e-real.sh: the REAL end-to-end gate for every datastash plugin release (owner 11-24). It extends test/e2e-install.sh
 # (the README's steps typed into a real interactive Claude Code on an empty HOME) past the sign-in: Claude Code is logged
-# in (a long-lived token, env only), /mcp Authenticate is finished through datastash's selftest sign-in (x-live XLI-314)
-# for one comped, flagged test account, and every step is read back from the server (test/e2e_server.py), not only from
+# in (a long-lived token, env only) and the computer signs in to datastash for one comped, flagged test account (the
+# selftest account, x-live XLI-314). 1.0.20+ (XLI-417): the person's one sign-in, typed: `datastash sync <email>` (the
+# test account's own example.invalid email), then `datastash sync <code>`; no inbox can get that code, so the harness
+# reads it once through x-live's selftest code door (POST /api/v1/selftest/email-code: the selftest secret, from the
+# build box, selftest accounts only; x-live #528). An older copy (6b stays on the published pin) still signs in with
+# /mcp Authenticate through the selftest OAuth sign-in. Every step is read back from the server (test/e2e_server.py), not only from
 # what the plugin printed. Runs against prod (https://getdatastash.com) and the published plugin.
 #
 # The matrix (computer = one throwaway HOME; all of them share the one selftest test account, label E2E_ACCOUNT, the
 # same fixed label every run):
-#   1  computer A, home folder: marketplace add, install for you, /exit and restart, /mcp Authenticate (selftest),
+#   1  computer A, home folder: marketplace add, install for you, /exit and restart, the sign-in (above; 1.0.20+: the
+#      session start's line Type "datastash sync you@email.com" to sign in this computer., the typed email, "Check your email for a code", the
+#      typed code, "Checking the code.", then `datastash login --check` on that computer says signed in),
 #      /datastash:install: agent "$E2E_USER" (the computer's user, never "agent"), the install list and "Time per card is
 #      on"; server: it is on. 1.0.16: every install and uninstall also checks what the person sees: the model's own reply
 #      starts with the plugin's line ("Done. Datastash is on for <name>." / "Done. Datastash is uninstalled from ..."),
@@ -80,6 +86,10 @@
 #   (E2E_SIGNIN_LEDGER, default ~/.local/state/datastash-e2e/selftest-signins: one time per line) would pass 20; a
 #   cleanup computer counts one more. E2E_BUDGET_WAIT=0: stop instead of waiting. A server refusal (HTTP 429) names
 #   its reason: rate_limited (the hourly limit) or too_many_accounts (no new label can be made).
+# Email sign-in budget (1.0.20+): x-live allows 5 code requests an hour per email (and 5 per 10 minutes per computer
+#   name and user), so each typed `datastash sync <email>` is counted in E2E_EMAIL_LEDGER (default
+#   ~/.local/state/datastash-e2e/email-signins) and waits, when 5 were made in the last hour, until the oldest frees.
+#   The cleanup signs every throwaway computer out (`datastash logout`) before its HOME goes to ~/trash.
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
 #   E2E_PARTS ("core update", default both; "step5" runs step 5 alone; "step4" runs step 4 after its home setup; "outbox" runs step 9 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
 #   E2E_CANDIDATE=<branch or tag, pushed to the plugin repo>: test that commit before it is released: the core steps
@@ -107,6 +117,9 @@ PARTS="${E2E_PARTS:-core update}"
 OLD_TAG="${E2E_OLD_TAG:-v1.0.12}"
 export E2E_SIGNIN_LEDGER="${E2E_SIGNIN_LEDGER:-$REAL_HOME/.local/state/datastash-e2e/selftest-signins}"
 SIGNIN_MAX_PER_HOUR=20
+export E2E_EMAIL_LEDGER="${E2E_EMAIL_LEDGER:-$REAL_HOME/.local/state/datastash-e2e/email-signins}"
+EMAIL_MAX_PER_HOUR=5
+CUR_HOME=""
 RUN="dsreal-$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ds-e2e-real.XXXXXX")"
 export E2E_SERVER_TOKEN_FILE="$WORK/server.tok"
@@ -139,6 +152,7 @@ cleanup() {
     : > "$E2E_SERVER_TOKEN_FILE"
   fi
   for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep "^$RUN-"); do tmux kill-session -t "$s" 2>/dev/null; done
+  declare -F logout_homes >/dev/null && logout_homes
   pkill -f "$WORK/" 2>/dev/null; sleep 1; pkill -9 -f "$WORK/" 2>/dev/null
   mkdir -p "$REAL_HOME/trash"
   mv "$WORK" "$REAL_HOME/trash/" 2>/dev/null && [[ "${E2E_KEEP:-0}" == 1 ]] && say "throwaway HOMEs kept in $REAL_HOME/trash/$(basename "$WORK")"
@@ -266,7 +280,8 @@ flat() { pane | tr -s ' \t\n' ' '; }  # the whole pane as one line (a wrapped li
 screen() { tmux capture-pane -t "$T" -p -J 2>/dev/null | grep -v '^[[:space:]]*$'; }
 count() { flat | grep -oF -- "$1" | wc -l; }
 type_line() { tmux send-keys -t "$T" -l -- "$1"; sleep 1; tmux send-keys -t "$T" Enter; }
-show_tail() { screen | tail -n "${1:-14}" | sed 's/^/    | /'; }
+redact() { sed -E 's/(sync( datastash)?|datastash sync) +[0-9]{6}/\1 ******/g; s/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.invalid/<test email>/g'; }
+show_tail() { screen | tail -n "${1:-14}" | redact | sed 's/^/    | /'; }
 wait_for() {  # wait_for <ERE> [seconds]: the pane shows it (no model turn; no dialog answered)
   local i
   for ((i = 0; i < ${2:-30}; i++)); do pane | grep -qE -- "$1" && return 0; sleep 1; done
@@ -335,7 +350,7 @@ start_claude() {  # start_claude <HOME> <folder>: an interactive session, the fo
   tmux set-option -t "$T" history-limit 100000
   # Claude Code 2.1.331+ draws in the terminal's alternate screen (no scrollback for the pane reads): kept off below
   tmux new-window -t "$T" -c "$dir" \
-    "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER='$E2E_USER' LOGNAME='$E2E_USER' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CODE_NO_FLICKER=0 E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
+    "env -i PATH='$WORK/bin:$(dirname "$CLAUDE_BIN"):/usr/local/bin:/usr/bin:/bin' HOME='$h' USER='$E2E_USER' LOGNAME='$E2E_USER' DATASTASH_DEVICE_NAME='e2e-$(basename "$(dirname "$h")")' TERM=xterm-256color LANG=C.UTF-8 BROWSER='$WORK/bin/browser' ENABLE_CLAUDEAI_MCP_SERVERS=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 CLAUDE_CODE_NO_FLICKER=0 E2E_CLAUDE_ENV_FILE='$( ((LOGIN)) && printf '%s' "$CLAUDE_ENV")' '$WORK/launch.sh' '$CLAUDE_BIN' ${model[*]}"
   tmux kill-window -t "$T:hold" 2>/dev/null
   if wait_for "trust this folder" 40; then
     # The dialog's default is "No, exit" and it shows its text before it takes keys: a Down sent too soon is dropped and
@@ -457,6 +472,7 @@ PY2
 
 readme_steps() {  # readme_steps <tag> <HOME> <folder> <catalog>: marketplace add, install for you, /exit, start again
   local tag="$1" h="$2" dir="$3" src="$4"
+  CUR_HOME="$h"  # the computer the next authenticate signs in
   start_claude "$h" "$dir" || { fail "$tag: claude did not start"; show_tail; return 1; }
   type_line "/plugin marketplace add $src"
   wait_for "Added marketplace|Successfully added marketplace" 120 || { fail "$tag: marketplace not added"; show_tail; return 1; }
@@ -470,7 +486,91 @@ readme_steps() {  # readme_steps <tag> <HOME> <folder> <catalog>: marketplace ad
   pass "$tag: marketplace added, installed for you, restarted (plugin $(installed_version "$h"))"
 }
 
-authenticate() {  # authenticate <tag>: /mcp, datastash, Authenticate, the selftest sign-in; server: one more app connection
+# --- the sign-in. 1.0.20+ (XLI-417): typed, by an emailed code; an older copy: /mcp Authenticate (selftest OAuth).
+email_signin_copy() {  # email_signin_copy <HOME>: the installed plugin signs in by `datastash sync <email>` (1.0.20+)
+  python3 -I -c 'import sys; v=tuple(int(x) for x in (sys.argv[1] or "0").split(".")[:3] if x.isdigit()); sys.exit(0 if v >= (1, 0, 20) else 1)' "$(installed_version "$1")"
+}
+plugin_cmd() {  # plugin_cmd <HOME> <args...>: the installed plugin's own datastash command on that computer (its env only)
+  local h="$1" root; shift
+  root="$(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["plugins"]["datastash@datastash"][0]["installPath"])' \
+    "$h/.claude/plugins/installed_plugins.json" 2>/dev/null)" || return 2
+  [[ -n "$root" && -f "$root/scripts/datastash" ]] || return 2
+  env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$h" USER="$E2E_USER" LOGNAME="$E2E_USER" LANG=C.UTF-8 \
+    DATASTASH_DEVICE_NAME="e2e-$(basename "$(dirname "$h")")" python3 "$root/scripts/datastash" "$@"
+}
+logout_homes() {  # every throwaway computer of this run signs out (its datastash login stops on the server)
+  local h out
+  for h in "$WORK"/*/person; do
+    [[ -d "$h/.config/datastash" ]] || continue
+    out="$(plugin_cmd "$h" logout 2>&1 | head -n 1)" || continue
+    [[ "$out" == "signed out: this computer was not signed in" ]] || say "cleanup: ${h#"$WORK/"}: $out"
+  done
+}
+email_budget_wait() {  # one typed `datastash sync <email>` more: wait while 5 were made in the last hour (x-live's limit)
+  local wait_s
+  wait_s="$(python3 -I -c 'import sys, time
+now, cap = time.time(), int(sys.argv[2])
+try:
+    ts = sorted(int(l) for l in open(sys.argv[1]) if l.strip().isdigit() and now - int(l) < 3600)
+except OSError:
+    ts = []
+print(int(ts[len(ts) - cap] + 3600 - now) + 10 if len(ts) >= cap else 0)' "$E2E_EMAIL_LEDGER" "$EMAIL_MAX_PER_HOUR")"
+  if ((wait_s > 0)); then
+    [[ "${E2E_BUDGET_WAIT:-1}" == 1 ]] || { say "email sign-in budget: $EMAIL_MAX_PER_HOUR used in the last hour; E2E_BUDGET_WAIT=0, so no wait"; return 1; }
+    say "email sign-in budget: $EMAIL_MAX_PER_HOUR code requests in the last hour (x-live's limit): waiting ${wait_s}s, until $(date -u -d "@$(($(date +%s) + wait_s))" +%H:%M:%SZ)"
+    sleep "$wait_s"
+  fi
+  mkdir -p "$(dirname "$E2E_EMAIL_LEDGER")" && date +%s >> "$E2E_EMAIL_LEDGER"
+}
+
+authenticate() {  # authenticate <tag>: sign the computer of the last readme_steps in (CUR_HOME)
+  if [[ -n "$CUR_HOME" ]] && email_signin_copy "$CUR_HOME"; then authenticate_email "$@"; else authenticate_mcp "$@"; fi
+}
+
+authenticate_email() {  # authenticate_email <tag>: the person's typed sign-in by one emailed code (1.0.20+, XLI-417)
+  local tag="$1" h="$CUR_HOME" email="selftest-oauth-${E2E_ACCOUNT}@example.invalid" code_file="$WORK/code.$$" code got i
+  ((LOGIN)) || { waiting "$tag: the typed sign-in (needs the Claude login)"; return 1; }
+  if [[ "$(plugin_cmd "$h" login --check 2>/dev/null | head -n 1)" == "signed in: yes"* ]]; then
+    fail "$tag: this throwaway computer is already signed in before the sign-in"; return 1
+  fi
+  if wait_for 'Type "datastash sync you@email\.com" to sign in this computer\.' 20; then
+    pass "$tag: the session start says: Type \"datastash sync you@email.com\" to sign in this computer."
+  else
+    fail "$tag: the session start did not say the sign-in line"; show_tail 8
+  fi
+  email_budget_wait || { fail "$tag: the email sign-in budget"; return 1; }
+  BADTOOL=0
+  local base; base="$(count "Check your email for a code")"
+  type_line "datastash sync $email"
+  drive_until '(( $(count "Check your email for a code") > base )) && ! screen | grep -qE "esc to interrupt"' 180 \
+    || { fail "$tag: datastash sync <email>: no \"Check your email for a code\" reply"; show_tail; return 1; }
+  ((BADTOOL)) && { fail "$tag: datastash sync <email>: the model tried a tool"; return 1; }
+  if got="$(flat | grep -oE "Check your email for a code\. Then type datastash sync CODE here\." | tail -n 1)" && [[ -n "$got" ]]; then
+    pass "$tag: datastash sync <email> -> \"$got\" (bold rendered)"
+  else
+    fail "$tag: datastash sync <email>: the reply is not the plugin's line word for word"; show_tail 8
+  fi
+  : > "$code_file"; chmod 600 "$code_file"
+  "${SRV[@]}" email-code "$code_file" 120 || { fail "$tag: no sign-in code reached the selftest door (reason above)"; show_tail 8; return 1; }
+  code="$(cat "$code_file")"; mv "$code_file" "$WORK/used-code.$(date +%s%N)"
+  base="$(count "Checking the code.")"
+  type_line "datastash sync $code"
+  drive_until '(( $(count "Checking the code.") > base )) && ! screen | grep -qE "esc to interrupt"' 180 \
+    || { fail "$tag: datastash sync <code>: no \"Checking the code.\" reply"; show_tail; return 1; }
+  ((BADTOOL)) && { fail "$tag: datastash sync <code>: the model tried a tool"; return 1; }
+  if (($(count "$code") <= 1)); then pass "$tag: datastash sync <code> -> \"Checking the code.\" (the code is shown only where it was typed)"
+  else fail "$tag: datastash sync <code>: the code shows again after the typed line"; fi
+  code=""
+  for ((i = 0; i < 120; i++)); do
+    got="$(plugin_cmd "$h" login --check 2>/dev/null | head -n 1)"
+    [[ "$got" == "signed in: yes"* ]] && break
+    sleep 1
+  done
+  if [[ "$got" == "signed in: yes"* ]]; then pass "$tag: this computer is signed in to datastash (its own login, picked up by its own poll: datastash login --check)"
+  else fail "$tag: after the code, datastash login --check says \"${got:-nothing}\""; return 1; fi
+}
+
+authenticate_mcp() {  # authenticate_mcp <tag>: /mcp, datastash, Authenticate, the selftest sign-in; server: one more app connection
   local tag="$1" after url="" i menu
   : > "$WORK/browser-urls"
   type_line "/mcp"
