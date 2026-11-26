@@ -13600,9 +13600,10 @@ ASKS_TEXT_MAX = 200
 
 
 def _asks_read():
-    """checkin's asks (dict) on the person's main key (as datastash read INBOX: the server gives asks to the person's own
-    connection only, never an agent's), or a short reason it isn't there."""
-    key = read_main_key()
+    """checkin's asks (dict) on this computer's key, or a short reason it isn't there. 1019-reach: the same key as "status of
+    all my agents" and show dds stats (_dds_key: the person's own, else this computer's agent key); the server answers an
+    agent key's asks only after the person typed datastash sync for that agent. Never shown to the model."""
+    key = _dds_key()
     if key is None:
         return "not connected on this computer yet"
     try:
