@@ -143,6 +143,11 @@ class WelcomeBack(AsksBase):
     def test_no_welcome_in_a_folder_with_no_agent(self):
         self.folder = os.path.realpath(harness.tmpdir(self, prefix="noagent-", dir=os.path.dirname(self.folder)))
         os.environ["CLAUDE_PROJECT_DIR"] = self.folder
+        pc = ds.conf_path(ds.PERSON_SLUG)  # an earlier test file's person watch (its folders may hold this one): aside
+        if os.path.exists(pc):
+            aside = pc + f".aside-{time.time()}"
+            os.replace(pc, aside)
+            self.addCleanup(os.replace, aside, pc)
         self.assertEqual(ds.resolve(self.folder)[0], None)
         self.assert_no_welcome_after_a_gap()
 
