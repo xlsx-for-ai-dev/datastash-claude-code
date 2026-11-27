@@ -4331,6 +4331,34 @@ class Xli375(Base):
         self.assertIn('"Make my datastash agent workbook."', told[0])
         self.assertEqual(ds.take_notices([ds.notice_cause("noworkbook")]), [])
 
+    def test_a_notes_tab_error_is_told_in_its_own_words_not_no_workbook(self):
+        # XLI-417 e2e run5: the account's agent workbook was at its tab cap; register answered (as a success) no notes
+        # tab and notes_tab_errors. The person reads that plain message, never the bare "no agent workbook" line.
+        a = self.used(os.path.join(self.root, "alpha"))
+        ds.enroll()
+        self.server.approval = "approved"
+        real = self.server.__call__
+
+        def capped(method, path, key=None, body=None, **kw):
+            st, ct, out = real(method, path, key=key, body=body, **kw)
+            if path.split("?")[0] == ds.AGENT_REGISTER_PATH:
+                ans = json.loads(out)
+                ans["notes_tabs"] = []
+                ans["notes_tab_errors"] = [{"code": "workbook_tab_limit", "workbook_id": "w", "workbook": "Agent",
+                                            "message": 'Your notes tab was not made: workbook "Agent" has 200 tabs, the '
+                                                       "most it can hold (200). Delete or archive some tabs there, then "
+                                                       "register again."}]
+                out = json.dumps(ans)
+            return st, ct, out
+        ds.http = capped
+        self.assertEqual(ds.advance(a), "no_workbook")
+        self.assertEqual(self.key_calls(), [])
+        told = ds.take_notices([ds.notice_cause("noworkbook")])
+        self.assertEqual(len(told), 1)
+        self.assertIn('has 200 tabs, the most it can hold (200). Delete or archive some tabs there', told[0])
+        self.assertNotIn("Make my datastash agent workbook.", told[0])
+        self.assertNotIn("no agent workbook", told[0])
+
     def test_the_removed_approval_route_never_forgets_a_live_agent(self):
         # e2e run3: x-live removed GET /api/v1/agent/approval (XLI-390 X4); its 404 made every enrolled agent "gone"
         # here while datastash kept it on (a "-2" at the next install). The same agent's register again says it now.

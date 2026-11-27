@@ -1719,6 +1719,10 @@ def notice_text(kind, agent=None, names=None):
         return (f'{NOTICE}: agent "{disp(agent["name"])}" is not set up on this computer yet. Type /datastash:install in '
                 "its session; it starts by itself once it has its key. Its messages wait in its inbox (delayed, never "
                 "dropped).")
+    if kind == "notesfailed":  # XLI-417: an agent workbook is there, but the register could not make its notes tab
+        why = re.sub(r"[.\s]+$", "", agent["why"])
+        return (f'{NOTICE}: agent "{disp(agent["name"])}" is allowed, but datastash could not make its notes tab, so it '
+                f"can't start: {why}. It starts by itself once the tab can be made.")
     if kind == "noworkbook":
         return (f'{NOTICE}: agent "{disp(agent["name"])}" is allowed, but your datastash has no agent workbook yet, so '
                 "it can't start. It starts by itself once there is one. "
@@ -2337,7 +2341,9 @@ def _first_key(folder, s, tok):
            and isinstance(t.get("workbook_id"), str) and re.fullmatch(AGENT_ID_RE, t["workbook_id"])]
     if not wbs:
         _update_enrolled(folder, no_workbook_at=int(time.time()))
-        raise_notice(notice_cause("noworkbook"), notice_text("noworkbook", agent={"name": rec["name"]}))
+        err = notes_tab_error(ans)
+        raise_notice(notice_cause("noworkbook"), notice_text("notesfailed", agent={"name": rec["name"], "why": err["message"]})
+                     if err else notice_text("noworkbook", agent={"name": rec["name"]}))
         return "no_workbook"
     clear_notices([notice_cause("noworkbook")])
     v = secrets.token_urlsafe(48)
@@ -14536,6 +14542,20 @@ def server_refused(body, failed=None):
     return f"Not done: datastash refused it ({code}{': ' + msg if msg else ''}). Nothing changed."
 
 
+def notes_tab_error(ans):
+    """XLI-417 (e2e run5): the register's own answer for a notes tab it could not make (notes_tab_errors[0]: its code,
+    such as workbook_tab_limit or notes_tab_not_made, and its plain message), so the person reads why, never a bare
+    no_agent_workbook. None when the answer names none."""
+    errs = ans.get("notes_tab_errors") if isinstance(ans, dict) else None
+    e = errs[0] if isinstance(errs, list) and errs and isinstance(errs[0], dict) else None
+    if e is None:
+        return None
+    code = e.get("code") if isinstance(e.get("code"), str) and re.fullmatch(r"[a-z0-9_]{1,48}", e["code"]) else "notes_tab_not_made"
+    msg = e.get("message") if isinstance(e.get("message"), str) else ""
+    msg = re.sub(r"\s+", " ", "".join(ch for ch in msg if unicodedata.category(ch)[0] != "C")).strip()[:240]
+    return {"code": code, "message": msg} if msg else {"code": code, "message": "your notes tab could not be made"}
+
+
 def _session_agent_path(sid):
     return os.path.join(STATE, f"session-agent-{sid}.json")
 
@@ -15371,8 +15391,8 @@ def _rest_key_here(inp, tok, name, here, typed):
         wbs = [t.get("workbook_id") for t in (ans.get("notes_tabs") or []) if isinstance(t, dict)
                and isinstance(t.get("workbook_id"), str) and re.fullmatch(AGENT_ID_RE, t["workbook_id"])]
         if not wbs:
-            return server_refused({"code": "no_agent_workbook", "message": "this account has no Dev Datastash workbook "
-                                   "yet"}, INSTALL_FAILED_LINE)
+            return server_refused(notes_tab_error(ans) or {"code": "no_agent_workbook", "message": "this account has no "
+                                  "Dev Datastash workbook yet"}, INSTALL_FAILED_LINE)
         v = secrets.token_urlsafe(48)
         try:
             k = api_json("POST", AGENT_KEY_PATH, tok, body={"name": rec["name"], "agent_id": rec["agent_id"],

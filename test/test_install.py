@@ -49,7 +49,7 @@ LIST = {"list_id": LIST_ID, "expires_in_seconds": 600,
                    {"agent_id": BETA, "name": "beta", "visibility": "public"}]}
 TOOL = "mcp__claude_ai_datastash__"
 OWN_TOOL = "mcp__plugin_datastash_datastash__"  # the plugin's own connector (https://getdatastash.com/mcp): trusted by URL
-PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path", "hook_input",
+PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "ENROLL_FILE", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path", "hook_input",
            "spawn_detached")
 
 
@@ -68,6 +68,7 @@ class Base(unittest.TestCase):
         root = os.path.realpath(harness.tmpdir(self, prefix="install-", dir=harness.ROOT))
         ds.CONF, ds.MAIN_DIR = os.path.join(root, "datastash"), os.path.join(root, "datastash main")
         ds.STATE, ds.PENDING, ds.OFF = (os.path.join(ds.CONF, d) for d in ("state", "pending", "off"))
+        ds.ENROLL_FILE = os.path.join(ds.CONF, "enroll.json")  # each test's own (a refused install leaves its record)
         self.env = os.environ.get("DATASTASH_CONFIG_DIR")
         os.environ["DATASTASH_CONFIG_DIR"] = ds.CONF
         self.folder = os.path.join(root, "web-app")
@@ -2485,6 +2486,27 @@ class OnTheLogin(Base):
     def stop(self, sid="s1"):
         return self.hook(ds.cmd_status_check, {"session_id": sid, "hook_event_name": "Stop", "cwd": self.folder,
                                                "transcript_path": self.transcript(sid)})
+
+    def test_a_notes_tab_error_on_register_is_shown_in_its_own_words(self):
+        # XLI-417 e2e run5: the register's notes tab could not be made (the workbook's tab cap); datastash answers that as
+        # notes_tab_errors. The install shows its code and plain message, asks no key, and changes nothing.
+        msg = ('Your notes tab was not made: workbook "Agent" has 200 tabs, the most it can hold (200). Delete or '
+               "archive some tabs there, then register again.")
+        self.answers[ds.AGENT_REGISTER_PATH] = (200, {"agent_id": OWN, "name": "web-app", "notes_tabs": [],
+                                                      "notes_tab_errors": [{"code": "workbook_tab_limit", "message": msg,
+                                                                            "workbook_id": WB, "workbook": "Agent"}]})
+        v, _pid = self.slash("/datastash:install")
+        text = json.dumps(v)
+        self.assertIn("workbook_tab_limit", text)
+        self.assertIn("has 200 tabs, the most it can hold (200). Delete or archive some tabs there", text)
+        self.assertNotIn("no_agent_workbook", text)
+        self.assertNotIn(ds.AGENT_KEY_PATH, self.paths("POST"))
+
+    def test_no_notes_tab_and_no_error_is_still_no_agent_workbook(self):
+        self.answers[ds.AGENT_REGISTER_PATH] = (200, {"agent_id": OWN, "name": "web-app", "notes_tabs": []})
+        v, _pid = self.slash("/datastash:install")
+        self.assertIn("no_agent_workbook", json.dumps(v))
+        self.assertNotIn(ds.AGENT_KEY_PATH, self.paths("POST"))
 
     def test_install_is_done_by_the_plugin_and_the_model_only_relays_the_list(self):
         v, pid = self.slash("/datastash:install")
