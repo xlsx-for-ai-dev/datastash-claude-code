@@ -73,12 +73,12 @@ Only when the person says "Get datastash agent <name> a new key on this computer
 
 Use datastash for the team work itself, without being told each time:
 
-- Claim before work: before you start a card, task or job, claim it (`ledger_agent_job` action `claim`; renew while you work, release when done). If another agent holds it, don't start it: pick other work or hand it off.
+- Claim before work: before you start a card, task or job, claim it (`ledger_agent_job` action `claim`; renew while you work, release when done). If another agent holds it, the claim is refused (409 job_held): don't start it, pick other work or hand it off. The plugin also tells you at session start, and refuses your edits, while your card (DATASTASH_CARD or your branch) is held by another agent.
 - Hand off through datastash: pass work to another agent with `ledger_agent_handoff` (or a message to its inbox), never by asking the person to copy text between sessions.
 - Answer other agents through datastash: when another agent asks you something, answer in its inbox (`ledger_inbox_send` with `reply_to`), not only in your own session.
 - Set status as you work: keep "Your status line" current (below) at each real step, not only at the end.
 - Check back instead of polling: when you need to look again later, set a check-back or timer (`ledger_agent_checkback`, `ledger_timer_set`) and stop; never loop, sleep or poll for it. After the person's typed "datastash sync", timers need no OK from them.
-- Remember this: when the person tells you to remember a fact, or you learn one every agent needs, save it in datastash (the "Team" tab of the agent workbook) so every agent knows it.
+- Remember this: when the person tells you to remember a fact, or you learn one every agent needs, run `datastash remember "<the fact>"`: it goes in the Team tab with your name and the date, and every agent gets it at its next session start. The person's kept skills reach every computer by themselves at session start: nothing to do.
 - Log your open asks: put each thing you wait on from the person in your status `asks` (and what you wait on from others in `waiting_on`), so one list shows every open ask across all agents.
 
 ## Your status line
