@@ -1507,21 +1507,51 @@ class RealSlashShape(Base):
             self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny", change)
         self.assertTrue(os.path.exists(ds.key_path("web-app")))
 
-    def test_the_desktop_code_tab_entry_passes(self):
-        """XLI-420: the real entry the Claude desktop app's Code tab writes for a typed /datastash:install (Claude Code
-        2.1.332 as the desktop host: entrypoint "claude-desktop", the host's human stamp, no promptSource) passes."""
+    def chains(self, chain, app="STAND_IN_APP_CHAIN"):
+        """XLI-420: the hooks see this process chain (test/fixtures/desktop-process-chains.json) and desktop app part."""
+        with open(os.path.join(FIXTURES, "desktop-process-chains.json")) as f:
+            fx = json.load(f)
+        saved = (ds.process_chain, ds.DESKTOP_APP_CHAIN)
+        self.addCleanup(lambda: (setattr(ds, "process_chain", saved[0]), setattr(ds, "DESKTOP_APP_CHAIN", saved[1])))
+        ds.process_chain = lambda: fx[chain] if isinstance(chain, str) else chain
+        ds.DESKTOP_APP_CHAIN = tuple(tuple(x) for x in fx[app]) if app else ()
+
+    def desktop_entry(self):
         with open(os.path.join(FIXTURES, "desktop-code-tab-2.1.332.jsonl")) as f:
             own = [json.loads(x) for x in f if x.strip()][0]
         self.assertEqual((own["origin"], own["entrypoint"], own["turnOrigin"], "promptSource" in own, own["isSidechain"]),
                          ({"kind": "human"}, "claude-desktop", "human", False, False))
-        self.assertTrue(ds._command_origin(own))
-        keep = {k: own[k] for k in ("entrypoint", "turnOrigin", "version", "userType")}
+        return {k: own[k] for k in ("entrypoint", "turnOrigin", "version", "userType")}
+
+    def test_the_desktop_code_tab_entry_passes(self):
+        """XLI-420: the real entry the Claude desktop app's Code tab writes for a typed slash command (Claude Code 2.1.332
+        as the desktop host) passes when the hook's process chain is the desktop app's (stand-in until the capture)."""
+        keep = self.desktop_entry()
+        self.chains("desktop_stand_in")
         got = self.note_after(**keep)["hookSpecificOutput"]
+        self.assertEqual(got["updatedInput"]["targets"], sorted([OWN, ALPHA, BETA]))
+        self.assertFalse(ds._command_origin(dict(keep, origin={"kind": "human"}, isSidechain=False)))  # entry alone: no
+
+    def test_review_1_headless_and_nested_slash_commands_are_refused(self):
+        """Review 1 HIGH: the same slash-command entry from a headless or nested run (an agent's shell), a detached run,
+        a terminal chain, an unreadable chain, or the shipped empty desktop part, is refused."""
+        keep = self.desktop_entry()
+        for chain, app in (("headless_review_1", "STAND_IN_APP_CHAIN"), ("nested_no_print", "STAND_IN_APP_CHAIN"),
+                           ("detached", "STAND_IN_APP_CHAIN"), ("terminal", "STAND_IN_APP_CHAIN"),
+                           (None, "STAND_IN_APP_CHAIN"), ("desktop_stand_in", None)):
+            self.chains(chain, app)
+            out = self.note_after(**keep)
+            self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny", chain)
+
+    def test_the_terminal_entry_is_unchanged_on_any_chain(self):
+        self.chains("headless_review_1")
+        got = self.note_after()["hookSpecificOutput"]
         self.assertEqual(got["updatedInput"]["targets"], sorted([OWN, ALPHA, BETA]))
 
     def test_the_desktop_entrypoint_without_the_person_stamp_is_refused(self):
-        """XLI-420: a desktop-entrypoint entry an agent or tool could make (no human origin, a side chain, meta, another
-        turn origin, a promptSource) is still refused."""
+        """XLI-420: on the desktop chain, a desktop-entrypoint entry an agent or tool could make (no human origin, a side
+        chain, meta, another turn origin, a promptSource) is still refused."""
+        self.chains("desktop_stand_in")
         for change in ({"origin": None}, {"origin": {"kind": "task-notification"}}, {"turnOrigin": "sdk"},
                        {"promptSource": "sdk"}, {"isMeta": True}, {"isSidechain": True}):
             out = self.note_after(**dict({"entrypoint": "claude-desktop", "turnOrigin": "human"}, **change))

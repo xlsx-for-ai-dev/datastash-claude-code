@@ -175,7 +175,7 @@ run_folder() {  # run_folder home|repo
     fail "$where step 4: /mcp datastash offers no Authenticate"
     grep -E "Status:|Issue:|OAuth|Error|Auth:" <<<"$menu" | sed 's/^/    | /'
     tmux send-keys -t "$T" Escape; sleep 1; tmux send-keys -t "$T" Escape; sleep 1
-    check_install_hook "$h" "$where" "$want"
+    check_install_hook "$h" "$where" "$want" "$dir"
     stop_claude
     return
   fi
@@ -199,12 +199,12 @@ run_folder() {  # run_folder home|repo
     fi
   fi
   tmux send-keys -t "$T" Escape; sleep 1; tmux send-keys -t "$T" Escape; sleep 1; tmux send-keys -t "$T" Escape; sleep 1
-  check_install_hook "$h" "$where" "$want"
+  check_install_hook "$h" "$where" "$want" "$dir"
   stop_claude
 }
 
 check_install_hook() {  # step 5, the plugin's half: the typed /datastash:install reaches its hook and names the agent
-  local h="$1" where="$2" want="$3" got
+  local h="$1" where="$2" want="$3" dir="$4" got
   type_line "/datastash:install"
   # 1.0.23 (card 1): a computer that is not signed in (the fresh home here never is) answers /datastash:install with one
   # line asking for the email, and records no install. That is the intended behavior and what this step now expects.
@@ -217,6 +217,17 @@ check_install_hook() {  # step 5, the plugin's half: the typed /datastash:instal
     pass "$where step 5: /datastash:install on a not-signed-in computer shows \"datastash sync you@email.com\""
   else
     fail "$where step 5: /datastash:install did not show \"datastash sync you@email.com\" (command record: $(command_record "$h" 2>/dev/null || true))"
+  fi
+  # Review 1 LOW (XLI-420): the agent name the plugin picks for this folder, as before 1.0.23 ("sam" in the home folder,
+  # "web-app" in the repo), from the installed plugin's own name picker in this HOME and folder.
+  local ds_script
+  ds_script="$(ls -d "$h"/.claude/plugins/cache/*/datastash/*/scripts/datastash 2>/dev/null | head -1)"
+  got="$( [[ -n "$ds_script" ]] && cd "$dir" && env -i PATH="$PATH" HOME="$h" USER=sam CLAUDE_PROJECT_DIR="$dir" \
+    python3 -I "$ds_script" auto-name 2>/dev/null | grep -m1 -E '^name: ' )"
+  if [[ "$got" == "name: $want" ]]; then
+    pass "$where step 5: the agent name picked here is \"$want\""
+  else
+    fail "$where step 5: wanted agent name \"$want\", the plugin picks: ${got:-nothing}"
   fi
   tmux send-keys -t "$T" Escape; sleep 1
   # Step 6 (1.0.16): uninstall from this key-less session (no agent key on this computer, the install never finished)

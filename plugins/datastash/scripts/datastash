@@ -4694,6 +4694,10 @@ def cmd_doctor(_args):
         print("note: " + signin_doctor_line())
     except Exception:
         pass
+    try:
+        print("note: " + chain_line())  # XLI-420: the desktop app's process chain, as the process table shows it
+    except Exception:  # noqa: BLE001
+        pass
     print(_listener_line(project, me))
     for f in found:
         print("problem: " + finding_line(f))
@@ -10185,20 +10189,120 @@ def _typed_text(v):
 DESKTOP_HOSTS = ("claude-desktop",)
 
 
-def _desktop_typed(v):
+# Review 1 HIGH: the entrypoint and the stamp are both set by whoever starts Claude Code
+# (`CLAUDE_CODE_ENTRYPOINT=claude-desktop claude -p --input-format stream-json` with origin human writes the same entry),
+# so the transcript never proves the desktop app. The desktop shape counts only when the real process table also shows
+# it (desktop_host_proven, read in the hook itself): this session's Claude Code was not started with -p/--print, no
+# Claude Code (or node) runs above it, and the processes right above it are the desktop app's own (DESKTOP_APP_CHAIN).
+# Anything that can't be read refuses.
+CC_PROC_NAMES = ("claude", "claude.exe", "node", "node.exe", "bun", "bun.exe")  # Claude Code itself (exact names)
+HEADLESS_FLAGS = ("-p", "--print")
+# (process name, app bundle or "") of the desktop app's processes right above its Claude Code, nearest first, taken from
+# a capture of the real app (`datastash doctor`, "process chain" line). Empty until that capture: nothing matches, so
+# the desktop shape is refused everywhere (the 1.0.25 behaviour).
+DESKTOP_APP_CHAIN = ()
+FLAG_RE = r"-{1,2}[A-Za-z][A-Za-z0-9\-]{0,40}"
+
+
+def _proc_row(pid):
+    """(parent pid, executable path, argv) of a process from the real process table (/proc, else ps), or None."""
+    if os.path.isdir("/proc/self"):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                st = f.read()
+            ppid = int(st[st.rindex(")") + 2:].split()[1])
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = [x.decode("utf-8", "replace") for x in f.read().split(b"\0") if x]
+            try:
+                exe = os.readlink(f"/proc/{pid}/exe")
+                exe = exe[:-len(" (deleted)")] if exe.endswith(" (deleted)") else exe  # a binary updated since
+            except OSError:
+                exe = argv[0] if argv else ""
+            return ppid, exe, argv
+        except (OSError, ValueError, IndexError):
+            return None
+    try:
+        a = subprocess.run(["ps", "-ww", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True,
+                           timeout=3).stdout.strip()
+        b = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True, text=True,
+                           timeout=3).stdout.strip()
+        ppid, _, comm = a.partition(" ")
+        return (int(ppid), comm.strip(), b.split()) if comm.strip() else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def process_chain():
+    """Every process above this one, nearest first, as {"name", "bundle", "flags"}: the executable's file name, the
+    app bundle it sits in ("Claude.app", or ""), and only the option names it was started with (no values, no paths).
+    None when any step can't be read (fail closed)."""
+    chain, pid = [], os.getppid()
+    for _ in range(40):
+        if pid <= 1:
+            return chain
+        row = _proc_row(pid)
+        if row is None:
+            return None
+        ppid, exe, argv = row
+        parts = (exe or "").replace("\\", "/").split("/")
+        bundle = next((x for x in reversed(parts[:-1]) if x.endswith(".app")), "")
+        flags = []
+        for x in argv[1:]:
+            f = x.split("=", 1)[0]
+            if re.fullmatch(FLAG_RE, f) and f not in flags:
+                flags.append(f)
+        chain.append({"name": parts[-1][:60], "bundle": bundle[:60], "flags": flags[:16]})
+        if ppid == pid:
+            return None
+        pid = ppid
+    return None
+
+
+def desktop_host_proven(chain=None):
+    """XLI-420: True only when the process table shows this hook under the desktop app's own Claude Code: the nearest
+    Claude Code above it was not started headless (-p/--print), the processes right above that one are
+    DESKTOP_APP_CHAIN, and no Claude Code (or node) runs anywhere above it. Anything unread or unknown: False."""
+    try:
+        chain = process_chain() if chain is None else chain
+        if not chain or not DESKTOP_APP_CHAIN:
+            return False
+        i = next((n for n, c in enumerate(chain) if c["name"] in CC_PROC_NAMES), None)
+        if i is None or any(f in HEADLESS_FLAGS for f in chain[i]["flags"]):
+            return False
+        above = chain[i + 1:]
+        if [(c["name"], c["bundle"]) for c in above[:len(DESKTOP_APP_CHAIN)]] != [tuple(x) for x in DESKTOP_APP_CHAIN]:
+            return False
+        return not any(c["name"] in CC_PROC_NAMES for c in above)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def chain_line():
+    """The doctor's "process chain" line: process names, app bundles and option names only."""
+    chain = process_chain()
+    if chain is None:
+        return "process chain: can't be read here"
+    show = [_clean(c["name"], 60) + (f" ({_clean(c['bundle'], 60)})" if c["bundle"] else "")
+            + (f" [{' '.join(c['flags'])}]" if c["flags"] else "") for c in chain]
+    return ("process chain (nearest first): " + " > ".join(show)
+            + ("; desktop app: yes" if desktop_host_proven(chain) else "; desktop app: not proven"))
+
+
+def _desktop_typed(v, desktop=False):
     """The desktop Code tab's typed line: entrypoint "claude-desktop", promptSource "sdk", turnOrigin "human" (the
-    caller has checked origin.kind "human")."""
-    return v.get("entrypoint") in DESKTOP_HOSTS and v.get("promptSource") == "sdk" and v.get("turnOrigin") == "human"
+    caller has checked origin.kind "human"), and only with desktop_host_proven() read in the hook (desktop)."""
+    return (desktop is True and v.get("entrypoint") in DESKTOP_HOSTS and v.get("promptSource") == "sdk"
+            and v.get("turnOrigin") == "human")
 
 
-def _person_origin(v):
+def _person_origin(v, desktop=False):
     """Addendum 6 N1: True only when Claude Code marked the entry as the person's own: origin.kind "human" and
-    promptSource "typed" or "queued", or (XLI-420) the desktop Code tab's typed line. A headless `claude -p` prompt
-    ("sdk" with no origin), a task notification or a peer message ("system"), or an entry without these fields (an
-    older Claude Code) is refused: fail closed."""
+    promptSource "typed" or "queued", or (XLI-420) the desktop Code tab's typed line when the hook proved the desktop
+    app from the process table (desktop). A headless `claude -p` prompt (stamped or not), a task notification or a peer
+    message ("system"), or an entry without these fields (an older Claude Code) is refused: fail closed."""
     o = v.get("origin")
     return isinstance(o, dict) and o.get("kind") == "human" and (v.get("promptSource") in ("typed", "queued")
-                                                                  or _desktop_typed(v))
+                                                                  or _desktop_typed(v, desktop))
 
 
 NOT_PERSON_LINE = ("Not done: Claude Code did not mark that prompt as typed by you (a headless run or an older Claude "
@@ -10250,7 +10354,7 @@ def _said_turns(entries, end, most=4):
     return turns
 
 
-def find_typed(tp, pid, prompt, at=None):
+def find_typed(tp, pid, prompt, at=None, desktop=False):
     """(entry, the assistant's last turns before it) when the session transcript holds the person's typed entry for
     this prompt id with exactly this text, else None; "not person" when that entry is there but Claude Code did not mark
     it as typed by a person (N1: `claude -p`, a notification, or no origin fields). Claude Code writes the entry right
@@ -10263,7 +10367,7 @@ def find_typed(tp, pid, prompt, at=None):
             continue
         if t.strip() != prompt.strip():
             return None
-        if not _person_origin(v):
+        if not _person_origin(v, desktop):
             return "not person"
         return v, _said_turns(entries, i)
     if at is None:
@@ -10318,6 +10422,7 @@ def start_check(shape, kind, prompt, data):
         ensure_dirs()
         write_private(_pending_path(pid), json.dumps({"kind": kind, "sid": sid, "tp": tp, "pid": pid, "prompt": prompt,
                                                       "at": time.time(), "data": data,
+                                                      "desktop": desktop_host_proven(),  # XLI-420: read in the hook
                                                       "cwd": getattr(shape, "cwd", None)}))
         spawn_detached([sys.executable, os.path.abspath(__file__), "status-verify", pid], CONF)
         return True
@@ -10345,7 +10450,7 @@ def cmd_status_verify(args):
     found = None
     while found is None and time.time() < deadline:
         if os.path.exists(rec["tp"]) and _transcript_ok(rec["tp"], rec["sid"]):
-            found = find_typed(rec["tp"], rec["pid"], rec["prompt"], at=rec.get("at"))
+            found = find_typed(rec["tp"], rec["pid"], rec["prompt"], at=rec.get("at"), desktop=rec.get("desktop") is True)
         if found is None:
             time.sleep(0.2)
     _drop(path)
@@ -14582,7 +14687,8 @@ def login_step_verify(rec, pending=None):
             if rec["kind"] in ("login_install", "login_uninstall"):
                 entry = _typed_entry(rec)
             else:
-                found = find_typed(rec["tp"], rec["pid"], rec["prompt"], at=rec.get("at")) \
+                found = find_typed(rec["tp"], rec["pid"], rec["prompt"], at=rec.get("at"),
+                                   desktop=rec.get("desktop") is True) \
                     if os.path.exists(rec["tp"]) and _transcript_ok(rec["tp"], sid) else None
                 entry = found[0] if isinstance(found, tuple) else found
             if entry is not None:
@@ -15634,6 +15740,8 @@ def load_cmd(sid):
 
 def save_cmd(sid, rec):
     ensure_dirs()
+    if "desktop" not in rec:  # XLI-420: read in the hook that first records the person's command
+        rec["desktop"] = desktop_host_proven()
     write_private(_cmd_path(sid), json.dumps(rec))
     write_private(_turn_path(sid, ".cmd"), "1")  # this turn is the person's datastash command (no status reminder)
 
@@ -15746,14 +15854,14 @@ def tool_answer(resp):
     return body if isinstance(body, dict) else None
 
 
-def _command_origin(v):
+def _command_origin(v, desktop=False):
     """A plugin slash command's entry as Claude Code writes it when the person types it in an interactive session:
     origin.kind "human", no promptSource (Claude Code marks typed text "typed" and these not at all), entrypoint "cli"
-    or (XLI-420) the desktop Code tab's "claude-desktop" (never sdk-cli or any other headless run), not meta, not a side
-    chain. Anything else fails closed."""
+    or (XLI-420) the desktop Code tab's "claude-desktop" only when the hook proved the desktop app from the process table
+    (desktop; never sdk-cli or any other headless run), not meta, not a side chain. Anything else fails closed."""
     o = v.get("origin")
     return (isinstance(o, dict) and o.get("kind") == "human" and "promptSource" not in v
-            and v.get("entrypoint") in ("cli",) + DESKTOP_HOSTS
+            and (v.get("entrypoint") == "cli" or (desktop is True and v.get("entrypoint") in DESKTOP_HOSTS))
             and v.get("turnOrigin", "human") == "human" and not v.get("isMeta") and v.get("isSidechain") is False)
 
 
@@ -15773,10 +15881,10 @@ def _typed_entry(rec):
                 t = f"/{tag.group(2)} {(tag.group(3) or '').strip()}".strip()
                 if " ".join(t.split()) != " ".join(want.split()):
                     return None
-                return v if _command_origin(v) else "not person"
+                return v if _command_origin(v, rec.get("desktop") is True) else "not person"
             if t.strip() != want:
                 return None
-            return v if _person_origin(v) else "not person"
+            return v if _person_origin(v, rec.get("desktop") is True) else "not person"
         if time.time() > deadline:
             return None
         time.sleep(0.2)

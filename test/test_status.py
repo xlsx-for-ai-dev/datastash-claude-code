@@ -826,15 +826,53 @@ class PersonOnly(Base):
             self.entry(sid, v)
         return write
 
+    def chains(self, chain, app=None):
+        """XLI-420: the prompt hook sees this process chain (test/fixtures/desktop-process-chains.json) and this desktop
+        app part (None: the shipped DESKTOP_APP_CHAIN)."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "desktop-process-chains.json")) as f:
+            fx = json.load(f)
+        saved = (ds.process_chain, ds.DESKTOP_APP_CHAIN)
+        self.addCleanup(lambda: (setattr(ds, "process_chain", saved[0]), setattr(ds, "DESKTOP_APP_CHAIN", saved[1])))
+        got = fx[chain] if isinstance(chain, str) else chain
+        ds.process_chain = lambda: got
+        if app is not None:
+            ds.DESKTOP_APP_CHAIN = tuple(tuple(x) for x in fx[app])
+
     def test_desktop_code_tab_typed_line_is_the_person(self):
-        """XLI-420: the desktop Code tab's typed line (promptSource "sdk", origin human, entrypoint claude-desktop)."""
+        """XLI-420: the desktop Code tab's typed line (promptSource "sdk", origin human, entrypoint claude-desktop)
+        passes when the hook's process chain is the desktop app's (stand-in chain until the owner's capture)."""
+        self.chains("desktop_stand_in", app="STAND_IN_APP_CHAIN")
         self.prompt(ds.KEEP_PHRASE, writer=self.desktop())
         self.assertEqual(ds.keep_state(), "yes")
         self.assertEqual(self.outcomes(), [])
 
+    def test_review_1_headless_run_and_nested_runs_are_refused(self):
+        """Review 1 HIGH: the exact transcript entry of a desktop line, made by `CLAUDE_CODE_ENTRYPOINT=claude-desktop
+        claude -p --input-format stream-json` with origin human from an agent's shell, without -p, detached from its
+        parent, or with a chain that can't be read, is refused, even with a desktop app part set."""
+        for chain in ("headless_review_1", "nested_no_print", "detached", "terminal", None, []):
+            self.chains(chain, app="STAND_IN_APP_CHAIN")
+            self.prompt(ds.KEEP_PHRASE, writer=self.desktop())
+            self.assertIsNone(ds.keep_state(), chain)
+            self.assertEqual(self.outcomes(), [ds.NOT_PERSON_LINE], chain)
+
+    def test_shipped_value_refuses_the_desktop_shape(self):
+        """Until the real app's chain is captured, DESKTOP_APP_CHAIN is empty and the desktop shape is refused."""
+        self.assertEqual(ds.DESKTOP_APP_CHAIN, ())
+        self.chains("desktop_stand_in")
+        self.prompt(ds.KEEP_PHRASE, writer=self.desktop())
+        self.assertIsNone(ds.keep_state())
+
+    def test_terminal_typed_line_unchanged_on_any_chain(self):
+        """The terminal's typed line (promptSource "typed") does not look at the process chain."""
+        self.chains("headless_review_1", app="STAND_IN_APP_CHAIN")
+        self.prompt(ds.KEEP_PHRASE)
+        self.assertEqual(ds.keep_state(), "yes")
+
     def test_desktop_shape_from_an_agent_or_a_tool_is_refused(self):
-        """XLI-420: the same shape without the host's human stamp (a `claude -p` or SDK run, an agent's text), from
-        another entrypoint, as a side chain or meta entry, or with a turn origin other than human, is still refused."""
+        """XLI-420: on the desktop chain, the same shape without the host's human stamp (a `claude -p` or SDK run, an
+        agent's text), from another entrypoint, as a side chain or meta entry, or another turn origin, is refused."""
+        self.chains("desktop_stand_in", app="STAND_IN_APP_CHAIN")
         for change in ({"origin": None}, {"origin": {"kind": "task-notification"}}, {"origin": {"kind": "peer", "from": "x"}},
                        {"entrypoint": "sdk-cli"}, {"entrypoint": "sdk-ts"}, {"entrypoint": None}, {"entrypoint": "cli"},
                        {"turnOrigin": "sdk"}, {"turnOrigin": None}, {"promptSource": "system"}, {"isSidechain": True},
@@ -843,12 +881,32 @@ class PersonOnly(Base):
             self.assertIsNone(ds.keep_state(), change)
             self.assertIn(self.outcomes(), ([ds.NOT_PERSON_LINE], []), change)
 
+    def test_unit_desktop_host_proven(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "desktop-process-chains.json")) as f:
+            fx = json.load(f)
+        saved = ds.DESKTOP_APP_CHAIN
+        self.addCleanup(setattr, ds, "DESKTOP_APP_CHAIN", saved)
+        ds.DESKTOP_APP_CHAIN = tuple(tuple(x) for x in fx["STAND_IN_APP_CHAIN"])
+        self.assertTrue(ds.desktop_host_proven(fx["desktop_stand_in"]))
+        for k in ("headless_review_1", "nested_no_print", "detached", "terminal"):
+            self.assertFalse(ds.desktop_host_proven(fx[k]), k)
+        with_print = [dict(c) for c in fx["desktop_stand_in"]]
+        with_print[1]["flags"] = ["--print", "--input-format"]
+        self.assertFalse(ds.desktop_host_proven(with_print))
+        real = ds.process_chain()  # this box's own table: names and option names only
+        self.assertIsInstance(real, list)
+        for c in real:
+            self.assertNotIn("/", c["name"])
+            self.assertTrue(all(re.fullmatch(ds.FLAG_RE, x) for x in c["flags"]), c)
+        self.assertTrue(ds.chain_line().startswith("process chain (nearest first): "))
+
     def test_unit_person_origin(self):
         human = {"type": "user", "origin": {"kind": "human"}}
         self.assertTrue(ds._person_origin(dict(human, promptSource="typed")))
         self.assertTrue(ds._person_origin(dict(human, promptSource="queued")))
         desk = dict(human, promptSource="sdk", entrypoint="claude-desktop", turnOrigin="human")
-        self.assertTrue(ds._person_origin(desk))  # XLI-420: the desktop Code tab
+        self.assertTrue(ds._person_origin(desk, desktop=True))  # XLI-420: the desktop Code tab, chain proven in the hook
+        self.assertFalse(ds._person_origin(desk))  # review 1 HIGH: the transcript alone never proves it
         for v in ({"type": "user"}, dict(human), dict(human, promptSource="sdk"), {"promptSource": "typed"},
                   dict(desk, origin=None), dict(desk, entrypoint="sdk-cli"), dict(desk, turnOrigin="sdk"),
                   {"origin": {"kind": "task-notification"}, "promptSource": "typed"}, {"origin": None, "promptSource": "typed"}):

@@ -1,0 +1,33 @@
+{
+  "note": "XLI-420 process chains above the prompt hook, nearest first, as datastash's process_chain() gives them (names, app bundles, option names only). 'headless_review_1' is the reviewer's exact run on this box (CLAUDE_CODE_ENTRYPOINT=claude-desktop claude -p --input-format stream-json --output-format stream-json --verbose) started from an agent's shell. 'nested_no_print' is the same without -p. 'detached' is a nested run started with setsid so its parent is gone. 'desktop_stand_in' is NOT a capture of the real app: it stands in for one until the owner's `datastash doctor` capture fills DESKTOP_APP_CHAIN, with STAND_IN_APP_CHAIN as its app part.",
+  "headless_review_1": [
+    {"name": "sh", "bundle": "", "flags": ["-c"]},
+    {"name": "claude.exe", "bundle": "", "flags": ["-p", "--input-format", "--output-format", "--verbose"]},
+    {"name": "bash", "bundle": "", "flags": ["-c"]},
+    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]},
+    {"name": "Claude", "bundle": "Claude.app", "flags": []}
+  ],
+  "nested_no_print": [
+    {"name": "sh", "bundle": "", "flags": ["-c"]},
+    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]},
+    {"name": "bash", "bundle": "", "flags": ["-c"]},
+    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]},
+    {"name": "Claude", "bundle": "Claude.app", "flags": []}
+  ],
+  "detached": [
+    {"name": "sh", "bundle": "", "flags": ["-c"]},
+    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]}
+  ],
+  "terminal": [
+    {"name": "sh", "bundle": "", "flags": ["-c"]},
+    {"name": "claude", "bundle": "", "flags": []},
+    {"name": "zsh", "bundle": "", "flags": ["-l"]},
+    {"name": "Terminal", "bundle": "Terminal.app", "flags": []}
+  ],
+  "desktop_stand_in": [
+    {"name": "sh", "bundle": "", "flags": ["-c"]},
+    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]},
+    {"name": "Claude", "bundle": "Claude.app", "flags": []}
+  ],
+  "STAND_IN_APP_CHAIN": [["Claude", "Claude.app"]]
+}
