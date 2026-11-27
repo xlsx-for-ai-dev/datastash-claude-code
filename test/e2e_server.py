@@ -430,7 +430,7 @@ def cmd_email_code(out, secs=90):
         time.sleep(3)
 
 
-E2E_NAME_RE = r"(e2e-home|e2e-clean|pat-named|web-app|upd-a|upd-b|site|agent)"  # the harness's own agent names (agent: before 1.0.16)
+E2E_NAME_RE = r"((?:e2e-home|e2e-clean|pat-named|web-app|upd-a|upd-b|site|api)(?:-r[0-9]{8})?|agent)"  # the harness's own agent names (agent: before 1.0.16; run7: -r<MMDDHHMM> run suffix)
 
 
 def workbook_tabs(wb):
