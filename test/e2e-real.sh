@@ -916,7 +916,13 @@ setup8e_check() {  # setup8e_check <tag> <HOME>: 1.0.21 (card 8e), on a signed-i
   BADTOOL=0
   if drive_until '[[ -s "$(key_file "$h" "$name")" ]]' 240; then
     pass "$tag: the fresh folder set itself up with nothing typed: \"$name\"'s key is here"
-  else fail "$tag: the fresh folder did not set itself up (no key for \"$name\")"; show_tail 14; stop_claude; return 1; fi
+  else
+    fail "$tag: the fresh folder did not set itself up (no key for \"$name\")"; show_tail 30
+    local st="$h/.config/datastash/state"
+    say "    plugin state: connector mark $([[ -f "$st/connector-ok.json" ]] && echo yes || echo no); sign-in check: $(cat "$st/signin-check.json" 2>/dev/null)"
+    tail -n 6 "$st"/enroll.log "$st"/listen.log 2>/dev/null | sed 's/^/    | /'
+    stop_claude; return 1
+  fi
   wait_idle 90
   ((BADTOOL)) && { fail "$tag: the self-setup asked for a tool that is not datastash's"; ok=0; }
   has_agent "$name" && pass "$tag: server: \"$name\" is on" || { fail "$tag: server: \"$name\" is not on"; ok=0; }
@@ -940,6 +946,10 @@ setup8e_check() {  # setup8e_check <tag> <HOME>: 1.0.21 (card 8e), on a signed-i
   if wait_for "From the Setup tab:" 20; then pass "$tag: \"who is $HA\" answered from the Setup tab"
   else fail "$tag: \"who is $HA\" got no answer"; show_tail 10; ok=0; fi
   grep -qF "/mcp" <<<"$(pane | sed -n '/Who I am/,$p')" && { fail "$tag: a who-are-you answer says /mcp"; ok=0; }
+  if ((!ok)); then  # the plugin's own logs (no secret is ever in them), before the cleanup takes the folder away
+    say "    plugin logs:"
+    tail -n 12 "$h/.config/datastash/state/"*.log 2>/dev/null | sed 's/^/    | /'
+  fi
   out="$(DS_AS="$name" ds_cli "$h" "$dir" "" self-check 2>&1)"
   if grep -qF "Full datastash (DDS) checklist, plugin $NEW_VERSION" <<<"$out" && grep -qE "Self-check" <<<"$out"; then
     pass "$tag: the checklist and its self-check run ($(grep -cE '^  - [A-D][0-9]+:' <<<"$out") lines)"

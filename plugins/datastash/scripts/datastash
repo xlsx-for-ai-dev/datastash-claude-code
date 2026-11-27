@@ -18249,7 +18249,7 @@ SIGNIN_CHECK_FRESH = 6 * 3600
 AUTO_SETUP_RETRY = 6 * 3600  # one self-setup try per folder in this long
 AUTO_SETUP_WAIT = float(os.environ.get("DATASTASH_AUTO_SETUP_WAIT", "0" if os.environ.get("DATASTASH_NO_NETWORK") == "1" else "20"))  # lets a typed install in the same session go first
 SETUP_ROW_TIMEOUT = 20
-SETUP_ROW_TRIES = 4  # the background write's tries
+SETUP_ROW_TRIES = 8  # the background write's tries
 SETUP_ROW_RETRY_SECONDS = float(os.environ.get("DATASTASH_SETUP_ROW_RETRY_SECONDS", "15"))
 WHO_TIMEOUT = 4  # the prompt hook has 10 s
 SETUP_CACHE_MAX = 7 * 86400
@@ -18796,7 +18796,8 @@ def cmd_setup_row(args):
         except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
             # A tab another agent made and has not shared with this one yet is refused: its maker's next write (kicked
             # beside this one) shares it, so a background run tries again a little later.
-            log(agent["slug"], f"setup row: not written ({type(e).__name__} {getattr(e, 'status', '')})")
+            code = re.sub(r"[^A-Za-z0-9_]", "", _body_code(e))[:40] if isinstance(e, ApiError) else ""
+            log(agent["slug"], f"setup row: not written ({type(e).__name__} {getattr(e, 'status', '')} {code})")
             if n + 1 >= tries:
                 print(f"datastash: the Setup row was not written ({type(e).__name__}).")
                 return 1
