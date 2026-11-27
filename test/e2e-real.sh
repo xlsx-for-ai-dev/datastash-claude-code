@@ -48,6 +48,11 @@
 #      the installed version within 12 minutes, with nobody typing an update. Every 1.0.17+ install also checks the
 #      setting is on; an uninstall of the last agent on a computer checks the setting is back exactly as it was before that
 #      HOME's first install (key absent, or its old value) and the line says so ("Auto-update is off for datastash.").
+#   12 1.0.23 (card 1), computer E, repo folder: the simple email sign-in, no connector: /datastash:install says
+#      "Type datastash sync you@email.com"; the typed datastash sync <email> asks for a code; the code is read once
+#      through the selftest door (x-live #528, never shown); the typed datastash sync <code> signs E in and says "Done.";
+#      server: the agent is on; a row written with its key is there; /datastash:uninstall NAME: off, key gone.
+#      E2E_PARTS=email runs it alone (one code request: 5 an hour per email).
 #   6  update, two ways, each from an older tag (E2E_OLD_TAG, default v1.0.12) in a local copy of the catalog pinned to it,
 #      then the catalog moved to the published pin (what a release does):
 #      6a `/plugin marketplace update datastash` + `/reload-plugins` (self-update held off for that HOME): the installed
@@ -81,7 +86,7 @@
 #   cleanup computer counts one more. E2E_BUDGET_WAIT=0: stop instead of waiting. A server refusal (HTTP 429) names
 #   its reason: rate_limited (the hourly limit) or too_many_accounts (no new label can be made).
 # Options: E2E_ACCOUNT (selftest label, default plugin-e2e), E2E_MODEL (a --model for the sessions; default Claude Code's),
-#   E2E_PARTS ("core update", default both; "step5" runs step 5 alone; "step4" runs step 4 after its home setup; "outbox" runs step 9 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
+#   E2E_PARTS ("email core update", default all three; "step5" runs step 5 alone; "step4" runs step 4 after its home setup; "outbox" runs step 9 alone), E2E_OLD_TAG, E2E_KEEP=1 (say where the HOMEs went in ~/trash),
 #   E2E_CANDIDATE=<branch or tag, pushed to the plugin repo>: test that commit before it is released: the core steps
 #   install it from a local copy of the catalog pinned to it, and 6a updates to it; 6b (self-update moves only to a
 #   release tag) stays on the published pin.
@@ -107,8 +112,8 @@ RS="${E2E_RUN_SUFFIX:-r$(date -u +%m%d%H%M)}"
 E2E_USER="${E2E_USER:-e2e-home}-$RS"
 HA="$E2E_USER"
 N_WEB="web-app-$RS" N_NOTES="notes-$RS" N_NAMED="named-$RS" N_PAT="pat-named-$RS" N_API="api-$RS" N_SITE="site-$RS"
-N_CLEAN="e2e-clean-$RS"
-PARTS="${E2E_PARTS:-core update}"
+N_CLEAN="e2e-clean-$RS" N_MAIL="mail-$RS"
+PARTS="${E2E_PARTS:-email core update}"
 OLD_TAG="${E2E_OLD_TAG:-v1.0.12}"
 export E2E_SIGNIN_LEDGER="${E2E_SIGNIN_LEDGER:-$REAL_HOME/.local/state/datastash-e2e/selftest-signins}"
 SIGNIN_MAX_PER_HOUR=20
@@ -1007,6 +1012,66 @@ step4_only() {  # E2E_PARTS=step4: step 4 alone, after what led to it: A home in
   stop_claude
   T="$TA"; stop_claude
 }
+step12_email() {  # step12_email: 1.0.23 (card 1), the simple email sign-in on a fresh computer E, repo folder
+  # ~/code/mail-RS: /datastash:install says to sign in; the typed "datastash sync <email>" (the test account's
+  # example.invalid email) asks for a code; the code is read once through the selftest door (x-live #528, never shown);
+  # the typed "datastash sync <code>" signs E in and installs this folder's agent ("Done."); server: it is on; one inbox
+  # row written with its key is on the server; /datastash:uninstall NAME: off on the server, its key gone here.
+  # One code request (the server allows 5 an hour per email); no selftest connector sign-in.
+  local tag="12 email sign-in" E dir name="$N_MAIL" email="selftest-oauth-${E2E_ACCOUNT}@example.invalid" cf b f wb mark got
+  ((LOGIN)) || { waiting "$tag (needs the Claude login)"; return 1; }
+  E="$(new_home E)"; dir="$E/code/$N_MAIL"; new_repo "$dir"; cf="$WORK/email-code"
+  mask() { sed -E 's/(datastash sync )[0-9]{6}/\1[code]/g'; }
+  say "== computer E, repo folder ~/code/$N_MAIL: the email sign-in (1.0.23)"
+  readme_steps "$tag" "$E" "$dir" "$CORE_SRC" || return 1
+  BADTOOL=0
+  b="$(count "datastash sync you@email.com")"
+  type_line "/datastash:install"
+  drive_until '(( $(count "datastash sync you@email.com") > b ))' 120; wait_idle 60
+  if (( $(count "datastash sync you@email.com") > b )); then pass "$tag: /datastash:install on a computer not signed in: \"Type datastash sync you@email.com\""
+  else fail "$tag: /datastash:install did not say to type datastash sync you@email.com"; show_tail 10; stop_claude; return 1; fi
+  b="$(count "Check your email for a 6-digit code")"
+  type_line "datastash sync $email"
+  drive_until '(( $(count "Check your email for a 6-digit code") > b ))' 120; wait_idle 60
+  if (( $(count "Check your email for a 6-digit code") > b )); then pass "$tag: datastash sync <email>: \"Check your email for a 6-digit code\""
+  else fail "$tag: datastash sync <email> did not say to check the email"; show_tail 10; stop_claude; return 1; fi
+  grep -qF "Not done" <<<"$(flat)" && { fail "$tag: datastash sync <email> said Not done"; show_tail 8; stop_claude; return 1; }
+  sleep 3
+  if ! "${SRV[@]}" email-code "$cf" | sed 's/^/    /'; then
+    fail "$tag: the selftest door gave no emailed code"; stop_claude; return 1
+  fi
+  [[ -s "$cf" ]] || { fail "$tag: no code kept"; stop_claude; return 1; }
+  b="$(count "Done.")/$(count "Not done")"
+  tmux send-keys -t "$T" -l -- "datastash sync $(cat "$cf")"; sleep 1; tmux send-keys -t "$T" Enter
+  mv "$cf" "$REAL_HOME/trash/e2e-email-code-used-$$" 2>/dev/null
+  say "    typed datastash sync [code]"
+  drive_until '[[ "$(count "Done.")/$(count "Not done")" != "$b" ]]' 120; wait_idle 60; sleep 3
+  f="$(flat)"
+  ((BADTOOL)) && fail "$tag: the model asked for a tool that is not datastash's (refused)"
+  if grep -qF "Not done" <<<"${f##*Checking the code}"; then fail "$tag: datastash sync <code>: Not done"; show_tail 10 | mask; stop_claude; return 1; fi
+  if [[ "$(count "Done.")/$(count "Not done")" != "$b" ]]; then pass "$tag: datastash sync <code>: \"Done.\""
+  else fail "$tag: datastash sync <code> showed no \"Done.\""; show_tail 10 | mask; stop_claude; return 1; fi
+  [[ -s "$E/.config/datastash/login.email.json" ]] && pass "$tag: this computer's login came from the emailed code" \
+    || fail "$tag: no email login record on this computer"
+  [[ -s "$(key_file "$E" "$name")" ]] && pass "$tag: \"$name\"'s key file is here" || fail "$tag: no key file for \"$name\""
+  has_agent "$name" && pass "$tag: server: \"$name\" is on ($(agents))" || { fail "$tag: server: \"$name\" is not on"; stop_claude; return 1; }
+  wb="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["workbook_id"])' "$E/.config/datastash/agent-$name.json" 2>/dev/null)"
+  mark="e2e-email-$RUN-$(date +%s)"
+  got="$(DS_AS="$name" ds_cli "$E" "$dir" "" api POST /api/v1/agent/inbox "{\"workbook_id\":\"$wb\",\"to\":\"$name\",\"message\":\"$mark #1\"}" 2>&1)"
+  sleep 3
+  got="$("${SRV[@]}" inbox-marks "$wb" "$name" "$mark")"
+  [[ "$got" == "[1]" ]] && pass "$tag: a row written with the agent's key is on the server (inbox $got)" \
+    || fail "$tag: the row written with the agent's key is not on the server ($got)"
+  b="$(count "Datastash is uninstalled from")/$(count "Not done")"
+  type_line "/datastash:uninstall $name"
+  drive_until '[[ "$(count "Datastash is uninstalled from")/$(count "Not done")" != "$b" ]]' 120; wait_idle 60; sleep 3
+  if (( $(count "Datastash is uninstalled from") > ${b%%/*} )); then pass "$tag: /datastash:uninstall $name: \"$(grep -oE "Datastash is uninstalled from [^.]*\." <<<"$(flat)" | tail -n 1)\""
+  else fail "$tag: /datastash:uninstall $name showed no uninstalled line"; show_tail 10 | mask; fi
+  if has_agent "$name"; then fail "$tag: server: \"$name\" is still on"; else pass "$tag: server: \"$name\" is off"; fi
+  key_gone "$tag" "$E" "$name" 10
+  stop_claude
+}
+
 core() {
   local A B TA others
   # --- computer A: steps 1 (home folder), 2, 4, 3, 7
@@ -1276,6 +1341,7 @@ say "server: test account \"$E2E_ACCOUNT\" signed in for read-back; clean: no ag
 
 for p in $PARTS; do
   case "$p" in
+    email) step12_email ;;
     core) core ;;
     step5) step5_only ;;
     step4) step4_only ;;

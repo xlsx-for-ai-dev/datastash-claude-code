@@ -21,6 +21,8 @@ Run with python3 -I. Never prints a secret, a code or a token.
                            whether one has an answer after it (holding MUST, when given), as JSON {"count", "answered"}
   timer-find WB NOTE        (1.0.18) whether a timer with NOTE is set in agent workbook WB; then cancels it, as JSON
   drop-tab NAME            (1.0.21) remove every tab called NAME from the account's workbooks (the clean start)
+  email-code FILE          (1.0.23 step 12) the test account's emailed sign-in code, read once through the selftest door
+                           (x-live #528, POST /api/v1/selftest/email-code), written to FILE (mode 600), never printed
   inbox-marks WB INBOX MARK  (XLI-408 step 9) every message in that inbox of workbook WB whose text holds "MARK #<n>",
                            as a JSON list of the n's in the order datastash added them (a repeat shows twice)
 
@@ -344,6 +346,32 @@ def cmd_inbox_marks(wb, inbox, mark):
     print(json.dumps([n for _mid, n in sorted(found)]))
 
 
+def cmd_email_code(path):
+    """1.0.23 step 12: the code the test account's `datastash sync <email>` asked for, kept by the server in place of an
+    email (x-live #528). Read once (the server drops it); waits up to 30 s for it. Only "ok" or a refusal is printed."""
+    for _ in range(15):
+        status, _h, body = call("the selftest email-code door", "POST", ORIGIN + "/api/v1/selftest/email-code",
+                                {"x-datastash-selftest-secret": secret(), "x-datastash-selftest-account": LABEL,
+                                 "content-type": "application/json"}, b"{}")
+        if status == 404:
+            die("the selftest email-code door answered 404: off on the server, a wrong secret, or not the build box")
+        if status != 200:
+            die(f"the selftest email-code door answered HTTP {status}")
+        try:
+            code = json.loads(body).get("code")
+        except (ValueError, AttributeError):
+            die("the selftest email-code door answered no JSON")
+        if isinstance(code, str) and code.isdigit() and len(code) == 6:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(code)
+            code = None
+            print("email code kept (not shown)")
+            return None
+        time.sleep(2)
+    die("no emailed code was kept for the test account in 30 s")
+
+
 def cmd_timer_find(wb, note):
     """1.0.18 (x-live #519): the agent's timer with this note in its workbook (set with no confirm after datastash sync):
     found or not, then cancelled so nothing fires later. Prints {"found": bool, "set_by": ...}."""
@@ -445,6 +473,8 @@ def main(argv):
         return cmd_timer_find(argv[1], argv[2])
     if c == "inbox-marks" and len(argv) == 4:
         return cmd_inbox_marks(argv[1], argv[2], argv[3])
+    if c == "email-code" and len(argv) == 2:
+        return cmd_email_code(argv[1])
     if c == "drop-tab" and len(argv) == 2:
         return cmd_drop_tab(argv[1])
     die("unknown command", 2)
