@@ -161,7 +161,7 @@ fi
 # --- the sign-in budget: what this run needs against the server's hourly limit, before anything signs in.
 NEED=1  # the read-back's own sign-in
 for p in $PARTS; do
-  case "$p" in core|step4|step5|update) NEED=$((NEED + 2)) ;; outbox) NEED=$((NEED + 1)) ;; esac
+  case "$p" in core|step4|step5|update) NEED=$((NEED + 2)) ;; outbox|setup8e) NEED=$((NEED + 1)) ;; esac
 done
 signins_last_hour() {
   python3 -I -c 'import sys, time
@@ -901,6 +901,60 @@ outbox_only() {  # E2E_PARTS=outbox: step 1 (A home), step 9, then the agent's o
   stop_claude
 }
 
+setup8e_check() {  # setup8e_check <tag> <HOME>: 1.0.21 (card 8e), on a signed-in computer: a fresh folder's first session
+  # sets its agent up with nothing typed; its Setup row is on the server; "who are you" (self, all, named) is shown by
+  # the plugin; the checklist self-check runs.
+  local tag="$1" h="$2" name="fresh8e" dir wb out i ok=1
+  dir="$h/code/$name"
+  new_repo "$dir"
+  start_claude "$h" "$dir" || { fail "$tag: claude did not start"; return 1; }
+  BADTOOL=0
+  if drive_until '[[ -s "$(key_file "$h" "$name")" ]]' 240; then
+    pass "$tag: the fresh folder set itself up with nothing typed: \"$name\"'s key is here"
+  else fail "$tag: the fresh folder did not set itself up (no key for \"$name\")"; show_tail 14; stop_claude; return 1; fi
+  wait_idle 90
+  ((BADTOOL)) && { fail "$tag: the self-setup asked for a tool that is not datastash's"; ok=0; }
+  has_agent "$name" && pass "$tag: server: \"$name\" is on" || { fail "$tag: server: \"$name\" is not on"; ok=0; }
+  wb="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["workbook_id"])' "$h/.config/datastash/agent-$name.json" 2>/dev/null)"
+  out=""
+  for ((i = 0; i < 30; i++)); do
+    out="$(DS_AS="$name" ds_cli "$h" "$dir" "" api GET "/api/v1/agent/rows/key?workbook_id=$wb&tab=Setup&key=$name" 2>&1)"
+    grep -qE '"registered" ?: ?"yes"' <<<"$out" && break
+    sleep 2
+  done
+  if grep -qE '"registered" ?: ?"yes"' <<<"$out" && grep -qE "\"plugin \(installed / running\)\" ?: ?\"[0-9.]+ / $NEW_VERSION\"" <<<"$out"; then
+    pass "$tag: server: \"$name\"'s Setup row is written (registered yes, running $NEW_VERSION)"
+  else fail "$tag: server: no Setup row for \"$name\": $(tail -c 400 <<<"$out")"; ok=0; fi
+  type_line "who are you"
+  if wait_for "Who I am \(from the Setup tab\)" 20; then pass "$tag: \"who are you\" answered by the plugin"
+  else fail "$tag: \"who are you\" got no Setup-tab answer"; show_tail 10; ok=0; fi
+  type_line "who are you all"
+  if wait_for "Your agents \(from the Setup tab" 20 && grep -qF -- "- $name" <<<"$(pane)"; then pass "$tag: \"who are you all\" lists the agents"
+  else fail "$tag: \"who are you all\" got no list with \"$name\""; show_tail 10; ok=0; fi
+  type_line "who is $HA"
+  if wait_for "From the Setup tab:" 20; then pass "$tag: \"who is $HA\" answered from the Setup tab"
+  else fail "$tag: \"who is $HA\" got no answer"; show_tail 10; ok=0; fi
+  grep -qF "/mcp" <<<"$(pane | sed -n '/Who I am/,$p')" && { fail "$tag: a who-are-you answer says /mcp"; ok=0; }
+  out="$(DS_AS="$name" ds_cli "$h" "$dir" "" self-check 2>&1)"
+  if grep -qF "Full datastash (DDS) checklist, plugin $NEW_VERSION" <<<"$out" && grep -qE "Self-check" <<<"$out"; then
+    pass "$tag: the checklist and its self-check run ($(grep -cE '^  - [A-D][0-9]+:' <<<"$out") lines)"
+  else fail "$tag: no checklist self-check: $(head -c 300 <<<"$out")"; ok=0; fi
+  stop_claude
+  ((ok))
+}
+
+setup8e_only() {  # E2E_PARTS=setup8e: the fast check of card 8e: computer A signed in (home agent), then setup8e_check
+  local A
+  A="$(new_home A)"
+  say "== setup8e: computer A, home folder: signed in, one agent"
+  readme_steps "8e setup A home" "$A" "$A" "$CORE_SRC" || return
+  authenticate "8e setup A home" || { stop_claude; return; }
+  ds_install "8e setup A home" "$A" "$HA" || { stop_claude; return; }
+  stop_claude
+  say "== setup8e: computer A, a fresh repo folder, nothing typed"
+  setup8e_check "8e" "$A"
+}
+
 key_here() { [[ -s "$(key_file "$2" "$3")" ]] && pass "$1: \"$3\"'s key file is still here" || fail "$1: \"$3\"'s key file is gone"; }
 
 on_names() { python3 -I -c 'import json,sys; print(*[n for n in json.load(sys.stdin) if n not in sys.argv[1:]])' "$@" <<<"$(agents)"; }
@@ -959,6 +1013,8 @@ core() {
     has_agent "$HA" && pass "4: server: \"$HA\" is still on" || fail "4: server: \"$HA\" was removed too"
   fi
   stop_claude
+  say "== computer A, a fresh repo folder, nothing typed (1.0.21, card 8e)"
+  setup8e_check "8e" "$A"
   T="$TA"
   say "== computer A, the home agent's own session"
   ds_uninstall "3 own session, uninstall $HA" "$A" "$HA" "$HA" && key_gone "3" "$A" "$HA" 10
@@ -1204,6 +1260,7 @@ for p in $PARTS; do
     step5) step5_only ;;
     step4) step4_only ;;
     outbox) outbox_only ;;
+    setup8e) setup8e_only ;;
     update) update_part a; update_part b ;;
     *) echo "unknown part: $p"; exit 2 ;;
   esac

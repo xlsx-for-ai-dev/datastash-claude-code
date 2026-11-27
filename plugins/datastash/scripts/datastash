@@ -2779,9 +2779,15 @@ def cmd_check(_args):
                 s_w = slug(w[1]["name"])
                 raise_notice(notice_cause("waiting", s_w), notice_text("waiting", agent={"name": w[1]["name"]}))
                 warn = warn + take_notices([notice_cause("waiting", s_w)])
-            warn = warn + [f'{LINK_NOTE}: this session is not a datastash agent yet. To set it up, the person types '
-                           "/datastash:install in this session (the plugin does it); never register an agent or get a "
-                           "key yourself."]
+            try:  # 1.0.21 (card 8e): set up by the plugin itself on a signed-in computer; else said plainly
+                setup = no_agent_setup_note(inp, project, me)
+            except Exception:  # noqa: BLE001
+                setup = None
+            if setup == NOT_SIGNED_IN_AI:
+                waiting["line"] = NOT_SIGNED_IN_LINE
+            warn = warn + [setup or (f'{LINK_NOTE}: this session is not a datastash agent yet. To set it up, the person '
+                                     "types /datastash:install in this session (the plugin does it); never register an "
+                                     "agent or get a key yourself.")]
         emit(" ".join(warn + _no_agent_notices(project, me)) + tail)
         return 0
     pre = "".join(w + " " for w in warn)
@@ -2826,8 +2832,16 @@ def cmd_check(_args):
     if kept:
         ctx += (f" {NOTE}: {kept} write(s) kept on this computer while datastash could not be reached are being sent now "
                 "in the background, in order and once each; nothing to do.")
-    ctx = pre + ctx + tail
+    note8e = None
+    if key is not None and not is_person(agent):
+        try:  # 1.0.21 (card 8e): the full-DDS checklist once per plugin version (install or update)
+            note8e = checklist_note(agent, project)
+        except Exception:  # noqa: BLE001
+            note8e = None
+    ctx = pre + ctx + tail + (" " + note8e if note8e else "")
     emit(ctx)
+    if key is not None and not is_person(agent):
+        setup_row_kick(agent, project)  # 1.0.21 (card 8e): this agent's own Setup row, in the background
     if key is not None and out.get("chat_told") is not None and out.get("sid"):
         chat_told(s, out["sid"], out["chat_told"])  # XLI-391: told only after the session start printed it
     if ids:
@@ -3083,6 +3097,16 @@ def _listen_start(inp, printer, forced):
     if forced is None and (off_here(inp) or is_off(project)):
         return 0  # XLI-328: no listener, hello, heartbeat, enroll or map from a folder the person left off
     agent = forced if forced is not None else listen_target(project, me=me)
+    if (agent is None or agent.get("via")) and printer is None and forced is None:
+        try:  # 1.0.21 (card 8e): a folder with no agent of its own: the plugin sets it up itself (signed in), once
+            wake = auto_setup_wake(inp, project, me)
+        except Exception as e:  # noqa: BLE001
+            log("enroll", f"auto-setup: {type(e).__name__}")
+            wake = None
+        if wake:
+            print(wake, file=sys.stderr)
+            sys.stderr.flush()
+            return 2
     if (agent is None or agent.get("via")) and printer is None and forced is None and signed_in() \
             and main_root(project) is None and not is_main_session(me):
         # Release 1.0.0: this folder has no agent here yet, and this computer still has an older (0.9.x) login. The
@@ -5985,6 +6009,10 @@ def cmd_agent_tool(_args):
     carrying an agent_proof the AI sent: the input with this agent's own proof, or with none (proof_binding). The session id's mark is written first, before the process walk, so a slow box
     can't skip it; the person's main session is never marked."""
     inp = hook_input()
+    try:  # 1.0.21 (card 8e): a datastash connector answer here means this computer is signed in (a time mark only)
+        note_connector_answer(inp)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         deny = off_connector_deny(inp)  # XLI-328: first, before anything else reads or rewrites the call
     except Exception:  # noqa: BLE001 (can't read the MCP configs: still deny a datastash-named server)
@@ -6249,7 +6277,8 @@ def cmd_prompt(_args):
         return 0
     if not is_main_phrase(prompt):
         try:
-            ctx = (clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
+            ctx = (who_prompt_context(inp)  # 1.0.21 (card 8e): "who are you", from the Setup tab, shown by the plugin
+                   or clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
                    or timers_prompt_context(inp)  # 1.0.18: "turn off timers" / "turn on timers"
                    or self_update_prompt_context(inp) or onboard_prompt_context(inp) or status_prompt_context(inp))
             ctx = onboard_after_status(inp, ctx)  # 1.0.18: the feature list and the chats ask, after the status
@@ -15267,7 +15296,21 @@ def command_tool(inp):
         return None
     if tool == "ledger_agent_key" and body is not None:
         line = collect_after_mint(inp, rec, body)
-        return _post(line) if line else None
+        ai = None
+        if line and line != INSTALL_FAILED_LINE:
+            try:  # 1.0.21 (card 8e): at install, the checklist for the new agent and its Setup row (background)
+                nm = (inp.get("tool_input") or {}).get("name")
+                new = next((a for a in all_agents() if isinstance(nm, str) and a["slug"] == slug(nm)), None)
+                here = (rec or {}).get("here") or project_of(inp)
+                ai = checklist_note(new, here, force=True)
+                setup_row_kick(new, here)
+                for other in all_agents():  # the others' writes share the Setup tab with the new agent (its maker's)
+                    if new is not None and other["slug"] != new["slug"] and not is_person(other) and read_key(other["slug"]):
+                        ps = [p for p in other.get("projects") or [] if isinstance(p, str)]
+                        setup_row_kick(other, ps[0] if ps else HOME)
+            except Exception:  # noqa: BLE001
+                ai = None
+        return _post(line, ai) if line else None
     if tool == "ledger_agents_list" and rec and rec.get("kind") in ("install", "uninstall") + VIS_KINDS:
         lst = norm_list(body)
         if lst is None:
@@ -18170,6 +18213,705 @@ def cmd_heartbeat(args):
     return 0
 
 
+# ------------------------------------------------------------------ 1.0.21 (card 8e, XLI-424, owner 11-26 "do both")
+# 1. Setup finishes itself: on a SIGNED-IN computer (this computer's datastash login, or the datastash connector answering
+#    here: a datastash connector answer seen on this computer, or Claude Code's own `claude mcp list` saying it is
+#    connected; never a read of Claude Code's own secret stores), a session whose folder has no agent of its own gets one
+#    with no person step: its listener wakes the session once with the plugin's own two connector calls (register with
+#    the auto-name, then the key with this machine's code_challenge); the key is collected and saved as at install. Never
+#    in the person's main session, a folder left off or private, the home folder or "/", a folder whose agent the person
+#    uninstalled (only their typed /datastash:install brings it back), right after an uninstall, or while this session's
+#    typed install runs. A computer that is NOT signed in is said plainly (the session start, and a one-time wake per
+#    folder per day); nothing is tried, and there is no /mcp text.
+# 2. The Setup tab row: at install and at every session start, in the background, the plugin writes this agent's own row
+#    in its agent workbook's "Setup" tab (keyed by agent; the hand-made tab's column names, kept exactly). Identity first
+#    (filled only where the row is empty: the person's own words stay), then setup (written every time).
+# 3. "who are you" / "who are you all" / "who is <agent>": answered by the plugin itself from the Setup tab (this agent,
+#    every agent, or one named agent), at once, with no model turn and no agent woken.
+# 4. The full-DDS checklist (one source: FULL_DDS below): at install and at the first session start of every plugin
+#    version, the agent gets the checklist, a self-check of what is missing with the one step for each (steps a person
+#    must type listed for the person), and what's new for its agent in this version.
+SETUP_NOTE = "datastash note (setup; the plugin's own steps)"
+SETUP_TAB = "Setup"
+SETUP_COLUMNS = ("agent", "other names", "line", "does", "computer / OS user", "reach", "plugin (installed / running)",
+                 "registered", "typed sync", "full-DDS missing", "next step", "who does it", "last checked")
+SETUP_IDENTITY = ("other names", "line", "does", "computer / OS user", "reach")  # filled only where the row is empty
+def _connector_ok_path():  # {"at": time} of the last datastash connector answer here
+    return os.path.join(STATE, "connector-ok.json")
+
+
+CONNECTOR_OK_DAYS = 30
+def _signin_check_path():  # {"state": "in"|"out", "at", "how"}: the last check's answer
+    return os.path.join(STATE, "signin-check.json")
+
+
+SIGNIN_CHECK_FRESH = 6 * 3600
+AUTO_SETUP_RETRY = 6 * 3600  # one self-setup try per folder in this long
+NOT_SIGNED_IN_TELL_EVERY = 86400
+AUTO_SETUP_WAIT = float(os.environ.get("DATASTASH_AUTO_SETUP_WAIT", "0" if os.environ.get("DATASTASH_NO_NETWORK") == "1" else "20"))  # lets a typed install in the same session go first
+SETUP_ROW_TIMEOUT = 20
+SETUP_ROW_TRIES = 4  # the background write's tries
+SETUP_ROW_RETRY_SECONDS = float(os.environ.get("DATASTASH_SETUP_ROW_RETRY_SECONDS", "15"))
+WHO_TIMEOUT = 4  # the prompt hook has 10 s
+SETUP_CACHE_MAX = 7 * 86400
+NOT_SIGNED_IN_LINE = ("This computer is not signed in to datastash, so this folder's agent is not set up yet. Nothing was "
+                      "tried.")
+NOT_SIGNED_IN_AI = (f"{SETUP_NOTE}: this folder has no datastash agent yet and this computer is not signed in to "
+                    "datastash, so the plugin set nothing up and tried nothing. Never register an agent, get a key or "
+                    "sign anything in yourself. Tell the person exactly this line, word for word, once: "
+                    f"\"{NOT_SIGNED_IN_LINE}\"")
+SETTING_UP_AI = (f"{SETUP_NOTE}: this folder has no datastash agent yet; this computer is signed in, so the plugin sets "
+                 "it up itself (its steps come as a datastash note). Never register an agent or get a key in any other "
+                 "way.")
+CHECKING_AI = (f"{SETUP_NOTE}: this folder has no datastash agent yet; the plugin is checking whether this computer is "
+               "signed in to datastash and sets the agent up itself if it is. Never register an agent or get a key "
+               "yourself.")
+AUTO_SETUP_AI = (f"{SETUP_NOTE}: this folder's datastash agent is not set up yet and this computer is signed in to "
+                 "datastash, so the plugin sets it up now, with no step for the person. Make exactly these datastash "
+                 'connector calls, in order, and nothing else: ledger_agent_register with name "{name}"; then '
+                 "ledger_agent_key with that name, the agent_id it answered and only_if_no_key true. The plugin adds "
+                 "every secret and proof itself: never send a code_challenge and never read or print a key. Then say "
+                 "only the plugin's line from the key call's note. If no datastash connector tool is there, make no "
+                 f"call and say only: \"{NOT_SIGNED_IN_LINE}\"")
+
+# The full-DDS checklist (XPM + EPM 11-26, ~/x/ops/fleet/full-dds-agent-checklist.md), the one source in code. Each item:
+# (id, what it is, check or None (a habit: listed, never checked here), the one step when missing, who does it).
+FULL_DDS = (
+    ("A. Setup, once per agent", (
+        ("A1", "The plugin is on its latest version with auto-update on.", "autoupdate",
+         "turn auto-update on for datastash (type **/datastash:install** again)", "the person"),
+        ("A2", "This folder is a datastash agent with its own key.", "registered",
+         "nothing to type: the plugin sets it up itself once this computer is signed in", "the plugin"),
+        ("A3", "The computer is unlocked: the person typed **datastash sync** once per OS user per machine.", "sync",
+         "type **datastash sync** in this session", "the person"),
+        ("A4", "This computer is signed in to datastash.", "signed_in",
+         "sign this computer in to datastash", "the person"),
+        ("A5", "Clean sessions are on if the person wants code out of the session (**clean sessions**).", None, "", ""))),
+    ("B. Running, automatic once set up", (
+        ("B6", "Wake: the inbox listener runs, so messages wake the agent. No polling crons.", "listener",
+         "restart this session at the next seam", "the agent"),
+        ("B7", "Heartbeat and status: the agent's status stays current, and claims stay held during long cards.", None,
+         "", ""),
+        ("B8", "Time per card is on.", "time_per_card", "type **datastash time-per-card on**", "the agent"),
+        ("B9", "Chats are saved by the plugin (only the visible exchange).", "sessions",
+         "type **save my sessions**", "the person"),
+        ("B11", "The offline outbox is on, by default.", None, "", ""))),
+    ("C. Habits: what the agent does", (
+        ("C12", "Claim before starting a card or task, and release it when done.", None, "", ""),
+        ("C13", "Hand off work to another agent through a datastash hand-off, not files or chat.", None, "", ""),
+        ("C14", "Answer other agents' asks through datastash; \"answer my agents\" for asks of the person.", None, "",
+         ""),
+        ("C15", "Use check back or timers instead of polling or sleep loops.", None, "", ""),
+        ("C16", "Use **remember this** for facts every agent should know.", None, "", ""),
+        ("C17", "Keep your asks current in the Asks tab; **show asks** lists them all.", None, "", ""),
+        ("C18", "Restart only at a seam.", None, "", ""),
+        ("C19", "Person-only steps stay person-typed; never try to work around them.", None, "", ""),
+        ("C20", "An agent under a carveout gets information only through datastash.", None, "", ""),
+        ("C21", "Never put secrets, keys, or customer or personal data in any tab or message.", None, "", ""))),
+    ("D. Per-role extras", (
+        ("D1", "PM agents keep the Asks and Function descriptions tabs current and give the morning update.", None, "",
+         ""),
+        ("D2", "Builder and helper agents claim the card id and keep their status at card, step and PR.", None, "",
+         ""))),
+)
+# What's new for every agent, per version (shown with the checklist at the first session start of that version).
+WHATS_NEW = {
+    "1.0.21": (
+        "Setup finishes itself: on a signed-in computer, a folder with no agent gets one with no step for the person.",
+        "Your row in the Setup tab is written at install and at every session start.",
+        "**who are you**, **who are you all** and **who is <agent>** answer from the Setup tab, at once.",
+        "This checklist and a self-check come at install and with every update.",
+        "Clean sessions: datastash's own writes (send, inbox mark, timers, status, heartbeat) run in the main session.",
+        "The key-folder guard reads Bash globs as the shell does (no more false refusals).",
+    ),
+}
+WHO_SELF_RE = re.compile(r"who are you|who r u|who are u")
+WHO_ALL_RE = re.compile(r"who are you all|who are all of you|who are all my agents|who are my agents|who are you guys")
+WHO_NAMED_RE = re.compile(r"who is ([a-z][a-z ]{0,60})|who are you ([a-z][a-z ]{0,60})")
+
+
+def note_connector_answer(inp):
+    """PostToolUse of a datastash connector call that answered: this computer is signed in to datastash (a mark with
+    only a time in it). A failed call that reads as a sign-in refusal takes the mark away."""
+    if not isinstance(inp, dict):
+        return
+    name, event = str(inp.get("tool_name") or ""), inp.get("hook_event_name")
+    if not name.startswith("mcp__") or "datastash" not in name.lower():
+        return
+    if event == "PostToolUse":
+        ensure_dirs()
+        write_private(_connector_ok_path(), json.dumps({"at": int(time.time())}))
+        _note_signin("in", "connector")
+    elif event == "PostToolUseFailure":
+        err = json.dumps(inp.get("error") or inp.get("tool_response") or "", default=str).lower()
+        if re.search(r"\b401\b|unauthori[sz]ed|authenticat|sign(ed)? ?in", err):
+            _drop(_connector_ok_path())
+            _note_signin("out", "connector")
+
+
+def _note_signin(state, how):
+    try:
+        ensure_dirs()
+        write_private(_signin_check_path(), json.dumps({"state": state, "at": int(time.time()), "how": how}))
+    except OSError:
+        pass
+
+
+def _connector_seen():
+    at = read_json(_connector_ok_path(), {}).get("at")
+    return _num_ok(at) and time.time() - at < CONNECTOR_OK_DAYS * 86400
+
+
+def signin_known():
+    """"in", "out" or None (not known yet) from local files only (no network, no claude run): fast, for the hooks."""
+    try:
+        if login_present() or _connector_seen():
+            return "in"
+    except Exception:  # noqa: BLE001
+        pass
+    rec = read_json(_signin_check_path(), {})
+    if rec.get("state") in ("in", "out") and _num_ok(rec.get("at")) and time.time() - rec["at"] < SIGNIN_CHECK_FRESH:
+        return rec["state"]
+    return None
+
+
+def _mcp_list_signed_in(timeout=60):
+    """Claude Code's own `claude mcp list`: True when a datastash server (getdatastash.com) shows connected, False when it
+    shows it needs a sign-in or fails, None when there is no datastash server or no answer. Reads no secret."""
+    claude = shutil.which("claude")
+    if not claude or os.environ.get("DATASTASH_NO_NETWORK") == "1":
+        return None
+    try:
+        out = subprocess.run([claude, "mcp", "list"], capture_output=True, text=True, timeout=timeout,
+                             stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = [x for x in (out or "").splitlines() if "getdatastash.com" in x.lower()]
+    if not lines:
+        return None
+    return any(re.search(r"connected", x, re.I) and not re.search(r"not connected|disconnected", x, re.I)
+               for x in lines)
+
+
+def computer_signed_in(deep=False):
+    """True / False / None (can't tell). deep: also asks Claude Code's own `claude mcp list` (slow; background only)."""
+    k = signin_known()
+    if k == "in" or not deep:
+        return None if k is None else k == "in"
+    got = _mcp_list_signed_in()
+    if got is not None:
+        _note_signin("in" if got else "out", "mcp list")
+        return got
+    return False if k == "out" else None
+
+
+def _folder_uninstalled(here):
+    """The person uninstalled this folder's agent before (the uninstall's name record lists the folder)."""
+    rows = read_json(_last_names_path(), {})
+    rp = os.path.realpath(here)
+    return any(isinstance(r, dict) and rp in (r.get("folders") or [])
+               for r in (rows.get("names") if isinstance(rows, dict) else None) or [])
+
+
+def _auto_mark_path(here):
+    return os.path.join(STATE, f"auto-setup-{hashlib.sha256(os.path.realpath(here).encode()).hexdigest()[:16]}.json")
+
+
+def auto_setup_name(project, me, inp=None):
+    """The name this folder's agent is set up under by itself, or None when the plugin must not set it up here."""
+    if not project or not linkable(project) or is_main_session(me) or main_root(project) is not None:
+        return None
+    if box_gone() or is_off(project) or _folder_uninstalled(project):
+        return None
+    try:
+        if inp is not None and (off_here(inp) or private_here(inp)):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    if os.environ.get("DATASTASH_AGENT", "").strip():
+        return None
+    a = agent_for(project, me=me)
+    if a is not None:
+        return None  # the folder has its own agent (with or without a key: that one's notices say what to do)
+    sid = _sid(inp) if inp is not None else None
+    rec = load_cmd(sid) if sid else None
+    if rec and rec.get("kind") in ("install", "uninstall"):
+        return None  # the person's typed command runs in this session now
+    try:
+        kind, name = auto_name(project, me)
+    except SystemExit:
+        return None
+    return name if kind == "name" else None
+
+
+def auto_setup_due(project):
+    rec = read_json(_auto_mark_path(project), {})
+    return not (_num_ok(rec.get("at")) and time.time() - rec["at"] < AUTO_SETUP_RETRY)
+
+
+def auto_setup_wake(inp, project, me):
+    """The listener's one wake for a folder with no agent: the plugin's own setup steps (signed in), the plain line (not
+    signed in, at most once a day per folder), or None (nothing to do here)."""
+    name = auto_setup_name(project, me, inp)
+    if name is None:
+        return None
+    if AUTO_SETUP_WAIT > 0:
+        time.sleep(AUTO_SETUP_WAIT)
+        name = auto_setup_name(project, me, inp)  # the person's typed install may have started meanwhile
+        if name is None:
+            return None
+    signed = computer_signed_in(deep=True)
+    mark = read_json(_auto_mark_path(project), {})
+    if signed:
+        if not auto_setup_due(project):
+            return None
+        write_private(_auto_mark_path(project), json.dumps({"at": int(time.time()), "name": name, "state": "tried"}))
+        log("enroll", "auto-setup: this folder has no agent and the computer is signed in; the session sets it up")
+        return AUTO_SETUP_AI.format(name=name)
+    told = mark.get("told_out")
+    if _num_ok(told) and time.time() - told < NOT_SIGNED_IN_TELL_EVERY:
+        return None
+    write_private(_auto_mark_path(project), json.dumps(dict(mark, told_out=int(time.time()))))
+    return NOT_SIGNED_IN_AI
+
+
+def no_agent_setup_note(inp, project, me):
+    """The session start's line for a folder with no agent here (or None to keep the older line)."""
+    if auto_setup_name(project, me, inp) is None:
+        return None
+    k = signin_known()
+    if k == "in":
+        return SETTING_UP_AI
+    if k == "out":
+        return NOT_SIGNED_IN_AI
+    return CHECKING_AI
+
+
+# --- the checklist and the self-check
+def _check_item(kind, agent, here):
+    """True (have it), False (missing) or None (can't tell here) for one checklist item."""
+    try:
+        if kind == "autoupdate":
+            return marketplace_autoupdate() is True
+        if kind == "registered":
+            return agent is not None and read_key(agent["slug"]) is not None
+        if kind == "sync":
+            return sync_on()
+        if kind == "signed_in":
+            if agent is not None and read_key(agent["slug"]) is not None and signin_known() is None:
+                return True  # an agent with its own key here was set up on a signed-in computer
+            return computer_signed_in()
+        if kind == "listener":
+            return None if agent is None else _lock_held(lock_path(agent["slug"]))
+        if kind == "time_per_card":
+            return tpc_is_on(here) if here else None
+        if kind == "sessions":
+            return sessions_on()
+    except Exception:  # noqa: BLE001  can't tell
+        return None
+    return None
+
+
+def self_check(agent, here):
+    """[(id, what, state, step, who)] for every item the plugin can check (state True / False / None)."""
+    out = []
+    for _head, items in FULL_DDS:
+        for iid, what, kind, step, who in items:
+            if kind is not None:
+                out.append((iid, what, _check_item(kind, agent, here), step, who))
+    return out
+
+
+def missing_items(checks):
+    return [c for c in checks if c[2] is False]
+
+
+def self_check_lines(checks):
+    miss = missing_items(checks)
+    if not miss:
+        return ["Self-check: nothing missing that the plugin can check."]
+    lines = ["Self-check, missing:"]
+    lines += [f"  - {iid}: {_sentence(what)} Step: {step} ({who})." for iid, what, _s, step, who in miss]
+    person = [f"{iid}: {step}" for iid, _w, _s, step, who in miss if who == "the person"]
+    if person:
+        lines.append("For the person to type: " + "; ".join(person) + ".")
+    return lines
+
+
+def checklist_text(agent, here, version=None):
+    version = version or plugin_version()
+    lines = [f"Full datastash (DDS) checklist, plugin {version}:"]
+    for head, items in FULL_DDS:
+        lines.append(head)
+        lines += [f"  - {iid}: {what}" for iid, what, _k, _s, _w in items]
+    lines += self_check_lines(self_check(agent, here))
+    new = WHATS_NEW.get(version)
+    if new:
+        lines.append(f"What's new for your agent in {version}:")
+        lines += [f"  - {x}" for x in new]
+    return "\n".join(lines)
+
+
+def _checklist_mark(s):
+    return os.path.join(STATE, f"checklist-{s}.json")
+
+
+def checklist_due(agent):
+    return read_json(_checklist_mark(agent["slug"]), {}).get("version") != plugin_version()
+
+
+def checklist_note(agent, here, force=False):
+    """The checklist note for this agent once per plugin version (install, update), or None. Marks it given."""
+    if agent is None or is_person(agent) or (not force and not checklist_due(agent)):
+        return None
+    try:
+        text = checklist_text(agent, here)
+        ensure_dirs()
+        write_private(_checklist_mark(agent["slug"]), json.dumps({"version": plugin_version(), "at": int(time.time())}))
+    except Exception as e:  # noqa: BLE001
+        log(agent["slug"], f"checklist: {type(e).__name__}")
+        return None
+    return (f"{SETUP_NOTE}: the full-DDS checklist for this agent (install or a new plugin version). Read it; adopt what "
+            "you need; for each missing item do its one step if it is yours, and tell the person once, in one short "
+            "line, the steps that are theirs (never do a person's step yourself).\n" + text)
+
+
+# --- the Setup tab row
+def _utc_minute(t=None):
+    return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(t or time.time()))
+
+
+def _installed_version():
+    """The datastash version Claude Code has installed for this user (its plugins file), else None."""
+    for p in (os.path.join(claude_plugins_dir(), "installed_plugins.json"),):
+        d = read_json(p, {})
+        plugs = d.get("plugins") if isinstance(d, dict) else None
+        if not isinstance(plugs, dict):
+            continue
+        best = None
+        for k, v in plugs.items():
+            if not str(k).startswith("datastash@"):
+                continue
+            for e in (v if isinstance(v, list) else [v]):
+                ver = e.get("version") if isinstance(e, dict) else None
+                if isinstance(ver, str) and re.fullmatch(r"\d+(\.\d+){1,3}", ver):
+                    best = ver if best is None or version_tuple(ver) > version_tuple(best) else best
+        if best:
+            return best
+    return None
+
+
+def _tmux_name():
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        out = subprocess.run(["tmux", "display-message", "-p", "#S"], capture_output=True, text=True, timeout=3,
+                             stdin=subprocess.DEVNULL).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if re.fullmatch(r"[A-Za-z0-9_.\-]{1,40}", out or "") else None
+
+
+def setup_row_cells(agent, here, checks=None):
+    """This agent's own row as the plugin knows it (no secret, no id). Identity first, then setup."""
+    checks = self_check(agent, here) if checks is None else checks
+    name = agent["name"] if agent else ""
+    others = []
+    folder = _folder_name(here) if here and linkable(here) else None
+    if folder and folder.casefold() != name.casefold():
+        others.append(f"{folder} (folder)")
+    t = _tmux_name()
+    if t and t.casefold() != name.casefold():
+        others.append(f"{t} (tmux)")
+    try:
+        host = socket.gethostname().split(".")[0]
+    except OSError:
+        host = "this computer"
+    running = plugin_version()
+    installed = _installed_version() or running
+    reg = agent is not None and read_key(agent["slug"]) is not None
+    signed = _check_item("signed_in", agent, here)
+    sync = sync_on()
+    miss = missing_items(checks)
+    first = next((c for c in miss if c[4] == "the person"), miss[0] if miss else None)
+    return {
+        "agent": name,
+        "other names": ", ".join(others),
+        "line": "",
+        "does": "",
+        "computer / OS user": f"{host} / {_user()}",
+        "reach": "datastash inbox",
+        "plugin (installed / running)": f"{installed} / {running}",
+        "registered": "yes" if reg else ("no: this computer is not signed in" if signed is False else "no"),
+        "typed sync": ("yes" if sync else "no") + ("; computer signed in" if signed else
+                                                   "; computer not signed in" if signed is False else ""),
+        "full-DDS missing": ", ".join(f"{iid} {_short(what)}" for iid, what, *_r in miss) or "none",
+        "next step": _plain_typed(first[3]) if first else "none",
+        "who does it": first[4] if first else "",
+        "last checked": _utc_minute(),
+    }
+
+
+def _short(what):
+    w = re.sub(r"\*\*([^*]+)\*\*", r"\1", what).rstrip(".")
+    return w if len(w) <= 40 else w[:38].rstrip() + "..."
+
+
+def merge_setup_row(old, new):
+    """The row to write: the plugin's setup fields always; identity fields only where the row has none (the person's own
+    words stay); the row's own key spelling kept."""
+    out = {k: new.get(k, "") for k in SETUP_COLUMNS}
+    old = old if isinstance(old, dict) else {}
+    if isinstance(old.get("agent"), str) and old["agent"].strip():
+        out["agent"] = old["agent"]
+    for k in SETUP_IDENTITY:
+        v = old.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v
+    return out
+
+
+def setup_cache_path(workbook_id):
+    return os.path.join(STATE, f"setup-{_wb_tag(workbook_id)}.json")
+
+
+def read_setup_rows(key, workbook_id, timeout=SETUP_ROW_TIMEOUT):
+    """{agent name casefolded: cells} of the Setup tab (None when there is no such tab this agent reaches)."""
+    out, cursor = {}, None
+    for _ in range(50):
+        q = {"workbook_id": workbook_id, "tab": SETUP_TAB, "limit": 200}
+        if cursor:
+            q["after"] = cursor
+        try:
+            body = api_json("GET", ROWS_PATH + "?" + urllib.parse.urlencode(q, quote_via=urllib.parse.quote), key,
+                            timeout=timeout)
+        except ApiError as e:
+            if e.status in (403, 404):
+                return None
+            raise
+        for r in body.get("rows") or []:
+            c = r.get("cells") if isinstance(r, dict) and not r.get("deleted") else None
+            if isinstance(c, dict) and isinstance(c.get("agent"), str) and c["agent"].strip():
+                out[c["agent"].strip().casefold()] = {k: c.get(k) for k in SETUP_COLUMNS}
+        cursor = body.get("cursor")
+        if not body.get("more") or not cursor:
+            break
+    try:
+        ensure_dirs()
+        write_private(setup_cache_path(workbook_id), json.dumps({"at": int(time.time()), "rows": out}))
+    except OSError:
+        pass
+    return out
+
+
+def read_setup_cache(workbook_id):
+    c = read_json(setup_cache_path(workbook_id), {})
+    if not _num_ok(c.get("at")) or time.time() - c["at"] > SETUP_CACHE_MAX or not isinstance(c.get("rows"), dict):
+        return None
+    return c["rows"]
+
+
+def _ensure_setup_tab(agent, key):
+    """The Setup tab with the hand-made tab's columns (key "agent"): made when this agent reaches none."""
+    try:
+        api_json("POST", "/api/v1/agent/tabs", key, body={
+            "workbook_id": agent["workbook_id"], "name": SETUP_TAB, "key_column": "agent",
+            "columns": [{"name": c, "type": "text"} for c in SETUP_COLUMNS]}, timeout=SETUP_ROW_TIMEOUT)
+    except ApiError as e:
+        if e.status != 409:
+            raise
+
+
+def _share_setup_tab(agent, key):
+    """This computer's other agents on the same workbook get the Setup tab (read and write), each once. Only the tab's
+    maker can share it; any other agent's try is refused by datastash and changes nothing."""
+    path = os.path.join(STATE, f"setup-shared-{agent['slug']}.json")
+    done = set(read_json(path, {}).get("names") or [])
+    new = sorted({a["name"] for a in all_agents() if not is_person(a) and a.get("workbook_id") == agent["workbook_id"]
+                  and a["slug"] != agent["slug"]} - done)
+    if not new:
+        return
+    try:
+        mcp_tool(key, "ledger_agent_workbook", {"action": "share", "workbook_id": agent["workbook_id"], "tab": SETUP_TAB,
+                                                "agents": new, "access": "write"}, timeout=SETUP_ROW_TIMEOUT)
+    except Exception:  # noqa: BLE001  not reached: tried again at the next write
+        return
+    try:
+        write_private(path, json.dumps({"names": sorted(done | set(new))}))
+    except OSError:
+        pass
+
+
+def write_setup_row(agent, here):
+    """Write this agent's own Setup row. Returns "written", "no_key" or raises on a network or server fault."""
+    key = read_key(agent["slug"])
+    if not key:
+        return "no_key"
+    rows = read_setup_rows(key, agent["workbook_id"])
+    if rows is None:
+        _ensure_setup_tab(agent, key)
+        rows = read_setup_rows(key, agent["workbook_id"]) or {}
+    _share_setup_tab(agent, key)
+    row = merge_setup_row(rows.get(agent["name"].strip().casefold()), setup_row_cells(agent, here))
+    is_err, body = mcp_tool(key, "ledger_rows_upsert", {"workbook_id": agent["workbook_id"], "tab": SETUP_TAB,
+                                                        "rows": [row], "key": "agent"}, timeout=SETUP_ROW_TIMEOUT)
+    if is_err:
+        raise ApiError(400, body if isinstance(body, dict) else {})
+    rows[row["agent"].strip().casefold()] = row
+    try:
+        write_private(setup_cache_path(agent["workbook_id"]), json.dumps({"at": int(time.time()), "rows": rows}))
+    except OSError:
+        pass
+    log(agent["slug"], "setup row: written")
+    return "written"
+
+
+def setup_row_kick(agent, here):
+    """Write the row in the background (the hook goes on at once)."""
+    if agent is None or is_person(agent):
+        return
+    try:
+        spawn_detached([sys.executable, os.path.realpath(__file__), "--agent", agent["name"], "setup-row", "--retry",
+                        "--folder", here or ""], here if here and os.path.isdir(here) else HOME)
+    except OSError:
+        pass
+
+
+def _agent_here(args):
+    folder = None
+    if "--folder" in args:
+        i = args.index("--folder")
+        folder = args[i + 1] if i + 1 < len(args) and args[i + 1] else None
+    here = os.path.realpath(folder or os.getcwd())
+    return agent_for(here), here
+
+
+def cmd_setup_row(args):
+    """`datastash setup-row`: write this agent's own row in its Setup tab now."""
+    agent, here = _agent_here(args)
+    if agent is None:
+        print("datastash: no agent here, so there is no Setup row to write.")
+        return 1
+    tries = SETUP_ROW_TRIES if "--retry" in args else 1
+    for n in range(tries):
+        try:
+            st = write_setup_row(agent, here)
+            break
+        except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError) as e:
+            # A tab another agent made and has not shared with this one yet is refused: its maker's next write (kicked
+            # beside this one) shares it, so a background run tries again a little later.
+            log(agent["slug"], f"setup row: not written ({type(e).__name__} {getattr(e, 'status', '')})")
+            if n + 1 >= tries:
+                print(f"datastash: the Setup row was not written ({type(e).__name__}).")
+                return 1
+            time.sleep(SETUP_ROW_RETRY_SECONDS)
+    print("datastash: the Setup row is written." if st == "written" else "datastash: this agent has no key here.")
+    return 0 if st == "written" else 1
+
+
+def cmd_self_check(args):
+    """`datastash self-check`: the full-DDS checklist and what is missing here."""
+    agent, here = _agent_here(args)
+    print(_plain_typed(checklist_text(agent, here)))
+    return 0
+
+
+# --- who are you
+def who_phrase(text):
+    """("self", None), ("all", None), ("named", words) or None for the person's whole prompt."""
+    t = _phrase_text(text)
+    if not t:
+        return None
+    if WHO_ALL_RE.fullmatch(t):
+        return "all", None
+    if WHO_SELF_RE.fullmatch(t):
+        return "self", None
+    m = WHO_NAMED_RE.fullmatch(t)
+    if m:
+        return "named", (m.group(1) or m.group(2)).strip()
+    return None
+
+
+def _fold_words(v):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z ]", " ", str(v or "").lower())).strip()
+
+
+def _row_names(r):
+    names = [r.get("agent") or ""]
+    for part in str(r.get("other names") or "").split(","):
+        names.append(re.sub(r"\(.*?\)", "", part))
+    return {_fold_words(n) for n in names if _fold_words(n)}
+
+
+def _who_rows(agent, live=True):
+    """The Setup tab's rows (live within WHO_TIMEOUT, else this computer's copy), or None."""
+    key = read_key(agent["slug"]) if agent else None
+    if key and live:
+        try:
+            got = read_setup_rows(key, agent["workbook_id"], timeout=WHO_TIMEOUT)
+            if got is not None:
+                return got
+        except Exception:  # noqa: BLE001  slow or down: this computer's copy
+            pass
+    return read_setup_cache(agent["workbook_id"]) if agent else None
+
+
+def _who_block(r):
+    v = lambda k: _clean(r.get(k), 300) or "-"  # noqa: E731
+    lines = [f"{_clean(r.get('agent'), 64)}" + (f" ({v('other names')})" if _clean(r.get("other names")) else "")]
+    lines += [f"  - Line: {v('line')}", f"  - Does: {v('does')}", f"  - Computer / OS user: {v('computer / OS user')}",
+              f"  - Reach: {v('reach')}",
+              f"  - Setup: plugin {v('plugin (installed / running)')}; registered {v('registered')}; typed sync "
+              f"{v('typed sync')}",
+              f"  - Missing: {v('full-DDS missing')}",
+              f"  - Next step: {v('next step')}" + (f" ({v('who does it')})" if _clean(r.get("who does it")) else ""),
+              f"  - Last checked: {v('last checked')}"]
+    return lines
+
+
+def who_text(kind, words, agent, here):
+    """The answer, plain text the plugin shows itself, or None (a named agent that is not in the tab: not ours)."""
+    rows = _who_rows(agent) or {}
+    if kind == "self":
+        mine = merge_setup_row(rows.get(agent["name"].strip().casefold()), setup_row_cells(agent, here))
+        return "\n".join(["Who I am (from the Setup tab):"] + _who_block(mine))
+    if kind == "all":
+        if not rows:
+            return "The Setup tab has no rows yet."
+        lines = [f"Your agents (from the Setup tab, {len(rows)}):"]
+        for _k, r in sorted(rows.items()):
+            extra = "; ".join(x for x in (_clean(r.get("does"), 160), _clean(r.get("computer / OS user"), 80),
+                                          "reach: " + (_clean(r.get("reach"), 80) or "-")) if x)
+            lines.append(f"  - {_clean(r.get('agent'), 64)}"
+                         + (f" ({_clean(r.get('other names'), 120)})" if _clean(r.get("other names")) else "")
+                         + f": {extra}")
+        return "\n".join(lines)
+    w = _fold_words(words)
+    hits = [r for r in rows.values() if w in _row_names(r)]
+    if agent is not None and w in {_fold_words(agent["name"])}:
+        hits = hits or [merge_setup_row(None, setup_row_cells(agent, here))]
+    if len(hits) != 1:
+        return None
+    return "\n".join(["From the Setup tab:"] + _who_block(hits[0]))
+
+
+def who_prompt_context(inp):
+    """UserPromptSubmit: {"show": text} for the person's "who are you" phrases, or None."""
+    got = who_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
+    if got is None:
+        return None
+    here = project_of(inp)
+    agent = agent_for(here, me=this_session(inp)) if here else None
+    if agent is None:
+        agent = next((a for a in all_agents() if not is_person(a) and read_key(a["slug"])), None)
+        if agent is None:
+            return None
+        if got[0] == "self":
+            return None  # this session is no agent: an ordinary prompt
+    text = who_text(got[0], got[1], agent, here)
+    return {"show": text} if text else None
+
+
 def take_agent_flag(argv):
     """1.0.18 real e2e: `datastash --agent NAME COMMAND ...` runs COMMAND as NAME, exactly as $DATASTASH_AGENT=NAME did,
     so every command the plugin gives the model starts with the datastash command itself and stays inside the one
@@ -18201,7 +18943,7 @@ def main():
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
-             "chat-save": cmd_chat_save}
+             "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
