@@ -29,13 +29,18 @@ FILES = ("LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_LOCK_FI
 class EmailSignIn(Base):
     def setUp(self):
         super().setUp()
-        self.saved_files = {k: getattr(ds, k) for k in FILES + ("VERIFY_WAIT", "_keychain_set", "setup_row_kick")}
+        self.saved_files = {k: getattr(ds, k) for k in FILES + ("VERIFY_WAIT", "_keychain_set", "setup_row_kick", "computer_signed_in")}
         for k in FILES:
             setattr(ds, k, os.path.join(ds.CONF, os.path.basename(getattr(ds, k))))
         ds.VERIFY_WAIT = 3
         ds._keychain_set = lambda token: False  # the refresh token goes to the mode-600 file here
         ds.setup_row_kick = lambda agent, here: None
         ds.computer_signed_in = lambda deep=False: None  # a fresh computer: no sign-in known here
+        try:  # the sign-in turns this computer's keep and sync on; later test files in this process start from what was here
+            with open(ds.CONSENT_PATH, "rb") as f:
+                self.saved_consent = f.read()
+        except OSError:
+            self.saved_consent = None
         self.accepts = []
         inner = ds.http
 
@@ -57,6 +62,14 @@ class EmailSignIn(Base):
     def tearDown(self):
         for k, v in self.saved_files.items():
             setattr(ds, k, v)
+        try:
+            if self.saved_consent is None:
+                os.remove(ds.CONSENT_PATH)
+            else:
+                with open(ds.CONSENT_PATH, "wb") as f:
+                    f.write(self.saved_consent)
+        except OSError:
+            pass
         super().tearDown()
 
     def check(self, pid):
