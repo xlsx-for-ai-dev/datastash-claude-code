@@ -4,11 +4,15 @@
   more; never the card's own run at work, never "no card", nothing under EST_MIN_CARD_MINUTES); different shapes give
   different estimates; --like narrows to the named cards; no history still answers.
 - The look-back splits a card's work into runs and keeps each run's shape and working time.
-- The tracker yes/no is the account's (datastash), asked once; the one titled comment is edited in place.
-- A subagent's card comes from its description, else the id written most often in capitals in its first prompt.
+- Estimates on the person's cards: only their typed **DDS estimates on** / **off**, checked and signed as typed datastash
+  sync and sent on this computer's login (never a bare yes/no); an unanswered ask at most once per session; no tracker
+  write until it is on. The one titled comment is found across every page and edited in place.
+- Time per card keeps v1.0.24's card order (description, DATASTASH_CARD, git branch); a subagent's first-prompt card is
+  only the last fallback. The look-back skips folders left off and folders with time per card off.
+- The actual is the card's Time per card minutes.
 - est_record writes a card's estimate once and later only refreshes its actual.
 - The prompt hook: the person's typed "DDS estimate XLI-12" (any card), the how-long rule, the build-list rule, and the
-  one-time tracker yes/no (recorded only while asked and unanswered).
+  typed DDS estimates on / off handed to the checker.
 No network, no key; under test/harness.py.
 Run: python3 -I test/test_estimates.py"""
 import json
@@ -126,7 +130,7 @@ class Runs(unittest.TestCase):
         self.assertAlmostEqual(first["minutes"], (3300 - 600) / 60.0)  # the person's own session at work then counts
         self.assertEqual((first["pieces"], first["parts"], first["lines"]), (2, "both", 400))
         self.assertEqual((runs[1]["pieces"], runs[1]["parts"]), (1, "server"))
-        self.assertAlmostEqual(ds.est_actual(hist, "XLI-5"), first["minutes"] + 60.0)
+        self.assertAlmostEqual(ds.est_actual(hist, "XLI-5"), (1200 + 900 + 3600) / 60.0)  # its own working time, never wall
 
     def test_kind_from_the_description(self):
         d = harness.tmpdir(self, prefix="kind-", dir=TMP)
@@ -142,20 +146,79 @@ class Runs(unittest.TestCase):
 
 
 class Tagging(unittest.TestCase):
-    def write(self, text, desc=""):
-        d = harness.tmpdir(self, prefix="sub-", dir=TMP)
+    def write(self, text, desc="", branch=None):
+        d = os.path.join(harness.tmpdir(self, prefix="sub-", dir=TMP), "sid", "subagents")
+        os.makedirs(d)
         p = os.path.join(d, "agent-a1.jsonl")
         with open(p, "w") as f:
             f.write(json.dumps({"type": "user", "message": {"content": text}}) + "\n")
+            for t in (0, 60, 120):
+                f.write(json.dumps({"type": "assistant", "uuid": f"u{t}", "message": {"id": f"m{t}", "model": "m", "content": []},
+                                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + t)),
+                                    **({"gitBranch": branch} if branch else {})}) + "\n")
         return p, {"description": desc}
 
     def test_first_prompt_card_in_capitals(self):
-        p, meta = self.write("You are a builder in ~/x/wt-1023 for plugin-1023, card-417: XLI-417 ... see XLI-417 and XLI-400")
-        self.assertEqual(ds.est_subagent_card(p, meta), "XLI-417")
-        p, meta = self.write("Build card 1 in wt-1023 (plugin-1023)")
-        self.assertIsNone(ds.est_subagent_card(p, meta))
-        p, meta = self.write("XLI-413 first line", desc="Review XLI-9 now")
-        self.assertEqual(ds.est_subagent_card(p, meta), "XLI-9")  # the description wins
+        p, _m = self.write("You are a builder in ~/x/wt-1023 for plugin-1023, card-417: XLI-417 ... see XLI-417 and XLI-400")
+        self.assertEqual(ds.est_prompt_card(p), "XLI-417")
+        p, _m = self.write("Build card 1 in wt-1023 (plugin-1023)")
+        self.assertIsNone(ds.est_prompt_card(p))
+
+    def test_v1024_order_kept_prompt_only_a_fallback(self):
+        """Review 4: DATASTASH_CARD, then the git branch, beat the prompt's card, as in v1.0.24 (description first)."""
+        old = os.environ.pop("DATASTASH_CARD", None)
+        try:
+            p, _m = self.write("Build XLI-523 XLI-523 XLI-523 (also XLI-426)", branch="xli-426-x")
+            rd = ds.TpcReader({}, None, False, ds.est_prompt_card(p))
+            self.assertEqual(rd.card_of({"gitBranch": "xli-426-x"}), "XLI-426")  # the branch, not the prompt's XLI-523
+            self.assertEqual(rd.card_of({}), "XLI-523")  # nothing else names one: the prompt's card
+            self.assertEqual(ds.TpcReader({}, "XLI-9", False, "XLI-523").card_of({"gitBranch": "xli-426-x"}), "XLI-9")
+            os.environ["DATASTASH_CARD"] = "XLI-77"
+            self.assertEqual(rd.card_of({"gitBranch": "xli-426-x"}), "XLI-77")
+            self.assertEqual(set(ds._est_busy(p, None)["spans"]), {"XLI-77"})
+            del os.environ["DATASTASH_CARD"]
+            self.assertEqual(set(ds._est_busy(p, None)["spans"]), {"XLI-426"})  # the look-back: the same order
+            # tpc_read gives a subagent's reader the prompt's card as its fallback only (read once, kept in its state).
+            fst = {"offset": 0}
+            rd, _off = ds.tpc_read(p, fst, None, False)
+            self.assertEqual(fst.get("prompt_card"), "XLI-523")
+            self.assertEqual({k[0] for k in rd.rows}, {"XLI-426"})  # its time books to the branch's card, as in v1.0.24
+            # tpc_files gives the description's card only, as in v1.0.24 (never the prompt's).
+            self.assertNotIn("est_subagent_card", dir(ds))
+        finally:
+            os.environ.pop("DATASTASH_CARD", None)
+            if old is not None:
+                os.environ["DATASTASH_CARD"] = old
+
+
+class Folders(unittest.TestCase):
+    """Review 3: the look-back and datastash estimate never use (or send) a folder left off or with time per card off."""
+
+    def test_left_off_and_tpc_off_folders_are_skipped(self):
+        saved = ds.is_off, ds.tpc_choice
+        ds.is_off = lambda f: f.startswith("/w/off")
+        ds.tpc_choice = lambda f: "off" if f == "/w/notpc" else None
+        span = {"XLI-1": [[NOW, NOW + 3600]]}
+        files = {"/p/a.jsonl": {"cwds": ["/w/on"], "spans": span},
+                 "/p/b.jsonl": {"cwds": ["/w/off/sub"], "spans": {"XLI-2": [[NOW, NOW + 3600]]}},
+                 "/p/b/subagents/agent-x.jsonl": {"cwds": ["/w/on"], "spans": {"XLI-3": [[NOW, NOW + 3600]]}},
+                 "/p/c.jsonl": {"cwds": ["/w/on", "/w/notpc"], "spans": {"XLI-4": [[NOW, NOW + 3600]]}},
+                 "/p/d.jsonl": {"cwds": [], "spans": {"XLI-5": [[NOW, NOW + 3600]]}}}
+        try:
+            self.assertEqual(sorted(ds._est_usable(files)), ["/p/a.jsonl"])
+            hist = ds._est_history(ds._est_usable(files))
+            self.assertEqual(sorted(hist), ["XLI-1"])
+            self.assertEqual(ds.est_in_progress(hist, NOW + 3600), ["XLI-1"])
+        finally:
+            ds.is_off, ds.tpc_choice = saved
+
+    def test_busy_keeps_the_folders(self):
+        d = harness.tmpdir(self, prefix="cwd-", dir=TMP)
+        p = os.path.join(d, "t.jsonl")
+        with open(p, "w") as f:
+            for t, c in ((0, "/w/on"), (60, "/w/on/x")):
+                f.write(json.dumps({"cwd": c, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW + t))}) + "\n")
+        self.assertEqual(ds._est_busy(p, "XLI-5")["cwds"], ["/w/on", "/w/on/x"])
 
 
 class FakeClient:
@@ -188,6 +251,15 @@ class Record(unittest.TestCase):
         ds.est_record(c, hist, ["XLI-9"], now=NOW)
         self.assertEqual(len(c.writes), 2)  # nothing new: nothing written
 
+    def test_actual_is_the_cards_time_per_card_minutes(self):
+        """Review 7: the actual comes from Time per card (its minutes), never the look-back's wall time."""
+        hist = {"XLI-1": h(60, 1), "XLI-9": {"minutes": 50.0, "last": NOW, "runs": [{"minutes": 400.0, "own": 50.0, "end": NOW}]}}
+        c = FakeClient({"XLI-9": {"card": "XLI-9", "estimate_minutes": 90, "rests_on": 2}})
+        out = ds.est_record(c, hist, ["XLI-9"], now=NOW, actuals={"XLI-9": 72.4})
+        self.assertEqual(out, [("XLI-9", 90, 2, 72.4)])
+        self.assertEqual(c.writes[-1], [{"card": "XLI-9", "actual_minutes": 72}])
+        self.assertEqual(ds.est_actual(hist, "XLI-9"), 50.0)  # no workbook: its own working time, never 400 wall
+
 
 class Prompt(unittest.TestCase):
     def setUp(self):
@@ -215,31 +287,76 @@ class Prompt(unittest.TestCase):
         self.assertIn("done-around", c)
         self.assertIsNone(self.ctx("fix the login bug"))
 
-    def test_tracker_answer_is_the_accounts_and_asked_once(self):
+    def test_bare_yes_never_answers_only_the_typed_phrase(self):
+        """Review 1: a bare yes/ok answers nothing; DDS estimates on / off goes to the checker, nothing is saved here."""
+        started = []
+        saved = ds.hook_shape, ds.start_check, ds.api_json
+        ds.hook_shape = lambda inp: ("sid", "/t.jsonl", "prompt-abcdefgh")
+        ds.start_check = lambda shape, kind, prompt, data: started.append((kind, prompt, data)) or True
+        ds.api_json = lambda *a, **k: self.fail("no datastash call from the prompt hook")
+        try:
+            for said in ("yes", "ok", "y", "sure", "no", "yes please"):
+                self.assertNotIn("datastash estimates: the plugin", self.ctx(said) or "")
+            self.assertEqual(started, [])
+            self.assertIn(ds.EST_ON_SAYING, self.ctx("DDS estimates on"))
+            self.assertIn(ds.EST_OFF_SAYING, self.ctx("datastash estimates off."))
+            self.assertIsNone(ds.est_onoff_kind("please turn DDS estimates on"))  # only the whole short prompt
+            self.assertEqual([k for k, _p, _d in started], ["estimates_on", "estimates_off"])
+            self.assertEqual(started[0][2], {"agent_id": "x"})
+        finally:
+            ds.hook_shape, ds.start_check, ds.api_json = saved
+
+    def test_checker_signs_the_typed_sync_proof_and_sends_it_on_the_login(self):
+        import hashlib
+        import hmac
+        sent = []
+        aid, grant = "11111111-2222-4333-8444-555555555555", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        saved = ds.read_answer_key, ds.login_token, ds.http
+        ds.read_answer_key = lambda: ("answer-key", grant)
+        ds.login_token = lambda force=False: "dsat_token"
+        ds.http = lambda method, path, key=None, body=None, timeout=40, **k: sent.append((method, path, key, body)) or (200, "", json.dumps({"answer": body["answer"]}))
+        try:
+            typed = {"pid": "prompt-abcdefgh", "prompt": "DDS estimates on", "typed_at": int(time.time() * 1000) - 1000}
+            rec = {"kind": "estimates_on", "prompt": "DDS estimates on", "data": {"agent_id": aid}}
+            self.assertEqual(ds.send_estimates_choice(rec, typed), [ds.EST_ON_DONE])
+            method, path, key, body = sent[0]
+            self.assertEqual((method, path, key, body["answer"]), ("POST", ds.EST_CHOICE_PATH, "dsat_token", "yes"))
+            pr = body["typed_proof"]
+            self.assertEqual(sorted(pr), ["agent_id", "iat", "mac", "prompt_id", "typed_at", "typed_sha256", "v"])
+            lines = [ds.TYPED_SYNC_LABEL, f"grant:{grant}", aid, "estimates_on", pr["prompt_id"],
+                     hashlib.sha256(b"DDS estimates on").hexdigest(), str(pr["typed_at"]), str(pr["iat"])]
+            self.assertEqual(pr["mac"], hmac.new(b"answer-key", "\n".join(lines).encode(), hashlib.sha256).hexdigest())
+            # A record whose prompt is not that phrase, or no login here: nothing sent.
+            self.assertEqual(ds.send_estimates_choice(dict(rec, prompt="yes"), typed), [])
+            ds.read_answer_key = lambda: None
+            self.assertEqual(ds.send_estimates_choice(rec, typed), [ds.EST_ONOFF_NO_LOGIN])
+            self.assertEqual(len(sent), 1)
+        finally:
+            ds.read_answer_key, ds.login_token, ds.http = saved
+
+    def test_ask_once_per_session_again_later_and_no_writes_until_on(self):
         server = {"answer": None, "asked_at": None}
-        calls = []
 
         def fake(method, path, key, body=None, timeout=40):
-            calls.append((method, body))
             self.assertEqual(path, ds.EST_CHOICE_PATH)
             if body == {"ask": True}:
-                first = server["asked_at"] is None and server["answer"] is None
-                server["asked_at"] = server["asked_at"] or "t"
-                return {"ask": first, **server}
-            if body and "answer" in body:
-                server["answer"] = body["answer"]
+                return {"ask": server["answer"] is None, **server}
+            self.assertIsNone(body)  # an agent never sends the answer
             return dict(server)
-        saved, saved_key = ds.api_json, ds._est_choice_key
-        ds.api_json, ds._est_choice_key = fake, (lambda: "k")
+        saved = ds.api_json, ds.lazy_me
+        sid = ["sess-%d" % time.time_ns()]
+        ds.api_json, ds.lazy_me = fake, (lambda inp=None: (lambda only: sid[0]))
+        wrote = []
+        w = lambda c, b, m, a: wrote.append(c) or "Linear"  # noqa: E731
         try:
-            self.assertNotIn("answered", self.ctx("yes") or "")  # not asked yet: a plain yes is not an answer
-            self.assertIsNone(server["answer"])
-            lines = ds.est_tracker_lines([("XLI-9", 150, 3, 0)], "k")
+            lines = ds.est_tracker_lines([("XLI-9", 150, 3, 0)], "k", write=w)
             self.assertIn(ds.EST_TRACKER_ASK, lines[0])
-            self.assertEqual(ds.est_tracker_lines([("XLI-9", 150, 3, 0)], "k"), [])  # asked once for the account, never again
-            self.assertIn("answered yes", self.ctx("yes"))
-            self.assertEqual(server["answer"], "yes")  # kept on datastash for the whole account
-            wrote = []
+            self.assertIn("Type **DDS estimates on**", lines[0])
+            self.assertEqual(ds.est_tracker_lines([("XLI-9", 150, 3, 0)], "k", write=w), [])  # once in this session
+            sid[0] += "-next"
+            self.assertIn(ds.EST_TRACKER_ASK, ds.est_tracker_lines([("XLI-9", 150, 3, 0)], "k", write=w)[0])  # asked again
+            self.assertEqual(wrote, [])  # not on: nothing written on any card
+            server["answer"] = "yes"
             lines = ds.est_tracker_lines([("XLI-9", 150, 3, 180), ("XLI-10", 60, 3, 0)], "k",
                                          write=lambda c, b, m, a: wrote.append((c, b)) or ("Linear" if c == "XLI-9" else None))
             self.assertEqual(wrote[0][0], "XLI-9")
@@ -249,9 +366,11 @@ class Prompt(unittest.TestCase):
             self.assertIn("edited in place", lines[1])
             self.assertTrue(lines[2].startswith("XLI-10: "))
             server["answer"] = "no"
-            self.assertEqual(ds.est_tracker_lines([("XLI-9", 150, 3, 0)], "k"), [])
+            self.assertEqual(ds.est_tracker_lines([("XLI-9", 150, 3, 0)], "k", write=w), [])
+            ds.api_json = lambda *a, **k: (_ for _ in ()).throw(OSError("down"))
+            self.assertEqual(ds.est_tracker_lines([("XLI-9", 150, 3, 0)], "k", write=w), [])  # unreachable: nothing
         finally:
-            ds.api_json, ds._est_choice_key = saved, saved_key
+            ds.api_json, ds.lazy_me = saved
 
 
 class TrackerComment(unittest.TestCase):
@@ -265,6 +384,50 @@ class TrackerComment(unittest.TestCase):
         newer = ds.est_tracker_body(150, 6, 170)
         self.assertEqual(ds.trk_upsert([("1", "x"), ("2", body)], up, add, newer), "updated")
         self.assertEqual((ups, len(adds)), ([("2", newer)], 1))
+
+    def test_finds_the_comment_on_any_page(self):
+        """Review 6: the estimate comment on a later page is edited, never a second one added (GitHub, Linear, Jira)."""
+        body = ds.est_tracker_body(150, 6, 170)
+        old = ds.est_tracker_body(150, 6)
+        calls = []
+        many = [{"id": i, "body": f"note {i}"} for i in range(150)] + [{"id": 999, "body": old}]
+
+        def gh(args, b=None):
+            calls.append(("gh", args, b))
+            if args[0].startswith("repos/o/r/issues/12/comments?"):
+                page = int(args[0].rsplit("page=", 1)[1])
+                return many[(page - 1) * 100:page * 100]
+            return {}
+
+        def linear(query, v):
+            calls.append(("linear", v))
+            if "comments" in query:
+                nodes = [{"id": str(i), "body": f"n {i}"} for i in range(100)] if v["after"] is None else [{"id": "L9", "body": old}]
+                return {"issue": {"id": "I1", "comments": {"nodes": nodes, "pageInfo": {"hasNextPage": v["after"] is None, "endCursor": "c1"}}}}
+            return {}
+
+        def jira(method, path, b=None):
+            calls.append(("jira", method, path, b))
+            if method == "GET":
+                start = int(path.split("startAt=")[1].split("&")[0])
+                allc = [{"id": str(i), "body": "x"} for i in range(100)] + [{"id": "J9", "body": old}]
+                return {"comments": allc[start:start + 100], "total": len(allc)}
+            return {}
+        saved = ds._trk_gh, ds._trk_linear, ds._trk_jira
+        ds._trk_gh, ds._trk_linear, ds._trk_jira = gh, linear, jira
+        try:
+            self.assertEqual(ds.trk_comment("o/r#12", body), "GitHub")
+            self.assertIn(("gh", ["-X", "PATCH", "repos/o/r/issues/comments/999"], {"body": body}), calls)
+            self.assertFalse(any(c[0] == "gh" and "POST" in c[1] for c in calls))
+            self.assertEqual(ds.trk_comment("XLI-9", body), "Linear")
+            self.assertTrue(any(c[0] == "linear" and c[1].get("id") == "L9" for c in calls))
+            self.assertFalse(any(c[0] == "linear" and "i" in c[1] for c in calls))  # no commentCreate
+            ds._trk_linear = lambda q, v: {}  # not a Linear card: Jira
+            self.assertEqual(ds.trk_comment("PROJ-7", body), "Jira")
+            self.assertIn(("jira", "PUT", "/rest/api/2/issue/PROJ-7/comment/J9", {"body": body}), calls)
+            self.assertFalse(any(c[0] == "jira" and c[1] == "POST" for c in calls))
+        finally:
+            ds._trk_gh, ds._trk_linear, ds._trk_jira = saved
 
     def test_no_login_here_leaves_it_to_the_agent(self):
         self.assertIsNone(ds.trk_comment("XLI-9", ds.est_tracker_body(150, 6)))  # offline tests: no tracker reachable

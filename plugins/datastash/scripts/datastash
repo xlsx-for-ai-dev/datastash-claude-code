@@ -6485,7 +6485,7 @@ def cmd_prompt(_args):
     if not is_main_phrase(prompt):
         try:
             ctx = (who_prompt_context(inp)  # 1.0.21 (card 8e): "who are you", from the Setup tab, shown by the plugin
-                   or estimate_prompt_context(inp)  # XLI-426: the tracker yes/no, and "how long" from datastash estimate
+                   or estimate_prompt_context(inp)  # XLI-426: the typed DDS estimates on/off, and "how long" from datastash estimate
                    or clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
                    or timers_prompt_context(inp)  # 1.0.18: "turn off timers" / "turn on timers"
                    or self_update_prompt_context(inp) or onboard_prompt_context(inp) or status_prompt_context(inp))
@@ -10378,6 +10378,9 @@ def cmd_status_verify(args):
                 add_outcome(sid, line)
         elif rec.get("kind") == "undo_default":
             for line in send_typed_answer(rec, v, undo=True):  # XLI-388: only the person's own typed "undo N"
+                add_outcome(sid, line)
+        elif rec.get("kind") in EST_ONOFF_KINDS:
+            for line in send_estimates_choice(rec, typed):  # XLI-426: only the person's own typed DDS estimates on / off
                 add_outcome(sid, line)
     except OSError:
         return 0
@@ -18047,8 +18050,9 @@ class TpcReader:
     """One transcript file's new part, folded per (card, activity, model). Its state (open tool calls, read targets, the
     turn being read, the last input's time) carries over to the next read. Only numbers leave it."""
 
-    def __init__(self, state, card_hint=None, review=False):
+    def __init__(self, state, card_hint=None, review=False, card_fallback=None):
         self.st, self.card_hint, self.review = state, card_hint, review
+        self.card_fallback = card_fallback  # XLI-426: a subagent's first-prompt card, only when nothing else names one
         self.rows, self.cards = {}, {}
 
     @staticmethod
@@ -18068,7 +18072,7 @@ class TpcReader:
 
     def card_of(self, e):
         return (self.card_hint or tpc_card(os.environ.get("DATASTASH_CARD", "")) or tpc_card(e.get("gitBranch"))
-                or "no card")
+                or self.card_fallback or "no card")
 
     def activity(self, kind, target):
         if self.review:
@@ -18199,7 +18203,9 @@ class TpcReader:
 def tpc_read(path, fst, card_hint=None, review=False):
     """Read path's complete lines from fst["offset"]; returns (reader, new offset). fst (the file's state) is changed in
     place; the caller keeps it only once the rows were sent."""
-    rd = TpcReader(fst, card_hint, review)
+    if os.sep + "subagents" + os.sep in path and "prompt_card" not in fst:
+        fst["prompt_card"] = est_prompt_card(path)  # read once: the card its first prompt names, a last fallback only
+    rd = TpcReader(fst, card_hint, review, fst.get("prompt_card") if isinstance(fst.get("prompt_card"), str) else None)
     off = int(fst.get("offset") or 0)
     try:
         with open(path, "rb") as f:
@@ -18256,7 +18262,7 @@ def tpc_files(transcript, sid):
                 continue
             meta = read_json(p[:-len(".jsonl")] + ".meta.json", {})
             about = f"{meta.get('description') or ''} {meta.get('agentType') or ''}"
-            out.append((os.path.realpath(p), est_subagent_card(p, meta), bool(re.search(r"review", about, re.I))))
+            out.append((os.path.realpath(p), tpc_card(str(meta.get("description") or "")), bool(re.search(r"review", about, re.I))))
     return out
 
 
@@ -18958,8 +18964,9 @@ def _step_bg(args):
 # starts it (time per card's background send writes it for a card it sees for the first time). Nothing else.
 # The Estimates tab (x-live burn preset) keeps estimate_minutes, rests_on and estimated_at, written once; each later send
 # refreshes actual_minutes from the card's Time per card minutes, so diff_minutes and off_share (engine formulas) are live.
-# The person's tracker (owner 11-27): after the person's typed yes to "Put estimates on your cards? (yes/no)" (asked
-# once for the whole ACCOUNT, the answer kept on datastash: /api/v1/agent/estimates/tracker), each card's ONE comment
+# The person's tracker (owner 11-27): after the person's typed **DDS estimates on** (asked "Put estimates on your cards?
+# Type **DDS estimates on**." at most once a session while unanswered; the typed phrase is checked and signed like typed
+# datastash sync and kept for the whole ACCOUNT on datastash: /api/v1/agent/estimates/tracker), each card's ONE comment
 # titled "DDS Development Time Estimate" is written or edited in place with this computer's own tracker login (gh,
 # LINEAR_API_KEY, JIRA_*; and Jira's original estimate), else the agent does it with its own tracker tools.
 # `datastash tracker lists` reads the person's build lists the same way.
@@ -18971,7 +18978,7 @@ EST_HALF_LIFE_DAYS = 1.0  # how a team builds changes fast: yesterday's cards we
 EST_NEAREST = 20  # the estimate rests on this many most similar finished runs
 EST_W_PIECES, EST_W_PARTS, EST_W_SIZE = 2.0, 0.5, 1.0 / 3  # how far apart two runs are: pieces, parts, size (log lines)
 EST_RUN_GAP_HOURS = 4.0  # a card's work more than this apart is a new run (a stage)
-EST_CACHE_VERSION = 2
+EST_CACHE_VERSION = 3  # 3: each file keeps the folders it worked in (a folder left off is never used)
 EST_NOT_BUILD_RE = re.compile(r"review|land|deploy|smoke|pin\b|e2e|probe|measure|helper|read-only|check|research|explore|"
                               r"audit|draft|status|look", re.I)
 EST_PLUGIN_RE = re.compile(rb"plugins/datastash/|wt-[\w-]*plugin|datastash-claude-code")
@@ -18981,7 +18988,21 @@ EST_MIN_CARD_MINUTES = 30  # a card with less work than this was only touched (a
 EST_ACTIVE_HOURS = 24
 EST_LOOKBACK_PATH = os.path.join(STATE, "estimate-lookback.json")
 EST_TRACKER_PATH = os.path.join(CONF, "estimates-tracker.json")
-EST_TRACKER_ASK = "Put estimates on your cards? (yes/no)"
+EST_TRACKER_ASK = "Put estimates on your cards? Type **DDS estimates on**."
+# XLI-426 review: only the person's own typed phrase turns it on or off (never a bare yes/no, which can answer anything).
+# Checked like typed datastash sync (the transcript shows the person typed it), signed with the same typed proof and
+# sent by the plugin itself on this computer's datastash login; datastash saves it for the whole account.
+EST_ONOFF_RE = re.compile(r"\s*(?:dds|datastash)\s+estimates\s+(on|off)[.!]*\s*", re.I)
+EST_ONOFF_KINDS = ("estimates_on", "estimates_off")
+EST_ASKED_DIR = os.path.join(STATE, "estimates-asked")  # one marker per session: an unanswered ask, at most once a session
+EST_ONOFF_AI = ("datastash estimates: the plugin itself saves this once it has checked the person typed it. Make no "
+                "datastash calls and run no command for it. Your whole reply is exactly this line: \"{line}\"")
+EST_ON_SAYING = "Turning estimates on your cards on."
+EST_OFF_SAYING = "Turning estimates on your cards off."
+EST_ON_DONE = "Estimates on your cards: on. Each card gets one \"DDS Development Time Estimate\" comment, kept up to date."
+EST_OFF_DONE = "Estimates on your cards: off. Nothing is written on your cards."
+EST_ONOFF_NO_LOGIN = "Not done: this computer is not signed in to datastash. Type **datastash sync you@email.com** first."
+EST_ONOFF_FAILED = "Not done: datastash could not save it just now. Type it again in a minute."
 EST_COMMENT_TITLE = "DDS Development Time Estimate"
 EST_ID_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,10})-(\d{1,7})(?![0-9])")
 EST_NOT_PREFIX = {"WT", "PLUGIN", "CARD", "PR", "MODE", "REVIEW", "RELEASE", "INSTALL", "DEPLOY", "ROUND", "STEP", "UTF",
@@ -19020,12 +19041,6 @@ def est_prompt_card(path):
     return None
 
 
-def est_subagent_card(path, meta):
-    """A subagent's card: its description's id, else its first prompt's (XLI-426 C: most builders and reviewers are
-    started with the card in their first line, not in the description)."""
-    return tpc_card(str(meta.get("description") or "")) or est_prompt_card(path)
-
-
 def _est_transcripts():
     """[(path, card hint, review)] for every Claude Code session on this computer: each main transcript and each of its
     subagents' files, only regular files of this user inside Claude Code's own projects folder."""
@@ -19049,11 +19064,13 @@ def _est_transcripts():
 
 
 def _est_busy(path, hint):
-    """One transcript, read here in memory: {"spans": {card: [[start, end], ...]}, "parts": [...], "lines": n}. spans are
+    """One transcript, read here in memory: {"spans": {card: [[start, end], ...]}, "parts": [...], "lines": n, "cwds": [...]}.
+    cwds are the folders it worked in (a folder left off or with time per card off is never used: _est_folders_ok). spans are
     the stretches between its entries no more than TPC_PAUSE_SECONDS apart (work, not a pause), merged; parts says which
     sides of the work it touched ("server", "plugin"), from the paths its tool calls name; lines is how many lines its
     edits wrote. Only these numbers and labels leave this; the entries themselves are never kept or sent."""
-    spans, prev, parts, lines = {}, None, set(), 0
+    spans, prev, parts, lines, cwds = {}, None, set(), 0, []
+    fallback = est_prompt_card(path) if os.sep + "subagents" + os.sep in path else None  # only when nothing else names one
     try:
         with open(path, "rb") as f:
             for raw in f:
@@ -19071,16 +19088,45 @@ def _est_busy(path, hint):
                     continue
                 if not isinstance(e, dict):
                     continue
+                cwd = e.get("cwd")
+                if isinstance(cwd, str) and cwd and cwd not in cwds and len(cwds) < 50:
+                    cwds.append(cwd)
                 ts = _week_ts(e.get("timestamp"))
                 if ts is None:
                     continue
                 if prev is not None and 0 <= ts - prev <= TPC_PAUSE_SECONDS:
-                    card = hint or tpc_card(os.environ.get("DATASTASH_CARD", "")) or tpc_card(e.get("gitBranch")) or "no card"
+                    card = (hint or tpc_card(os.environ.get("DATASTASH_CARD", "")) or tpc_card(e.get("gitBranch")) or fallback
+                            or "no card")
                     spans.setdefault(card, []).append([prev, ts])
                 prev = ts if prev is None else max(prev, ts)
     except OSError:
-        return {"spans": {}, "parts": [], "lines": 0}
-    return {"spans": {c: _est_union(v) for c, v in spans.items()}, "parts": sorted(parts), "lines": lines}
+        return {"spans": {}, "parts": [], "lines": 0, "cwds": []}
+    return {"spans": {c: _est_union(v) for c, v in spans.items()}, "parts": sorted(parts), "lines": lines, "cwds": cwds}
+
+
+def _est_folders_ok(cwds):
+    """XLI-426: a session's work counts (and its card ids and minutes may be sent) only when every folder it worked in is
+    on: never a folder the person left off, never one whose time per card is off; no folder known: not used."""
+    if not isinstance(cwds, list) or not cwds:
+        return False
+    try:
+        return not any(not isinstance(c, str) or is_off(c) or tpc_choice(c) == "off" for c in cwds)
+    except (OSError, ValueError):
+        return False
+
+
+def _est_usable(files):
+    """The look-back's files whose folders are on (_est_folders_ok); a subagent's file only when its session's is too.
+    Checked at every use, so a folder left off later is dropped at once."""
+    ok = {p: g for p, g in files.items() if isinstance(g, dict) and _est_folders_ok(g.get("cwds"))}
+    out = {}
+    for p, g in ok.items():
+        if os.sep + "subagents" + os.sep in p:
+            main = os.path.dirname(os.path.dirname(p)) + ".jsonl"  # <project>/<sid>/subagents/x.jsonl: <project>/<sid>.jsonl
+            if main in files and main not in ok:
+                continue
+        out[p] = g
+    return out
 
 
 def _est_edit_lines(raw):
@@ -19142,7 +19188,7 @@ def est_lookback(save=True):
             continue
         sig = f"{st.st_size}:{int(st.st_mtime)}"
         got = files.get(path)
-        if not isinstance(got, dict) or got.get("sig") != sig or got.get("hint") != hint or "spans" not in got:
+        if not isinstance(got, dict) or got.get("sig") != sig or got.get("hint") != hint or "cwds" not in got:
             got = {"sig": sig, "hint": hint, "kind": _est_kind(path), **_est_busy(path, hint)}
             changed = True
         seen[path] = got
@@ -19152,7 +19198,7 @@ def est_lookback(save=True):
             write_private(EST_LOOKBACK_PATH, json.dumps({"v": EST_CACHE_VERSION, "files": seen}))
         except OSError:
             pass
-    return _est_history(seen)
+    return _est_history(_est_usable(seen))
 
 
 def _est_spans_history(files):
@@ -19308,11 +19354,12 @@ def est_estimate(history, card, like=None, now=None, shape=None):
     return int(round(m)), len({r["card"] for r in near})
 
 
-def est_actual(history, card):
-    """A card's actual: its runs' minutes (as its estimate counts them), else its own working time."""
-    p = history.get(card) or {}
-    runs = [r for r in (p.get("runs") or []) if isinstance(r, dict)]
-    return sum(float(r.get("minutes") or 0) for r in runs) if runs else float(p.get("minutes") or 0)
+def est_actual(history, card, actuals=None):
+    """A card's actual: its minutes on the Time per card tab (actuals, from est_account_history), as the write lines say;
+    with no workbook (--local), its own working time here, by the same active-minutes rules. Never wall time."""
+    if actuals is not None:
+        return float(actuals.get(card) or 0)
+    return float((history.get(card) or {}).get("minutes") or 0)
 
 
 def est_hours(minutes):
@@ -19345,11 +19392,6 @@ def _est_tracker():
     return s if isinstance(s, dict) else {}
 
 
-def _est_choice_key():
-    agent = _own_agent({})
-    return read_key(agent["slug"]) if agent else None
-
-
 def est_account_choice(key, action=None):
     """The account's one yes/no on datastash (GET, or POST {"ask": true} / {"answer": ...}): {"answer", "asked_at",
     "ask"?}, or None when datastash can't be reached. A known answer is copied to this computer."""
@@ -19377,6 +19419,65 @@ def est_tracker_choice(key=None):
     return v if v in ("yes", "no") else None
 
 
+def _est_ask_this_session():
+    """True once per Claude Code session (then False): the session's one showing of an unanswered ask."""
+    sid = lazy_me()(True) or "no-session-" + time.strftime("%Y%m%d")
+    path = os.path.join(EST_ASKED_DIR, re.sub(r"[^A-Za-z0-9_-]", "_", sid)[:80])
+    try:
+        os.makedirs(EST_ASKED_DIR, mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+
+
+def est_onoff_kind(prompt):
+    """"estimates_on" / "estimates_off" for the person's whole short prompt **DDS estimates on** / **off** (or
+    "datastash estimates on/off"), else None."""
+    m = EST_ONOFF_RE.fullmatch(prompt) if isinstance(prompt, str) and len(prompt) <= 80 else None
+    return None if m is None else ("estimates_on" if m.group(1).lower() == "on" else "estimates_off")
+
+
+def send_estimates_choice(rec, typed):
+    """The checker, after the person's own typed **DDS estimates on** / **off** (proved by find_typed, fresh, used once):
+    signs the typed proof (the typed datastash sync proof, action estimates_on / estimates_off) with this computer's
+    login answer key and sends it on the login itself. The lines for the person. Never prints the key or token."""
+    kind = rec.get("kind")
+    d = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    aid = d.get("agent_id")
+    if kind not in EST_ONOFF_KINDS or est_onoff_kind(rec.get("prompt")) != kind or not isinstance(aid, str) \
+            or not re.fullmatch(GRANT_ID_RE, aid.lower()) or not isinstance(typed, dict):
+        return []
+    login = read_answer_key()
+    if login is None or not re.fullmatch(GRANT_ID_RE, str(login[1]).lower()):
+        return [EST_ONOFF_NO_LOGIN]
+    iat = int(time.time() * 1000)
+    proof = typed_sync_proof(login[0], f"grant:{login[1].lower()}", aid, kind, typed["pid"], typed["prompt"],
+                             min(int(typed["typed_at"]), iat), iat)
+    login = None
+    token = login_token()
+    if token is None:
+        return [EST_ONOFF_NO_LOGIN]
+    answer = "yes" if kind == "estimates_on" else "no"
+    try:
+        status, _ct, text = http("POST", EST_CHOICE_PATH, key=token, timeout=20,
+                                 body={"answer": answer, "typed_proof": proof})
+        got = json.loads(text) if text.strip() else {}
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return [EST_ONOFF_FAILED]
+    if status != 200 or not isinstance(got, dict) or got.get("answer") != answer:
+        return [EST_ONOFF_FAILED]
+    try:
+        ensure_dirs()
+        write_private(EST_TRACKER_PATH, json.dumps({"answer": answer, "at": int(time.time())}))
+    except OSError:
+        pass
+    return [EST_ON_DONE if answer == "yes" else EST_OFF_DONE]
+
+
 def est_tracker_body(minutes, rests_on, actual=0):
     body = f"{EST_COMMENT_TITLE}\nEstimate: {est_hours(minutes)} (from {rests_on} of your cards)"
     if actual:
@@ -19390,22 +19491,20 @@ def est_tracker_lines(rows, key=None, write=None):
     card's one comment is written or updated here when this computer's own tracker login reaches it (write), else the
     agent is told to do it with its own tracker tools, with the exact body."""
     got = est_account_choice(key) if key else None
-    choice = (got or {}).get("answer") if got is not None else est_tracker_choice()
+    if got is None:
+        return []  # datastash not reachable: nothing is written on any tracker, and nothing asked
+    choice = got.get("answer") if got.get("answer") in ("yes", "no") else None
     if choice == "no":
         return []
-    if choice is None:
-        if got is None:
-            return []  # datastash not reachable: ask later, never twice
+    if choice is None:  # not on: no tracker writes. The ask, at most once per session, again later while unanswered
+        if not _est_ask_this_session():
+            return []
         claim = est_account_choice(key, {"ask": True}) or {}
         if not claim.get("ask"):
-            return []  # another agent of the account asked already; its answer is the account's
-        try:
-            ensure_dirs()
-            write_private(EST_TRACKER_PATH, json.dumps({"asked_at": int(time.time())}))
-        except OSError:
-            pass
-        return [f'Ask the person once, in these words: "{EST_TRACKER_ASK}" (their typed answer is saved for the whole '
-                'account by datastash; never answer it for them).']
+            return []  # answered meanwhile
+        return [f'Ask the person once, in these words: "{EST_TRACKER_ASK}" Only their own typed **DDS estimates on** '
+                '(or **DDS estimates off**) turns it on or off, for the whole account; never type it, answer it or '
+                'turn it on for them. Until then nothing is written on their cards.']
     out, left = [], []
     for card, minutes, rests_on, actual in rows:
         body = est_tracker_body(minutes, rests_on, actual)
@@ -19503,8 +19602,15 @@ def trk_comment(card, body, minutes=None, actual=None):
             if not repo:
                 return None
             base = f"repos/{repo}/issues"
-            got = _trk_gh([f"{base}/{gh.group(2)}/comments?per_page=100"])
-            trk_upsert([(c.get("id"), c.get("body")) for c in got if isinstance(c, dict)],
+            got, page = [], 1
+            while True:  # every page, so a card with many comments never gets a second estimate comment
+                part = _trk_gh([f"{base}/{gh.group(2)}/comments?per_page=100&page={page}"])
+                part = [c for c in part if isinstance(c, dict)] if isinstance(part, list) else []
+                got += part
+                if len(part) < 100:
+                    break
+                page += 1
+            trk_upsert([(c.get("id"), c.get("body")) for c in got],
                        lambda cid, b: _trk_gh(["-X", "PATCH", f"{base}/comments/{cid}"], {"body": b}),
                        lambda b: _trk_gh(["-X", "POST", f"{base}/{gh.group(2)}/comments"], {"body": b}), body)
             return "GitHub"
@@ -19513,10 +19619,18 @@ def trk_comment(card, body, minutes=None, actual=None):
     if not EST_ID_RE.fullmatch(card):
         return None
     try:
-        d = _trk_linear("query($id:String!){issue(id:$id){id comments(first:100){nodes{id body}}}}", {"id": card})
+        q = ("query($id:String!,$after:String){issue(id:$id){id comments(first:100,after:$after){nodes{id body} "
+             "pageInfo{hasNextPage endCursor}}}}")
+        d = _trk_linear(q, {"id": card, "after": None})
         issue = d.get("issue") or {}
+        nodes = list(((issue.get("comments") or {}).get("nodes") or []))
+        info = (issue.get("comments") or {}).get("pageInfo") or {}
+        while issue.get("id") and info.get("hasNextPage") and info.get("endCursor"):  # every page of comments
+            more = (_trk_linear(q, {"id": card, "after": info["endCursor"]}).get("issue") or {}).get("comments") or {}
+            nodes += more.get("nodes") or []
+            info = more.get("pageInfo") or {}
         if issue.get("id"):
-            trk_upsert([(c.get("id"), c.get("body")) for c in ((issue.get("comments") or {}).get("nodes") or [])],
+            trk_upsert([(c.get("id"), c.get("body")) for c in nodes if isinstance(c, dict)],
                        lambda cid, b: _trk_linear("mutation($id:String!,$b:String!){commentUpdate(id:$id,input:{body:$b}){success}}",
                                                   {"id": cid, "b": b}),
                        lambda b: _trk_linear("mutation($i:String!,$b:String!){commentCreate(input:{issueId:$i,body:$b}){success}}",
@@ -19525,8 +19639,16 @@ def trk_comment(card, body, minutes=None, actual=None):
     except (OSError, ValueError, urllib.error.URLError, httpclient.HTTPException):
         pass
     try:
-        got = _trk_jira("GET", f"/rest/api/2/issue/{card}/comment?maxResults=100")
-        trk_upsert([(c.get("id"), c.get("body")) for c in (got.get("comments") or []) if isinstance(c, dict)],
+        comments, start = [], 0
+        while True:  # every page of comments
+            got = _trk_jira("GET", f"/rest/api/2/issue/{card}/comment?startAt={start}&maxResults=100")
+            part = [c for c in (got.get("comments") or []) if isinstance(c, dict)]
+            comments += part
+            start += len(part)
+            total = got.get("total") if isinstance(got.get("total"), int) else start
+            if not part or start >= total:
+                break
+        trk_upsert([(c.get("id"), c.get("body")) for c in comments],
                    lambda cid, b: _trk_jira("PUT", f"/rest/api/2/issue/{card}/comment/{cid}", {"body": b}),
                    lambda b: _trk_jira("POST", f"/rest/api/2/issue/{card}/comment", {"body": b}), body)
         if minutes:
@@ -19602,26 +19724,21 @@ EST_HOW_LONG_RULE = ("answer how long from `datastash estimate <card ids>` (one 
 EST_LIST_RULE = ("whenever you write or show a build list, first run `datastash estimate <every card id on the list>`; show "
                  "each card's estimate inline on its line, and end the list with its total line and done-around time, as "
                  "printed. Then follow its tracker lines, if any (each card's \"" + EST_COMMENT_TITLE + "\" comment).")
-EST_YES_RE = re.compile(r"\s*(yes|y|yeah|yep|sure|ok|okay)[\s.!]*", re.I)
-EST_NO_RE = re.compile(r"\s*(no|n|nope|no thanks)[\s.!]*", re.I)
 
 
 def estimate_prompt_context(inp):
-    """UserPromptSubmit: the person's typed yes/no to the one tracker question (only while it is asked and unanswered;
-    the person's own prompt, never a tool call), else the how-long rule for a prompt that asks how long. Or None."""
+    """UserPromptSubmit: the person's typed **DDS estimates on** / **off** (handed to the checker: saved for the account
+    only once the transcript shows the person typed it), else the estimate, build-list and how-long rules. Or None."""
     prompt = inp.get("prompt") if isinstance(inp, dict) else None
-    if not isinstance(prompt, str) or _own_agent(inp) is None:
+    agent = _own_agent(inp) if isinstance(prompt, str) else None
+    if agent is None:
         return None
-    yes, no = EST_YES_RE.fullmatch(prompt), EST_NO_RE.fullmatch(prompt)
-    if (yes or no) and _est_tracker().get("asked_at") and not _est_tracker().get("answer"):
-        # The one ask was made on this computer and is unanswered: the person's typed answer is the ACCOUNT's (datastash).
-        key = _est_choice_key()
-        now_choice = est_account_choice(key) if key else None
-        if now_choice is not None and now_choice.get("answer") is None:
-            if est_account_choice(key, {"answer": "yes" if yes else "no"}) is None:
-                return None
-            return ("datastash estimates: the person answered " + ("yes: from now on keep the \"" + EST_COMMENT_TITLE +
-                    "\" comment on their cards, as `datastash estimate` says." if yes else "no: never put estimates on their cards."))
+    kind = est_onoff_kind(prompt)
+    if kind is not None:
+        shape = hook_shape(inp)
+        if shape is None or not start_check(shape, kind, prompt, {"agent_id": agent["agent_id"].lower()}):
+            return None
+        return EST_ONOFF_AI.format(line=EST_ON_SAYING if kind == "estimates_on" else EST_OFF_SAYING)
     typed = EST_TYPED_RE.fullmatch(prompt)
     if typed:  # owner 11-27: "DDS estimate XLI-12" (or datastash estimate) for ANY card, backlog and new ones too
         ids = [tpc_card(x) for x in re.split(r"[,\s]+", typed.group(1)) if tpc_card(x)]
@@ -19651,15 +19768,15 @@ def _est_write(client, rows, tag):
     return client.tool("ledger_rows_upsert", args, "writing Estimates", soft=True) is not None
 
 
-def est_record(client, history, cards, like=None, now=None, shapes=None):
+def est_record(client, history, cards, like=None, now=None, shapes=None, actuals=None):
     """For each card: its estimate (the stored one when there is one, else a new one, written once) and its actual so
-    far, refreshed on the row. Returns [(card, minutes, rests_on, actual)]."""
+    far (its Time per card minutes: actuals), refreshed on the row. Returns [(card, minutes, rests_on, actual)]."""
     now = time.time() if now is None else now
     have = _est_rows_get(client, cards) if cards else {}
     out, write = [], []
     for c in cards:
         row = have.get(c) or {}
-        actual = est_actual(history, c)
+        actual = est_actual(history, c, actuals)
         m, n = _est_num(row.get("estimate_minutes")), _est_num(row.get("rests_on"))
         if m is None:
             m, n = est_estimate(history, c, like, now, (shapes or {}).get(c))
@@ -19680,9 +19797,10 @@ def est_after_send(client, cards, now=None):
     if not ids:
         return
     try:
-        hist = est_merge(_est_cached_lookback(), est_account_history(client))
-        rows = est_record(client, hist, ids, now=now)
-        if _est_tracker().get("answer") == "yes":  # the account said yes: the card's one comment follows its actual
+        acct = est_account_history(client)
+        hist = est_merge(_est_cached_lookback(), acct)
+        rows = est_record(client, hist, ids, now=now, actuals={c: p["minutes"] for c, p in acct.items()})
+        if est_tracker_choice(client.key) == "yes":  # only after the person's typed DDS estimates on: the comment follows its actual
             for card, m, n, actual in rows:
                 if actual:
                     trk_comment(card, est_tracker_body(m, n, actual), m, actual)
@@ -19693,7 +19811,7 @@ def est_after_send(client, cards, now=None):
 def _est_cached_lookback():
     """The look-back as last saved (the send never reads every session itself; `datastash estimate` refreshes it)."""
     cache = read_json(EST_LOOKBACK_PATH, {})
-    return _est_history(cache.get("files") if isinstance(cache.get("files"), dict) and cache.get("v") == EST_CACHE_VERSION else {})
+    return _est_history(_est_usable(cache.get("files")) if isinstance(cache.get("files"), dict) and cache.get("v") == EST_CACHE_VERSION else {})
 
 
 def cmd_estimate(args):
@@ -19732,7 +19850,7 @@ def cmd_estimate(args):
     cards = list(dict.fromkeys(cards))
     now = time.time()
     hist = est_lookback()
-    client = None
+    client, actuals = None, None
     if not local:
         agent = _own_agent({})
         key = read_key(agent["slug"]) if agent else None
@@ -19740,7 +19858,8 @@ def cmd_estimate(args):
             client = CiClient(key, agent["workbook_id"], now + TPC_WAIT_SECONDS)
             client.cards_tab = _tpc_card_tab(agent["workbook_id"])
             try:
-                hist = est_merge(hist, est_account_history(client))
+                acct = est_account_history(client)
+                hist, actuals = est_merge(hist, acct), {c: p["minutes"] for c, p in acct.items()}
             except CiProblem as e:
                 log(agent["slug"], f"estimate: {e}")
                 client = None
@@ -19752,13 +19871,13 @@ def cmd_estimate(args):
     shapes = {c: est_shape(hist, c, now, **named) for c in cards}
     if client is not None:
         try:
-            rows = est_record(client, hist, cards, like, now, shapes)
+            rows = est_record(client, hist, cards, like, now, shapes, actuals)
         except CiProblem:
             rows = None
     else:
         rows = None
     if rows is None:
-        rows = [(c, *est_estimate(hist, c, like, now, shapes.get(c)), est_actual(hist, c)) for c in cards]
+        rows = [(c, *est_estimate(hist, c, like, now, shapes.get(c)), est_actual(hist, c, actuals)) for c in cards]
     for c, m, n, actual in rows:
         print(est_line(c, m, n, actual))
     if len(rows) > 1:
