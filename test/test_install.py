@@ -50,7 +50,7 @@ LIST = {"list_id": LIST_ID, "expires_in_seconds": 600,
 TOOL = "mcp__claude_ai_datastash__"
 OWN_TOOL = "mcp__plugin_datastash_datastash__"  # the plugin's own connector (https://getdatastash.com/mcp): trusted by URL
 PATCHED = ("CONF", "STATE", "PENDING", "OFF", "MAIN_DIR", "http", "_claude_chain", "_kc", "_stop_listener", "_gone_path", "hook_input",
-           "spawn_detached")
+           "spawn_detached", "_temp_roots")
 
 
 def real_entries(name):
@@ -66,6 +66,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.saved = {k: getattr(ds, k) for k in PATCHED}
         root = os.path.realpath(harness.tmpdir(self, prefix="install-", dir=harness.ROOT))
+        ds._temp_roots = lambda: []  # the throwaway folders live in a temp folder; test_setup.py's TempAndSystem checks the real list
         ds.CONF, ds.MAIN_DIR = os.path.join(root, "datastash"), os.path.join(root, "datastash main")
         ds.STATE, ds.PENDING, ds.OFF = (os.path.join(ds.CONF, d) for d in ("state", "pending", "off"))
         self.env = os.environ.get("DATASTASH_CONFIG_DIR")

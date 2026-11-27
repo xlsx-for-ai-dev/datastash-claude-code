@@ -18414,10 +18414,43 @@ def _auto_mark_path(here):
     return os.path.join(STATE, f"auto-setup-{hashlib.sha256(os.path.realpath(here).encode()).hexdigest()[:16]}.json")
 
 
+SYSTEM_ROOTS = ("/etc", "/usr", "/opt", "/var", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/sys",
+                "/dev", "/run", "/boot", "/root", "/snap", "/private/tmp", "/private/var", "/System", "/Library",
+                "/Applications", "/Volumes")
+
+
+def _temp_roots():
+    """The temporary folders of this computer: /tmp, /var/tmp, the OS temp folder and $TMPDIR (macOS's too)."""
+    got = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/folders", tempfile.gettempdir(),
+           os.environ.get("TMPDIR", "")]
+    return [g for g in got if g]
+
+
+def _roots_real(roots):
+    out = set()
+    for r in roots:
+        out.update((r.rstrip("/") or "/", os.path.realpath(r)))
+    return out
+
+
+def temp_or_system(here):
+    """1.0.21 (M1): a temp folder or a system folder, or inside one (links resolved first). Self-setup never registers
+    an agent there. A sandboxed home (the home folder itself inside a temp folder, as in a test computer) keeps its own
+    subfolders."""
+    rp = os.path.realpath(here)
+    temps = _roots_real(_temp_roots())
+    home = os.path.realpath(HOME)
+    if rp != home and _within(rp, home) and any(_within(home, t) for t in temps):
+        return False
+    return any(_within(rp, r) for r in temps | _roots_real(SYSTEM_ROOTS))
+
+
 def auto_setup_name(project, me, inp=None):
     """The name this folder's agent is set up under by itself, or None when the plugin must not set it up here."""
     if not project or not linkable(project) or is_main_session(me) or main_root(project) is not None:
         return None
+    if temp_or_system(project):
+        return None  # never a permanent agent for a temp or system folder
     if box_gone() or is_off(project) or _folder_uninstalled(project):
         return None
     try:

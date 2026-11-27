@@ -334,5 +334,54 @@ class Checklist(SetupBase):
         self.assertNotIn("**", out.getvalue())
 
 
+class TempAndSystem(SetupBase):
+    """1.0.21 review M1: self-setup never registers a permanent agent in a temp or system folder (links resolved)."""
+    def setUp(self):
+        super().setUp()
+        ds._temp_roots = self.saved["_temp_roots"]  # the real list (Base points it away from the throwaway folders)
+        self.signed_in()
+
+    def refused(self, folder):
+        self.assertTrue(ds.temp_or_system(folder), folder)
+        self.assertIsNone(ds.auto_setup_name(folder, ds.this_session(self.inp(folder=folder)), self.inp(folder=folder)),
+                          folder)
+
+    def test_temp_folders_are_refused(self):
+        for d in ("/tmp", "/var/tmp", "/private/tmp", ds.tempfile.gettempdir(), os.environ["TMPDIR"]):
+            self.refused(d)
+        fresh = harness.tmpdir(self, prefix="probe-")  # a fresh temp folder (outside the home folder)
+        self.refused(fresh)
+        self.assertIsNone(self.wake(folder=fresh))
+        self.refused(os.path.join(fresh, "clone"))
+
+    def test_system_roots_are_refused(self):
+        for d in ("/etc", "/usr", "/opt", "/var", "/bin", "/sbin", "/lib", "/proc", "/sys", "/dev", "/run", "/boot",
+                  "/root", "/snap", "/private/var", "/System", "/Library", "/Applications", "/Volumes"):
+            self.refused(d)
+
+    def test_folders_inside_a_system_root_are_refused(self):
+        for d in ("/usr/local", "/usr/local/src/app", "/opt/app", "/var/www/site", "/etc/nginx", "/root/proj",
+                  "/Volumes/Disk/proj", "/private/var/folders/xy/T/proj"):
+            self.refused(d)
+
+    def test_a_link_into_a_temp_or_system_folder_is_refused(self):
+        home_code = os.path.join(ds.HOME, "code")
+        os.makedirs(home_code, exist_ok=True)
+        for name, target in (("etc-link", "/etc"), ("local-link", "/usr/local"),
+                             ("tmp-link", harness.tmpdir(self, prefix="probe-"))):
+            link = os.path.join(home_code, name)
+            os.symlink(target, link)
+            self.addCleanup(harness.remove_tree, link)
+            self.refused(link)
+
+    def test_a_project_folder_under_home_still_sets_itself_up(self):
+        proj = os.path.join(ds.HOME, "code", "web-app")
+        os.makedirs(proj, exist_ok=True)
+        self.addCleanup(harness.remove_tree, proj)
+        self.assertFalse(ds.temp_or_system(proj))
+        self.assertEqual(self.wake(folder=proj), ds.AUTO_SETUP_AI.format(name="web-app"))
+        self.assertIsNone(ds.auto_setup_name(ds.HOME, None))  # the home folder itself: never
+
+
 if __name__ == "__main__":
     unittest.main()
