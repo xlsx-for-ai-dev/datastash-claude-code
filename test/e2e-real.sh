@@ -936,12 +936,15 @@ setup8e_check() {  # setup8e_check <tag> <HOME>: 1.0.21 (card 8e), on a signed-i
   if grep -qE '"registered" ?: ?"yes"' <<<"$out" && grep -qE "\"plugin \(installed / running\)\" ?: ?\"[0-9.]+ / $NEW_VERSION\"" <<<"$out"; then
     pass "$tag: server: \"$name\"'s Setup row is written (registered yes, running $NEW_VERSION)"
   else fail "$tag: server: no Setup row for \"$name\": $(tail -c 400 <<<"$out")"; ok=0; fi
+  tmux send-keys -t "$T" C-u; sleep 0.5  # a prompt the plugin answered itself stays in the input box
   type_line "who are you"
   if wait_for "Who I am \(from the Setup tab\)" 20; then pass "$tag: \"who are you\" answered by the plugin"
   else fail "$tag: \"who are you\" got no Setup-tab answer"; show_tail 10; ok=0; fi
+  tmux send-keys -t "$T" C-u; sleep 0.5  # a prompt the plugin answered itself stays in the input box
   type_line "who are you all"
   if wait_for "Your agents \(from the Setup tab" 20 && grep -qF -- "- $name" <<<"$(pane)"; then pass "$tag: \"who are you all\" lists the agents"
   else fail "$tag: \"who are you all\" got no list with \"$name\""; show_tail 10; ok=0; fi
+  tmux send-keys -t "$T" C-u; sleep 0.5  # a prompt the plugin answered itself stays in the input box
   type_line "who is $HA"
   if wait_for "From the Setup tab:" 20; then pass "$tag: \"who is $HA\" answered from the Setup tab"
   else fail "$tag: \"who is $HA\" got no answer"; show_tail 10; ok=0; fi
@@ -1268,6 +1271,7 @@ if [[ "$START_APPS" != "[]" ]]; then
   "${SRV[@]}" disconnect-others | sed 's/^/  /'
   [[ "$("${SRV[@]}" other-apps)" == "[]" ]] || { echo "CAN'T RUN: the test account still has other app connections"; exit 2; }
 fi
+"${SRV[@]}" drop-tab Setup 2>&1 | sed 's/^/clean start: /'  # 1.0.21: an earlier run's Setup tab (its maker is gone)
 say "server: test account \"$E2E_ACCOUNT\" signed in for read-back; clean: no agent on, no other app connection"
 
 for p in $PARTS; do

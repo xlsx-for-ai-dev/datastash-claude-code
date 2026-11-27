@@ -20,6 +20,7 @@ Run with python3 -I. Never prints a secret, a code or a token.
   chat-count TEXT [MUST]    (1.0.18) how many saved exchanges start "User: TEXT" across the account's saved chats, and
                            whether one has an answer after it (holding MUST, when given), as JSON {"count", "answered"}
   timer-find WB NOTE        (1.0.18) whether a timer with NOTE is set in agent workbook WB; then cancels it, as JSON
+  drop-tab NAME            (1.0.21) remove every tab called NAME from the account's workbooks (the clean start)
   inbox-marks WB INBOX MARK  (XLI-408 step 9) every message in that inbox of workbook WB whose text holds "MARK #<n>",
                            as a JSON list of the n's in the order datastash added them (a repeat shows twice)
 
@@ -394,6 +395,26 @@ def cmd_chat_count(text, must=None):
     print(json.dumps({"count": n, "answered": answered}))
 
 
+def cmd_drop_tab(name):
+    """1.0.21 (card 8e): remove every tab called NAME from the account's workbooks (the person's own delete), so a tab an
+    earlier run's agent made (and no agent of this run can write) never blocks this run."""
+    err, out = tool("ledger_workbook_list", {})
+    items = (out.get("items") or out.get("workbooks") or []) if isinstance(out, dict) else []
+    if err:
+        die("ledger_workbook_list refused")
+    n = 0
+    for w in items:
+        wb = w.get("workbook_id") or w.get("id") if isinstance(w, dict) else None
+        if not isinstance(wb, str):
+            continue
+        err, got = tool("ledger_workbook_open", {"workbook_id": wb})
+        for t in (got.get("tabs") or []) if isinstance(got, dict) and not err else []:
+            if isinstance(t, dict) and t.get("name") == name:
+                e2, _ = tool("ledger_tab_delete", {"workbook_id": wb, "tab_id": t.get("tab_id") or t.get("id"), "confirm": True})
+                n += not e2
+    print(f"removed {n} tab(s) named {name!r}")
+
+
 def main(argv):
     if not argv:
         die(__doc__.strip().splitlines()[0], 2)
@@ -424,6 +445,8 @@ def main(argv):
         return cmd_timer_find(argv[1], argv[2])
     if c == "inbox-marks" and len(argv) == 4:
         return cmd_inbox_marks(argv[1], argv[2], argv[3])
+    if c == "drop-tab" and len(argv) == 2:
+        return cmd_drop_tab(argv[1])
     die("unknown command", 2)
 
 

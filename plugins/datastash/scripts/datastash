@@ -18723,8 +18723,15 @@ def _share_setup_tab(agent, key):
     maker can share it; any other agent's try is refused by datastash and changes nothing."""
     path = os.path.join(STATE, f"setup-shared-{agent['slug']}.json")
     done = set(read_json(path, {}).get("names") or [])
-    new = sorted({a["name"] for a in all_agents() if not is_person(a) and a.get("workbook_id") == agent["workbook_id"]
-                  and a["slug"] != agent["slug"]} - done)
+    names = {a["name"] for a in all_agents() if not is_person(a) and a.get("workbook_id") == agent["workbook_id"]}
+    try:  # every agent of the account (other computers too), so each can write its own row
+        err, body = mcp_tool(key, "ledger_agent_list", {}, timeout=SETUP_ROW_TIMEOUT)
+        if not err:
+            names |= {a["name"] for a in body.get("agents") or [] if isinstance(a, dict) and isinstance(a.get("name"), str)
+                      and not a.get("switched_off_at") and not a.get("switched_off") and a.get("approval") is None}
+    except Exception:  # noqa: BLE001  this computer's agents only, this time
+        pass
+    new = sorted(n for n in names - done if n.casefold() != agent["name"].casefold())
     if not new:
         return
     try:

@@ -224,6 +224,21 @@ class SetupRow(SetupBase):
         self.assertNotEqual(row["last checked"], "old")
         self.assertNotIn("web-app", self.rows)  # updated, not a second row
 
+    def test_the_tab_is_shared_read_write_with_every_agent_of_the_account_once(self):
+        a = self.agent()
+        keep = ds.mcp_tool
+
+        def mcp(key, name, args, timeout=60):
+            if name == "ledger_agent_list":
+                return False, {"agents": [{"name": "web-app"}, {"name": "EPM"}, {"name": "old", "switched_off_at": "x"}]}
+            return keep(key, name, args, timeout)
+        ds.mcp_tool = mcp
+        ds.write_setup_row(a, self.folder)
+        ds.write_setup_row(a, self.folder)
+        shares = [x for n, x in self.mcp if n == "ledger_agent_workbook"]
+        self.assertEqual(len(shares), 1)  # each agent once
+        self.assertEqual((shares[0]["agents"], shares[0]["access"], shares[0]["tab"]), (["EPM"], "write", "Setup"))
+
     def test_session_start_kicks_the_row_in_the_background(self):
         self.agent()
         ds.hook_input = lambda: self.inp()
