@@ -809,11 +809,48 @@ class PersonOnly(Base):
         self.assertEqual(ds.keep_state(), "yes")
         self.assertEqual(self.outcomes(), [])
 
+    def desktop(self, change=None):
+        """XLI-420: the real entry the Claude desktop app's Code tab writes for a typed line (Claude Code 2.1.332 run as
+        the desktop host, entrypoint "claude-desktop", the host's {kind: "human"} stamp; test/fixtures), with `change`
+        applied (None removes a field)."""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "desktop-code-tab-2.1.332.jsonl")) as f:
+            real = [json.loads(x) for x in f if x.strip()][-1]
+
+        def write(sid, text, pid):
+            v = dict(real, promptId=pid, turnPromptId=pid, sessionId=sid, message={"role": "user", "content": text})
+            for k, val in (change or {}).items():
+                if val is None:
+                    v.pop(k, None)
+                else:
+                    v[k] = val
+            self.entry(sid, v)
+        return write
+
+    def test_desktop_code_tab_typed_line_is_the_person(self):
+        """XLI-420: the desktop Code tab's typed line (promptSource "sdk", origin human, entrypoint claude-desktop)."""
+        self.prompt(ds.KEEP_PHRASE, writer=self.desktop())
+        self.assertEqual(ds.keep_state(), "yes")
+        self.assertEqual(self.outcomes(), [])
+
+    def test_desktop_shape_from_an_agent_or_a_tool_is_refused(self):
+        """XLI-420: the same shape without the host's human stamp (a `claude -p` or SDK run, an agent's text), from
+        another entrypoint, as a side chain or meta entry, or with a turn origin other than human, is still refused."""
+        for change in ({"origin": None}, {"origin": {"kind": "task-notification"}}, {"origin": {"kind": "peer", "from": "x"}},
+                       {"entrypoint": "sdk-cli"}, {"entrypoint": "sdk-ts"}, {"entrypoint": None}, {"entrypoint": "cli"},
+                       {"turnOrigin": "sdk"}, {"turnOrigin": None}, {"promptSource": "system"}, {"isSidechain": True},
+                       {"isMeta": True}):
+            self.prompt(ds.KEEP_PHRASE, writer=self.desktop(change))
+            self.assertIsNone(ds.keep_state(), change)
+            self.assertIn(self.outcomes(), ([ds.NOT_PERSON_LINE], []), change)
+
     def test_unit_person_origin(self):
         human = {"type": "user", "origin": {"kind": "human"}}
         self.assertTrue(ds._person_origin(dict(human, promptSource="typed")))
         self.assertTrue(ds._person_origin(dict(human, promptSource="queued")))
+        desk = dict(human, promptSource="sdk", entrypoint="claude-desktop", turnOrigin="human")
+        self.assertTrue(ds._person_origin(desk))  # XLI-420: the desktop Code tab
         for v in ({"type": "user"}, dict(human), dict(human, promptSource="sdk"), {"promptSource": "typed"},
+                  dict(desk, origin=None), dict(desk, entrypoint="sdk-cli"), dict(desk, turnOrigin="sdk"),
                   {"origin": {"kind": "task-notification"}, "promptSource": "typed"}, {"origin": None, "promptSource": "typed"}):
             self.assertFalse(ds._person_origin(v), v)
 

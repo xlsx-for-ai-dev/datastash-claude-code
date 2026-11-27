@@ -1507,6 +1507,26 @@ class RealSlashShape(Base):
             self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny", change)
         self.assertTrue(os.path.exists(ds.key_path("web-app")))
 
+    def test_the_desktop_code_tab_entry_passes(self):
+        """XLI-420: the real entry the Claude desktop app's Code tab writes for a typed /datastash:install (Claude Code
+        2.1.332 as the desktop host: entrypoint "claude-desktop", the host's human stamp, no promptSource) passes."""
+        with open(os.path.join(FIXTURES, "desktop-code-tab-2.1.332.jsonl")) as f:
+            own = [json.loads(x) for x in f if x.strip()][0]
+        self.assertEqual((own["origin"], own["entrypoint"], own["turnOrigin"], "promptSource" in own, own["isSidechain"]),
+                         ({"kind": "human"}, "claude-desktop", "human", False, False))
+        self.assertTrue(ds._command_origin(own))
+        keep = {k: own[k] for k in ("entrypoint", "turnOrigin", "version", "userType")}
+        got = self.note_after(**keep)["hookSpecificOutput"]
+        self.assertEqual(got["updatedInput"]["targets"], sorted([OWN, ALPHA, BETA]))
+
+    def test_the_desktop_entrypoint_without_the_person_stamp_is_refused(self):
+        """XLI-420: a desktop-entrypoint entry an agent or tool could make (no human origin, a side chain, meta, another
+        turn origin, a promptSource) is still refused."""
+        for change in ({"origin": None}, {"origin": {"kind": "task-notification"}}, {"turnOrigin": "sdk"},
+                       {"promptSource": "sdk"}, {"isMeta": True}, {"isSidechain": True}):
+            out = self.note_after(**dict({"entrypoint": "claude-desktop", "turnOrigin": "human"}, **change))
+            self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny", change)
+
     def test_the_older_tag_order_and_a_name_that_differs_are_refused(self):
         for content in ("<command-name>/datastash:uninstall</command-name>\n<command-message>datastash:uninstall"
                         "</command-message>\n<command-args>alpha beta web-app</command-args>",

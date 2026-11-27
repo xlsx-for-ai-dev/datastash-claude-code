@@ -10178,12 +10178,27 @@ def _typed_text(v):
     return None
 
 
+# XLI-420: the Claude desktop app's Code tab runs Claude Code as a host (entrypoint "claude-desktop", stream-json in), so
+# a line the person types there is written with promptSource "sdk"; the host stamps the keyboard line origin.kind
+# "human" (Claude Code's own contract: a host wrapping keyboard input must stamp {kind:'human'}; an absent origin fails
+# closed), and Claude Code then writes turnOrigin "human". A plain `claude -p` or SDK run has no origin at all.
+DESKTOP_HOSTS = ("claude-desktop",)
+
+
+def _desktop_typed(v):
+    """The desktop Code tab's typed line: entrypoint "claude-desktop", promptSource "sdk", turnOrigin "human" (the
+    caller has checked origin.kind "human")."""
+    return v.get("entrypoint") in DESKTOP_HOSTS and v.get("promptSource") == "sdk" and v.get("turnOrigin") == "human"
+
+
 def _person_origin(v):
     """Addendum 6 N1: True only when Claude Code marked the entry as the person's own: origin.kind "human" and
-    promptSource "typed" or "queued". A headless `claude -p` prompt ("sdk"), a task notification or a peer message
-    ("system"), or an entry without these fields (an older Claude Code) is refused: fail closed."""
+    promptSource "typed" or "queued", or (XLI-420) the desktop Code tab's typed line. A headless `claude -p` prompt
+    ("sdk" with no origin), a task notification or a peer message ("system"), or an entry without these fields (an
+    older Claude Code) is refused: fail closed."""
     o = v.get("origin")
-    return isinstance(o, dict) and o.get("kind") == "human" and v.get("promptSource") in ("typed", "queued")
+    return isinstance(o, dict) and o.get("kind") == "human" and (v.get("promptSource") in ("typed", "queued")
+                                                                  or _desktop_typed(v))
 
 
 NOT_PERSON_LINE = ("Not done: Claude Code did not mark that prompt as typed by you (a headless run or an older Claude "
@@ -15734,9 +15749,11 @@ def tool_answer(resp):
 def _command_origin(v):
     """A plugin slash command's entry as Claude Code writes it when the person types it in an interactive session:
     origin.kind "human", no promptSource (Claude Code marks typed text "typed" and these not at all), entrypoint "cli"
-    (never sdk-cli or any other headless run), not meta, not a side chain. Anything else fails closed."""
+    or (XLI-420) the desktop Code tab's "claude-desktop" (never sdk-cli or any other headless run), not meta, not a side
+    chain. Anything else fails closed."""
     o = v.get("origin")
-    return (isinstance(o, dict) and o.get("kind") == "human" and "promptSource" not in v and v.get("entrypoint") == "cli"
+    return (isinstance(o, dict) and o.get("kind") == "human" and "promptSource" not in v
+            and v.get("entrypoint") in ("cli",) + DESKTOP_HOSTS
             and v.get("turnOrigin", "human") == "human" and not v.get("isMeta") and v.get("isSidechain") is False)
 
 
