@@ -18,7 +18,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import harness  # noqa: E402,F401
-from test_status import Base, ds, KEY, GRANT  # noqa: E402
+from test_status import Base, ds, KEY, GRANT, WB  # noqa: E402
 
 WB2 = "bbbbbbbb-0000-4000-8000-00000000000b"
 I_P = "cccccccc-0000-4000-8000-000000000001"
@@ -103,6 +103,53 @@ class AnswerFromList(AsksBase):
 
 
 class WelcomeBack(AsksBase):
+    def setUp(self):
+        super().setUp()
+        self.env.setdefault("CLAUDE_CODE_ENTRYPOINT", os.environ.get("CLAUDE_CODE_ENTRYPOINT"))
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a person at an interactive Claude Code session
+
+    def gap(self, sid="sess1"):
+        old = time.time() - ds.WELCOME_GAP - 5
+        os.utime(ds._turn_path(sid), (old, old))
+
+    def assert_no_welcome_after_a_gap(self):
+        """1.0.22 review M1: the first prompt after a gap makes no datastash call, shows no list, saves no numbers, and
+        a typed "3: yes" sends nothing."""
+        self.prompt("hello")
+        self.gap()
+        n_calls = len(self.calls)
+        self.prompt("back again")
+        self.assertEqual(self.reads, 0)
+        self.assertEqual(self.calls[n_calls:], [])
+        self.assertNotIn(ds.WELCOME_HEAD, (self.last_hook or {}).get("systemMessage") or "")
+        self.assertNotIn("welcome-back", ((self.last_hook or {}).get("hookSpecificOutput") or {})
+                         .get("additionalContext") or "")
+        self.assertNotIn("3", (ds.read_view("sess1") or {}).get("numbers") or {})
+        self.prompt("3: yes")
+        self.assertEqual(self.sent(), [])
+
+    def test_no_welcome_in_a_folder_left_off(self):
+        ds.record_left_off([self.folder], "web-app")
+        self.assert_no_welcome_after_a_gap()
+
+    def test_no_welcome_in_a_private_folder(self):
+        aid = "11111111-aaaa-bbbb-cccc-000000000001"
+        ds.write_private(ds.conf_path("web-app"), json.dumps({"name": "web-app", "agent_id": aid, "workbook_id": WB,
+                                                              "projects": [self.folder]}))
+        self.assertTrue(ds.note_private({"agent_id": aid, "private": True}, aid))
+        self.assertTrue(ds.private_here({"cwd": self.folder}))
+        self.assert_no_welcome_after_a_gap()
+
+    def test_no_welcome_in_a_folder_with_no_agent(self):
+        self.folder = os.path.realpath(harness.tmpdir(self, prefix="noagent-", dir=os.path.dirname(self.folder)))
+        os.environ["CLAUDE_PROJECT_DIR"] = self.folder
+        self.assertEqual(ds.resolve(self.folder)[0], None)
+        self.assert_no_welcome_after_a_gap()
+
+    def test_no_welcome_in_a_headless_run(self):
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "sdk-cli"  # claude -p
+        self.assert_no_welcome_after_a_gap()
+
     def test_the_list_is_blocking_first_and_short(self):
         t = ds.welcome_text(self.asks)
         lines = t.split("\n")

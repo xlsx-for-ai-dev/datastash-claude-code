@@ -6385,7 +6385,7 @@ def cmd_prompt(_args):
                                                      "suppressOriginalPrompt": True}}))
             return 0
         person, ai = _safe_followup(inp, isinstance(prompt, str) and "datastash" in prompt.lower())
-        if back and ctx is None:  # XLI-415: the first prompt after a long gap opens with the open asks
+        if back and ctx is None and welcome_here(inp):  # XLI-415: the first prompt after a long gap opens with the asks
             try:
                 w_person, w_ai = welcome_asks(sid)
             except Exception:  # noqa: BLE001  never in the person's way
@@ -14009,6 +14009,23 @@ def welcome_asks(sid):
         return None, None
     save_asks_view(sid, asks)
     return _plain_typed(text), WELCOME_AI.format(text=text)
+
+
+def welcome_here(inp):
+    """1.0.22 review M1: the prompt-side welcome-back runs only where the session-start one does: never in a folder the
+    person left off (XLI-328: no datastash calls from here), never in a private folder, never in a headless run
+    (`claude -p`, SDK), and only for a linked agent (not the person) that has its key. File checks only: no network."""
+    try:
+        if not interactive_run() or off_here(inp) or private_here(inp):
+            return False
+        me = this_session(inp)
+        project = project_of(inp)
+        agent, _warn = resolve(project, me=me)
+        if agent is None and _fallback_allowed(project, me):
+            agent = only_agent()  # XLI-374: the one agent with no folder of its own, as at session start
+        return agent is not None and not is_person(agent) and read_key(agent["slug"]) is not None
+    except Exception:  # noqa: BLE001  can't tell: no welcome (less is always safe)
+        return False
 
 
 def welcome_due(sid):
