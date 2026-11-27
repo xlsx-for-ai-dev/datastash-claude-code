@@ -43,6 +43,12 @@ Subcommands (run `datastash help`); `datastash --agent NAME COMMAND ...` runs an
                             [--answer TEXT]`, `repeat show N|QUESTION`, `repeat answer N TEXT` (the shared answer),
                             `repeat part N TEXT` (this agent's own part, kept current by it), `repeat remove N`.
                             repeat and repeats are the same word; small typos work. The answer is printed as for api
+  estimate [CARD ...] [--like CARD,CARD] [--local]
+                            XLI-426: one best estimate per card from your own finished cards (time per card, and from
+                            day one the sessions already on this computer; newer cards weigh more), with how many cards
+                            it rests on; several cards (a build list): a total and a done-around time; no card: the cards
+                            in progress. Kept in the Estimates tab with the actual once worked; a card an agent starts
+                            gets one by itself. --local: this computer only, nothing sent
   lookups [steps SERVICE]   today's repeated outside lookups on this computer (shapes and counts only) and what
                             datastash keeps; steps github|linear|jira: that feed's setup steps, after the person's
                             "do N" on the status offer
@@ -6473,6 +6479,7 @@ def cmd_prompt(_args):
     if not is_main_phrase(prompt):
         try:
             ctx = (who_prompt_context(inp)  # 1.0.21 (card 8e): "who are you", from the Setup tab, shown by the plugin
+                   or estimate_prompt_context(inp)  # XLI-426: the tracker yes/no, and "how long" from datastash estimate
                    or clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
                    or timers_prompt_context(inp)  # 1.0.18: "turn off timers" / "turn on timers"
                    or self_update_prompt_context(inp) or onboard_prompt_context(inp) or status_prompt_context(inp))
@@ -18243,7 +18250,7 @@ def tpc_files(transcript, sid):
                 continue
             meta = read_json(p[:-len(".jsonl")] + ".meta.json", {})
             about = f"{meta.get('description') or ''} {meta.get('agentType') or ''}"
-            out.append((os.path.realpath(p), tpc_card(str(meta.get("description") or "")), bool(re.search(r"review", about, re.I))))
+            out.append((os.path.realpath(p), est_subagent_card(p, meta), bool(re.search(r"review", about, re.I))))
     return out
 
 
@@ -18440,6 +18447,7 @@ def tpc_run(sid, transcript, ended, key, wb, now=None):
             save()
             _tpc_send(client, pend, save)
             sent = {"burn": len(burn), "cards": len(cards)}
+            est_after_send(client, cards, now)  # XLI-426: a card's estimate the first time, its actual after
         state.pop("pending", None)
         state["files"], state["main_card"], state["carry"] = new_files, main_card, carry
         save()
@@ -18927,6 +18935,435 @@ def _step_bg(args):
     return 0
 
 
+# --- XLI-426: experience-based time estimates ("Uses your data. Good from day one, better every week.").
+# One best estimate per card, from the account's OWN finished cards: their minutes on the Time per card tab (the engine's
+# totals) and, from day one, the look-back: the Claude Code sessions already on this computer, read here with the same
+# active-minutes rules as time per card (TpcReader; only numbers leave the reader, nothing is sent by the look-back).
+# A card's time is its working time, sessions and subagents side by side counted once. Every finished card counts;
+# newer ones weigh more (half the weight every EST_HALF_LIFE_DAYS). The estimate is the weighted mean, with how many
+# cards it rests on; it never refuses (no history yet: EST_DEFAULT_MINUTES, on 0 cards) and never shows the method.
+# First run (owner 11-27, every user, new installs and updates alike): the 1.0.25 what's-new tells each agent, once, to
+# run the look-back and estimate every card of every build list it can find, with each list's total.
+# Which cards get one (owner 11-27): every card of a build list (`datastash estimate XLI-1 XLI-2 ...`, with a total and a
+# done-around time), the cards in progress (worked on in the last EST_ACTIVE_HOURS), and any card the moment an agent
+# starts it (time per card's background send writes it for a card it sees for the first time). Nothing else.
+# The Estimates tab (x-live burn preset) keeps estimate_minutes, rests_on and estimated_at, written once; each later send
+# refreshes actual_minutes from the card's Time per card minutes, so diff_minutes and off_share (engine formulas) are live.
+# The person's tracker (owner 11-27): after the person's typed yes to "Put estimates on your cards? (yes/no)" (asked
+# once, saved for this computer's login), the estimate answer tells the agent to keep ONE comment titled "DDS
+# Development Time Estimate" on the card, edited in place, with its own tracker login (and Jira's original estimate).
+EST_USAGE = ("usage: datastash estimate [CARD ...] [--like CARD,CARD] [--local]   (one best estimate per card from your own "
+             "finished cards; several cards: a total and a done-around time; no card: the cards in progress)")
+EST_TAB = "Estimates"
+EST_HALF_LIFE_DAYS = 14.0
+EST_DEFAULT_MINUTES = 120
+EST_MIN_CARD_MINUTES = 30  # a card with less work than this was only touched (a look, a mention), not built
+EST_ACTIVE_HOURS = 24
+EST_LOOKBACK_PATH = os.path.join(STATE, "estimate-lookback.json")
+EST_TRACKER_PATH = os.path.join(CONF, "estimates-tracker.json")
+EST_TRACKER_ASK = "Put estimates on your cards? (yes/no)"
+EST_COMMENT_TITLE = "DDS Development Time Estimate"
+EST_ID_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2,10})-(\d{1,7})(?![0-9])")
+EST_NOT_PREFIX = {"WT", "PLUGIN", "CARD", "PR", "MODE", "REVIEW", "RELEASE", "INSTALL", "DEPLOY", "ROUND", "STEP", "UTF",
+                  "SHA", "ISO", "RFC", "CVE", "HTTP", "TLS", "AES", "GPT", "LLM", "API", "MCP"}
+EST_HOW_LONG_RE = re.compile(r"\b(how long|how much (more |longer |time)|eta\b|time estimate|estimate[sd]?\b|when will .{0,60}"
+                             r"\bdone|done by when|how many hours)", re.I)
+
+
+def est_prompt_card(path):
+    """The card a subagent was started for, from its first prompt read here in memory: the id written most often in
+    capitals (XLI-417), never a word like wt-1023 or card-417. None when there is none."""
+    try:
+        with open(path, "rb") as f:
+            for _ in range(20):
+                line = f.readline()
+                if not line:
+                    return None
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(e, dict) or e.get("type") != "user":
+                    continue
+                c = (e.get("message") or {}).get("content") if isinstance(e.get("message"), dict) else None
+                text = c if isinstance(c, str) else " ".join(str(x.get("text") or "") for x in c if isinstance(x, dict)) \
+                    if isinstance(c, list) else ""
+                counts = {}
+                for m in EST_ID_RE.finditer(text[:200000]):
+                    if m.group(1) in EST_NOT_PREFIX or m.group(1).lower() in TPC_NOT_CARD:
+                        continue
+                    cid = f"{m.group(1)}-{int(m.group(2))}"
+                    counts[cid] = counts.get(cid, 0) + 1
+                return max(sorted(counts), key=lambda k: counts[k]) if counts else None
+    except OSError:
+        return None
+    return None
+
+
+def est_subagent_card(path, meta):
+    """A subagent's card: its description's id, else its first prompt's (XLI-426 C: most builders and reviewers are
+    started with the card in their first line, not in the description)."""
+    return tpc_card(str(meta.get("description") or "")) or est_prompt_card(path)
+
+
+def _est_transcripts():
+    """[(path, card hint, review)] for every Claude Code session on this computer: each main transcript and each of its
+    subagents' files, only regular files of this user inside Claude Code's own projects folder."""
+    root = _tpc_projects_root()
+    out = []
+    try:
+        projects = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for proj in projects:
+        d = os.path.join(root, proj)
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for n in names:
+            if n.endswith(".jsonl"):
+                for item in tpc_files(os.path.join(d, n), n[:-len(".jsonl")]):
+                    out.append(item)
+    return out
+
+
+def _est_busy(path, hint):
+    """{card: [[start, end], ...]} for one transcript: the spans between its entries no more than TPC_PAUSE_SECONDS apart
+    (work, not a pause), merged. Only times leave this; the entries are read here in memory."""
+    spans, prev = {}, None
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(e, dict):
+                    continue
+                ts = _week_ts(e.get("timestamp"))
+                if ts is None:
+                    continue
+                if prev is not None and 0 <= ts - prev <= TPC_PAUSE_SECONDS:
+                    card = hint or tpc_card(os.environ.get("DATASTASH_CARD", "")) or tpc_card(e.get("gitBranch")) or "no card"
+                    spans.setdefault(card, []).append([prev, ts])
+                prev = ts if prev is None else max(prev, ts)
+    except OSError:
+        return {}
+    return {c: _est_union(v) for c, v in spans.items()}
+
+
+def _est_union(spans):
+    out = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return out
+
+
+def est_lookback(save=True):
+    """{card: {"minutes", "last"}} from every session on this computer: each card's working time, its sessions and
+    subagents running side by side counted once (a person waits that long). Each file is read once and its spans kept
+    (by size and time) in this computer's private state, so the next look-back reads only new or changed files."""
+    cache = read_json(EST_LOOKBACK_PATH, {})
+    files = cache.get("files") if isinstance(cache.get("files"), dict) else {}
+    seen, changed = {}, False
+    for path, hint, _review in _est_transcripts():
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        sig = f"{st.st_size}:{int(st.st_mtime)}"
+        got = files.get(path)
+        if not isinstance(got, dict) or got.get("sig") != sig or got.get("hint") != hint or "spans" not in got:
+            got = {"sig": sig, "hint": hint, "spans": _est_busy(path, hint)}
+            changed = True
+        seen[path] = got
+    if save and (changed or len(seen) != len(files)):
+        try:
+            ensure_dirs()
+            write_private(EST_LOOKBACK_PATH, json.dumps({"files": seen}))
+        except OSError:
+            pass
+    return _est_spans_history(seen)
+
+
+def _est_spans_history(files):
+    per = {}
+    for got in files.values():
+        for card, sp in ((got or {}).get("spans") or {}).items() if isinstance(got, dict) else []:
+            per.setdefault(card, []).extend(x for x in sp if isinstance(x, list) and len(x) == 2)
+    out = {}
+    for card, sp in per.items():
+        u = _est_union(sp)
+        out[card] = {"minutes": sum(b - a for a, b in u) / 60.0, "last": u[-1][1] if u else None}
+    return out
+
+
+def _est_num(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def est_account_history(client):
+    """{card: {"minutes", "last"}} from the workbook's Time per card tab (the engine's minutes per card), or {}."""
+    out = {}
+    for r in client.filter(_tpc_cards(client), {"ne": ["card", ""]}):
+        c = r.get("card") if isinstance(r.get("card"), str) else None
+        m = _est_num(r.get("minutes"))
+        if not c or m is None:
+            continue
+        out[c] = {"minutes": m, "last": _week_ts(r.get("last_seen")) if isinstance(r.get("last_seen"), str) else None}
+    return out
+
+
+def est_merge(*histories):
+    """One history: per card the first history that has it (the look-back's working time first; the workbook's minutes
+    for a card worked on elsewhere). The same work is never added twice."""
+    out = {}
+    for hist in histories:
+        for c, p in (hist or {}).items():
+            out.setdefault(c, {"minutes": float(p.get("minutes") or 0), "last": p.get("last")})
+    return out
+
+
+def est_estimate(history, card, like=None, now=None):
+    """(minutes, rests_on): the recency-weighted mean of the finished cards' working time (every card but this one and
+    "no card"; newer ones weigh more), over the named similar cards when any of them has history. Never refuses."""
+    now = time.time() if now is None else now
+    pool = [(c, p) for c, p in history.items() if c != card and c != "no card" and (p.get("minutes") or 0) >= EST_MIN_CARD_MINUTES]
+    if like:
+        named = [(c, p) for c, p in pool if c in set(like)]
+        pool = named or pool
+    if not pool:
+        return EST_DEFAULT_MINUTES, 0
+    num = den = 0.0
+    for _c, p in pool:
+        age = max(0.0, (now - p["last"]) / 86400.0) if p.get("last") is not None else 30.0
+        w = 0.5 ** (age / EST_HALF_LIFE_DAYS)
+        num, den = num + w * float(p["minutes"]), den + w
+    return int(round(num / den)) if den > 0 else int(round(sum(float(p["minutes"]) for _c, p in pool) / len(pool))), len(pool)
+
+
+def est_hours(minutes):
+    h = minutes / 60.0
+    return f"{h:.1f} h" if h >= 1 else f"{int(round(minutes))} min"
+
+
+def est_line(card, minutes, rests_on, done=None):
+    line = f"{card}: about {est_hours(minutes)} (from {rests_on} of your cards)" if rests_on else \
+        f"{card}: about {est_hours(minutes)} (no finished cards of yours yet; better after the first)"
+    if done is not None and done > 0:
+        line += f"; {est_hours(done)} done so far"
+    return line
+
+
+def est_in_progress(history, now=None):
+    """The cards worked on in the last EST_ACTIVE_HOURS, newest first."""
+    now = time.time() if now is None else now
+    act = [(p["last"], c) for c, p in history.items() if c != "no card" and p.get("last") is not None
+           and now - p["last"] <= EST_ACTIVE_HOURS * 3600]
+    return [c for _t, c in sorted(act, reverse=True)]
+
+
+def _est_tracker():
+    s = read_json(EST_TRACKER_PATH, {})
+    return s if isinstance(s, dict) else {}
+
+
+def est_tracker_choice():
+    """"yes", "no", or None (not asked yet, or asked and not answered)."""
+    v = _est_tracker().get("answer")
+    return v if v in ("yes", "no") else None
+
+
+def est_tracker_lines(rows):
+    """What the agent is told about the person's own tracker for these (card, minutes, rests_on, actual) rows."""
+    choice = est_tracker_choice()
+    if choice == "no":
+        return []
+    if choice is None:
+        try:
+            ensure_dirs()
+            write_private(EST_TRACKER_PATH, json.dumps({**_est_tracker(), "asked_at": int(time.time())}))
+        except OSError:
+            pass
+        return [f'Ask the person once, in these words: "{EST_TRACKER_ASK}" (their typed answer is saved by datastash; '
+                'never answer it for them).']
+    out = [f'On each card\'s own tracker card, with your own tracker login (Linear, GitHub or Jira), keep ONE comment titled '
+           f'"{EST_COMMENT_TITLE}", edited in place (never a second one): the estimate and how many cards it rests on; '
+           'once the card is done, the same comment also gets the actual time and the difference. In Jira also set the '
+           "card's original estimate; Linear's estimate is points: leave it. Body per card:"]
+    for card, minutes, rests_on, actual in rows:
+        body = f"{EST_COMMENT_TITLE}\nEstimate: {est_hours(minutes)} (from {rests_on} of your cards)"
+        if actual:
+            body += f"\nActual: {est_hours(actual)}\nDifference: {'+' if actual >= minutes else '-'}{est_hours(abs(actual - minutes))}"
+        out.append(f"{card}: {json.dumps(body)}")
+    return out
+
+
+EST_TYPED_RE = re.compile(r"\s*(?:dds|datastash)\s+estimates?\s+((?:#?[A-Za-z]{2,10}-\d{1,7}[\s,]*)+)[.?!]*\s*", re.I)
+EST_LIST_RE = re.compile(r"\b(build list|card list|list of cards|(list|show|plan) (the |my |our )?(next |open |remaining )?cards"
+                         r"|cards (left|to build|next)|what'?s (next|left)|what is (next|left)|work plan|build plan|roadmap)", re.I)
+EST_HOW_LONG_RULE = ("answer how long from `datastash estimate <card ids>` (one best estimate from this account's own "
+                     "finished cards; several cards give a total and a done-around time; no card: the cards in progress). "
+                     "Say its lines as they are; never give your own guess.")
+EST_LIST_RULE = ("whenever you write or show a build list, first run `datastash estimate <every card id on the list>`; show "
+                 "each card's estimate inline on its line, and end the list with its total line and done-around time, as "
+                 "printed. Then follow its tracker lines, if any (each card's \"" + EST_COMMENT_TITLE + "\" comment).")
+EST_YES_RE = re.compile(r"\s*(yes|y|yeah|yep|sure|ok|okay)[\s.!]*", re.I)
+EST_NO_RE = re.compile(r"\s*(no|n|nope|no thanks)[\s.!]*", re.I)
+
+
+def estimate_prompt_context(inp):
+    """UserPromptSubmit: the person's typed yes/no to the one tracker question (only while it is asked and unanswered;
+    the person's own prompt, never a tool call), else the how-long rule for a prompt that asks how long. Or None."""
+    prompt = inp.get("prompt") if isinstance(inp, dict) else None
+    if not isinstance(prompt, str) or _own_agent(inp) is None:
+        return None
+    s = _est_tracker()
+    if s.get("asked_at") and est_tracker_choice() is None:
+        yes, no = EST_YES_RE.fullmatch(prompt), EST_NO_RE.fullmatch(prompt)
+        if yes or no:
+            try:
+                write_private(EST_TRACKER_PATH, json.dumps({**s, "answer": "yes" if yes else "no", "at": int(time.time())}))
+            except OSError:
+                return None
+            return ("datastash estimates: the person answered " + ("yes: from now on keep the \"" + EST_COMMENT_TITLE +
+                    "\" comment on their cards, as `datastash estimate` says." if yes else "no: never put estimates on their cards."))
+    typed = EST_TYPED_RE.fullmatch(prompt)
+    if typed:  # owner 11-27: "DDS estimate XLI-12" (or datastash estimate) for ANY card, backlog and new ones too
+        ids = [tpc_card(x) for x in re.split(r"[,\s]+", typed.group(1)) if tpc_card(x)]
+        return ("datastash estimates: the person typed an estimate ask. Run `datastash estimate " + " ".join(ids) +
+                "` now and give its lines exactly as printed (one best estimate per card, made fresh when there is none; "
+                "never refuse, never explain how). Then follow its tracker lines, if any: asking about a card picks it, "
+                'so its "' + EST_COMMENT_TITLE + '" comment is written or updated too.')
+    if EST_LIST_RE.search(prompt[:2000]):  # owner 11-27: a build list always carries its estimates
+        return ("datastash estimates: " + EST_LIST_RULE + (" " + EST_HOW_LONG_RULE if EST_HOW_LONG_RE.search(prompt[:2000]) else ""))
+    if EST_HOW_LONG_RE.search(prompt[:2000]):
+        return "datastash estimates: " + EST_HOW_LONG_RULE
+    return None
+
+
+def _est_rows_get(client, keys):
+    body = client.tool("ledger_rows_get", {"workbook_id": client.wb, "tab": EST_TAB, "keys": keys}, "reading Estimates",
+                       missing_ok=True)
+    return {r.get("card"): r for r in (body or {}).get("rows") or [] if isinstance(r, dict) and r.get("card")}
+
+
+def _est_write(client, rows, tag):
+    """Upsert Estimates rows; an older workbook without the tab gets it from the burn preset once, then the write again."""
+    args = {"workbook_id": client.wb, "tab": EST_TAB, "rows": rows, "key": "card", "idempotency_key": tag}
+    if client.tool("ledger_rows_upsert", args, "writing Estimates", soft=True) is not None:
+        return True
+    client.tool("ledger_feeds_setup", {"workbook_id": client.wb, "services": ["burn"]}, "setting up Estimates", soft=True)
+    return client.tool("ledger_rows_upsert", args, "writing Estimates", soft=True) is not None
+
+
+def est_record(client, history, cards, like=None, now=None):
+    """For each card: its estimate (the stored one when there is one, else a new one, written once) and its actual so
+    far, refreshed on the row. Returns [(card, minutes, rests_on, actual)]."""
+    now = time.time() if now is None else now
+    have = _est_rows_get(client, cards) if cards else {}
+    out, write = [], []
+    for c in cards:
+        row = have.get(c) or {}
+        actual = (history.get(c) or {}).get("minutes") or 0
+        m, n = _est_num(row.get("estimate_minutes")), _est_num(row.get("rests_on"))
+        if m is None:
+            m, n = est_estimate(history, c, like, now)
+            write.append({"card": c, "estimate_minutes": int(m), "rests_on": int(n), "estimated_at": _tpc_iso(now),
+                          **({"actual_minutes": int(round(actual))} if actual else {})})
+        elif actual and int(round(actual)) != _est_num(row.get("actual_minutes")):
+            write.append({"card": c, "actual_minutes": int(round(actual))})
+        out.append((c, int(m), int(n or 0), actual))
+    if write:
+        _est_write(client, write, "est-" + _tpc_hash(json.dumps(write, sort_keys=True)))
+    return out
+
+
+def est_after_send(client, cards, now=None):
+    """Time per card's background send: a card it sent gets its estimate the first time (an agent started it) and its
+    actual refreshed after. Never fails the send."""
+    ids = sorted({c.get("card") for c in cards if isinstance(c, dict) and isinstance(c.get("card"), str)} - {"no card"})
+    if not ids:
+        return
+    try:
+        hist = est_merge(_est_cached_lookback(), est_account_history(client))
+        est_record(client, hist, ids, now=now)
+    except Exception as e:  # noqa: BLE001  the rows are sent; an estimate is made again at the next send
+        log("status", f"estimate after send: {type(e).__name__}")
+
+
+def _est_cached_lookback():
+    """The look-back as last saved (the send never reads every session itself; `datastash estimate` refreshes it)."""
+    cache = read_json(EST_LOOKBACK_PATH, {})
+    return _est_spans_history(cache.get("files") if isinstance(cache.get("files"), dict) else {})
+
+
+def cmd_estimate(args):
+    """`datastash estimate [CARD ...] [--like CARD,CARD] [--local]`: one best estimate per card (a build list: also a
+    total and a done-around time; no card: the cards in progress), from the account's own finished cards and this
+    computer's sessions. Written to the Estimates tab (once; the actual is kept current). --local: this computer only,
+    nothing sent."""
+    cards, like, local = [], [], False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(EST_USAGE)
+            return 0
+        if a == "--local":
+            local = True
+        elif a == "--like" and i + 1 < len(args):
+            like += [tpc_card(x) for x in re.split(r"[,\s]+", args[i + 1]) if tpc_card(x)]
+            i += 1
+        elif tpc_card(a):
+            cards.append(tpc_card(a))
+        else:
+            die(EST_USAGE)
+        i += 1
+    cards = list(dict.fromkeys(cards))
+    now = time.time()
+    hist = est_lookback()
+    client = None
+    if not local:
+        agent = _own_agent({})
+        key = read_key(agent["slug"]) if agent else None
+        if agent and key:
+            client = CiClient(key, agent["workbook_id"], now + TPC_WAIT_SECONDS)
+            client.cards_tab = _tpc_card_tab(agent["workbook_id"])
+            try:
+                hist = est_merge(hist, est_account_history(client))
+            except CiProblem as e:
+                log(agent["slug"], f"estimate: {e}")
+                client = None
+    if not cards:
+        cards = est_in_progress(hist, now)
+        if not cards:
+            print("datastash estimate: no card in progress; name the cards: datastash estimate XLI-1 XLI-2")
+            return 0
+    if client is not None:
+        try:
+            rows = est_record(client, hist, cards, like, now)
+        except CiProblem:
+            rows = None
+    else:
+        rows = None
+    if rows is None:
+        rows = [(c, *est_estimate(hist, c, like, now), (hist.get(c) or {}).get("minutes") or 0) for c in cards]
+    for c, m, n, actual in rows:
+        print(est_line(c, m, n, actual))
+    if len(rows) > 1:
+        left = sum(max(0.0, m - (actual or 0)) for _c, m, _n, actual in rows)
+        done_at = time.strftime("%a %H:%M", time.localtime(now + left * 60))
+        print(f"All {len(rows)} cards: about {est_hours(sum(m for _c, m, _n, _a in rows))}; done around {done_at}")
+    for line in est_tracker_lines(rows) if client is not None else []:
+        print(line)
+    return 0
+
+
 def cmd_heartbeat(args):
     """`datastash heartbeat [STEP [--tab TAB] [--column COLUMN] | off]`: this folder's step heartbeat."""
     if args and args[0] == "run":
@@ -19066,7 +19503,9 @@ FULL_DDS = (
         ("C21", "Never put secrets, keys, or customer or personal data in any tab or message.", None, "", ""),
         ("C22", "When the person asks a question on the account's repeats list (**datastash repeats**), answer at once from "
          "its stored answer and the agents' parts; keep your own part current (**datastash repeat part N TEXT**).", None,
-         "", ""))),
+         "", ""),
+        ("C23", "Answer every how long from **datastash estimate <cards>**, never a guess; every build list shows each card's "
+         "estimate and ends with the total and a done-around time.", None, "", ""))),
     ("D. Per-role extras", (
         ("D1", "PM agents keep the Asks and Function descriptions tabs current and give the morning update.", None, "",
          ""),
@@ -19075,6 +19514,16 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.25": (
+        "**datastash estimate <cards>** (or the person's typed **DDS estimate <card>**) gives one best estimate per card "
+        "from your own finished cards; a build list also gets a total and a done-around time.",
+        "A card an agent starts gets its estimate by itself; the Estimates tab keeps the actual and the difference.",
+        "Once, now: run **datastash estimate** (it reads this computer's past sessions first), then find ALL of the "
+        "person's build lists (their tracker's cycles, milestones and projects, with your own tracker login, and the "
+        "numbered build lists you or they wrote) and run **datastash estimate <every card id on the list>** for each list; "
+        "show each list with its cards' estimates and its total, and follow its tracker lines.",
+        "Start each subagent with its card id in the first line of its prompt, so its time counts toward that card.",
+    ),
     "1.0.24": (
         "**datastash repeat add <question>** keeps a question the person asks over and over, on ONE list for every agent "
         "of the account; **datastash repeats** lists them, **datastash repeat remove N** removes one.",
@@ -20065,7 +20514,8 @@ def main():
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
              "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share,
-             "remember": cmd_remember, "skills-sync": cmd_skills_sync, "repeat": cmd_repeat, "repeats": cmd_repeat}
+             "remember": cmd_remember, "skills-sync": cmd_skills_sync, "repeat": cmd_repeat, "repeats": cmd_repeat,
+             "estimate": cmd_estimate, "estimates": cmd_estimate}
     if cmd not in table and repeat_word(cmd) is not None:  # XLI-413: repeat / repeats / a small typo of either
         cmd = "repeat"
     if cmd not in table:
