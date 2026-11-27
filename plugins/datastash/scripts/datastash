@@ -18970,7 +18970,7 @@ EST_ACTIVE_HOURS = 24.0  # a card worked on this recently is in progress
 EST_DEFAULT_MINUTES = 120  # no finished card yet: one best guess, on 0 cards
 EST_MIN_SAME = 3  # a shape rests on its own cards once the account has this many
 EST_OWN_WEIGHT = 3.0  # a card's own earlier stages weigh this much more than other cards' 
-EST_CACHE_VERSION = 2  # 2: each file keeps the parts its edits touched
+EST_CACHE_VERSION = 3  # 2: each file keeps the parts its edits touched; 3: every cwd, nothing kept from left-off folders
 EST_PARTS = ("server", "plugin", "both")
 EST_LOOKBACK_PATH = os.path.join(STATE, "estimates-lookback.json")
 EST_DONE_PATH = os.path.join(STATE, "estimates-done.json")  # cards an agent marked done here: {card: time}
@@ -19066,7 +19066,8 @@ def _est_parts_label(parts):
 
 def _est_file(path, hint, sub):
     """One transcript, read here in memory: {"cwds": [...], "parts": [...], "cards": {card: [minutes, first, last]}}.
-    parts: which parts its edits touched (from the edited files' paths; no path or text is kept)."""
+    parts: which parts its edits touched (from the edited files' paths; no path or text is kept). Reading stops at the
+    first folder that is left off or has time per card off: then nothing of it is kept ("off": True)."""
     rd = _EstReader({}, hint, est_prompt_card(path) if sub and not hint else None)
     cwds, parts = [], set()
     try:
@@ -19081,8 +19082,10 @@ def _est_file(path, hint, sub):
                 if not isinstance(e, dict):
                     continue
                 cwd = e.get("cwd")
-                if isinstance(cwd, str) and cwd and cwd not in cwds and len(cwds) < 20:
+                if isinstance(cwd, str) and cwd and cwd not in cwds:
                     cwds.append(cwd)
+                    if not _est_folder_on([cwd]):
+                        return {"cwds": cwds, "parts": [], "cards": {}, "off": True}
                 if len(parts) < 2 and e.get("type") == "assistant" and isinstance(e.get("message"), dict):
                     for x in e["message"].get("content") or [] if isinstance(e["message"].get("content"), list) else []:
                         if isinstance(x, dict) and x.get("type") == "tool_use" and x.get("name") in TPC_EDIT_TOOLS:
@@ -19139,7 +19142,8 @@ def _est_folder_on(cwds):
 def est_lookback(save=True):
     """{path: {"sig", "sub", "main", "cwds", "cards"}} for every session file on this computer, each file read once and
     kept (by size and time) in this computer's private state, so the next look-back reads only new or changed files.
-    Folders are checked at use (est_usable), never here."""
+    A file from a left-off folder is not read further and nothing of it is kept (re-read once its folders are on);
+    folders are checked again at use (est_usable)."""
     cache = read_json(EST_LOOKBACK_PATH, {})
     files = cache.get("files") if isinstance(cache, dict) and cache.get("v") == EST_CACHE_VERSION and \
         isinstance(cache.get("files"), dict) else {}
@@ -19151,8 +19155,11 @@ def est_lookback(save=True):
             continue
         sig = f"{st.st_size}:{int(st.st_mtime)}:{hint or ''}"
         got = files.get(path)
-        if not isinstance(got, dict) or got.get("sig") != sig:
+        if not isinstance(got, dict) or got.get("sig") != sig or (got.get("off") and _est_folder_on(got.get("cwds"))):
             got = {"sig": sig, "sub": sub, "main": main, **_est_file(path, hint, sub)}
+            changed = True
+        if not got.get("off") and got.get("cards") and not _est_folder_on(got.get("cwds")):
+            got = {**got, "parts": [], "cards": {}, "off": True}  # left off since: keep nothing from it
             changed = True
         seen[path] = got
     if save and (changed or len(seen) != len(files)):
@@ -19586,7 +19593,7 @@ def trk_card(card):
     return None
 
 
-def trk_comment(card, minutes, rests_on, actual=None, found=None):
+def trk_comment(card, minutes, rests_on, actual=None):
     """Writes or edits the card's one "DDS Development Time Estimate" comment (and Jira's original estimate). One card at
     a time on this computer (a lock), so two agents here never both add one. Where it was kept, or None."""
     lock = None
@@ -19595,7 +19602,7 @@ def trk_comment(card, minutes, rests_on, actual=None, found=None):
         lock = open(os.path.join(STATE, "estimates-comment-" + _tpc_hash(card) + ".lock"), "a")
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)
-        got = found or trk_card(card)
+        got = trk_card(card)  # read again under the lock: a list read before it may miss another agent's new comment
         if got is None:
             return None
         where, comments, update, create, _closed = got
@@ -19768,7 +19775,7 @@ def cmd_estimate(args):
             client = CiClient(key, agent["workbook_id"], now + TPC_WAIT_SECONDS)
             client.cards_tab = _tpc_card_tab(agent["workbook_id"])
             acct = est_account(client)
-            tab = est_tab(agent, key, now)
+            tab = est_tab(agent, key, now) if tpc_is_on(os.getcwd()) else None  # time per card off here: no burn tabs
         except CiProblem as e:
             log(agent["slug"], f"estimate: {e}")
             client, tab = None, None
@@ -19825,7 +19832,7 @@ def cmd_estimate(args):
                     if client is not None and tab:
                         got = est_record(client, tab, hist, [c], now, marks, actuals)
                         actual = got[0][3] if got else None
-                where = trk_comment(c, m, n, actual, found)
+                where = trk_comment(c, m, n, actual)
                 if where:
                     comments.append(f"{c}: \"{EST_COMMENT_TITLE}\" kept on {where}.")
                 else:

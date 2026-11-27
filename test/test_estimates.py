@@ -220,6 +220,43 @@ class Comment(unittest.TestCase):
         self.assertFalse(any(m == "POST" for m, _p, _b in done))
         self.assertIn("Estimate: 1.5 h (from 4 of your cards)", done[0][2]["body"])
 
+    def test_two_at_once_leave_one_comment(self):
+        """Two agents here estimate the same card at once, each after its own (stale) read: the card keeps one comment."""
+        import threading
+        kept, lock = [], threading.Lock()
+        start = threading.Barrier(2)
+
+        def gh(args, body=None):
+            a = " ".join(args)
+            if "comments?per_page=100&page=" in a:
+                with lock:
+                    now = [dict(c) for c in kept]
+                time.sleep(0.2)  # a slow tracker: the other agent runs meanwhile
+                return now if a.endswith("page=1") else []
+            if "-X" in args and args[1] == "POST":
+                with lock:
+                    kept.append({"id": len(kept) + 1, "body": body["body"]})
+                return {}
+            if "-X" in args:
+                return {}
+            return {"state": "open"}
+
+        def one():
+            ds.trk_card("o/r#7")  # cmd_estimate's read before the lock: both see no comment
+            start.wait()
+            ds.trk_comment("o/r#7", 90, 4)
+        saved = ds._trk_gh
+        ds._trk_gh = gh
+        try:
+            ts = [threading.Thread(target=one) for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(10)
+        finally:
+            ds._trk_gh = saved
+        self.assertEqual(len([c for c in kept if c["body"].startswith(ds.EST_COMMENT_TITLE)]), 1)
+
     def test_none_there_adds_exactly_one(self):
         made = []
         self.assertEqual(ds.trk_upsert([(1, "x")], lambda i, b: made.append(("edit", i)), lambda b: made.append("add"), "B"), "added")
