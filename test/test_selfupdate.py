@@ -191,11 +191,11 @@ class SelfUpdate(Base):
         self.patch("hook_input", lambda: {})
         out = io.StringIO()
         with redirect_stdout(out):
-            self.assertEqual(ds.cmd_self_update([]), 0)
+            self.assertEqual(ds.cmd_self_update(["--here"]), 0)
         self.assertEqual(out.getvalue(), "")
         self.assertEqual(self.state()["result"], "updated")
         self.patch("self_update", lambda now=None: 1 / 0)
-        self.assertEqual(ds.cmd_self_update([]), 0)
+        self.assertEqual(ds.cmd_self_update(["--here"]), 0)
 
 
 class InstalledFrom(Base):

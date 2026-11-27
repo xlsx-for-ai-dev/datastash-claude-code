@@ -4656,6 +4656,58 @@ def _listener_line(project, me):
     return f"ok: listener: running for this session (pid {info['pid']})."
 
 
+# XLI-429: doctor names the version this session runs, the one Claude Code has on disk, and the newest published one
+# (the public marketplace catalog's pin), and says plainly when this install is behind, with the one fix line.
+CATALOG_URL = "https://raw.githubusercontent.com/xlsx-for-ai-dev/datastash-claude-code/main/.claude-plugin/marketplace.json"
+UPDATE_CMD = "claude plugin marketplace update datastash && claude plugin update datastash@datastash"
+
+
+def published_version(timeout=8):
+    """The newest published datastash version ("X.Y.Z", from the public catalog's pinned vX.Y.Z tag), or None."""
+    if os.environ.get("DATASTASH_NO_NETWORK") == "1":
+        return None
+    try:
+        req = urllib.request.Request(CATALOG_URL, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            cat = json.loads(r.read(1 << 20).decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError, httpclient.HTTPException):
+        return None
+    pin = catalog_pin(cat)
+    v = pin[0][1:] if pin and isinstance(pin[0], str) and pin[0].startswith("v") else None
+    return v if version_tuple(v) else None
+
+
+def installed_version(root=None):
+    """The newest version Claude Code has installed on disk for datastash@datastash (installed_plugins.json), or None."""
+    root = os.path.realpath(root or os.environ.get("CLAUDE_PLUGIN_ROOT") or PLUGIN_ROOT)
+    plugins = (os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(root))))
+               if installed_from_marketplace(root) else os.path.join(CLAUDE_DIR, "plugins"))
+    rows = read_json(os.path.join(plugins, "installed_plugins.json"), {}).get("plugins")
+    rows = rows.get(PLUGIN_ID) if isinstance(rows, dict) else None
+    found = [r.get("version") for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+    found = [v for v in found if version_tuple(v)]
+    return max(found, key=version_tuple) if found else None
+
+
+def version_report(newest, on_disk, running=None):
+    """doctor's version lines: [(kind, text)], kind ok/note/problem/fix."""
+    running = running or PLUGIN_VERSION or "unknown"
+    disk = on_disk or running
+    first = (f"version: this session runs datastash {running}; installed: {disk}; newest: "
+             f"{newest or 'could not be read right now'}.")
+    have = max((v for v in (running, on_disk) if version_tuple(v)), key=version_tuple, default=None)
+    if not newest:
+        return [("note", first)]
+    if have is None or version_tuple(have) < version_tuple(newest):
+        return [("note", first),
+                ("problem", f"version: this computer is behind (datastash {have or running}, newest {newest}). Update "
+                            "in a terminal, then restart Claude Code."),
+                ("fix", UPDATE_CMD)]
+    if version_tuple(running) is not None and version_tuple(running) < version_tuple(have):
+        return [("note", first + " Restart Claude Code to finish the update.")]
+    return [("ok", first)]
+
+
 def cmd_doctor(_args):
     """Every setup check, each with ok/problem/note, and each problem's exact fix."""
     project = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
@@ -4699,6 +4751,12 @@ def cmd_doctor(_args):
     except Exception:  # noqa: BLE001
         pass
     print(_listener_line(project, me))
+    try:
+        vlines = version_report(published_version(), installed_version())
+    except Exception:  # noqa: BLE001
+        vlines = []
+    for kind, text in vlines:
+        print(f"{kind}: {text}")
     for f in found:
         print("problem: " + finding_line(f))
         if f["cmd"]:
@@ -4710,7 +4768,7 @@ def cmd_doctor(_args):
         rules = []
     for b in rules:
         print("problem: " + b["text"])
-    found = found + rules
+    found = found + rules + [v for v in vlines if v[0] == "problem"]
     print(f"summary: {len(found)} problem{'s' if len(found) != 1 else ''}."
           + (" Tell the person each one in plain words." if found else ""))
     return 0
@@ -12987,6 +13045,7 @@ RELEASE_REPO = "https://github.com/xlsx-for-ai-dev/datastash-claude-code.git"
 MARKETPLACE_NAME = "datastash"
 PLUGIN_ID = "datastash@datastash"
 SELF_UPDATE_EVERY = 24 * 3600
+SELF_UPDATE_STALE = 15 * 60  # XLI-429: an unfinished check ("checking") is tried again after this
 SELF_UPDATE_FILE = os.path.join(STATE, "self-update.json")  # last check time and result (no secret)
 VERSION_SEEN_FILE = os.path.join(STATE, "version-seen.json")  # the version the last session start ran
 UPDATED_LINE = "datastash updated to v{version}"
@@ -13132,7 +13191,9 @@ def self_update(now=None):
         return "off"  # the person's choice: no check, no network, no Claude Code run
     st = read_json(SELF_UPDATE_FILE, {})
     last = st.get("checked_at")
-    if isinstance(last, (int, float)) and 0 <= now - last < SELF_UPDATE_EVERY:
+    # XLI-429: a check that never finished (its process was stopped mid-way) holds the day only for a short while
+    wait = SELF_UPDATE_STALE if st.get("result") == "checking" else SELF_UPDATE_EVERY
+    if isinstance(last, (int, float)) and 0 <= now - last < wait:
         return "recent"
     if not installed_from_marketplace():
         return "not-installed"
@@ -13181,9 +13242,18 @@ def updated_line():
     return UPDATED_LINE.format(version=cur) if old is not None and version_tuple(cur) > old else None
 
 
-def cmd_self_update(_args):
-    """SessionStart hook (async): one self_update pass under a lock; prints nothing, always exits 0."""
+def cmd_self_update(args):
+    """SessionStart hook (async): one self_update pass under a lock; prints nothing, always exits 0.
+    XLI-429: Claude Code stops an async hook when the session ends, and a `claude -p` run ends in seconds, before the
+    check is done (it stayed at "checking" and the day was used up). So the hook starts the pass on its own (a new
+    session, no terminal) and returns at once; `self-update --here` runs it in this process."""
     hook_input()
+    if "--here" not in (args or []):
+        try:
+            spawn_detached([sys.executable, os.path.realpath(__file__), "self-update", "--here"], HOME)
+            return 0
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass  # could not start it on its own: run it here
     lock = None
     try:
         ensure_dirs()

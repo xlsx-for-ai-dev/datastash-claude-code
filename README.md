@@ -64,8 +64,10 @@ What it adds:
   secret), and the `/datastash:uninstall` that removes the last agent on this computer puts back exactly that ("Auto-update
   is off for datastash."): a value the person had already turned on is left alone, a key or entry the install added is
   taken out, a folder file it made is moved aside. With no record (an install before 1.0.17) the setting is left as it
-  is ("Auto-update for datastash left as it was."). Claude Code then updates datastash by itself in interactive sessions; the self-update above stays as
-  the backstop.
+  is ("Auto-update for datastash left as it was."). Claude Code then updates datastash by itself in interactive sessions only (a few minutes after the first typed
+  message; never in `claude -p`); the new version loads at the next start. The self-update above stays as the backstop,
+  and since 1.0.27 it runs on its own, so a short `claude -p` run no longer cuts it off (a check cut off is tried again
+  after 15 minutes, not the next day).
 
 Requires `python3` (3.8 or later, standard library only) and Claude Code with plugin hooks.
 
@@ -947,7 +949,7 @@ list, asks first and idle agents last, from any session: "status", "status of al
 Run `datastash doctor`. It checks that the plugin's hooks fire (they write a heartbeat), that Claude Code's settings
 files (`~/.claude/settings.json` and the project's `.claude/settings*.json`) belong to this user and are readable and
 writable, that the plugin is turned on, that the key files are private (mode 600), that https://getdatastash.com
-answers, that the datastash connector is signed in, and whether the listener runs for this session. Each problem comes with its exact fix. The cheap checks also
+answers, that the datastash connector is signed in, and whether the listener runs for this session. It also names the datastash version this session runs, the one installed, and the newest published one (1.0.27); when this computer is behind it says so, with the one fix line (`claude plugin marketplace update datastash && claude plugin update datastash@datastash`, then restart Claude Code). Each problem comes with its exact fix. The cheap checks also
 run on their own at an agent's first datastash use (`auto-name`, `status`, the session's first `api` call); on a
 healthy machine they print nothing.
 
