@@ -37,6 +37,12 @@ Subcommands (run `datastash help`); `datastash --agent NAME COMMAND ...` runs an
                             read and write with --write (XLI-425: POST /api/v1/agent/tabs/share, the connector's own share
                             rules: only the tab's maker or the person shares it). The workbook is the agent's own unless
                             --workbook names one. The answer is printed as for api
+  repeat[s] [list|add|show|answer|part|remove] ...
+                            XLI-413: the person's repeat questions, ONE list for the whole account, shared by every
+                            agent: `repeats` lists them (--for AGENT: only that agent's parts), `repeat add QUESTION
+                            [--answer TEXT]`, `repeat show N|QUESTION`, `repeat answer N TEXT` (the shared answer),
+                            `repeat part N TEXT` (this agent's own part, kept current by it), `repeat remove N`.
+                            repeat and repeats are the same word; small typos work. The answer is printed as for api
   lookups [steps SERVICE]   today's repeated outside lookups on this computer (shapes and counts only) and what
                             datastash keeps; steps github|linear|jira: that feed's setup steps, after the person's
                             "do N" on the status offer
@@ -5105,6 +5111,109 @@ def cmd_share(args):
             die("no agent workbook is linked to this folder (datastash link NAME --workbook ID, or --workbook ID)")
     body = {"workbook_id": wb, "tab": tab, "agents": names, "access": access}
     return cmd_api(["POST", AGENT_TAB_SHARE_PATH, json.dumps(body)])
+
+
+AGENT_REPEATS_PATH = "/api/v1/agent/repeats"
+REPEAT_USAGE = ("usage: datastash repeat[s] [list] [--for AGENT] | repeat add QUESTION [--answer TEXT] | repeat show N|QUESTION "
+                "[--for AGENT] | repeat answer N TEXT | repeat part N TEXT | repeat remove N|QUESTION")
+# XLI-413 repeats (owner 11-26): "repeat" and "repeats" are the same word everywhere, and small typos still work.
+REPEAT_WORDS = ("repeat", "repeats")
+REPEAT_ACTIONS = {"add": "add", "new": "add", "list": "list", "ls": "list", "all": "list", "remove": "remove",
+                  "rm": "remove", "delete": "remove", "del": "remove", "drop": "remove", "answer": "answer",
+                  "part": "part", "mine": "part", "show": "show", "get": "show", "ask": "show"}
+# Typos are matched only for these (never "show": "who are you" must not read as "show are you").
+REPEAT_FUZZY = ("add", "list", "remove", "delete", "answer", "part")
+
+
+def repeat_word(cmd):
+    """XLI-413: the top-level command word read forgivingly: repeat, repeats, Repeats, repaet, repeast... -> "repeat";
+    anything else -> None (only asked for a word that is no other command)."""
+    w = (cmd or "").strip().lower()
+    if w in REPEAT_WORDS:
+        return "repeat"
+    if len(w) < 5 or not w.isalpha():
+        return None
+    return "repeat" if difflib.SequenceMatcher(None, w.rstrip("s"), "repeat").ratio() >= 0.8 else None
+
+
+def repeat_action(word):
+    """The repeat sub-action for a word (singular or plural, a small typo), or None."""
+    w = (word or "").strip().lower()
+    if w in REPEAT_ACTIONS:
+        return REPEAT_ACTIONS[w]
+    if w.endswith("s") and w[:-1] in REPEAT_ACTIONS:
+        return REPEAT_ACTIONS[w[:-1]]
+    if len(w) < 2 or not w.isalpha():
+        return None
+    near = difflib.get_close_matches(w.rstrip("s"), REPEAT_FUZZY, n=1, cutoff=0.75)
+    return REPEAT_ACTIONS[near[0]] if near else None
+
+
+def repeat_target(words):
+    """N (its number in the list) or the question itself, as the routes' {n} or {question}."""
+    text = " ".join(words).strip()
+    if not text:
+        die(REPEAT_USAGE)
+    if re.fullmatch(r"#?\d{1,9}", text) and int(text.lstrip("#")) > 0:
+        return {"n": int(text.lstrip("#"))}
+    return {"question": text}
+
+
+def repeat_args(args):
+    """`datastash repeat ...` as (action, words, flags {for, answer}); dies with the usage line on a bad flag."""
+    words, flags, i = [], {}, 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--for", "--agent", "--answer"):
+            if i + 1 >= len(args) or not args[i + 1].strip():
+                die(REPEAT_USAGE)
+            flags["for" if a != "--answer" else "answer"] = args[i + 1].strip()
+            i += 2
+            continue
+        if a.startswith(("--for=", "--agent=", "--answer=")):
+            k, v = a[2:].split("=", 1)
+            flags["for" if k != "answer" else "answer"] = v.strip()
+            i += 1
+            continue
+        words.append(a)
+        i += 1
+    if not words:
+        return "list", [], flags
+    action = repeat_action(words[0])
+    if action is None:  # `datastash repeat 2` or `datastash repeats who are you`: that one repeat
+        return "show", words, flags
+    return action, words[1:], flags
+
+
+def cmd_repeat(args):
+    """XLI-413 repeats: the person's repeat questions, ONE list per account shared by every agent (GET/POST
+    /api/v1/agent/repeats as this folder's agent; every guard of `datastash api` applies)."""
+    action, words, flags = repeat_args(args)
+    who = flags.get("for")
+    if action == "list":
+        if words:
+            die(REPEAT_USAGE)
+        return cmd_api(["GET", AGENT_REPEATS_PATH + ("?" + urllib.parse.urlencode({"agent": who}) if who else "")])
+    if action == "show":
+        q = dict(repeat_target(words))
+        if who:
+            q["agent"] = who
+        return cmd_api(["GET", AGENT_REPEATS_PATH + "?" + urllib.parse.urlencode(q)])
+    if action == "add":
+        question = " ".join(words).strip()
+        if not question:
+            die(REPEAT_USAGE)
+        body = {"question": question}
+        if flags.get("answer"):
+            body["answer"] = flags["answer"]
+        return cmd_api(["POST", AGENT_REPEATS_PATH, json.dumps(body)])
+    if action == "remove":
+        return cmd_api(["POST", AGENT_REPEATS_PATH + "/remove", json.dumps(repeat_target(words))])
+    # answer N TEXT / part N TEXT: the shared answer, or this agent's own part ("" clears it).
+    if not words or not re.fullmatch(r"#?\d{1,9}", words[0]) or int(words[0].lstrip("#")) < 1:
+        die(REPEAT_USAGE)
+    body = {"n": int(words[0].lstrip("#")), action: " ".join(words[1:]).strip()}
+    return cmd_api(["POST", AGENT_REPEATS_PATH + "/" + action, json.dumps(body)])
 
 
 def plain_call(method, path, key, body):
@@ -18954,7 +19063,10 @@ FULL_DDS = (
         ("C18", "Restart only at a seam.", None, "", ""),
         ("C19", "Person-only steps stay person-typed; never try to work around them.", None, "", ""),
         ("C20", "An agent under a carveout gets information only through datastash.", None, "", ""),
-        ("C21", "Never put secrets, keys, or customer or personal data in any tab or message.", None, "", ""))),
+        ("C21", "Never put secrets, keys, or customer or personal data in any tab or message.", None, "", ""),
+        ("C22", "When the person asks a question on the account's repeats list (**datastash repeats**), answer at once from "
+         "its stored answer and the agents' parts; keep your own part current (**datastash repeat part N TEXT**).", None,
+         "", ""))),
     ("D. Per-role extras", (
         ("D1", "PM agents keep the Asks and Function descriptions tabs current and give the morning update.", None, "",
          ""),
@@ -18963,6 +19075,12 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.24": (
+        "**datastash repeat add <question>** keeps a question the person asks over and over, on ONE list for every agent "
+        "of the account; **datastash repeats** lists them, **datastash repeat remove N** removes one.",
+        "Each repeat keeps a shared answer and each agent's own part (**datastash repeat part N TEXT**); answer a listed "
+        "question at once from the list.",
+    ),
     "1.0.21": (
         "Setup finishes itself: on a signed-in computer, a folder with no agent gets one with no step for the person.",
         "Your row in the Setup tab is written at install and at every session start.",
@@ -19947,7 +20065,9 @@ def main():
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
              "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share,
-             "remember": cmd_remember, "skills-sync": cmd_skills_sync}
+             "remember": cmd_remember, "skills-sync": cmd_skills_sync, "repeat": cmd_repeat, "repeats": cmd_repeat}
+    if cmd not in table and repeat_word(cmd) is not None:  # XLI-413: repeat / repeats / a small typo of either
+        cmd = "repeat"
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
