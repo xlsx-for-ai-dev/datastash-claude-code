@@ -3516,8 +3516,9 @@ class Xli374(Base):
 
     def setUp(self):
         super().setUp()
-        for k in ("send_beat", "BEAT_SECONDS", "_is_listener", "cmd_fetch", "login_token"):
+        for k in ("send_beat", "BEAT_SECONDS", "_is_listener", "cmd_fetch", "login_token", "auto_setup_wake"):
             self.saved[k] = getattr(ds, k)
+        ds.auto_setup_wake = lambda inp, project, me: None  # 1.0.21 card 8e's self-setup: test/test_setup.py
         self.net = Net()
         ds.http = self.net
         ds.send_beat = lambda agent, key, project: None
@@ -4135,8 +4136,9 @@ class Xli375(Base):
 
     def setUp(self):
         super().setUp()
-        for k in ("login_token", "send_beat", "APPROVAL_POLL_SECONDS", "time"):
+        for k in ("login_token", "send_beat", "APPROVAL_POLL_SECONDS", "time", "auto_setup_wake"):
             self.saved[k] = getattr(ds, k)
+        ds.auto_setup_wake = lambda inp, project, me: None  # 1.0.21 card 8e's self-setup: test/test_setup.py
         ds.send_beat = lambda agent, key, project: None
         ds.login_token = lambda force=False: "dsat_" + "t" * 30
         ds.resolve = self.saved["resolve"]

@@ -18247,7 +18247,6 @@ def _signin_check_path():  # {"state": "in"|"out", "at", "how"}: the last check'
 
 SIGNIN_CHECK_FRESH = 6 * 3600
 AUTO_SETUP_RETRY = 6 * 3600  # one self-setup try per folder in this long
-NOT_SIGNED_IN_TELL_EVERY = 86400
 AUTO_SETUP_WAIT = float(os.environ.get("DATASTASH_AUTO_SETUP_WAIT", "0" if os.environ.get("DATASTASH_NO_NETWORK") == "1" else "20"))  # lets a typed install in the same session go first
 SETUP_ROW_TIMEOUT = 20
 SETUP_ROW_TRIES = 4  # the background write's tries
@@ -18365,7 +18364,7 @@ def _connector_seen():
 def signin_known():
     """"in", "out" or None (not known yet) from local files only (no network, no claude run): fast, for the hooks."""
     try:
-        if login_present() or _connector_seen():
+        if signed_in() or _connector_seen():
             return "in"
     except Exception:  # noqa: BLE001
         pass
@@ -18396,13 +18395,11 @@ def _mcp_list_signed_in(timeout=60):
 def computer_signed_in(deep=False):
     """True / False / None (can't tell). deep: also asks Claude Code's own `claude mcp list` (slow; background only)."""
     k = signin_known()
-    if k == "in" or not deep:
+    if k is not None or not deep:
         return None if k is None else k == "in"
     got = _mcp_list_signed_in()
-    if got is not None:
-        _note_signin("in" if got else "out", "mcp list")
-        return got
-    return False if k == "out" else None
+    _note_signin("in" if got else "out", "mcp list")  # no datastash server or no answer counts as not signed in
+    return bool(got)
 
 
 def _folder_uninstalled(here):
@@ -18450,8 +18447,8 @@ def auto_setup_due(project):
 
 
 def auto_setup_wake(inp, project, me):
-    """The listener's one wake for a folder with no agent: the plugin's own setup steps (signed in), the plain line (not
-    signed in, at most once a day per folder), or None (nothing to do here)."""
+    """The listener's one wake for a folder with no agent on a signed-in computer: the plugin's own setup steps; None
+    otherwise (not signed in: nothing is tried, and the next session start says so plainly)."""
     name = auto_setup_name(project, me, inp)
     if name is None:
         return None
@@ -18461,18 +18458,13 @@ def auto_setup_wake(inp, project, me):
         if name is None:
             return None
     signed = computer_signed_in(deep=True)
-    mark = read_json(_auto_mark_path(project), {})
     if signed:
         if not auto_setup_due(project):
             return None
         write_private(_auto_mark_path(project), json.dumps({"at": int(time.time()), "name": name, "state": "tried"}))
         log("enroll", "auto-setup: this folder has no agent and the computer is signed in; the session sets it up")
         return AUTO_SETUP_AI.format(name=name)
-    told = mark.get("told_out")
-    if _num_ok(told) and time.time() - told < NOT_SIGNED_IN_TELL_EVERY:
-        return None
-    write_private(_auto_mark_path(project), json.dumps(dict(mark, told_out=int(time.time()))))
-    return NOT_SIGNED_IN_AI
+    return None  # not signed in: nothing tried; the next session start says so plainly (the check is kept)
 
 
 def no_agent_setup_note(inp, project, me):
@@ -18483,8 +18475,12 @@ def no_agent_setup_note(inp, project, me):
     if k == "in":
         return SETTING_UP_AI
     if k == "out":
-        return NOT_SIGNED_IN_AI
+        return None if _keyed_agents() else NOT_SIGNED_IN_AI
     return CHECKING_AI
+
+
+def _keyed_agents():
+    return [a for a in all_agents() if not is_person(a) and read_key(a["slug"])]
 
 
 # --- the checklist and the self-check

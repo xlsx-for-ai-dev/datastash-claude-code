@@ -154,13 +154,20 @@ class SelfSetup(SetupBase):
 
 
 class NotSignedIn(SetupBase):
-    def test_said_plainly_once_a_day_and_nothing_is_tried(self):
-        ai = self.wake()
-        self.assertEqual(ai, ds.NOT_SIGNED_IN_AI)
-        self.assertIn(ds.NOT_SIGNED_IN_LINE, ai)
-        self.assertIsNone(self.wake())  # told once a day
+    def test_nothing_is_tried_and_the_check_is_kept_for_the_session_start(self):
+        self.assertIsNone(self.wake())  # no wake: the session start says it
         self.assertFalse([c for c in self.calls])  # nothing sent anywhere
         self.assertIsNone(ds.agent_for(self.folder))
+        self.assertEqual(ds.signin_known(), "out")
+        i = self.inp(sid="s2")
+        self.assertEqual(ds.no_agent_setup_note(i, self.folder, ds.this_session(i)), ds.NOT_SIGNED_IN_AI)
+        self.assertIn(ds.NOT_SIGNED_IN_LINE, ds.NOT_SIGNED_IN_AI)
+
+    def test_agents_with_their_own_keys_here_get_no_not_signed_in_line(self):
+        ds._note_signin("out", "mcp list")
+        ds.save_agent("other", OWN, KEY, WB, os.path.join(os.path.dirname(self.folder), "other"))
+        i = self.inp()
+        self.assertIsNone(ds.no_agent_setup_note(i, self.folder, ds.this_session(i)))
 
     def test_session_start_says_it_and_has_no_mcp_text(self):
         ds._note_signin("out", "mcp list")
