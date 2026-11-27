@@ -63,6 +63,8 @@ def real_entries(name):
 
 
 class Base(unittest.TestCase):
+    CONNECTOR_SIGNED_IN = False  # 1.0.23 (card 1): the connector-install tests below set it
+
     def setUp(self):
         self.saved = {k: getattr(ds, k) for k in PATCHED}
         root = os.path.realpath(harness.tmpdir(self, prefix="install-", dir=harness.ROOT))
@@ -95,6 +97,12 @@ class Base(unittest.TestCase):
                 self.kc[account] = value
             return self.kc_works if op == "put" else self.kc.get(account) if op == "get" else self.kc.pop(account, None)
         ds._kc = fake_kc
+        # 1.0.23 (card 1): these tests run the connector's install, on a computer whose connector is signed in; one that
+        # is not signed in gets the email sign-in line instead (test/test_email_signin.py)
+        if self.CONNECTOR_SIGNED_IN:
+            real_signed_in = ds.computer_signed_in
+            ds.computer_signed_in = lambda deep=False: True
+            self.addCleanup(setattr, ds, "computer_signed_in", real_signed_in)
 
     def tearDown(self):
         for k, v in self.saved.items():
@@ -2437,6 +2445,12 @@ class ReinstallKeepsTheName(Base):
             lines = ds.waiting_lines(rec)
         self.assertEqual(lines, ["- Not set up yet: beta. Type /datastash:install in its session.",
                                  "- Ship the fix? To answer, type **status**, then the number it shows."])
+
+
+# 1.0.23 (card 1): this file's tests run the connector's install on a computer whose connector is signed in (a computer
+# with no sign-in gets the email sign-in line instead: test/test_email_signin.py). Files that import Base keep the real check.
+for _c in [v for v in list(globals().values()) if isinstance(v, type) and issubclass(v, Base) and v is not Base and v.__module__ == __name__]:
+    _c.CONNECTOR_SIGNED_IN = True
 
 
 if __name__ == "__main__":

@@ -4416,15 +4416,17 @@ class Xli375(Base):
         self.assertIn(a, ds._enrolled())
 
     def test_the_only_key_ask_in_the_plugin_is_the_first_key(self):
-        """Nothing anywhere else asks for a key: AGENT_KEY_PATH is used by _first_key alone, with only_if_no_key."""
+        """Nothing anywhere else asks for a key: AGENT_KEY_PATH is used by _first_key and (1.0.23, card 1) the install on
+        the emailed-code login, login_install, both with only_if_no_key."""
         import ast
         import inspect
         with open(BIN) as f:
             tree = ast.parse(f.read())
         users = sorted({fn.name for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
                         for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == "AGENT_KEY_PATH"})
-        self.assertEqual(users, ["_first_key"])
+        self.assertEqual(users, ["_first_key", "login_install"])
         self.assertIn('"only_if_no_key": True', inspect.getsource(ds._first_key))
+        self.assertIn('"only_if_no_key": True', inspect.getsource(ds.login_install))
 
     # nothing the model can reach approves, registers or mints
     def test_approval_looking_prompt_or_stdin_does_nothing(self):

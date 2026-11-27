@@ -9930,8 +9930,10 @@ def _status_check():
     sid = inp.get("session_id")
     if not isinstance(sid, str) or not re.fullmatch(SID_RE, sid):
         return 0
-    said = take_outcomes(sid)  # the checker's line for the person (a refused phrase): no model turn
-    msg = {"systemMessage": "datastash: " + " ".join(said)} if said else None
+    login_step_wait(sid)  # card 1: this turn's own sign-in or install step shows its line in this turn
+    said = take_outcomes(sid) + take_gone_outcome(sid)  # the checker's line for the person (a refused phrase): no model turn
+    msg = {"systemMessage": "datastash: " + (_plain_typed("\n".join(said)) if any("\n" in x for x in said)
+                                             else " ".join(said))} if said else None
     try:  # 1.0.18 (XLI-413): the plugin saves this exchange itself, in the background; the person is told once
         saving = chat_auto_start(inp) if not inp.get("stop_hook_active") else None
     except Exception as e:  # noqa: BLE001  never in the session's way
@@ -10205,6 +10207,8 @@ def cmd_status_verify(args):
                                                                                   cwd=rec.get("cwd")):
         _drop(path)
         return 0
+    if rec.get("kind") in LOGIN_STEP_KINDS:
+        return login_step_verify(rec, path)  # card 1: the email sign-in and the install and uninstall on that login
     deadline = time.time() + VERIFY_WAIT
     found = None
     while found is None and time.time() < deadline:
@@ -14119,6 +14123,408 @@ def onboard_verified(kind, sid, typed=None):
     grant_typed(kind, sid, typed)
 
 
+# --- Card 1 (owner 11-27, plugin 1.0.23): the simple email sign-in, for one computer and this folder. The person types
+# `datastash sync you@email.com` (datastash emails a 6-digit code), then `datastash sync 482913` in the same session:
+# this computer (this OS login, every folder under it) is signed in, this folder's agent is registered on that login,
+# picks up its key and answer key, gets its notes tab, and the plugin says "Done." Both typed lines pass the person-typed
+# check (the checker acts only once the transcript shows them typed by the person). A code signs in only the computer
+# that asked (x-live: the batch listing is off): no waiting requests at session start, no batching. On such a login,
+# /datastash:install and /datastash:uninstall run on the login's REST routes, by the plugin, with no connector.
+EMAIL_WAIT_PATH = "/api/v1/device/email/wait"
+EMAIL_START_PATH = "/api/v1/device/email/start"
+EMAIL_CODE_PATH = "/api/v1/device/email/code"
+AGENTS_LIST_PATH = "/api/v1/agent/agents"
+AGENTS_NOTE_PATH = "/api/v1/agent/agents/note"
+EMAIL_LOGIN_FILE = os.path.join(CONF, "login.email.json")  # {"at"}: this computer's login came from the emailed code
+EMAIL_RE = r"[^\s@<>\"'`]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}"
+SYNC_EMAIL_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(" + EMAIL_RE + r")\s*", re.I)
+SYNC_CODE_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(\d{6})\s*", re.I)
+EMAIL_CODE_LIFE = 600  # the emailed code works for 10 minutes
+LOGIN_STEP_KINDS = ("sync_email", "sync_code", "login_install", "login_uninstall")
+LOGIN_STEP_WAIT = 8.0  # the Stop hook (10 s) waits this long at most for the plugin's own step to finish
+SIGN_IN_FIRST_LINE = "Type **datastash sync you@email.com**"
+CHECK_EMAIL_LINE = "Check your email for a 6-digit code. Then type **datastash sync CODE** here."
+DONE_LINE = "Done."
+NAME_TAKEN_LINE = "That name is taken. Type /datastash:install NEWNAME."
+NO_CODE_ASKED_LINE = "Not done: no code was asked for in this session. Type **datastash sync you@email.com** first."
+BAD_CODE_LINE = "Not done: that code is wrong or expired. Type **datastash sync you@email.com** for a new one."
+SIGN_IN_FAILED_LINE = "Not done: datastash could not be reached. Type **datastash sync you@email.com** again in a minute."
+LOGIN_STEP_AI = (f"{ONBOARD_NOTE}: the plugin does this step itself once it has checked the person typed it. Make no "
+                 "datastash calls and run no command for it; never repeat an email or a code. Your whole reply is exactly "
+                 "this line, word for word (keep its bold): \"{line}\"")
+
+
+def sync_email_of(text):
+    """The email in the person's whole prompt `datastash sync <email>`, lower case, else None."""
+    m = SYNC_EMAIL_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 300 else None
+    return m.group(1).strip().lower() if m else None
+
+
+def sync_code_of(text):
+    m = SYNC_CODE_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 80 else None
+    return m.group(1) if m else None
+
+
+def email_login():
+    """True when this computer's datastash login came from the emailed code (card 1): install and uninstall run on it."""
+    return login_present() and os.path.exists(EMAIL_LOGIN_FILE)
+
+
+def not_signed_in(own=None):
+    """Nothing here can reach datastash: no login on this computer, no keyed agent for this folder, and no connector
+    sign-in seen here. Cheap file checks only."""
+    if login_present() or (own is not None and read_key(own["slug"])):
+        return False
+    return computer_signed_in() is not True
+
+
+def _os_user():
+    try:
+        import getpass
+        return re.sub(r"[^A-Za-z0-9._-]", "", getpass.getuser())[:60] or "user"
+    except Exception:  # noqa: BLE001
+        return "user"
+
+
+def _computer():
+    return {"device_name": _device_name(), "os": _device_os(), "user": _os_user()}
+
+
+def _code_req_path(sid):
+    return os.path.join(STATE, f"email-code-{sid}.json")
+
+
+def _step_busy_path(sid):
+    return os.path.join(STATE, f"login-step-{sid}.busy")
+
+
+def _post_json(path, body, tok=None, timeout=30):
+    _st, _ct, text = http("POST", path, key=tok, body=body, timeout=timeout)
+    got = json.loads(text)
+    return got if isinstance(got, dict) else {}
+
+
+def email_sign_in_start(sid, email):
+    """The person's own typed `datastash sync <email>`: file this computer's own request and ask for one code, bound to
+    this session. Lines for the person (none when all went well: the model already said to check the email)."""
+    try:
+        w = _post_json(EMAIL_WAIT_PATH, dict(_computer(), email=email))
+        waiting = w.get("device_code")
+        if not isinstance(waiting, str) or not waiting.startswith("dsdc_"):
+            return [SIGN_IN_FAILED_LINE]
+        s = _post_json(EMAIL_START_PATH, dict(_computer(), email=email, waiting_code=waiting))
+    except ApiError as e:
+        return [server_refused(e.body, SIGN_IN_FAILED_LINE)]
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return [SIGN_IN_FAILED_LINE]
+    dev = s.get("device_code")
+    if not isinstance(dev, str) or not dev.startswith("dsdc_"):
+        return [SIGN_IN_FAILED_LINE]
+    ensure_dirs()
+    write_private(_code_req_path(sid), json.dumps({"device_code": dev, "waiting": waiting,
+                                                   "until": int(time.time()) + EMAIL_CODE_LIFE}))
+    return []
+
+
+def _pick_up_login(waiting):
+    """This computer's own grant, once its code was right: a few quick polls of its own request. True when saved."""
+    for _ in range(6):
+        try:
+            got = _post_json(DEVICE_TOKEN_PATH, {"device_code": waiting})
+        except ApiError as e:
+            if e.body.get("error") in ("authorization_pending", "slow_down"):
+                time.sleep(1)
+                continue
+            return False
+        except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+            time.sleep(1)
+            continue
+        rt, at = got.get("refresh_token"), got.get("access_token")
+        if not (isinstance(rt, str) and re.fullmatch(REFRESH_RE, rt) and isinstance(at, str) and re.fullmatch(ACCESS_RE, at)):
+            return False
+        with _login_lock():
+            _save_login(rt, at, got.get("expires_in"), got.get("answer_key"), got.get("grant_id"))
+        rt = at = None
+        write_private(EMAIL_LOGIN_FILE, json.dumps({"at": int(time.time())}))
+        _change_signin(SIGNIN_DEVICE, "email sign-in")
+        return True
+    return False
+
+
+def login_typed_sync():
+    """x-live #531: the typed email and code sign-in IS the person's typed datastash sync. The same here: keeping, sync,
+    timers and session saving on, unless the person chose otherwise on this computer before."""
+    try:
+        if keep_state() is None:
+            record_keep_all(True, "typed")
+        if keep_state() != "yes":
+            return
+        record_sync_on()
+        if timers_choice() is None:
+            set_timers(True, "sync")
+        if sessions_on() is None:
+            record_sessions(True)
+    except OSError:
+        pass
+
+
+def email_sign_in_code(sid, code, name, here):
+    """The person's own typed `datastash sync <code>`: send it with THIS session's code request, pick this computer's
+    login up, then set this folder's agent up on it. Lines for the person."""
+    req = _read_private_json(_code_req_path(sid))
+    if not isinstance(req, dict) or not isinstance(req.get("device_code"), str) or not isinstance(req.get("waiting"), str) \
+            or not _num_ok(req.get("until")) or req["until"] < time.time():
+        return [NO_CODE_ASKED_LINE]
+    try:
+        _post_json(EMAIL_CODE_PATH, {"device_code": req["device_code"], "code": code})
+    except ApiError as e:
+        if e.body.get("error") == "invalid_code" or e.status in (400, 401, 403):
+            return [BAD_CODE_LINE]
+        return [server_refused(e.body, SIGN_IN_FAILED_LINE)]
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return [SIGN_IN_FAILED_LINE]
+    _drop(_code_req_path(sid))
+    if not _pick_up_login(req["waiting"]):
+        return [SIGN_IN_FAILED_LINE]
+    login_typed_sync()
+    if not name:
+        return [DONE_LINE + " This computer is signed in. Type **/datastash:install** in an agent's folder."]
+    return [login_install(name, here)]
+
+
+def login_install(name, here):
+    """This folder's agent on this computer's login: register, its first key (bound, only_if_no_key), the pickup with its
+    answer key, saved here (mode 600) and linked. The person's one line."""
+    tok = login_token() if isinstance(name, str) and name and isinstance(here, str) and here else None
+    if not tok:
+        return INSTALL_FAILED_LINE
+    proof = secrets.token_urlsafe(32)
+    try:
+        reg = api_json("POST", AGENT_REGISTER_PATH, tok, body={"name": name, "agent_proof": proof}, timeout=30)
+    except ApiError as e:
+        return NAME_TAKEN_LINE if _body_code(e) == "agent_name_taken" else server_refused(e.body, INSTALL_FAILED_LINE)
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return INSTALL_FAILED_LINE
+    reg = reg if isinstance(reg, dict) else {}
+    agent_id = reg.get("agent_id")
+    if not isinstance(agent_id, str) or not re.fullmatch(AGENT_ID_RE, agent_id):
+        return server_refused(reg, INSTALL_FAILED_LINE)
+    wbs = [t.get("workbook_id") for t in reg.get("notes_tabs") or [] if isinstance(t, dict)
+           and isinstance(t.get("workbook_id"), str) and re.fullmatch(AGENT_ID_RE, t["workbook_id"])]
+    if not wbs:
+        errs = reg.get("notes_tab_errors")
+        err = errs[0] if isinstance(errs, list) and errs and isinstance(errs[0], dict) else None
+        return server_refused(err or {"code": "no_agent_workbook"}, INSTALL_FAILED_LINE)
+    srv = reg.get("name").strip() if isinstance(reg.get("name"), str) else ""
+    name = srv if srv and slug(srv) == slug(name) else name
+    v = secrets.token_urlsafe(48)
+    try:
+        k = api_json("POST", AGENT_KEY_PATH, tok, body={"name": name, "agent_id": agent_id, "code_challenge": challenge_of(v),
+                                                        "agent_proof": proof, "only_if_no_key": True}, timeout=30)
+        code = k.get("pickup_code") if isinstance(k, dict) else None
+        if not (isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_\-]{6,200}", code)):
+            return INSTALL_FAILED_LINE
+        _st, _ct, text = http("POST", PICKUP_PATH, form=pickup_form(code, v), timeout=30, accept="application/json")
+        got = json.loads(text)
+    except ApiError as e:
+        return server_refused(e.body, INSTALL_FAILED_LINE)
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return INSTALL_FAILED_LINE
+    finally:
+        tok = v = None
+    key = got.get("key") if isinstance(got, dict) else None
+    answer = got.get("answer_key") if isinstance(got, dict) else None
+    if not (isinstance(key, str) and re.fullmatch(r"ldgr_ag_[A-Za-z0-9_\-]+", key)):
+        return INSTALL_FAILED_LINE
+    try:
+        new = save_agent(name, agent_id, key, wbs[0], here, proof=proof)
+        if isinstance(answer, str) and answer:
+            save_agent_answer(slug(name), answer)
+    except OSError:
+        return INSTALL_FAILED_LINE
+    finally:
+        key = answer = None
+    try:
+        setup_row_kick(new, here)
+    except Exception:  # noqa: BLE001  the Setup row is a background extra, never the install's result
+        pass
+    return DONE_LINE
+
+
+def _login_list():
+    tok = login_token()
+    if not tok:
+        raise ApiError(401, {})
+    return norm_list(api_json("GET", AGENTS_LIST_PATH, tok, timeout=20))
+
+
+def login_uninstall(sid, typed_at):
+    """The person's own typed uninstall step on an email login (the command, a pick, or "remove all N"), checked by the
+    checker: list on the login, resolve the names, then the uninstall note signed by an agent's answer key here. Lines."""
+    rec = load_cmd(sid)
+    if not rec or rec.get("kind") != "uninstall":
+        return [NO_STEP_LINE]
+    try:
+        lst = _login_list() if not rec.get("targets") else rec.get("list")
+    except ApiError as e:
+        _drop(_cmd_path(sid))
+        return [server_refused(e.body)]
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        _drop(_cmd_path(sid))
+        return [OTHERS_FAILED_LINE]
+    if lst is None:
+        _drop(_cmd_path(sid))
+        return [server_refused({})]
+    targets = rec.get("targets")
+    if not targets:
+        picks = rec.get("picks") or ""
+        if not picks:
+            save_cmd(sid, dict(rec, list=lst, at=time.time()))
+            return ["\n".join(list_lines(lst, LIST_HEAD) + [PICK_LINE])]
+        got = resolve_picks(picks, lst, None)
+        if got == "confirm":
+            save_cmd(sid, dict(rec, list=lst, picks="", confirm=all_confirm(lst), at=time.time()))
+            return [all_confirm_lines(lst)]
+        if not isinstance(got, list):
+            _drop(_cmd_path(sid))
+            return [pick_refused_line(picks, lst, None)]
+        targets = got
+    signer = note_signer(lst, targets)
+    if signer is None:
+        _drop(_cmd_path(sid))
+        return [NO_SIGNER_LINE]
+    key, mine = read_agent_answer(signer["slug"]), signer["agent_id"].lower()
+    targets = sorted(t.lower() for t in targets)
+    proof = note_proof(key, mine, lst["list_id"], "uninstall", targets, rec["pid"], rec["prompt"], typed_at,
+                       int(time.time() * 1000))
+    key = None
+    rec = dict(rec, list=lst, targets=targets, signer={"slug": signer["slug"], "agent_id": mine})
+    _drop(_cmd_path(sid))
+    try:
+        body = api_json("POST", AGENTS_NOTE_PATH, login_token(), body={"kind": "uninstall", "list_id": lst["list_id"],
+                                                                       "targets": targets, "typed_proof": proof}, timeout=30)
+    except ApiError as e:
+        body = e.body or {"error": "refused"}
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return [OTHERS_FAILED_LINE]
+    return [note_result({}, rec, body)]
+
+
+def login_step_prompt(inp, shape, prompt):
+    """UserPromptSubmit: `datastash sync <email>` or `datastash sync <code>` (whole prompt), handed to the checker.
+    (line, AI note, block) or None."""
+    email, code = sync_email_of(prompt), sync_code_of(prompt)
+    if not email and not code:
+        return None
+    if email:
+        ok = start_check(shape, "sync_email", prompt, {"email": email})
+        return (None, LOGIN_STEP_AI.format(line=CHECK_EMAIL_LINE), False) if ok else None
+    name, here = None, project_of(inp)
+    try:
+        kind, got = auto_name(here, this_session(inp), session_name=_session_name(inp))
+        name = got if kind in ("name", "linked") else None
+    except SystemExit:
+        name = None
+    ok = start_check(shape, "sync_code", prompt, {"code": code, "name": name, "here": here})
+    return (None, LOGIN_STEP_AI.format(line="Checking the code."), False) if ok else None
+
+
+def login_step_verify(rec, pending=None):
+    """The checker for the card 1 steps: acts only on the person's own typed entry (the slash command's form too), once
+    and while fresh; the result lines go to the session's outcome (the Stop hook shows them)."""
+    sid = rec["sid"]
+    busy = _step_busy_path(sid)
+    try:
+        write_private(busy, json.dumps({"at": time.time()}))
+    except OSError:
+        return 0
+    finally:
+        if pending:
+            _drop(pending)  # the busy mark is up first, so the Stop hook never sees a gap
+    try:
+        deadline, entry = time.time() + VERIFY_WAIT, None
+        while time.time() < deadline:
+            if rec["kind"] in ("login_install", "login_uninstall"):
+                entry = _typed_entry(rec)
+            else:
+                found = find_typed(rec["tp"], rec["pid"], rec["prompt"], at=rec.get("at")) \
+                    if os.path.exists(rec["tp"]) and _transcript_ok(rec["tp"], sid) else None
+                entry = found[0] if isinstance(found, tuple) else found
+            if entry is not None:
+                break
+            time.sleep(0.2)
+        if entry == "not person":
+            add_outcome(sid, NOT_PERSON_LINE)
+            return 0
+        t = _when(entry.get("timestamp")) if isinstance(entry, dict) else None
+        used = read_json(_typed_used_path(sid), {}).get("ids")
+        used = used if isinstance(used, list) else []
+        if t is None or not (-60 <= t - rec["at"] <= TYPED_FRESH) or rec["pid"] in used:
+            log("status", f"verify: no fresh typed entry for {rec['kind']}")
+            return 0
+        write_private(_typed_used_path(sid), json.dumps({"ids": (used + [rec["pid"]])[-50:]}))
+        data = rec.get("data") or {}
+        if rec["kind"] == "sync_email":
+            lines = email_sign_in_start(sid, data.get("email"))
+        elif rec["kind"] == "sync_code":
+            lines = email_sign_in_code(sid, data.get("code"), data.get("name"), data.get("here"))
+        elif rec["kind"] == "login_install":
+            lines = [login_install(data.get("name"), data.get("here"))]
+        else:
+            lines = login_uninstall(sid, int(t * 1000))
+        for line in lines:
+            add_outcome(sid, line)
+        if lines and not os.path.exists(_outcome_path(sid)):
+            _gone_outcome(sid, lines)  # an uninstall that took the plugin's last folder with it: its line still shows
+    except Exception as e:  # noqa: BLE001  never a traceback: one plain line
+        log("status", f"login step: {type(e).__name__}")
+        add_outcome(sid, INSTALL_FAILED_LINE if rec["kind"] == "login_install" else SIGN_IN_FAILED_LINE)
+    finally:
+        _drop(busy)
+    return 0
+
+
+def _gone_outcome_path(sid):
+    return os.path.join(tempfile.gettempdir(), f"datastash-{os.getuid() if hasattr(os, 'getuid') else 0}-{sid}.outcome")
+
+
+def _gone_outcome(sid, lines):
+    """The result lines of a step whose uninstall removed the plugin's own folder (nothing secret: names only), kept in
+    one fixed file of this user's (mode 600) until the Stop hook shows them."""
+    try:
+        fd = os.open(_gone_outcome_path(sid), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"lines": lines[-10:]}))
+    except OSError:
+        pass
+
+
+def take_gone_outcome(sid):
+    p = _gone_outcome_path(sid)
+    try:
+        st = os.lstat(p)
+        if not stat.S_ISREG(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+            return []
+    except OSError:
+        return []
+    rec = read_json(p, {})
+    _drop(p)
+    return [x for x in (rec.get("lines") or []) if isinstance(x, str)]
+
+
+def login_step_wait(sid, limit=LOGIN_STEP_WAIT):
+    """The Stop hook: wait (a few seconds at most) for this session's own sign-in or install step to finish, so its line
+    shows at the end of the same turn."""
+    end = time.time() + limit
+    while time.time() < end:
+        try:
+            if not (os.path.exists(_step_busy_path(sid)) or _checks_pending(sid, LOGIN_STEP_KINDS)):
+                return
+        except OSError:
+            return  # the plugin's folder is gone (an uninstall): nothing more to wait for
+        time.sleep(0.2)
+
+
 # --- the connector's sync calls: start and start_chatstash run only after the person's own typed phrase
 
 SYNC_TOOL_RE = re.compile(r"mcp__(.+)__sync")
@@ -15112,6 +15518,9 @@ def command_prompt(inp):
         return None
     sid, tp, pid = shape
     base = {"sid": sid, "tp": tp, "pid": pid, "prompt": prompt, "at": time.time()}
+    got = login_step_prompt(inp, shape, prompt)  # card 1: `datastash sync <email>` / `datastash sync <code>`
+    if got is not None:
+        return got
     m = UNINSTALL_RE.fullmatch(prompt)
     im = INSTALL_RE.fullmatch(prompt)
     if im:
@@ -15134,13 +15543,21 @@ def command_prompt(inp):
             name = own["name"]  # XLI-390 install fix: this session's agent again, never a new "-2"
         elif kind == "ask":
             return ASK_NAME_LINE, None, True
+        if email_login():  # card 1: this computer's emailed-code login: the plugin installs on it, no connector
+            if own is not None and read_key(own["slug"]):
+                return DONE_LINE, None, True
+            if not start_check(shape, "login_install", prompt, {"name": name, "here": here}):
+                return INSTALL_FAILED_LINE, None, True
+            return None, LOGIN_STEP_AI.format(line="Setting up."), False
+        if not_signed_in(own):  # card 1: nothing here is signed in: the one line, nothing tried
+            return SIGN_IN_FIRST_LINE, None, True
         save_cmd(sid, dict(base, kind="install", name=name, here=here))
         hours_kick()  # 1.0.18: the person's own hours, counted here in the background while the install runs
         steps = "" if own is not None and read_agent_answer(own["slug"]) else INSTALL_KEY_STEPS.format(name=name)
         return None, INSTALL_AI.format(steps=steps), False
     if m:
-        save_cmd(sid, dict(base, kind="uninstall", picks=m.group(1) or ""))
-        return None, UNINSTALL_LIST_AI, False
+        save_cmd(sid, dict(base, kind="uninstall", picks=m.group(1) or "", rest=email_login()))
+        return _login_uninstall_step(shape, prompt) if email_login() else (None, UNINSTALL_LIST_AI, False)
     v = VISIBILITY_RE.fullmatch(prompt)
     if v and _own(inp) is not None:
         toks, _ = pick_tokens(v.group(1))  # "make this private" alone stays an ordinary prompt; mixed is refused later
@@ -15156,7 +15573,7 @@ def command_prompt(inp):
             _drop(_cmd_path(sid))
             return ALL_NOT_CONFIRMED_LINE, None, True
         save_cmd(sid, dict(rec, **base, targets=list(rec["confirm"]["ids"]), confirm=None))
-        return None, UNINSTALL_NOTE_AI.format(list=""), False
+        return _login_uninstall_step(shape, prompt) if rec.get("rest") else (None, UNINSTALL_NOTE_AI.format(list=""), False)
     if not rec or rec.get("kind") != "uninstall" or rec.get("picks") or not isinstance(rec.get("list"), dict):
         return None
     own = _own(inp)
@@ -15170,7 +15587,14 @@ def command_prompt(inp):
     if got is None:
         return pick_refused_line(prompt, rec["list"], own["agent_id"].lower() if own else None), None, True
     save_cmd(sid, dict(rec, **base, targets=got))
-    return None, UNINSTALL_NOTE_AI.format(list=""), False
+    return _login_uninstall_step(shape, prompt) if rec.get("rest") else (None, UNINSTALL_NOTE_AI.format(list=""), False)
+
+
+def _login_uninstall_step(shape, prompt):
+    """Card 1: an uninstall step on an emailed-code login, done by the plugin once the checker found it typed."""
+    if not start_check(shape, "login_uninstall", prompt, {}):
+        return INSTALL_FAILED_LINE, None, True
+    return None, LOGIN_STEP_AI.format(line="Checking."), False
 
 
 def tool_answer(resp):
@@ -18477,8 +18901,8 @@ SETUP_ROW_TRIES = 8  # the background write's tries
 SETUP_ROW_RETRY_SECONDS = float(os.environ.get("DATASTASH_SETUP_ROW_RETRY_SECONDS", "15"))
 WHO_TIMEOUT = 4  # the prompt hook has 10 s
 SETUP_CACHE_MAX = 7 * 86400
-NOT_SIGNED_IN_LINE = ("This computer is not signed in to datastash, so this folder's agent is not set up yet. Nothing was "
-                      "tried.")
+NOT_SIGNED_IN_LINE = ("This computer is not signed in to datastash, so this folder's agent is not set up yet. Type "
+                      "**datastash sync you@email.com** to sign in.")  # card 1
 NOT_SIGNED_IN_AI = (f"{SETUP_NOTE}: this folder has no datastash agent yet and this computer is not signed in to "
                     "datastash, so the plugin set nothing up and tried nothing. Never register an agent, get a key or "
                     "sign anything in yourself. Tell the person exactly this line, word for word, once: "
