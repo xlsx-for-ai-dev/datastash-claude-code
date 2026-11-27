@@ -2732,10 +2732,19 @@ def cmd_check(_args):
     signin = {}
 
     def _signin():
+        try:  # XLI-419: a machine holding a fleet key joins by itself first (its own login; no typing, no email)
+            joined = fleet_join()
+        except Exception:  # noqa: BLE001  never in the session's way
+            joined = None
         try:
-            signin["v"] = session_sign_in(inp)
+            fleet_setup_kick(inp)  # a fleet login: this folder's agent is set up on it in the background
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            got = session_sign_in(inp)
         except Exception:
-            signin["v"] = _late_sign_in_note(inp)
+            got = _late_sign_in_note(inp)
+        signin["v"] = (" ".join(x for x in (joined, got[0]) if x) or None, got[1]) if joined else got
     t_signin = threading.Thread(target=_signin, daemon=True)
     t_signin.start()
     t0 = time.time()
@@ -14140,7 +14149,8 @@ EMAIL_RE = r"[^\s@<>\"'`]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}"
 SYNC_EMAIL_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(" + EMAIL_RE + r")\s*", re.I)
 SYNC_CODE_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(\d{6})\s*", re.I)
 EMAIL_CODE_LIFE = 600  # the emailed code works for 10 minutes
-LOGIN_STEP_KINDS = ("sync_email", "sync_code", "login_install", "login_uninstall")
+LOGIN_STEP_KINDS = ("sync_email", "sync_code", "login_install", "login_uninstall", "fleet_create", "fleet_list",
+                    "fleet_revoke")  # XLI-419: the fleet-key lines too
 LOGIN_STEP_WAIT = 8.0  # the Stop hook (10 s) waits this long at most for the plugin's own step to finish
 SIGN_IN_FIRST_LINE = "Type **datastash sync you@email.com**"
 CHECK_EMAIL_LINE = "Check your email for a 6-digit code. Then type **datastash sync CODE** here."
@@ -14470,6 +14480,8 @@ def login_step_verify(rec, pending=None):
             lines = email_sign_in_code(sid, data.get("code"), data.get("name"), data.get("here"))
         elif rec["kind"] == "login_install":
             lines = [login_install(data.get("name"), data.get("here"))]
+        elif rec["kind"] in FLEET_STEP_KINDS:
+            lines = fleet_step(rec, rec["kind"], int(t * 1000))
         else:
             lines = login_uninstall(sid, int(t * 1000))
         for line in lines:
@@ -14523,6 +14535,298 @@ def login_step_wait(sid, limit=LOGIN_STEP_WAIT):
         except OSError:
             return  # the plugin's folder is gone (an uninstall): nothing more to wait for
         time.sleep(0.2)
+
+
+# --- XLI-419 (plugin 1.0.24): the fleet key. The person, in their own signed-in session, types
+# `datastash fleet-key create <name> [--expires <time>]`: the plugin checks it was typed by the person (the checker), signs
+# the typed proof with this computer's login answer key (bound to the name and the expiry) and shows the key ONCE, to the
+# person only (the Stop hook's line, never the model). A machine holding the key (DATASTASH_FLEET_KEY, or the mode-600 file
+# ~/.config/datastash/fleet.key) joins by itself at session start: its OWN computer login, with no typing and no email,
+# and then this folder's agent is set up on that login the normal way (in the background). `datastash fleet-key list` and
+# `datastash fleet-key revoke <name>` (typed by the person too) show and stop keys; a revoke signs every machine out.
+FLEET_CREATE_PATH = "/api/v1/device/fleet-key/create"
+FLEET_JOIN_PATH = "/api/v1/device/fleet-key/join"
+FLEET_LIST_PATH = "/api/v1/device/fleet-keys"
+FLEET_REVOKE_PATH = "/api/v1/device/fleet-key/revoke"
+FLEET_KEY_FILE = os.path.join(CONF, "fleet.key")
+FLEET_LOGIN_FILE = os.path.join(CONF, "login.fleet.json")  # {"fleet", "at"}: this computer's login joined with a fleet key
+FLEET_KEY_RE = r"dsfk_[A-Za-z0-9_\-]{43}"
+FLEET_NAME_RE = r"[a-z0-9][a-z0-9-]{0,39}"
+FLEET_ACTION = "fleet_key_create"
+FLEET_STEP_KINDS = ("fleet_create", "fleet_list", "fleet_revoke")
+FLEET_PROMPT_RE = re.compile(r"\s*datastash fleet-key\s+(create|list|revoke)(?:\s+(.*?))?\s*", re.I | re.S)
+FLEET_EXPIRES_RE = re.compile(r"(\d{1,5})\s*(m|min|mins|minutes?|h|hours?|d|days?|w|weeks?)", re.I)
+FLEET_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+FLEET_USAGE_LINE = ("Not done. Type **datastash fleet-key create NAME** (optional **--expires 1d**), "
+                    "**datastash fleet-key list** or **datastash fleet-key revoke NAME**. A name is lower-case letters, "
+                    "digits or dashes.")
+FLEET_NO_LOGIN_LINE = "Not done: this computer is not signed in. Type **datastash sync you@email.com** first."
+FLEET_NO_AGENT_LINE = "Not done: this computer has no datastash agent to sign with yet. Type **/datastash:install** first."
+FLEET_FAILED_LINE = "Not done: datastash could not be reached. Try again in a minute."
+FLEET_SHOWN_LINES = ("Fleet key **{name}** made{until}. This is the only time it is shown:\n\n{key}\n\n"
+                     "Put it on each machine as the environment variable DATASTASH_FLEET_KEY, or in the file "
+                     "~/.config/datastash/fleet.key (mode 600). Each machine signs itself in at its next session start. "
+                     "To stop it: **datastash fleet-key revoke {name}**.")
+FLEET_JOINED_LINE = "This machine joined the fleet **{fleet}** and is signed in to datastash."
+FLEET_REFUSED_LINE = ("This machine's fleet key did not sign it in (wrong, revoked or expired). Ask for a new one, or "
+                      "type **datastash sync you@email.com**.")
+FLEET_FILE_OPEN_LINE = ("The fleet key file ~/.config/datastash/fleet.key can be read by others, so it was not used. "
+                        "Run: chmod 600 ~/.config/datastash/fleet.key")
+
+
+def fleet_expires_of(text):
+    """Seconds for an --expires value (30m, 12h, 1d, 2w), else None; 'bad' for anything else."""
+    m = FLEET_EXPIRES_RE.fullmatch(text.strip()) if isinstance(text, str) else None
+    if not m:
+        return "bad"
+    n = int(m.group(1)) * FLEET_UNITS[m.group(2)[0].lower()]
+    return n if 60 <= n <= 10 * 365 * 86400 else "bad"
+
+
+def fleet_prompt_of(text):
+    """The person's whole prompt `datastash fleet-key ...`: ("create", name, seconds|None), ("list",), ("revoke", name),
+    "usage" for a malformed one, else None (any other prompt)."""
+    m = FLEET_PROMPT_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 200 else None
+    if not m:
+        return None
+    verb, rest = m.group(1).lower(), (m.group(2) or "").strip()
+    if verb == "list":
+        return ("list",) if not rest else "usage"
+    parts = rest.split()
+    if not parts or not re.fullmatch(FLEET_NAME_RE, parts[0]):
+        return "usage"
+    if verb == "revoke":
+        return ("revoke", parts[0]) if len(parts) == 1 else "usage"
+    exp = None
+    if len(parts) > 1:
+        tail = " ".join(parts[1:])
+        em = re.fullmatch(r"--expires(?:=|\s+)(.+)", tail)
+        exp = fleet_expires_of(em.group(1)) if em else "bad"
+        if exp == "bad":
+            return "usage"
+    return ("create", parts[0], exp)
+
+
+def fleet_action(name, seconds):
+    return f"{FLEET_ACTION}:{name}:{seconds or 0}"
+
+
+def fleet_key_held():
+    """This machine's fleet key: DATASTASH_FLEET_KEY, else the mode-600 file. (key or None, line for the person or None).
+    Never printed or logged."""
+    env = os.environ.get("DATASTASH_FLEET_KEY", "").strip()
+    if env:
+        return (env, None) if re.fullmatch(FLEET_KEY_RE, env) else (None, FLEET_REFUSED_LINE)
+    try:
+        fd = os.open(FLEET_KEY_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None, None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+            return None, None
+        if st.st_mode & 0o077:
+            return None, FLEET_FILE_OPEN_LINE
+        text = os.read(fd, 512).decode("utf-8", "replace").strip()
+    finally:
+        os.close(fd)
+    return (text, None) if re.fullmatch(FLEET_KEY_RE, text) else (None, FLEET_REFUSED_LINE)
+
+
+def fleet_login():
+    """The fleet name when this computer's login joined with a fleet key, else None."""
+    if not login_present():
+        return None
+    rec = read_json(FLEET_LOGIN_FILE, {})
+    f = rec.get("fleet") if isinstance(rec, dict) else None
+    return f if isinstance(f, str) and re.fullmatch(FLEET_NAME_RE, f) else None
+
+
+def fleet_join():
+    """Session start on a machine with no login and a fleet key: join (this machine's own login, no typing). The line for
+    the person, or None when there is nothing to do."""
+    if login_present():
+        return None
+    key, line = fleet_key_held()
+    if not key:
+        return line
+    mark = os.path.join(STATE, "fleet-refused.json")
+    kh = hashlib.sha256(key.encode()).hexdigest()[:16]
+    if read_json(mark, {}).get("k") == kh:
+        return None  # this key was refused before: said once, not tried at every start
+    try:
+        got = _post_json(FLEET_JOIN_PATH, dict(_computer(), fleet_key=key), timeout=HOOK_START_SECONDS - 0.5)
+    except ApiError as e:
+        if e.status in (400, 401, 403):
+            ensure_dirs()
+            write_private(mark, json.dumps({"k": kh, "at": int(time.time())}))
+            return FLEET_REFUSED_LINE
+        return None
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return None
+    finally:
+        key = None
+    rt, at = got.get("refresh_token"), got.get("access_token")
+    fleet = got.get("fleet") if isinstance(got.get("fleet"), str) and re.fullmatch(FLEET_NAME_RE, got["fleet"]) else "fleet"
+    if not (isinstance(rt, str) and re.fullmatch(REFRESH_RE, rt) and isinstance(at, str) and re.fullmatch(ACCESS_RE, at)):
+        return None
+    with _login_lock():
+        _save_login(rt, at, got.get("expires_in"), got.get("answer_key"), got.get("grant_id"))
+    rt = at = got = None
+    write_private(EMAIL_LOGIN_FILE, json.dumps({"at": int(time.time())}))  # installs run on this login's REST routes
+    write_private(FLEET_LOGIN_FILE, json.dumps({"fleet": fleet, "at": int(time.time())}))
+    _drop(mark)
+    _change_signin(SIGNIN_DEVICE, "fleet key")
+    login_typed_sync()
+    log("enroll", f"fleet: joined {fleet}")
+    return FLEET_JOINED_LINE.format(fleet=fleet)
+
+
+def fleet_setup_kick(inp):
+    """On a fleet machine's login, a folder with no agent of its own: set it up on the login in the background (once per
+    folder per AUTO_SETUP_RETRY), as /datastash:install does."""
+    if fleet_login() is None:
+        return
+    project, me = project_of(inp), this_session(inp)
+    name = auto_setup_name(project, me, inp)
+    if name is None or not auto_setup_due(project):
+        return
+    write_private(_auto_mark_path(project), json.dumps({"at": int(time.time()), "name": name, "state": "fleet"}))
+    try:
+        spawn_detached([sys.executable, os.path.realpath(__file__), "fleet-setup", "--name", name, "--folder", project],
+                       project if os.path.isdir(project) else HOME)
+    except OSError:
+        pass
+
+
+def cmd_fleet_setup(args):
+    """Background only (the session start on a fleet machine): this folder's agent on the fleet login."""
+    def val(flag):
+        i = args.index(flag) if flag in args else -1
+        return args[i + 1] if 0 <= i < len(args) - 1 else None
+    name, here = val("--name"), val("--folder")
+    if fleet_login() is None or not name or not here:
+        return 1
+    line = login_install(name, os.path.realpath(here))
+    log("enroll", "fleet setup: " + ("done" if line == DONE_LINE else "not done"))
+    return 0 if line == DONE_LINE else 1
+
+
+def cmd_fleet_key(_args):
+    """`datastash fleet-key` in a terminal: only the person's own typed line in their Claude Code session does this."""
+    print("datastash: type datastash fleet-key create NAME, list or revoke NAME in your own Claude Code session; the "
+          "plugin checks you typed it. Nothing was done.")
+    return 2
+
+
+def _fleet_signer(data):
+    """(answer key, grant id, agent id) to sign the create with: this computer's login and an agent keyed here."""
+    login = read_answer_key()
+    aid = data.get("agent_id")
+    if login is None or not re.fullmatch(GRANT_ID_RE, str(login[1]).lower()):
+        return None
+    if not (isinstance(aid, str) and re.fullmatch(GRANT_ID_RE, aid.lower())):
+        return None
+    return login[0], login[1].lower(), aid.lower()
+
+
+def fleet_step(rec, kind, typed_ms):
+    """The person's typed fleet-key line, checked by the checker. Lines for the person."""
+    data = rec.get("data") or {}
+    if not login_present() or fleet_login() is not None:
+        return [FLEET_NO_LOGIN_LINE]
+    tok = login_token()
+    if not tok:
+        return [FLEET_NO_LOGIN_LINE]
+    try:
+        if kind == "fleet_list":
+            got = api_json("GET", FLEET_LIST_PATH, tok, timeout=20)
+            return [fleet_list_lines(got.get("fleet_keys") if isinstance(got, dict) else None)]
+        name = data.get("name")
+        if not (isinstance(name, str) and re.fullmatch(FLEET_NAME_RE, name)):
+            return [FLEET_USAGE_LINE]
+        if kind == "fleet_revoke":
+            got = api_json("POST", FLEET_REVOKE_PATH, tok, body={"name": name}, timeout=30)
+            n = got.get("signed_out") if isinstance(got, dict) else None
+            n = n if isinstance(n, int) and not isinstance(n, bool) else 0
+            return [f"Fleet key **{name}** revoked. {n} machine{'' if n == 1 else 's'} signed out."]
+        exp = data.get("expires")
+        exp = exp if isinstance(exp, int) and not isinstance(exp, bool) and exp > 0 else None
+        signer = _fleet_signer(data)
+        if signer is None:
+            return [FLEET_NO_AGENT_LINE]
+        iat = int(time.time() * 1000)
+        proof = typed_sync_proof(signer[0], f"grant:{signer[1]}", signer[2], fleet_action(name, exp), rec["pid"],
+                                 rec["prompt"], min(typed_ms, iat), iat)
+        signer = None
+        body = {"name": name, "typed_proof": proof}
+        if exp:
+            body["expires_in_seconds"] = exp
+        got = api_json("POST", FLEET_CREATE_PATH, tok, body=body, timeout=30)
+    except ApiError as e:
+        return [server_refused(e.body, FLEET_FAILED_LINE)]
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return [FLEET_FAILED_LINE]
+    finally:
+        tok = None
+    key = got.get("fleet_key") if isinstance(got, dict) else None
+    if not (isinstance(key, str) and re.fullmatch(FLEET_KEY_RE, key)):
+        return [FLEET_FAILED_LINE]
+    until = got.get("expires_at")
+    until = f" (it adds machines until {until})" if isinstance(until, str) and len(until) <= 30 else " (no expiry)"
+    line = FLEET_SHOWN_LINES.format(name=name, until=until, key=key)
+    key = None
+    return [line]
+
+
+def fleet_list_lines(keys):
+    if not isinstance(keys, list):
+        return FLEET_FAILED_LINE
+    if not keys:
+        return "No fleet keys yet. Type **datastash fleet-key create NAME** to make one."
+    out = ["Fleet keys:"]
+    for k in keys[:50]:
+        if not isinstance(k, dict) or not isinstance(k.get("name"), str):
+            continue
+        state = ("revoked" if k.get("revoked_at") else "expired" if k.get("expired")
+                 else f"adds machines until {k['expires_at']}" if k.get("expires_at") else "no expiry")
+        ms = [m for m in k.get("machines") or [] if isinstance(m, dict)]
+        live = sum(1 for m in ms if m.get("signed_in") is True)
+        out.append(f"- {k['name']}: {state}; {live} of {len(ms)} machine{'' if len(ms) == 1 else 's'} signed in")
+        for m in ms[:20]:
+            nm = fleet_machine_name(m.get("device_name"))
+            out.append(f"    {nm}: {'signed in' if m.get('signed_in') is True else 'signed out'}")
+    return "\n".join(out)
+
+
+def fleet_machine_name(v, max_len=60):
+    return re.sub(r"[^\w .:/@()-]", "", v)[:max_len] if isinstance(v, str) and v else "a machine"
+
+
+def fleet_step_prompt(inp, shape, prompt):
+    """UserPromptSubmit: the person's whole prompt `datastash fleet-key ...`, handed to the checker. (line, AI, block)."""
+    got = fleet_prompt_of(prompt)
+    if got is None:
+        return None
+    if got == "usage":
+        return FLEET_USAGE_LINE, None, True
+    if not login_present() or fleet_login() is not None:
+        return FLEET_NO_LOGIN_LINE, None, True
+    data = {}
+    if got[0] == "create":
+        own = _own(inp)
+        aid = own.get("agent_id") if isinstance(own, dict) else None
+        if not isinstance(aid, str):
+            keyed = _keyed_agents()
+            aid = keyed[0].get("agent_id") if keyed else None
+        if not isinstance(aid, str):
+            return FLEET_NO_AGENT_LINE, None, True
+        data = {"name": got[1], "expires": got[2], "agent_id": aid}
+    elif got[0] == "revoke":
+        data = {"name": got[1]}
+    if not start_check(shape, "fleet_" + got[0], prompt, data):
+        return FLEET_FAILED_LINE, None, True
+    return None, LOGIN_STEP_AI.format(line="Checking."), False
 
 
 # --- the connector's sync calls: start and start_chatstash run only after the person's own typed phrase
@@ -15519,6 +15823,9 @@ def command_prompt(inp):
     sid, tp, pid = shape
     base = {"sid": sid, "tp": tp, "pid": pid, "prompt": prompt, "at": time.time()}
     got = login_step_prompt(inp, shape, prompt)  # card 1: `datastash sync <email>` / `datastash sync <code>`
+    if got is not None:
+        return got
+    got = fleet_step_prompt(inp, shape, prompt)  # XLI-419: `datastash fleet-key create|list|revoke ...`
     if got is not None:
         return got
     m = UNINSTALL_RE.fullmatch(prompt)
@@ -19131,8 +19438,8 @@ def auto_setup_wake(inp, project, me):
     """The listener's one wake for a folder with no agent on a signed-in computer: the plugin's own setup steps; None
     otherwise (not signed in: nothing is tried, and the next session start says so plainly)."""
     name = auto_setup_name(project, me, inp)
-    if name is None:
-        return None
+    if name is None or fleet_login() is not None:
+        return None  # XLI-419: a fleet login's folder is set up by the session start's background step, never the model
     if AUTO_SETUP_WAIT > 0:
         time.sleep(AUTO_SETUP_WAIT)
         name = auto_setup_name(project, me, inp)  # the person's typed install may have started meanwhile
@@ -19947,7 +20254,8 @@ def main():
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
              "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share,
-             "remember": cmd_remember, "skills-sync": cmd_skills_sync}
+             "remember": cmd_remember, "skills-sync": cmd_skills_sync,
+             "fleet-key": cmd_fleet_key, "fleet-setup": cmd_fleet_setup}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
