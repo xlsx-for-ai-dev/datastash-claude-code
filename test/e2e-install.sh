@@ -12,7 +12,7 @@
 #   4. /mcp, datastash: it must say it needs sign-in and offer Authenticate (1.0.1: "failed", the helper's placeholder
 #      header turned Claude Code's OAuth off). Authenticate is chosen: the sign-in link Claude Code makes must open
 #      datastash's own sign-in page (the page a person signs in on). The run stops there (Esc).
-#   5. /datastash:install: the plugin's own prompt hook takes the typed command and picks the agent's name: "agent" in
+#   5. (1.0.23+: a not-signed-in computer shows "datastash sync you@email.com" and records no install.) /datastash:install: the plugin's own prompt hook takes the typed command and picks the agent's name: "agent" in
 #      the home folder (1.0.1: the computer user's name), "web-app" in the repo.
 #   6. /datastash:uninstall in that same session, which has no agent key on this computer (1.0.12 refused it there
 #      with "Type /datastash:install again"): 1.0.16's prompt hook answers it with its own line, "Datastash isn't
@@ -206,16 +206,17 @@ run_folder() {  # run_folder home|repo
 check_install_hook() {  # step 5, the plugin's half: the typed /datastash:install reaches its hook and names the agent
   local h="$1" where="$2" want="$3" got
   type_line "/datastash:install"
-  local i
+  # 1.0.23 (card 1): a computer that is not signed in (the fresh home here never is) answers /datastash:install with one
+  # line asking for the email, and records no install. That is the intended behavior and what this step now expects.
+  local i ok=0
   for ((i = 0; i < 30; i++)); do
-    got="$(command_record "$h" 2>/dev/null)"
-    [[ "$got" == install* ]] && break
+    if pane | grep -qF -- "datastash sync you@email.com"; then ok=1; break; fi
     sleep 1
   done
-  if [[ "$got" == "install $want" ]]; then
-    pass "$where step 5: /datastash:install reached the plugin, agent name \"$want\""
+  if ((ok)); then
+    pass "$where step 5: /datastash:install on a not-signed-in computer shows \"datastash sync you@email.com\""
   else
-    fail "$where step 5: /datastash:install: wanted agent name \"$want\", the plugin has: ${got:-nothing}"
+    fail "$where step 5: /datastash:install did not show \"datastash sync you@email.com\" (command record: $(command_record "$h" 2>/dev/null || true))"
   fi
   tmux send-keys -t "$T" Escape; sleep 1
   # Step 6 (1.0.16): uninstall from this key-less session (no agent key on this computer, the install never finished)
