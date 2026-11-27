@@ -60,6 +60,8 @@
 #         version moves to the published one; then sign-in and /datastash:install on the updated copy: on the server.
 #      6b self-update at session start: the old copy updates itself; the next start says "datastash updated to vX";
 #         then sign-in and /datastash:install: on the server.
+#      6c 1.0.20 (x-live #533): 6b's agent, made through the connector sign-in and uninstalled, installs again under the
+#         same name on a new computer with the candidate and its typed email-code sign-in: back, rebound there; removed.
 # Every model turn's permission dialog is answered Yes only for a datastash connector tool; any other tool is refused
 # (Esc) and fails the step. claude.ai connectors are off in the throwaway HOMEs (ENABLE_CLAUDEAI_MCP_SERVERS=false), so
 # no step can reach any account but the selftest one.
@@ -81,7 +83,7 @@
 #   Recovery of a name an older harness switched off: E2E_SWITCH_ON="agent ..." first switches those back on through the
 #   person's own switch-on (ledger_agent_switch_off action "on"), so the clean start's typed uninstall removes them.
 # Every run tees its whole output to E2E_LOG (default ~/x/ops/proofs/plugin-e2e-real-<UTC time>-<pid>.md).
-# Sign-in budget: a run counts the selftest sign-ins it needs (the read-back 1; core 2, step5 2, outbox 1, update 2) and
+# Sign-in budget: a run counts the selftest sign-ins it needs (the read-back 1; core 2, step5 2, outbox 1, update 3) and
 #   waits (one sleep, until enough of the oldest free) when those plus this harness's own sign-ins of the last hour
 #   (E2E_SIGNIN_LEDGER, default ~/.local/state/datastash-e2e/selftest-signins: one time per line) would pass 20; a
 #   cleanup computer counts one more. E2E_BUDGET_WAIT=0: stop instead of waiting. A server refusal (HTTP 429) names
@@ -124,7 +126,7 @@ RUN="dsreal-$$"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/ds-e2e-real.XXXXXX")"
 export E2E_SERVER_TOKEN_FILE="$WORK/server.tok"
 SRV=(python3 -I "$HERE/e2e_server.py")
-FAILS=0 WAITS=0 STARTS=0 T="" LOGIN=0 BADTOOL=0 NOANSWER=0 IN_CLEANUP=0 END_CLEAN=0 CLEAN_N=0 CLEAN_HOME=""
+STEP6C_NAME="" FAILS=0 WAITS=0 STARTS=0 T="" LOGIN=0 BADTOOL=0 NOANSWER=0 IN_CLEANUP=0 END_CLEAN=0 CLEAN_N=0 CLEAN_HOME=""
 RESULTS=()
 
 # --- the log: every run leaves its whole output under ~/x/ops/proofs (no secret is ever printed).
@@ -175,7 +177,7 @@ fi
 # --- the sign-in budget: what this run needs against the server's hourly limit, before anything signs in.
 NEED=1  # the read-back's own sign-in
 for p in $PARTS; do
-  case "$p" in core|step4|step5|update) NEED=$((NEED + 2)) ;; outbox) NEED=$((NEED + 1)) ;; esac
+  case "$p" in core|step4|step5) NEED=$((NEED + 2)) ;; update) NEED=$((NEED + 3)) ;; outbox) NEED=$((NEED + 1)) ;; esac
 done
 signins_last_hour() {
   python3 -I -c 'import sys, time
@@ -1269,7 +1271,25 @@ update_part() {  # update_part a|b
     fi
   fi
   authenticate "6$how" || { stop_claude; return; }
-  ds_install "6$how updated copy" "$h" "$name" && ds_uninstall "6$how cleanup" "$h" "$name" "$name"
+  ds_install "6$how updated copy" "$h" "$name" && ds_uninstall "6$how cleanup" "$h" "$name" "$name" && [[ "$how" == b ]] && STEP6C_NAME="$name"
+  stop_claude
+}
+
+step6c_connector_name_back() {  # 1.0.20 (XLI-417, x-live #533): 6b's name, made through the CONNECTOR sign-in (the
+  # 1.0.19 way, /mcp Authenticate) and then uninstalled, installs again under the same name on a brand-new computer with
+  # the candidate and its typed email-code sign-in: the removed agent comes back, rebound here (key here, server on,
+  # no "<name>-N"); then the typed uninstall removes it again.
+  local name="${STEP6C_NAME:-}" h dir
+  [[ -n "${E2E_CANDIDATE:-}" ]] || { say "6c: skipped (needs E2E_CANDIDATE: the typed sign-in is 1.0.20+)"; return; }
+  [[ -n "$name" ]] || { fail "6c: 6b did not make and uninstall its connector-made agent, so its reinstall was not checked"; return; }
+  has_agent "$name" && { fail "6c: server: \"$name\" is still on before its reinstall"; return; }
+  h="$(new_home U6c)"; dir="$h/code/$name"; new_repo "$dir"
+  say "== 6c: a new computer with the candidate: the connector-made \"$name\" (6b, uninstalled) installs again"
+  readme_steps "6c" "$h" "$dir" "$CORE_SRC" || return
+  authenticate "6c" || { stop_claude; return; }
+  ds_install "6c reinstall of the connector-made \"$name\" (email-code sign-in)" "$h" "$name" \
+    && pass "6c: the connector-made \"$name\" came back under its own name, rebound to this computer (key here; server: $(agents))" \
+    && ds_uninstall "6c cleanup" "$h" "$name" "$name"
   stop_claude
 }
 
@@ -1347,7 +1367,7 @@ for p in $PARTS; do
     step5) step5_only ;;
     step4) step4_only ;;
     outbox) outbox_only ;;
-    update) update_part a; update_part b ;;
+    update) update_part a; update_part b; step6c_connector_name_back ;;
     *) echo "unknown part: $p"; exit 2 ;;
   esac
 done
