@@ -32,6 +32,11 @@ Subcommands (run `datastash help`); `datastash --agent NAME COMMAND ...` runs an
                             (XLI-408: a POST datastash can't take now, no connection, a timeout or a 5xx, is kept
                             on this computer and sent in order, once, when it answers: "saved, will send when the
                             server is back"; a GET is never kept and says to try again shortly)
+  share TAB --with AGENT[,AGENT] [--write] [--workbook ID]
+                            share a tab this folder's agent made with other agents of the account, by name: read only, or
+                            read and write with --write (XLI-425: POST /api/v1/agent/tabs/share, the connector's own share
+                            rules: only the tab's maker or the person shares it). The workbook is the agent's own unless
+                            --workbook names one. The answer is printed as for api
   lookups [steps SERVICE]   today's repeated outside lookups on this computer (shapes and counts only) and what
                             datastash keeps; steps github|linear|jira: that feed's setup steps, after the person's
                             "do N" on the status offer
@@ -5027,6 +5032,54 @@ def cmd_api(args):
     if outbox_keeps(method, path, body):  # XLI-408: kept on this computer when datastash can't be reached, sent once later
         return outbox_call(agent["slug"], key, method, path, body)
     return plain_call(method, path, key, body)
+
+
+AGENT_TAB_SHARE_PATH = "/api/v1/agent/tabs/share"
+SHARE_USAGE = "usage: datastash share TAB --with AGENT[,AGENT] [--write] [--workbook ID]"
+
+
+def share_args(args):
+    """XLI-425: `datastash share` arguments as (tab, [agents], access, workbook or None); dies with the usage line on
+    anything else. --with takes a comma list and may be given more than once (--with=A,B too)."""
+    tab, names, access, wb = None, [], "read", None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--with", "--workbook"):
+            if i + 1 >= len(args) or not args[i + 1].strip() or args[i + 1].startswith("--"):
+                die(SHARE_USAGE)
+            v, i = args[i + 1], i + 2
+        elif a.startswith(("--with=", "--workbook=")):
+            a, v = a.split("=", 1)
+            i += 1
+        elif a == "--write":
+            access, i = "write", i + 1
+            continue
+        elif a.startswith("--") or tab is not None or not a.strip():
+            die(SHARE_USAGE)
+        else:
+            tab, i = a.strip(), i + 1
+            continue
+        if a == "--with":
+            names += [n.strip() for n in v.split(",") if n.strip()]
+        else:
+            wb = v.strip() or None
+    if tab is None or not names:
+        die(SHARE_USAGE)
+    return tab, list(dict.fromkeys(names)), access, wb
+
+
+def cmd_share(args):
+    """`datastash share TAB --with AGENT[,AGENT] [--write]`: the connector's ledger_agent_workbook share over REST, as
+    this folder's agent (every guard of `datastash api` applies: never in the person's main, the agent's own key)."""
+    tab, names, access, wb = share_args(args)
+    if wb is None:
+        agent = agent_for(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), me=this_session())
+        wb = (agent or {}).get("workbook_id")
+        if not wb:
+            die("no agent workbook is linked to this folder (datastash link NAME --workbook ID, or --workbook ID)")
+    body = {"workbook_id": wb, "tab": tab, "agents": names, "access": access}
+    return cmd_api(["POST", AGENT_TAB_SHARE_PATH, json.dumps(body)])
 
 
 def plain_call(method, path, key, body):
@@ -18980,7 +19033,7 @@ def main():
              "where": cmd_where, "file": cmd_file, "map-refresh": cmd_map_refresh,
              "fingerprint": cmd_fingerprint, "self-update": cmd_self_update, "ci-report": cmd_ci_report, "eval-report": cmd_eval_report, "xlsx-test": cmd_xlsx_test,
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
-             "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check}
+             "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share}
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
