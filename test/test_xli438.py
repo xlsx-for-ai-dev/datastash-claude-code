@@ -7,8 +7,7 @@
   timer (never a second one).
 - `datastash dds-update --auto` (the 6 AM wake) posts only on a day of the seven and not twice a day, records the post,
   and ends with exactly the one line; after the seven days it removes the wake and prints nothing.
-- The where-to-deliver question comes once in the first week, after a typed update, never in an automatic post; the
-  typed answer is kept on this computer only.
+- XLI-439 (plugin 1.0.39): the where-to-deliver question is in test/test_xli439.py (a morning post, kept on the account).
 No network, no key; a throwaway HOME and config folder, enforced by test/harness.py.
 Run: python3 -I test/test_xli438.py"""
 import json
@@ -47,7 +46,7 @@ def update(week=None, agents=True, missed=True):
 class DdsBase(Base):
     def setUp(self):
         super().setUp()
-        for p in (ds.DDS_DELIVER_PATH, ds._dds_week_path("web-app")):
+        for p in (ds._dds_week_path("web-app"),):
             if os.path.exists(p):
                 os.replace(p, p + f".old-{id(self)}")
         self.server = update()
@@ -57,7 +56,7 @@ class DdsBase(Base):
         def http(method, path, key=None, body=None, form=None, timeout=40):
             if path.startswith(ds.DDS_UPDATE_PATH) or path.startswith(ds.AGENT_TIMERS_PATH):
                 self.calls.append((method, path, key, body))
-            if method == "GET" and path == ds.DDS_UPDATE_PATH:
+            if method == "GET" and path.split("?")[0] == ds.DDS_UPDATE_PATH:
                 if self.server is None:
                     raise ds.ApiError(503, {})
                 return 200, "application/json", json.dumps(self.server)
@@ -93,23 +92,9 @@ class Typed(DdsBase):
             self.assertEqual(ctx.count("web-app (this agent)"), 1)  # its own list once, not again under all agents
             self.assertNotIn(ds.DDS_UPDATE_ENDING, ctx)  # the ending line is for the automatic posts only
 
-    def test_the_where_to_deliver_question_comes_once_in_the_first_week(self):
-        first = self.prompt("DDS update")
-        self.assertIn(ds.DDS_DELIVER_QUESTION, first)
+    def test_a_typed_update_never_asks_where_to_deliver(self):  # XLI-439: the question comes in a morning post only
+        self.server["delivery"] = {"answer": None, "asked": False, "ask_now": False, "sent_to": ["session"]}
         self.assertNotIn(ds.DDS_DELIVER_QUESTION, self.prompt("DDS update"))
-
-    def test_no_question_outside_the_first_week(self):
-        self.server = update(week={"day": None, "auto": False})
-        self.assertNotIn(ds.DDS_DELIVER_QUESTION, self.prompt("DDS update"))
-
-    def test_the_typed_answer_is_kept_here_only(self):
-        ctx = self.prompt("DDS update also Slack")
-        self.assertIn(ds.DDS_DELIVER_SAVED["slack"], ctx)
-        self.assertEqual(ds.dds_deliver_choice().get("answer"), "slack")
-        self.assertEqual(oct(os.stat(ds.DDS_DELIVER_PATH).st_mode & 0o777), "0o600")
-        self.assertIn(ds.DDS_DELIVER_SAVED["here"], self.prompt("DDS update here only"))
-        self.assertIn(ds.DDS_DELIVER_SAVED["email"], self.prompt("dds update also by email"))
-        self.assertFalse([c for c in self.calls if "slack" in json.dumps(c).lower() or "email" in c[1]])
 
     def test_without_the_sync_yes_it_says_how_to_see_every_agent(self):
         self.server = update(agents=False, missed=False)

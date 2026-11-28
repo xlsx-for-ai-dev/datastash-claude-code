@@ -11444,6 +11444,9 @@ def cmd_status_verify(args):
         elif rec.get("kind") == "undo_default":
             for line in send_typed_answer(rec, v, undo=True):  # XLI-388: only the person's own typed "undo N"
                 add_outcome(sid, line)
+        elif rec.get("kind") in DDS_DELIVER_KINDS:
+            for line in send_dds_delivery(rec, typed):  # XLI-439: only the person's own typed DDS update here only / also ...
+                add_outcome(sid, line)
         elif rec.get("kind") in EST_ONOFF_KINDS:
             for line in send_estimates_choice(rec, typed):  # XLI-426: only the person's own typed DDS estimates on / off
                 add_outcome(sid, line)
@@ -15252,8 +15255,11 @@ def asks_text(asks=None):
 # and overdue flags computed by the engine). The only place the open list shows: one nudge a day. For an agent's first
 # seven days it is posted automatically at 6:00 AM US Central in the agent's own session, woken by a datastash timer
 # (XLI-433, set up once per agent by the listener); each of those posts ends with exactly DDS_UPDATE_ENDING. After that
-# only when the person types it. The one where-to-deliver question comes once in the first week, after a typed update
-# (never inside an automatic post). Slack and email are opt-in only and not sent yet: the answer is kept here.
+# only when the person types it. XLI-439: the 6 AM read is GET ?post=auto, and the server records the post as it serves
+# it (an agent's own "posted" no longer counts by itself); the server also ends the wake after day 7. The one
+# where-to-deliver question comes once per account, at the end of the morning post the server marks (delivery.ask_now),
+# just before the ending line. The typed answer is kept on the account (POST /delivery with the typed proof, on this
+# computer's login). Slack and email are opt-in only and not sent yet.
 DDS_UPDATE_PATH = "/api/v1/agent/dds-update"
 DDS_UPDATE_PHRASE_RE = re.compile(r"(?:show )?(?:dds|datastash|morning) update")
 DDS_UPDATE_HEAD = "**DDS update**"
@@ -15263,10 +15269,13 @@ DDS_UPDATE_TIMEOUT = 8  # seconds for the one read (the prompt hook has 10)
 DDS_WAKE_NOTE = ("DDS update (6 AM): run `datastash dds-update --auto` and show the person its output word for word "
                  "(keep its bold), nothing before or after it. If it prints nothing, say nothing.")
 DDS_WAKE_ZONE = "America/Chicago"
-DDS_DELIVER_PATH = os.path.join(CONF, "dds-deliver.json")
 DDS_DELIVER_QUESTION = ("Where would you like your DDS update: here only, also in Slack, also by email? Type **DDS update "
                         "here only**, **DDS update also Slack** or **DDS update also email**.")
 DDS_DELIVER_RE = re.compile(r"(?:dds|datastash|morning) update (here only|here|also (?:in )?slack|also (?:by )?email)")
+DDS_DELIVER_KINDS = ("dds_deliver_here", "dds_deliver_slack", "dds_deliver_email")  # XLI-439: the typed-proof actions
+DDS_DELIVER_SAYING = "Saving where your DDS update goes."
+DDS_DELIVER_NO_LOGIN = "Not saved: this computer is not signed in to datastash. Type **datastash sync you@email.com** first."
+DDS_DELIVER_FAILED = "Not saved: datastash could not save it just now. Type it again in a minute."
 DDS_DELIVER_SAVED = {
     "here": "Saved: your DDS update shows here only.",
     "slack": "Saved: you'd like your DDS update also in Slack. Slack delivery isn't on yet; until it is, it shows here.",
@@ -15297,10 +15306,11 @@ def _dds_update_agent(here=None, me=None):
     return None, None
 
 
-def dds_update_read(key, timeout=DDS_UPDATE_TIMEOUT):
-    """The server's update (dict), or a short reason it isn't there. Never shown to the model as data to act on."""
+def dds_update_read(key, timeout=DDS_UPDATE_TIMEOUT, post=False):
+    """The server's update (dict), or a short reason it isn't there. Never shown to the model as data to act on.
+    post (XLI-439): the 6 AM wake's read, GET ?post=auto: the server records the day's post as it serves it."""
     try:
-        status, _ct, text = http("GET", DDS_UPDATE_PATH, key=key, timeout=timeout)
+        status, _ct, text = http("GET", DDS_UPDATE_PATH + ("?post=auto" if post else ""), key=key, timeout=timeout)
         d = json.loads(text)
     except ApiError as e:
         return "not on this server yet" if e.status == 404 else "datastash didn't answer just now"
@@ -15322,7 +15332,12 @@ def _dds_row(i):
     due = _clean(i.get("due"), 32)
     if due and i.get("kind") in ("wait", "ask", "handoff", "checkback"):
         extra.append(f"by {due[:16].replace('T', ' ')} UTC")
-    return f"{tags}: {_clean(i.get('what'), 200)}" + (f" ({', '.join(extra)})" if extra else "")
+    line = f"{tags}: {_clean(i.get('what'), 200)}" + (f" ({', '.join(extra)})" if extra else "")
+    if i.get("kind") == "card":  # XLI-439: the card's own done-when words, next to its age
+        dw = _clean(i.get("done_when"), 300)
+        line += f"; done when: {dw}" if dw else "; no done-when on the card"
+    note = _clean(i.get("by_note"), 200)  # XLI-439: a by that is not a time, said plainly
+    return line + (f"; {note}" if note else "")
 
 
 def _dds_list_lines(lst, mine=False):
@@ -15340,7 +15355,8 @@ def _dds_list_lines(lst, mine=False):
 
 def dds_update_text(d, auto=False):
     """The update in the plugin's own lines: missed 6 AM posts first (each its own line), this agent's list, then every
-    other agent's. An automatic post ends with exactly DDS_UPDATE_ENDING."""
+    other agent's. An automatic post ends with exactly DDS_UPDATE_ENDING; XLI-439: the one post the server marks
+    (delivery.ask_now) has the where-to-deliver question just before it."""
     if not isinstance(d, dict):
         lines = [DDS_UPDATE_HEAD, f"  - **Open list:** {d}"]
         return "\n".join(lines + ([DDS_UPDATE_ENDING] if auto else []))
@@ -15358,28 +15374,10 @@ def dds_update_text(d, auto=False):
     else:
         lines.append("  - **All agents:** type **datastash sync** in this agent's session to see every agent's list here.")
     if auto:
+        if ((d.get("delivery") or {}) if isinstance(d.get("delivery"), dict) else {}).get("ask_now") is True:
+            lines += ["", DDS_DELIVER_QUESTION]
         lines.append(DDS_UPDATE_ENDING)
     return "\n".join(lines)
-
-
-def dds_deliver_choice():
-    d = read_json(DDS_DELIVER_PATH, {})
-    return d if isinstance(d, dict) else {}
-
-
-def dds_deliver_ask(d):
-    """The where-to-deliver question, once, in the first week: only when the update says this agent is in its seven
-    days and it was never asked here. Marks it asked."""
-    if not isinstance(d, dict) or not (d.get("week") or {}).get("auto"):
-        return None
-    if dds_deliver_choice().get("asked_at"):
-        return None
-    try:
-        ensure_dirs()
-        write_private(DDS_DELIVER_PATH, json.dumps(dict(dds_deliver_choice(), asked_at=int(time.time()))))
-    except OSError:
-        return None
-    return DDS_DELIVER_QUESTION
 
 
 def dds_deliver_phrase(text):
@@ -15392,15 +15390,49 @@ def dds_deliver_phrase(text):
     return "slack" if "slack" in w else "email" if "email" in w else "here"
 
 
-def dds_deliver_save(choice):
-    """Kept on this computer only (opt-in; never email by default): Slack and email delivery are not sent yet."""
+def send_dds_delivery(rec, typed):
+    """XLI-439, the checker, after the person's own typed **DDS update here only** / **also Slack** / **also email**
+    (find_typed: their typed entry, fresh, used once): signs the typed sync proof (action dds_deliver_<answer>) with this
+    computer's login answer key and saves the answer on the account. The lines for the person. Never prints the key."""
+    kind = rec.get("kind")
+    d = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    aid = d.get("agent_id")
+    choice = dds_deliver_phrase(rec.get("prompt"))
+    if kind not in DDS_DELIVER_KINDS or choice is None or kind != "dds_deliver_" + choice or not isinstance(aid, str) \
+            or not re.fullmatch(GRANT_ID_RE, aid.lower()) or not isinstance(typed, dict):
+        return []
+    login = read_answer_key()
+    if login is None or not re.fullmatch(GRANT_ID_RE, str(login[1]).lower()):
+        return [DDS_DELIVER_NO_LOGIN]
+    iat = int(time.time() * 1000)
+    proof = typed_sync_proof(login[0], f"grant:{login[1].lower()}", aid, kind, typed["pid"], typed["prompt"],
+                             min(int(typed["typed_at"]), iat), iat)
+    login = None
+    token = login_token()
+    if token is None:
+        return [DDS_DELIVER_NO_LOGIN]
     try:
-        ensure_dirs()
-        write_private(DDS_DELIVER_PATH, json.dumps(dict(dds_deliver_choice(), answer=choice, answered_at=int(time.time()),
-                                                         asked_at=dds_deliver_choice().get("asked_at") or int(time.time()))))
-    except OSError:
-        return "Not saved: this computer couldn't keep it. Nothing changed."
-    return DDS_DELIVER_SAVED[choice]
+        status, _ct, text = http("POST", DDS_UPDATE_PATH + "/delivery", key=token, timeout=20,
+                                 body={"answer": choice, "typed_proof": proof})
+        got = json.loads(text) if text.strip() else {}
+    except (ApiError, urllib.error.URLError, httpclient.HTTPException, OSError, ValueError):
+        return [DDS_DELIVER_FAILED]
+    if status != 200 or not isinstance(got, dict) or (got.get("delivery") or {}).get("answer") != choice:
+        return [DDS_DELIVER_FAILED]
+    return [DDS_DELIVER_SAVED[choice]]
+
+
+def dds_deliver_prompt_text(inp):
+    """XLI-439: the person's typed answer is handed to the checker, which saves it on the account once the transcript
+    shows they typed it. The one line to relay now."""
+    choice = dds_deliver_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
+    agent = _own_agent(inp)
+    shape = hook_shape(inp)
+    if choice is None or agent is None or shape is None:
+        return "Not saved: this folder has no datastash agent. Type **/datastash:install** first."
+    if not start_check(shape, "dds_deliver_" + choice, inp.get("prompt"), {"agent_id": agent["agent_id"].lower()}):
+        return DDS_DELIVER_FAILED
+    return DDS_DELIVER_SAYING
 
 
 def dds_prompt_text(inp):
@@ -15409,10 +15441,7 @@ def dds_prompt_text(inp):
     _a, key = _dds_update_agent(here, me=this_session(inp) if isinstance(inp, dict) else None)
     if key is None:
         return "\n".join([DDS_UPDATE_HEAD, "  - **Open list:** not connected on this computer yet"])
-    d = dds_update_read(key)
-    text = dds_update_text(d)
-    ask = dds_deliver_ask(d)
-    return text + ("\n\n" + ask if ask else "")
+    return dds_update_text(dds_update_read(key))  # XLI-439: the delivery question comes in a morning post only
 
 
 def _dds_timer_note_ok(note):
@@ -15498,17 +15527,21 @@ def cmd_dds_update(args):
     agent, key = _dds_update_agent(here, me=me)
     if key is None:
         die("no agent with a key on this computer (/datastash:install)")
-    d = dds_update_read(key, timeout=30)
+    d = dds_update_read(key, timeout=30, post=auto)
     if auto:
         week = d.get("week") if isinstance(d, dict) else None
         if isinstance(week, dict) and not week.get("auto"):
             if week.get("ends_on"):
                 _dds_stop_timer(agent, key)
             return 0
+        if isinstance(d, dict) and "posted" in d:  # XLI-439: the server recorded the post as it served it, or not
+            if d.get("posted") is True:
+                print(dds_update_text(d, auto=True))
+            return 0
         if isinstance(week, dict) and week.get("posted_today"):
             return 0
         print(dds_update_text(d, auto=True))
-        if isinstance(d, dict):
+        if isinstance(d, dict):  # an older server: the post is reported after it is shown
             try:
                 http("POST", DDS_UPDATE_PATH + "/posted", key=key, body={}, timeout=20)
             except Exception:  # noqa: BLE001  not recorded: the next update shows it as missed, nothing else
@@ -15680,8 +15713,8 @@ def onboard_prompt_context(inp):
         return ONBOARD_RELAY_AI.format(text=asks_text(asks))
     if kind == "dds_update":  # XLI-438: only reads the server's open lists: nothing turns on, so no check
         return ONBOARD_RELAY_AI.format(text=dds_prompt_text(inp))
-    if kind == "dds_deliver":  # XLI-438: kept on this computer only; nothing is sent anywhere new
-        return ONBOARD_RELAY_AI.format(text=dds_deliver_save(dds_deliver_phrase(inp.get("prompt"))))
+    if kind == "dds_deliver":  # XLI-439: kept on the account, only after the checker sees the person typed it
+        return ONBOARD_RELAY_AI.format(text=dds_deliver_prompt_text(inp))
     if kind == "chats_off":  # only narrows: saved at once, no check
         try:
             record_sessions(False)
@@ -21873,6 +21906,13 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.39": (
+        "The DDS update also lists your deploys no live check proved (a passing CI run named live, prod, smoke, probe or "
+        "e2e at that commit), flags datastash can't check, the claims, hand-offs and check-backs you never used, and each "
+        "card's own done-when: clear them by their sources, never by editing the list.",
+        "Your own report that you posted the morning update no longer counts by itself: datastash records the post when "
+        "it serves it.",
+    ),
     "1.0.38": (
         "With clean sessions on, the main session claims a card itself (ledger_agent_job, or **datastash api POST "
         "/api/v1/agent/job**), as it hands off and writes its status: claim before every card.",

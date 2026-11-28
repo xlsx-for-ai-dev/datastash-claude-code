@@ -2,6 +2,7 @@
 
 One line per release, newest first.
 
+- **1.0.39**: The DDS update also lists deploys no live check proved, flags it can't check, features an agent hasn't used yet and each card's own done-when; where you want it (**DDS update here only**, **also Slack**, **also email**) is kept for your whole account, asked once at the end of a morning update.
 - **1.0.38**: With clean sessions on, the main session can claim a card; the status list shows a project name instead of "?" and one row for an agent's duplicates; the GitHub lookups offer says a yes adds a webhook to the repo; the Setup tab's full-DDS missing column also names unused claims, hand-offs, check-backs and remember.
 - **1.0.37**: Typed lines are checked more strictly: a line Claude Code marks as not typed in this session never counts, and an allowed watcher that changed since you allowed it doesn't run until you type **datastash allow watcher PATH** again.
 - **1.0.36**: Asking any command for help (`--help` or `-h`) only shows help and never saves or sends anything; `datastash --help` lists every command; status and doctor agree on whether the listener runs; old versions no longer pile up on PATH, and unused old version folders are moved to a trash folder instead of piling up; the sign-in guard no longer refuses a plain file just because it names a datastash command; "Check your email" shows once.
