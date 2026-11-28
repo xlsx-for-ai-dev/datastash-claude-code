@@ -9092,7 +9092,7 @@ def clean_block(inp):
         return None
     if clean_tool_ok(inp, cur["no_code"]):
         return None
-    return CLEAN_DENY
+    return watcher_changed_deny(inp) or CLEAN_DENY
 
 
 CLEAN_DENY = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -9125,6 +9125,8 @@ WATCHER_DONE = ("Done: {cmd} may run in the background in your main session whil
 WATCHER_REMOVED = "Done: {path} no longer runs in your main session while clean sessions is on."
 WATCHER_NONE_TO_REMOVE = "Nothing to remove: {path} is not an allowed watcher."
 WATCHER_FAILED = "Not done: the choice could not be saved (the datastash config folder is not writable)."
+WATCHER_CHANGED = ("Not run: the watcher {path} changed since you allowed it. If you made that change, type "
+                   "**datastash allow watcher {cmd}** again.")
 WATCHER_ONLY_TYPED = ("Only the person can allow or remove a watcher: they type datastash allow watcher PATH (or "
                       "datastash disallow watcher PATH) themselves.")
 
@@ -9144,12 +9146,71 @@ def watcher_parse(rest):
     return words[0], words[1:]
 
 
+def _under(path, top):
+    """True when the path is top or inside it (leading slashes folded: //proc is /proc)."""
+    p = "/" + path.lstrip("/")
+    return p == top or p.startswith(top + "/")
+
+
 def watcher_resolve(typed):
-    """(absolute path, the file it resolves to now) for a typed path, ~/ as this user's home; None if not absolute."""
-    p = os.path.join(HOME, typed[2:]) if typed.startswith("~/") else typed
+    """(absolute path, the file it resolves to now) for a typed path, or None. XLI-432: ~/ is expanded exactly as bash
+    does (HOME followed by the rest, slash included), and a path starting ~// is refused (bash runs HOME//ABS, not
+    /ABS). A path in /proc or /dev/fd, as typed, as bash runs it or as it resolves, is refused: it can name a
+    different file in the hook and in the shell."""
+    if typed.startswith("~//"):
+        return None
+    p = HOME + typed[1:] if typed.startswith("~/") else typed
     if not os.path.isabs(p):
         return None
-    return os.path.normpath(p), os.path.realpath(p)
+    n, r = os.path.normpath(p), os.path.realpath(p)
+    if any(_under(x, top) for x in (p, n, r) for top in WATCHER_NO_DIRS) or _via_dirs(p, WATCHER_NO_DIRS):
+        return None
+    return n, r
+
+
+WATCHER_NO_DIRS = ("/proc", "/dev/fd")
+
+
+def _via_dirs(path, tops, most=40):
+    """True when resolving the path step by step (each symlink followed, as the kernel does) passes through any of the
+    folders, e.g. /dev/stdin -> /proc/self/fd/0 or a link to /proc/self/cwd/x. Anything unreadable: True."""
+    try:
+        cur, rest, links = "/", [x for x in path.split("/") if x], 0
+        while rest:
+            name = rest.pop(0)
+            if name == ".":
+                continue
+            if name == "..":
+                cur = os.path.dirname(cur)
+                continue
+            nxt = os.path.join(cur, name)
+            if any(_under(nxt, t) for t in tops):
+                return True
+            if os.path.islink(nxt):
+                links += 1
+                if links > most:
+                    return True
+                tgt = os.readlink(nxt)
+                if tgt.startswith("/"):
+                    cur = "/"
+                rest = [x for x in tgt.split("/") if x] + rest
+                continue
+            cur = nxt
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def watcher_sha(real):
+    """sha256 of the watcher file's bytes now, or None when it can't be read."""
+    try:
+        h = hashlib.sha256()
+        with open(real, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        return h.hexdigest()
+    except OSError:
+        return None
 
 
 def watchers():
@@ -9161,7 +9222,8 @@ def watchers():
         if (isinstance(w, dict) and isinstance(w.get("path"), str) and isinstance(w.get("real"), str)
                 and os.path.isabs(w["real"]) and isinstance(w.get("args"), list)
                 and all(isinstance(a, str) and _WATCHER_ARG.fullmatch(a) for a in w["args"])):
-            out.append({"path": w["path"], "real": w["real"], "args": list(w["args"]), "at": w.get("at")})
+            sha = w.get("sha256") if isinstance(w.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", w.get("sha256")) else None
+            out.append({"path": w["path"], "real": w["real"], "args": list(w["args"]), "at": w.get("at"), "sha256": sha})
     return out
 
 
@@ -9183,30 +9245,61 @@ def watcher_list_text():
             + "\nTo remove one, type: datastash disallow watcher PATH")
 
 
+def _watcher_match(tool, ti):
+    """("ok" | "changed", row) for a background call of one of the person's allowed watchers, else None. "changed" when
+    the path and arguments match but the file's sha256 is not the one pinned when the person allowed it (XLI-432; a row
+    from before 1.0.37 has no pin and counts as changed)."""
+    if not isinstance(ti, dict):
+        return None
+    if tool == "Bash":
+        if ti.get("run_in_background") is not True:
+            return None
+    elif tool != "Monitor" or ti.get("ws") is not None:
+        return None
+    cmd = ti.get("command")
+    if not isinstance(cmd, str) or len(cmd) > 2000 or not re.fullmatch(r"[\x20-\x7e]+", cmd):
+        return None
+    got = watcher_parse(cmd)
+    if got is None:
+        return None
+    where = watcher_resolve(got[0])
+    if where is None or not os.path.isfile(where[1]):
+        return None
+    rows = [w for w in watchers() if w["real"] == where[1] and w["args"] == got[1]]
+    if not rows:
+        return None
+    sha = watcher_sha(where[1])
+    for w in rows:
+        if sha is not None and w["sha256"] == sha:
+            return "ok", w
+    return "changed", rows[0]
+
+
 def clean_watcher_ok(tool, ti):
     """True only for one of the person's allowed watchers, run in the background: a Monitor (a command, never a
     WebSocket) or Bash with run_in_background, whose command is exactly the allowed path (the same file it resolved to
-    when allowed) and exactly its declared arguments, as plain words. Anything it can't parse is refused."""
+    when allowed, with the same sha256 as then) and exactly its declared arguments, as plain words. Anything it can't
+    parse is refused."""
     try:
-        if not isinstance(ti, dict):
-            return False
-        if tool == "Bash":
-            if ti.get("run_in_background") is not True:
-                return False
-        elif tool != "Monitor" or ti.get("ws") is not None:
-            return False
-        cmd = ti.get("command")
-        if not isinstance(cmd, str) or len(cmd) > 2000 or not re.fullmatch(r"[\x20-\x7e]+", cmd):
-            return False
-        got = watcher_parse(cmd)
-        if got is None:
-            return False
-        where = watcher_resolve(got[0])
-        if where is None or not os.path.isfile(where[1]):
-            return False
-        return any(w["real"] == where[1] and w["args"] == got[1] for w in watchers())
+        m = _watcher_match(tool, ti)
+        return m is not None and m[0] == "ok"
     except Exception:  # noqa: BLE001  can't tell: refused
         return False
+
+
+def watcher_changed_deny(inp):
+    """XLI-432: the main session's refusal for an allowed watcher whose file changed since it was allowed: the plain
+    line for the person (and the same reason for the model), or None."""
+    try:
+        m = _watcher_match(inp.get("tool_name"), inp.get("tool_input"))
+    except Exception:  # noqa: BLE001
+        return None
+    if m is None or m[0] != "changed":
+        return None
+    line = WATCHER_CHANGED.format(path=m[1]["path"], cmd=watcher_cmd_text(m[1]))
+    return {"systemMessage": "datastash: " + line,
+            "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                   "permissionDecisionReason": line}}
 
 
 def watcher_phrase(text):
@@ -9245,6 +9338,9 @@ def watcher_prompt_context(inp):
         return (f"{WATCHER_NOTE}: nothing changed. Make no datastash calls and run no command for it. Your whole reply is "
                 f"exactly this line: \"{WATCHER_BAD}\"")
     where = watcher_resolve(parsed[0])
+    if kind == "allow" and where is None:  # XLI-432: ~//, /proc or /dev/fd
+        return (f"{WATCHER_NOTE}: nothing changed. Make no datastash calls and run no command for it. Your whole reply is "
+                f"exactly this line: \"{WATCHER_BAD}\"")
     if kind == "allow" and (where is None or not os.path.isfile(where[1]) or not os.access(where[1], os.X_OK)):
         return (f"{WATCHER_NOTE}: nothing changed. Make no datastash calls and run no command for it. Your whole reply is "
                 f"exactly this line: \"{WATCHER_NOT_PROGRAM.format(path=parsed[0])}\"")
@@ -9271,9 +9367,10 @@ def watcher_typed(rec):
     rows = watchers()
     try:
         if want == "allow":
-            if not os.path.isfile(real) or not os.access(real, os.X_OK):
+            sha = watcher_sha(real)
+            if not os.path.isfile(real) or not os.access(real, os.X_OK) or sha is None:
                 return [WATCHER_NOT_PROGRAM.format(path=parsed[0])]
-            row = {"path": path, "real": real, "args": parsed[1], "at": int(time.time())}
+            row = {"path": path, "real": real, "args": parsed[1], "at": int(time.time()), "sha256": sha}
             rows = [w for w in rows if not (w["real"] == real and w["args"] == parsed[1])] + [row]
             _write_watchers(rows)
             return [WATCHER_DONE.format(cmd=watcher_cmd_text(row))]
@@ -10921,6 +11018,13 @@ DESKTOP_APP_CHAIN = ()
 FLAG_RE = r"-{1,2}[A-Za-z][A-Za-z0-9\-]{0,40}"
 
 
+def _headless(flags):
+    """XLI-432: started headless when any option is a single-dash short-flag group holding p (-p, -dp, -pd, -xp) or
+    any --print... form (the 1.0.28 review: `claude -dp` runs in print mode)."""
+    return any(f.startswith("--print") or (f.startswith("-") and not f.startswith("--") and "p" in f[1:])
+               for f in flags)
+
+
 def _proc_row(pid):
     """(parent pid, executable path, argv) of a process from the real process table (/proc, else ps), or None."""
     if os.path.isdir("/proc/self"):
@@ -10984,7 +11088,7 @@ def desktop_host_proven(chain=None):
         if not chain or not DESKTOP_APP_CHAIN:
             return False
         i = next((n for n, c in enumerate(chain) if c["name"] in CC_PROC_NAMES), None)
-        if i is None or any(f in HEADLESS_FLAGS for f in chain[i]["flags"]):
+        if i is None or _headless(chain[i]["flags"]):
             return False
         above = chain[i + 1:]
         if [(c["name"], c["bundle"]) for c in above[:len(DESKTOP_APP_CHAIN)]] != [tuple(x) for x in DESKTOP_APP_CHAIN]:
@@ -11008,7 +11112,7 @@ def terminal_host_proven(chain=None):
         if not chain:
             return False
         i = next((n for n, c in enumerate(chain) if _is_cc(c)), None)
-        if i is None or any(f in HEADLESS_FLAGS for f in chain[i]["flags"]):
+        if i is None or _headless(chain[i]["flags"]):
             return False
         return not any(_is_cc(c) for c in chain[i + 1:])
     except Exception:  # noqa: BLE001
@@ -11103,7 +11207,22 @@ def _midturn_typed(v, prompt):
     o = a.get("origin")
     return (isinstance(o, dict) and o.get("kind") == "human" and a.get("humanTurn") is True
             and isinstance(a.get("prompt"), str) and a["prompt"].strip() == prompt.strip()
-            and v.get("entrypoint") in MIDTURN_HOSTS and isinstance(a.get("source_uuid"), str))
+            and v.get("entrypoint") in MIDTURN_HOSTS and isinstance(a.get("source_uuid"), str)
+            and not _marked_not_typed(a) and not _marked_not_typed(v))
+
+
+# XLI-432: the marks Claude Code 2.1.332 writes on a queued line that the person did not type in this session (its
+# queued_command writer: promptRewritten, fromConnector, fromAnotherSession, verifiedSlackHumanTurn, textNotTyped,
+# hostsOwnTurn; the user entry carries fromConnector, fromAnotherSession and promptRewritten too). humanTurn can still be
+# set beside several of them, so any one of them (or isMeta) refuses the line: fail closed.
+NOT_TYPED_MARKS = ("fromAnotherSession", "textNotTyped", "fromConnector", "hostsOwnTurn", "promptRewritten",
+                   "verifiedSlackHumanTurn", "isMeta")
+
+
+def _marked_not_typed(d):
+    """True when the entry (or its attachment) carries any of Claude Code's not-typed-here marks with a value other
+    than false or null."""
+    return isinstance(d, dict) and any(d.get(k) not in (None, False) for k in NOT_TYPED_MARKS)
 
 
 MIDTURN_HOSTS = ("cli", "claude-vscode")
@@ -11149,6 +11268,8 @@ def find_typed(tp, pid, prompt, at=None, desktop=False, midturn=False):
             continue
         t = _typed_text(v)
         if t is None or t.strip() != prompt.strip() or v.get("promptSource") != "queued" or not _person_origin(v):
+            continue
+        if _marked_not_typed(v):  # XLI-432: a queued line Claude Code marks as not typed here
             continue
         w = _when(v.get("timestamp"))
         if w is None or not (-5 <= w - at <= 30):
@@ -21697,6 +21818,11 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.37": (
+        "A line Claude Code marks as not typed in this session (another session, a connector, rewritten) never counts "
+        "as the person's typed line. An allowed watcher whose file changed since it was allowed does not run in the "
+        "main session until the person types **datastash allow watcher PATH** again.",
+    ),
     "1.0.36": (
         "**datastash COMMAND --help** (or -h) shows that command's usage and never saves or sends anything; words "
         "after -- are data, never help. **datastash --help** lists every command.",

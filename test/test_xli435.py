@@ -346,8 +346,8 @@ class ReleaseNotes(unittest.TestCase):
         for v, lines in ds.WHATS_NEW.items():
             for x in lines:
                 self.assertNotIn("/mcp", x)
-        self.assertIn("datastash remember", " ".join(ds.WHATS_NEW[ds.PLUGIN_VERSION]))
-        self.assertIn("Function descriptions", " ".join(ds.WHATS_NEW[ds.PLUGIN_VERSION]))
+        self.assertIn("datastash remember", " ".join(ds.WHATS_NEW["1.0.36"]))
+        self.assertIn("Function descriptions", " ".join(ds.WHATS_NEW["1.0.36"]))
 
     def test_readme_troubleshooting_has_no_mcp(self):
         with open(os.path.join(ROOT, "README.md")) as f:

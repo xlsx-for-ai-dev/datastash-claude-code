@@ -1,6 +1,6 @@
 {
   "name": "datastash",
-  "version": "1.0.36",
+  "version": "1.0.37",
   "description": "datastash agent workbooks for Claude Code: register an agent, keep its key in a private file, work in the agent workbook, and wake on inbox messages.",
   "author": {
     "name": "datastash",

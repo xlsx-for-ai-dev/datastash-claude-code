@@ -2,6 +2,7 @@
 
 One line per release, newest first.
 
+- **1.0.37**: Typed lines are checked more strictly: a line Claude Code marks as not typed in this session never counts, and an allowed watcher that changed since you allowed it doesn't run until you type **datastash allow watcher PATH** again.
 - **1.0.36**: Asking any command for help (`--help` or `-h`) only shows help and never saves or sends anything; `datastash --help` lists every command; status and doctor agree on whether the listener runs; old versions no longer pile up on PATH, and unused old version folders are moved to a trash folder instead of piling up; the sign-in guard no longer refuses a plain file just because it names a datastash command; "Check your email" shows once.
 - **1.0.35**: Type **DDS update** (or **morning update**) to see each agent's open list and every agent's together; for the first week it also arrives at 6 AM.
 - **1.0.34**: With clean sessions on, a wake watcher you allow by typing **datastash allow watcher PATH** can run in your main session, in the background only.
