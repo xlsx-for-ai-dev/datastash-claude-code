@@ -356,12 +356,12 @@ class TempAndSystem(SetupBase):
 
     def test_system_roots_are_refused(self):
         for d in ("/etc", "/usr", "/opt", "/var", "/bin", "/sbin", "/lib", "/proc", "/sys", "/dev", "/run", "/boot",
-                  "/root", "/snap", "/private/var", "/System", "/Library", "/Applications", "/Volumes"):
+                  "/root", "/snap", "/private/var", "/System", "/Library", "/Applications"):
             self.refused(d)
 
     def test_folders_inside_a_system_root_are_refused(self):
         for d in ("/usr/local", "/usr/local/src/app", "/opt/app", "/var/www/site", "/etc/nginx", "/root/proj",
-                  "/Volumes/Disk/proj", "/private/var/folders/xy/T/proj"):
+                  "/private/var/folders/xy/T/proj"):
             self.refused(d)
 
     def test_a_link_into_a_temp_or_system_folder_is_refused(self):
@@ -381,6 +381,23 @@ class TempAndSystem(SetupBase):
         self.assertFalse(ds.temp_or_system(proj))
         self.assertEqual(self.wake(folder=proj), ds.AUTO_SETUP_AI.format(name="web-app"))
         self.assertIsNone(ds.auto_setup_name(ds.HOME, None))  # the home folder itself: never
+
+    def test_real_homes_keep_their_subfolders(self):
+        """XLI-419 exposure #15: running as root (/root) or with a Fedora home (/var/home/NAME), a project folder in that
+        home sets itself up; the home folder itself, and root's home when it is not this home, are still refused;
+        /Volumes drives are no system folder."""
+        for home in ("/root", "/var/home/dev"):
+            saved = ds.HOME
+            ds.HOME = home
+            try:
+                self.assertFalse(ds.temp_or_system(home + "/code/web-app"), home)
+                self.assertFalse(ds.linkable(home), home)  # the home itself: never
+                self.assertIsNone(ds.auto_setup_name(home, None), home)
+                self.assertTrue(ds.temp_or_system("/var/www/site" if home == "/root" else "/root/proj"), home)
+            finally:
+                ds.HOME = saved
+        self.assertFalse(ds.temp_or_system("/Volumes/Disk/proj"))
+        self.assertTrue(ds.temp_or_system("/root/proj"))  # not this computer's home: still a system folder
 
 
 if __name__ == "__main__":

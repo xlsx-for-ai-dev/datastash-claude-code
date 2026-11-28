@@ -206,16 +206,44 @@ class FolderSearches(KeyBase):
                 self.assert_refused("Bash", {"command": f"ls {p}"})
 
     def test_a_search_of_a_folder_above_it_is_refused_in_the_file_tools_only(self):
-        """PM ruling (review 1.0.4): Bash and Monitor have no folder-above check, only a literal-name check."""
+        """PM ruling (review 1.0.4): Bash and Monitor have no folder-above check for "/" or a script's own walk, only a
+        literal-name check. XLI-419 exposure #4 adds the named home folder and ~/.config (test below)."""
         for p in (HOME, "~", "~/.config", "/", os.path.dirname(DEFAULT)):
             with self.subTest(path=p):
                 self.assert_refused("Grep", {"pattern": "dsak_", "path": p})
-                for cmd in (f"grep -r dsak_ {p}", f"grep -R -l dsak_ {p}", f"grep --recursive x {p}",
-                            f"rg dsak_ {p}", f"rg --hidden dsak_ {p}", f"find {p} -type f -exec cat {{}} +",
-                            f"tar czf /tmp/all.tgz {p}", f"cp -r {p} /tmp/copy", f"rsync -a {p} /tmp/copy",
-                            f"python3 -c \"import os;[print(r) for r in os.walk('{p}')]\""):
-                    self.assert_allowed("Bash", {"command": cmd})
-                self.assert_allowed("Monitor", {"command": f"grep -r dsak_ {p}"})
+                self.assert_allowed("Bash", {"command": f"python3 -c \"import os;[print(r) for r in os.walk('{p}')]\""})
+        for cmd in ("grep -r dsak_ /", "find / -type f -exec cat {} +", "tar czf /tmp/all.tgz /", "rsync -a / /tmp/copy"):
+            with self.subTest(cmd=cmd):
+                self.assert_allowed("Bash", {"command": cmd})
+                self.assert_allowed("Monitor", {"command": cmd})
+
+    def test_a_search_or_copy_of_home_or_config_by_name_is_refused_in_bash(self):
+        """XLI-419 exposure #4: find, tar, cp -r, grep -r, rsync, zip, ls -R (and the like) over ~ or ~/.config."""
+        for p in (HOME, "~", "~/", "$HOME", "${HOME}", "~/.config", "~/.config/", "$HOME/.config", os.path.dirname(DEFAULT)):
+            for cmd in (f"grep -r dsak_ {p}", f"grep -R -l dsak_ {p}", f"grep --recursive x {p}", f"egrep -rn x {p}",
+                        f"rg dsak_ {p}", f"rg --hidden dsak_ {p}", f"find {p} -type f -exec cat {{}} +", f"find {p} -name '*.key'", f"find {p} -maxdepth 3 -type f",
+                        f"tar czf /tmp/all.tgz {p}", f"cp -r {p} /tmp/copy", f"cp -a {p} /tmp/copy", f"rsync -a {p} /tmp/copy",
+                        f"zip -r /tmp/all.zip {p}", f"ls -R {p}", f"ls -laR {p}", f"cd /tmp && tar cf x.tar {p}",
+                        f"git status; find {p} -type f | head", f"sudo find {p} -name x", f"echo hi && rg x {p}"):
+                for name in ("Bash", "Monitor"):
+                    with self.subTest(cmd=cmd, tool=name):
+                        self.assert_refused(name, {"command": cmd}, self.project)
+
+    def test_a_note_or_message_that_names_such_a_command_is_not_a_search(self):
+        """XLI-419 exposure #4 keeps 1.0.36's fixes: text that only names a command is fine, and so is ordinary work."""
+        for cmd in ("cat > notes.md <<'EOF'\nTo look, run find ~ -name x or grep -r foo ~/.config\nEOF",
+                    "git commit -m \"docs: never run grep -r x ~ or tar czf a.tgz ~/.config\"",
+                    "echo 'find ~ -type f is refused'", "ls ~", "ls -la ~/.config", "ls -l ~",
+                    "grep -rn foo ~/code", "find ~/code -name '*.py'", "tar czf /tmp/a.tgz ~/code/web-app",
+                    "cp -r ~/code/web-app /tmp/copy", "cp ~/notes.md /tmp/", "find . -name '*.md'", "grep -rn foo .",
+                    "datastash status", "printf 'see ls -R ~ in the notes'\n", "find ~ -maxdepth 2 -name x",
+                    "find ~/.config -maxdepth 1 -type d"):
+            for name in ("Bash", "Monitor"):
+                with self.subTest(cmd=cmd, tool=name):
+                    self.assert_allowed(name, {"command": cmd}, self.project)
+        self.assert_allowed("Write", {"file_path": os.path.join(self.project, "notes.md"),
+                                      "content": "Run find ~ -name x, or grep -r foo ~/.config, or tar czf a.tgz ~.\n"},
+                            self.project)
 
     def test_a_search_with_no_folder_where_the_session_runs_above_it(self):
         self.assert_refused("Grep", {"pattern": "dsak_"})  # cwd HOME

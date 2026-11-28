@@ -673,6 +673,7 @@ def signed_in():
 
 def _save_login(refresh, access, expires_in, answer_key=None, grant_id=None):
     ensure_dirs()
+    _drop(SIGNED_OUT_FILE)  # XLI-419: signed in again
     forget_answer_key()  # a new login (a new grant): an earlier login's answer key is no use any more
     if _keychain_set(refresh):
         _drop(LOGIN_REFRESH_FILE)
@@ -826,6 +827,7 @@ def login_token(force=False, lock_wait=None):
         except ApiError as e:
             if e.status in (400, 401):
                 _forget_login()  # signed out at datastash (account page, logout elsewhere, or a copied token)
+                note_signed_out(e.body)  # XLI-419: why and when, for the next session start and the Setup row
             return None
         except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
             return None
@@ -2772,10 +2774,23 @@ def cmd_check(_args):
     signin = {}
 
     def _signin():
+        try:  # XLI-419: a machine holding a fleet key joins by itself first (its own login; no typing, no email)
+            joined = fleet_join()
+        except Exception:  # noqa: BLE001  never in the session's way
+            joined = None
         try:
-            signin["v"] = session_sign_in(inp)
+            fleet_setup_kick(inp)  # a fleet login: this folder's agent is set up on it in the background
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # XLI-419: a computer signed out at datastash says so (why and when) and how to bring it back
+            joined = " ".join(x for x in (joined, signed_out_self_line(inp)) if x) or None
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            got = session_sign_in(inp)
         except Exception:
-            signin["v"] = _late_sign_in_note(inp)
+            got = _late_sign_in_note(inp)
+        signin["v"] = (" ".join(x for x in (joined, got[0]) if x) or None, got[1]) if joined else got
     t_signin = threading.Thread(target=_signin, daemon=True)
     t_signin.start()
     t0 = time.time()
@@ -6659,6 +6674,58 @@ def _key_text_deny(text, cwd, roots, recurse_tool=False, ancestors=True):
     return False
 
 
+# XLI-419 exposure #4: in Bash and Monitor, a copying or searching command (find, tar, zip, rsync, rg, cp -r, grep -r,
+# ls -R...) in command position whose own arguments name the home folder or ~/.config itself (literally: ~, $HOME, an
+# absolute path) is refused: it would read the key folder inside it. Only words of the command line count, never a
+# here-doc's body or a quoted sentence, so a file or message that names such a command is not a search (1.0.36).
+KEY_PARENT_CMD_RE = re.compile(
+    r"(?:^|[;&|(\n{]|\bthen\b|\bdo\b|\belse\b)\s*(?:(?:sudo|command|nice|nohup|time|xargs|env)\s+(?:-\S+\s+)*)*"
+    r"(find|tar|bsdtar|gtar|zip|7z|7za|rsync|rg|ag|ack|ugrep|cpio|pax|scp|cp|gcp|[efz]?grep|ls|tree)(?=\s)([^;&|\n]*)")
+KEY_PARENT_FLAG_RE = {
+    "cp": r"\s(?:-[a-z]*[rRa][a-z]*|--recursive|--archive)(?!\S)", "gcp": r"\s(?:-[a-z]*[rRa][a-z]*|--recursive|--archive)(?!\S)",
+    "scp": r"\s-[a-z]*r[a-z]*(?!\S)", "ls": r"\s(?:-[a-zA-Z]*R[a-zA-Z]*|--recursive)(?!\S)",
+    "grep": r"\s(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive|--dereference-recursive|--directories=?\s*recurse|-d\s*recurse)(?!\S)",
+}
+
+
+def _key_parent_folders():
+    """The real home and its .config (each as written and real, lowercased): the folders that hold the key folder."""
+    out = set()
+    for d in (HOME, os.path.join(HOME, ".config"), os.environ.get("XDG_CONFIG_HOME") or ""):
+        if d and os.path.isabs(d):
+            for f in (os.path.normpath(d), os.path.realpath(d)):
+                out.add(f.lower().rstrip("/") or "/")
+    out.discard("/")
+    return out
+
+
+def _key_parent_search(command):
+    """True when a Bash or Monitor command copies or searches the home folder or ~/.config by name (exposure #4)."""
+    if not isinstance(command, str) or not command:
+        return False
+    t = re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?(?:\n\s*\2\s*(?:\n|$)|$)", "\n", command, flags=re.S)  # here-docs
+    t = re.sub(r"'[^']*\s[^']*'|\"[^\"]*\s[^\"]*\"", " ", t)  # quoted sentences (a message, a pattern with spaces)
+    parents = _key_parent_folders()
+    for m in KEY_PARENT_CMD_RE.finditer(t):
+        cmd, rest = m.group(1).lower(), " " + m.group(2)
+        flag = KEY_PARENT_FLAG_RE.get("grep" if cmd.endswith("grep") else cmd)
+        if flag and not re.search(flag, rest):
+            continue
+        depth = re.search(r"\s-maxdepth\s+(\d+)", rest) if cmd == "find" else None
+        for w in _key_words(_key_norm(rest)):
+            w = _key_expand(w)
+            if not os.path.isabs(w):
+                continue
+            for f in (os.path.normpath(w), os.path.realpath(w)):
+                f = f.lower().rstrip("/")
+                if f in parents:
+                    # a shallow find never reaches the key files (3 levels below the home, 2 below ~/.config)
+                    need = 3 if f in (os.path.normpath(HOME).lower(), os.path.realpath(HOME).lower()) else 2
+                    if depth is None or int(depth.group(1)) >= need:
+                        return True
+    return False
+
+
 def key_path_deny(inp):
     """PreToolUse, every tool and every session: the deny for a call that could reach a datastash key file (see
     KEY_DENY), else None. Never reads a key file: it looks at paths and names only."""
@@ -6697,6 +6764,8 @@ def key_path_deny(inp):
     else:
         ancestors = name not in ("Bash", "Monitor")  # those two: a literal name only (see _key_text_deny)
         hit = any(_key_text_deny(x, cwd, roots, ancestors=ancestors) for x in _strings(args, []))
+        if not ancestors and not hit:  # XLI-419 exposure #4: a search or copy of the home folder or ~/.config by name
+            hit = _key_parent_search(args.get("command"))
     if not hit:
         return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -15753,7 +15822,8 @@ EMAIL_RE = r"[^\s@<>\"'`]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}"
 SYNC_EMAIL_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(" + EMAIL_RE + r")\s*", re.I)
 SYNC_CODE_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(\d{6})\s*", re.I)
 EMAIL_CODE_LIFE = 600  # the emailed code works for 10 minutes
-LOGIN_STEP_KINDS = ("sync_email", "sync_code", "login_install", "login_uninstall")
+LOGIN_STEP_KINDS = ("sync_email", "sync_code", "login_install", "login_uninstall", "fleet_create", "fleet_list",
+                    "fleet_revoke", "computers_list", "computer_remove")  # XLI-419: the fleet-key and computers lines too
 LOGIN_STEP_WAIT = 25.0  # the Stop hook (30 s) waits this long at most for the plugin's own step to finish (XLI-427)
 SIGN_IN_FIRST_LINE = "Type **datastash sync you@email.com**"
 CHECK_EMAIL_LINE = "Check your email for a 6-digit code. Then type **datastash sync CODE** here."
@@ -15929,6 +15999,9 @@ def login_install(name, here):
     try:
         reg = api_json("POST", AGENT_REGISTER_PATH, tok, body={"name": name, "agent_proof": proof}, timeout=30)
     except ApiError as e:
+        msg = e.body.get("message") if isinstance(e.body.get("message"), str) else ""
+        if _body_code(e) in ("agent_name_taken", "agent_bound") and "datastash computer remove" in msg:
+            return _plain_line(msg)  # XLI-419: "X is on old-laptop (last seen ...). Type datastash computer remove ..."
         return NAME_TAKEN_LINE if _body_code(e) == "agent_name_taken" else server_refused(e.body, INSTALL_FAILED_LINE)
     except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
         return INSTALL_FAILED_LINE
@@ -16116,6 +16189,10 @@ def login_step_verify(rec, pending=None):
             lines = email_sign_in_code(sid, data.get("code"), data.get("name"), data.get("here"))
         elif rec["kind"] == "login_install":
             lines = [login_install(data.get("name"), data.get("here"))]
+        elif rec["kind"] in FLEET_STEP_KINDS:
+            lines = fleet_step(rec, rec["kind"], int(t * 1000))
+        elif rec["kind"] in COMPUTER_STEP_KINDS:
+            lines = computer_step(rec, rec["kind"], int(t * 1000))
         else:
             lines = login_uninstall(sid, int(t * 1000))
         for line in lines:
@@ -16175,6 +16252,530 @@ def login_step_wait(sid, limit=LOGIN_STEP_WAIT):
         except OSError:
             return  # the plugin's folder is gone (an uninstall): nothing more to wait for
         time.sleep(0.2)
+
+
+# --- XLI-419 (plugin 1.0.40): the fleet key. The person, in their own signed-in session, types
+# `datastash fleet-key create <name> [--expires <time>]`: the plugin checks it was typed by the person (the checker), signs
+# the typed proof with this computer's login answer key (bound to the name and the expiry) and shows the key ONCE, to the
+# person only (the Stop hook's line, never the model). A machine holding the key (DATASTASH_FLEET_KEY, or the mode-600 file
+# ~/.config/datastash/fleet.key) joins by itself at session start: its OWN computer login, with no typing and no email,
+# and then this folder's agent is set up on that login the normal way (in the background). `datastash fleet-key list` and
+# `datastash fleet-key revoke <name>` (typed by the person too) show and stop keys; a revoke signs every machine out.
+FLEET_CREATE_PATH = "/api/v1/device/fleet-key/create"
+FLEET_JOIN_PATH = "/api/v1/device/fleet-key/join"
+FLEET_LIST_PATH = "/api/v1/device/fleet-keys"
+FLEET_REVOKE_PATH = "/api/v1/device/fleet-key/revoke"
+FLEET_KEY_FILE = os.path.join(CONF, "fleet.key")
+FLEET_LOGIN_FILE = os.path.join(CONF, "login.fleet.json")  # {"fleet", "at"}: this computer's login joined with a fleet key
+FLEET_KEY_RE = r"dsfk_[A-Za-z0-9_\-]{43}"
+FLEET_NAME_RE = r"[a-z0-9][a-z0-9-]{0,39}"
+FLEET_ACTION = "fleet_key_create"
+FLEET_STEP_KINDS = ("fleet_create", "fleet_list", "fleet_revoke")
+FLEET_PROMPT_RE = re.compile(r"\s*datastash fleet-key\s+(create|list|revoke)(?:\s+(.*?))?\s*", re.I | re.S)
+FLEET_EXPIRES_RE = re.compile(r"(\d{1,5})\s*(m|min|mins|minutes?|h|hours?|d|days?|w|weeks?)", re.I)
+FLEET_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+FLEET_USAGE_LINE = ("Not done. Type **datastash fleet-key create NAME** (optional **--expires 1d**), "
+                    "**datastash fleet-key list** or **datastash fleet-key revoke NAME**. A name is lower-case letters, "
+                    "digits or dashes.")
+FLEET_NO_LOGIN_LINE = "Not done: this computer is not signed in. Type **datastash sync you@email.com** first."
+FLEET_NO_AGENT_LINE = "Not done: this computer has no datastash agent to sign with yet. Type **/datastash:install** first."
+FLEET_FAILED_LINE = "Not done: datastash could not be reached. Try again in a minute."
+FLEET_SHOWN_LINES = ("Fleet key **{name}** made{until}. This is the only time it is shown:\n\n{key}\n\n"
+                     "Put it on each machine as the environment variable DATASTASH_FLEET_KEY, or in the file "
+                     "~/.config/datastash/fleet.key (mode 600). Each machine signs itself in at its next session start. "
+                     "To stop it: **datastash fleet-key revoke {name}**.")
+FLEET_JOINED_LINE = "This machine joined the fleet **{fleet}** and is signed in to datastash."
+FLEET_REFUSED_LINE = ("This machine's fleet key did not sign it in (wrong, revoked or expired). Ask for a new one, or "
+                      "type **datastash sync you@email.com**.")
+FLEET_FILE_OPEN_LINE = ("The fleet key file ~/.config/datastash/fleet.key can be read by others, so it was not used. "
+                        "Run: chmod 600 ~/.config/datastash/fleet.key")
+
+
+def fleet_expires_of(text):
+    """Seconds for an --expires value (30m, 12h, 1d, 2w), else None; 'bad' for anything else."""
+    m = FLEET_EXPIRES_RE.fullmatch(text.strip()) if isinstance(text, str) else None
+    if not m:
+        return "bad"
+    n = int(m.group(1)) * FLEET_UNITS[m.group(2)[0].lower()]
+    return n if 60 <= n <= 10 * 365 * 86400 else "bad"
+
+
+def fleet_prompt_of(text):
+    """The person's whole prompt `datastash fleet-key ...`: ("create", name, seconds|None), ("list",), ("revoke", name),
+    "usage" for a malformed one, else None (any other prompt)."""
+    m = FLEET_PROMPT_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 200 else None
+    if not m:
+        return None
+    verb, rest = m.group(1).lower(), (m.group(2) or "").strip()
+    if verb == "list":
+        return ("list",) if not rest else "usage"
+    parts = rest.split()
+    if not parts or not re.fullmatch(FLEET_NAME_RE, parts[0]):
+        return "usage"
+    if verb == "revoke":
+        return ("revoke", parts[0]) if len(parts) == 1 else "usage"
+    exp = None
+    if len(parts) > 1:
+        tail = " ".join(parts[1:])
+        em = re.fullmatch(r"--expires(?:=|\s+)(.+)", tail)
+        exp = fleet_expires_of(em.group(1)) if em else "bad"
+        if exp == "bad":
+            return "usage"
+    return ("create", parts[0], exp)
+
+
+def fleet_action(name, seconds):
+    return f"{FLEET_ACTION}:{name}:{seconds or 0}"
+
+
+def fleet_key_held():
+    """This machine's fleet key: DATASTASH_FLEET_KEY, else the mode-600 file. (key or None, line for the person or None).
+    Never printed or logged."""
+    env = os.environ.get("DATASTASH_FLEET_KEY", "").strip()
+    if env:
+        return (env, None) if re.fullmatch(FLEET_KEY_RE, env) else (None, FLEET_REFUSED_LINE)
+    try:
+        fd = os.open(FLEET_KEY_FILE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None, None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+            return None, None
+        if st.st_mode & 0o077:
+            return None, FLEET_FILE_OPEN_LINE
+        text = os.read(fd, 512).decode("utf-8", "replace").strip()
+    finally:
+        os.close(fd)
+    return (text, None) if re.fullmatch(FLEET_KEY_RE, text) else (None, FLEET_REFUSED_LINE)
+
+
+def fleet_login():
+    """The fleet name when this computer's login joined with a fleet key, else None."""
+    if not login_present():
+        return None
+    rec = read_json(FLEET_LOGIN_FILE, {})
+    f = rec.get("fleet") if isinstance(rec, dict) else None
+    return f if isinstance(f, str) and re.fullmatch(FLEET_NAME_RE, f) else None
+
+
+def fleet_join():
+    """Session start on a machine with no login and a fleet key: join (this machine's own login, no typing). The line for
+    the person, or None when there is nothing to do."""
+    if login_present():
+        return None
+    key, line = fleet_key_held()
+    if not key:
+        return line
+    mark = os.path.join(STATE, "fleet-refused.json")
+    kh = hashlib.sha256(key.encode()).hexdigest()[:16]
+    if read_json(mark, {}).get("k") == kh:
+        return None  # this key was refused before: said once, not tried at every start
+    try:
+        got = _post_json(FLEET_JOIN_PATH, dict(_computer(), fleet_key=key), timeout=HOOK_START_SECONDS - 0.5)
+    except ApiError as e:
+        if e.status in (400, 401, 403):
+            ensure_dirs()
+            write_private(mark, json.dumps({"k": kh, "at": int(time.time())}))
+            return FLEET_REFUSED_LINE
+        return None
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return None
+    finally:
+        key = None
+    rt, at = got.get("refresh_token"), got.get("access_token")
+    fleet = got.get("fleet") if isinstance(got.get("fleet"), str) and re.fullmatch(FLEET_NAME_RE, got["fleet"]) else "fleet"
+    if not (isinstance(rt, str) and re.fullmatch(REFRESH_RE, rt) and isinstance(at, str) and re.fullmatch(ACCESS_RE, at)):
+        return None
+    with _login_lock():
+        _save_login(rt, at, got.get("expires_in"), got.get("answer_key"), got.get("grant_id"))
+    rt = at = got = None
+    write_private(EMAIL_LOGIN_FILE, json.dumps({"at": int(time.time())}))  # installs run on this login's REST routes
+    write_private(FLEET_LOGIN_FILE, json.dumps({"fleet": fleet, "at": int(time.time())}))
+    _drop(mark)
+    _change_signin(SIGNIN_DEVICE, "fleet key")
+    login_typed_sync()
+    log("enroll", f"fleet: joined {fleet}")
+    return FLEET_JOINED_LINE.format(fleet=fleet)
+
+
+def fleet_setup_kick(inp):
+    """On a fleet machine's login, a folder with no agent of its own: set it up on the login in the background (once per
+    folder per AUTO_SETUP_RETRY), as /datastash:install does."""
+    if fleet_login() is None:
+        return
+    project, me = project_of(inp), this_session(inp)
+    name = auto_setup_name(project, me, inp)
+    if name is None or not auto_setup_due(project):
+        return
+    write_private(_auto_mark_path(project), json.dumps({"at": int(time.time()), "name": name, "state": "fleet"}))
+    try:
+        spawn_detached([sys.executable, os.path.realpath(__file__), "fleet-setup", "--name", name, "--folder", project],
+                       project if os.path.isdir(project) else HOME)
+    except OSError:
+        pass
+
+
+def cmd_fleet_setup(args):
+    """Background only (the session start on a fleet machine): this folder's agent on the fleet login."""
+    def val(flag):
+        i = args.index(flag) if flag in args else -1
+        return args[i + 1] if 0 <= i < len(args) - 1 else None
+    name, here = val("--name"), val("--folder")
+    if fleet_login() is None or not name or not here:
+        return 1
+    line = login_install(name, os.path.realpath(here))
+    log("enroll", "fleet setup: " + ("done" if line == DONE_LINE else "not done"))
+    return 0 if line == DONE_LINE else 1
+
+
+def cmd_fleet_key(_args):
+    """`datastash fleet-key` in a terminal: only the person's own typed line in their Claude Code session does this."""
+    print("datastash: type datastash fleet-key create NAME, list or revoke NAME in your own Claude Code session; the "
+          "plugin checks you typed it. Nothing was done.")
+    return 2
+
+
+def _fleet_signer(data):
+    """(answer key, grant id, agent id) to sign the create with: this computer's login and an agent keyed here."""
+    login = read_answer_key()
+    aid = data.get("agent_id")
+    if login is None or not re.fullmatch(GRANT_ID_RE, str(login[1]).lower()):
+        return None
+    if not (isinstance(aid, str) and re.fullmatch(GRANT_ID_RE, aid.lower())):
+        return None
+    return login[0], login[1].lower(), aid.lower()
+
+
+def fleet_step(rec, kind, typed_ms):
+    """The person's typed fleet-key line, checked by the checker. Lines for the person."""
+    data = rec.get("data") or {}
+    if not login_present() or fleet_login() is not None:
+        return [FLEET_NO_LOGIN_LINE]
+    tok = login_token()
+    if not tok:
+        return [FLEET_NO_LOGIN_LINE]
+    try:
+        if kind == "fleet_list":
+            got = api_json("GET", FLEET_LIST_PATH, tok, timeout=20)
+            return [fleet_list_lines(got.get("fleet_keys") if isinstance(got, dict) else None)]
+        name = data.get("name")
+        if not (isinstance(name, str) and re.fullmatch(FLEET_NAME_RE, name)):
+            return [FLEET_USAGE_LINE]
+        if kind == "fleet_revoke":
+            got = api_json("POST", FLEET_REVOKE_PATH, tok, body={"name": name}, timeout=30)
+            n = got.get("signed_out") if isinstance(got, dict) else None
+            n = n if isinstance(n, int) and not isinstance(n, bool) else 0
+            return [f"Fleet key **{name}** revoked. {n} machine{'' if n == 1 else 's'} signed out."]
+        exp = data.get("expires")
+        exp = exp if isinstance(exp, int) and not isinstance(exp, bool) and exp > 0 else None
+        signer = _fleet_signer(data)
+        if signer is None:
+            return [FLEET_NO_AGENT_LINE]
+        iat = int(time.time() * 1000)
+        proof = typed_sync_proof(signer[0], f"grant:{signer[1]}", signer[2], fleet_action(name, exp), rec["pid"],
+                                 rec["prompt"], min(typed_ms, iat), iat)
+        signer = None
+        body = {"name": name, "typed_proof": proof}
+        if exp:
+            body["expires_in_seconds"] = exp
+        got = api_json("POST", FLEET_CREATE_PATH, tok, body=body, timeout=30)
+    except ApiError as e:
+        return [server_refused(e.body, FLEET_FAILED_LINE)]
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return [FLEET_FAILED_LINE]
+    finally:
+        tok = None
+    key = got.get("fleet_key") if isinstance(got, dict) else None
+    if not (isinstance(key, str) and re.fullmatch(FLEET_KEY_RE, key)):
+        return [FLEET_FAILED_LINE]
+    until = got.get("expires_at")
+    until = f" (it adds machines until {until})" if isinstance(until, str) and len(until) <= 30 else " (no expiry)"
+    line = FLEET_SHOWN_LINES.format(name=name, until=until, key=key)
+    key = None
+    return [line]
+
+
+def fleet_list_lines(keys):
+    if not isinstance(keys, list):
+        return FLEET_FAILED_LINE
+    if not keys:
+        return "No fleet keys yet. Type **datastash fleet-key create NAME** to make one."
+    out = ["Fleet keys:"]
+    for k in keys[:50]:
+        if not isinstance(k, dict) or not isinstance(k.get("name"), str):
+            continue
+        state = ("revoked" if k.get("revoked_at") else "expired" if k.get("expired")
+                 else f"adds machines until {k['expires_at']}" if k.get("expires_at") else "no expiry")
+        ms = [m for m in k.get("machines") or [] if isinstance(m, dict)]
+        live = sum(1 for m in ms if m.get("signed_in") is True)
+        out.append(f"- {k['name']}: {state}; {live} of {len(ms)} machine{'' if len(ms) == 1 else 's'} signed in")
+        for m in ms[:20]:
+            nm = fleet_machine_name(m.get("device_name"))
+            out.append(f"    {nm}: {'signed in' if m.get('signed_in') is True else 'signed out'}")
+    return "\n".join(out)
+
+
+def fleet_machine_name(v, max_len=60):
+    return re.sub(r"[^\w .:/@()-]", "", v)[:max_len] if isinstance(v, str) and v else "a machine"
+
+
+def fleet_step_prompt(inp, shape, prompt):
+    """UserPromptSubmit: the person's whole prompt `datastash fleet-key ...`, handed to the checker. (line, AI, block)."""
+    got = fleet_prompt_of(prompt)
+    if got is None:
+        return None
+    if got == "usage":
+        return FLEET_USAGE_LINE, None, True
+    if not login_present() or fleet_login() is not None:
+        return FLEET_NO_LOGIN_LINE, None, True
+    data = {}
+    if got[0] == "create":
+        own = _own(inp)
+        aid = own.get("agent_id") if isinstance(own, dict) else None
+        if not isinstance(aid, str):
+            keyed = _keyed_agents()
+            aid = keyed[0].get("agent_id") if keyed else None
+        if not isinstance(aid, str):
+            return FLEET_NO_AGENT_LINE, None, True
+        data = {"name": got[1], "expires": got[2], "agent_id": aid}
+    elif got[0] == "revoke":
+        data = {"name": got[1]}
+    if not start_check(shape, "fleet_" + got[0], prompt, data):
+        return FLEET_FAILED_LINE, None, True
+    return None, LOGIN_STEP_AI.format(line="Checking."), False
+
+
+# --- XLI-419 sign-in batch (plugin 1.0.40): the person's computers. `datastash computers` lists the account's computer
+# sign-ins (name, OS, last seen, agents, how each signed in, signed in or out with when and why); `datastash computer
+# remove NAME` signs one out for good and frees its agent names. Both are the person's own typed lines, checked by the
+# checker; the remove is signed with this computer's login answer key (agent id = the login's own grant id, so a
+# computer with no agent can still free a name). Never this computer itself (the server refuses it).
+COMPUTERS_PATH = "/api/v1/device/computers"
+COMPUTER_REMOVE_PATH = "/api/v1/device/computer/remove"
+COMPUTER_REMOVE_ACTION = "computer_remove"
+COMPUTER_NAME_RE = r"[A-Za-z0-9][A-Za-z0-9._@-]{0,59}"
+COMPUTER_STEP_KINDS = ("computers_list", "computer_remove")
+COMPUTERS_PROMPT_RE = re.compile(r"\s*datastash\s+(?:computers|computer\s+(list|remove)(?:\s+(.*?))?)\s*", re.I | re.S)
+COMPUTER_USAGE_LINE = ("Not done. Type **datastash computers** to see this account's computers, or "
+                       "**datastash computer remove NAME** to remove one.")
+COMPUTER_FAILED_LINE = "Not done: datastash could not be reached. Try again in a minute."
+# Why a sign-in ended, as the person reads it (the server's x.device_grants.revoked_why; src/agents/computers.ts).
+SIGNED_OUT_WHY = {"copied": "its sign-in was copied", "logout": "signed out with datastash logout",
+                  "sign_out": "signed out on the datastash site", "fleet_key_revoked": "its fleet key was revoked",
+                  "computer_remove": "removed", "stop_all": "every computer was signed out"}
+
+
+def signed_out_why_text(why):
+    return SIGNED_OUT_WHY.get(why, "signed out") if isinstance(why, str) else "signed out"
+
+
+def computers_prompt_of(text):
+    """The person's whole prompt: ("list",), ("remove", name), "usage" for a malformed one, else None."""
+    m = COMPUTERS_PROMPT_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 200 else None
+    if not m:
+        return None
+    verb, rest = (m.group(1) or "list").lower(), (m.group(2) or "").strip()
+    if verb == "list":
+        return ("list",) if not rest else "usage"
+    return ("remove", rest) if re.fullmatch(COMPUTER_NAME_RE, rest) else "usage"
+
+
+def computer_action(name):
+    return f"{COMPUTER_REMOVE_ACTION}:{name.lower()}"
+
+
+def _plain_cell(v, max_len=60):
+    return re.sub(r"[^\w .:/@()-]", "", v)[:max_len] if isinstance(v, str) else ""
+
+
+def _day_of(iso):
+    return iso[:10] if isinstance(iso, str) and re.match(r"\d{4}-\d{2}-\d{2}", iso) else ""
+
+
+def _ago_of(iso, now=None):
+    """'12 days ago', '3 hours ago', 'just now' (as the server's agoText), or 'never'."""
+    try:
+        import calendar
+        t = calendar.timegm(time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return "never"
+    s = max(0, int((now or time.time()) - t))
+    unit = lambda n, w: f"{n} {w}{'' if n == 1 else 's'} ago"  # noqa: E731
+    if s < 120:
+        return "just now"
+    if s < 7200:
+        return unit(s // 60, "minute")
+    if s < 2 * 86400:
+        return unit(s // 3600, "hour")
+    return unit(s // 86400, "day")
+
+
+def computers_lines(items):
+    if not isinstance(items, list):
+        return COMPUTER_FAILED_LINE
+    items = [c for c in items if isinstance(c, dict) and isinstance(c.get("name"), str)]
+    if not items:
+        return "No computers are signed in to this account."
+    out = ["Computers:"]
+    for c in items[:50]:
+        name, cid = _plain_cell(c["name"]) or "a computer", _plain_cell(c.get("id"), 8)
+        os_ = _plain_cell(c.get("os"), 30)
+        agents = [_plain_cell(a, 40) for a in (c.get("agents") or []) if isinstance(a, str)][:10]
+        how = c.get("how") if c.get("how") in ("email code", "fleet key") else None
+        if c.get("state") == "signed out":
+            state = f"signed out {_day_of(c.get('signed_out_at'))} ({_plain_cell(c.get('why'), 60) or 'signed out'})"
+        else:
+            state = "signed in" + (f" by {how}" if how else "")
+        bits = [state, f"last seen {_ago_of(c.get('last_seen'))}",
+                ("agents: " + ", ".join(agents)) if agents else "no agents"]
+        head = f"- **{name}**" + (f" ({os_}" + (f", id {cid}" if cid else "") + ")" if os_ or cid else "")
+        out.append(head + ": " + "; ".join(bits) + (" (this computer)" if c.get("this_computer") is True else ""))
+    out.append("To remove one, type **datastash computer remove NAME**.")
+    return "\n".join(out)
+
+
+def computer_step(rec, kind, typed_ms):
+    """The person's typed computers line, checked by the checker. Lines for the person."""
+    data = rec.get("data") or {}
+    if not login_present() or fleet_login() is not None:
+        return [FLEET_NO_LOGIN_LINE]
+    tok = login_token()
+    if not tok:
+        return [FLEET_NO_LOGIN_LINE]
+    try:
+        if kind == "computers_list":
+            got = api_json("GET", COMPUTERS_PATH, tok, timeout=20)
+            return [computers_lines(got.get("computers") if isinstance(got, dict) else None)]
+        name = data.get("name")
+        if not (isinstance(name, str) and re.fullmatch(COMPUTER_NAME_RE, name)):
+            return [COMPUTER_USAGE_LINE]
+        login = read_answer_key()
+        if login is None or not re.fullmatch(GRANT_ID_RE, str(login[1]).lower()):
+            return [FLEET_NO_LOGIN_LINE]
+        grant = login[1].lower()
+        iat = int(time.time() * 1000)
+        proof = typed_sync_proof(login[0], f"grant:{grant}", grant, computer_action(name), rec["pid"], rec["prompt"],
+                                 min(typed_ms, iat), iat)
+        login = None
+        got = api_json("POST", COMPUTER_REMOVE_PATH, tok, body={"name": name, "typed_proof": proof}, timeout=30)
+    except ApiError as e:
+        msg = e.body.get("message") if isinstance(e.body.get("message"), str) else ""
+        if e.status in (400, 404, 409) and msg and "datastash" in msg:
+            return [_plain_line(msg)]  # the server's own plain line (no such computer, several, this computer)
+        return [server_refused(e.body, COMPUTER_FAILED_LINE)]
+    except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return [COMPUTER_FAILED_LINE]
+    finally:
+        tok = None
+    if not (isinstance(got, dict) and got.get("removed") is True):
+        return [COMPUTER_FAILED_LINE]
+    nm = _plain_cell(got.get("name")) or name
+    freed = [_plain_cell(a, 40) for a in (got.get("freed_agents") or []) if isinstance(a, str)][:10]
+    tail = (" Its agent name" + ("s " if len(freed) != 1 else " ") + ", ".join(freed)
+            + (" are" if len(freed) != 1 else " is") + " free again.") if freed else ""
+    return [f"**{nm}** is removed: it is signed out for good.{tail}"]
+
+
+def _plain_line(msg, max_len=300):
+    msg = re.sub(r"\s+", " ", "".join(ch for ch in msg if unicodedata.category(ch)[0] != "C")).strip()
+    msg = re.sub(r"(datastash computer remove [A-Za-z0-9._@-]+|datastash computers|datastash logout|datastash sync)",
+                 r"**\1**", msg[:max_len])
+    return msg
+
+
+def computer_step_prompt(inp, shape, prompt):
+    """UserPromptSubmit: the person's whole prompt `datastash computers` / `datastash computer remove NAME`, handed to the
+    checker. (line, AI, block) or None."""
+    got = computers_prompt_of(prompt)
+    if got is None:
+        return None
+    if got == "usage":
+        return COMPUTER_USAGE_LINE, None, True
+    if not login_present() or fleet_login() is not None:
+        return FLEET_NO_LOGIN_LINE, None, True
+    kind, data = ("computers_list", {}) if got[0] == "list" else ("computer_remove", {"name": got[1]})
+    if not start_check(shape, kind, prompt, data):
+        return COMPUTER_FAILED_LINE, None, True
+    return None, LOGIN_STEP_AI.format(line="Checking."), False
+
+
+# --- XLI-419 batch: the signed-out line. A refresh datastash answers 401 with `signed_out: {at, why}` (this computer was
+# removed, its sign-in copied, its fleet key revoked...): the fact is kept here, and the next session start says it once.
+SIGNED_OUT_FILE = os.path.join(CONF, "signed-out.json")  # {"at", "why"}: this computer was signed out at datastash
+SIGNED_OUT_SELF_LINE = ("This computer is signed out ({why}, {day}). To bring it back, type "
+                        "**datastash sync you@email.com**.")
+
+
+def note_signed_out(body):
+    """Keep the server's signed_out fact (from a refused refresh), if it gave one."""
+    so = body.get("signed_out") if isinstance(body, dict) else None
+    if not isinstance(so, dict):
+        return
+    why = so.get("why") if isinstance(so.get("why"), str) and re.fullmatch(r"[a-z_]{1,40}", so["why"]) else None
+    at = so.get("at") if isinstance(so.get("at"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T[\d:]{8}Z", so["at"]) else None
+    try:
+        ensure_dirs()
+        write_private(SIGNED_OUT_FILE, json.dumps({"at": at, "why": why}))
+    except OSError:
+        pass
+
+
+def signed_out_self():
+    """(why text, day) when this computer was signed out at datastash and has not signed in again, else None."""
+    if login_present():
+        return None
+    rec = _read_private_json(SIGNED_OUT_FILE)
+    if not isinstance(rec, dict):
+        return None
+    return signed_out_why_text(rec.get("why")), (_day_of(rec.get("at")) or "date unknown")
+
+
+def signed_out_self_line(inp):
+    """The session start's one line on a signed-out computer, once per session."""
+    got = signed_out_self()
+    if got is None:
+        return None
+    sid = _sid(inp)
+    if sid is not None:
+        mark = os.path.join(STATE, f"signed-out-said-{sid}")
+        if os.path.exists(mark):
+            return None
+        ensure_dirs()
+        write_private(mark, json.dumps({"at": int(time.time())}))
+    return SIGNED_OUT_SELF_LINE.format(why=got[0], day=got[1])
+
+
+def signed_out_setup_rows(rows):
+    """Setup rows for the agents of this account's signed-out computers (a signed-out computer has no live key, so it
+    cannot write its own row): read by a signed-in computer's person login. Only rows already in the tab are changed."""
+    if not rows or not login_present() or fleet_login() is not None:
+        return []
+    tok = login_token()
+    if not tok:
+        return []
+    try:
+        got = api_json("GET", COMPUTERS_PATH, tok, timeout=SETUP_ROW_TIMEOUT)
+    except (ApiError, ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
+        return []
+    finally:
+        tok = None
+    out = []
+    for c in (got.get("computers") if isinstance(got, dict) else None) or []:
+        if not isinstance(c, dict) or c.get("state") != "signed out" or not isinstance(c.get("name"), str):
+            continue
+        name = _plain_cell(c["name"].split(" / ")[0].strip() or c["name"])
+        for a in c.get("agents") or []:
+            old = rows.get(a.strip().casefold()) if isinstance(a, str) else None
+            if not isinstance(old, dict):
+                continue
+            row = {k: old.get(k, "") for k in SETUP_COLUMNS}
+            row["registered"] = f"signed out {_day_of(c.get('signed_out_at'))} ({_plain_cell(c.get('why'), 60) or 'signed out'})"
+            row["next step"] = (f"type datastash sync you@email.com on {name}, or datastash computer remove {name}")
+            row["who does it"] = "the person"
+            if row != {k: old.get(k, "") for k in SETUP_COLUMNS}:
+                out.append(row)
+    return out[:50]
 
 
 # --- the connector's sync calls: start and start_chatstash run only after the person's own typed phrase
@@ -17189,6 +17790,12 @@ def command_prompt(inp):
     sid, tp, pid = shape
     base = {"sid": sid, "tp": tp, "pid": pid, "prompt": prompt, "at": time.time()}
     got = login_step_prompt(inp, shape, prompt)  # card 1: `datastash sync <email>` / `datastash sync <code>`
+    if got is not None:
+        return got
+    got = fleet_step_prompt(inp, shape, prompt)  # XLI-419: `datastash fleet-key create|list|revoke ...`
+    if got is not None:
+        return got
+    got = computer_step_prompt(inp, shape, prompt)  # XLI-419: `datastash computers` / `datastash computer remove NAME`
     if got is not None:
         return got
     m = UNINSTALL_RE.fullmatch(prompt)
@@ -22104,7 +22711,7 @@ def _auto_mark_path(here):
 
 SYSTEM_ROOTS = ("/etc", "/usr", "/opt", "/var", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/proc", "/sys",
                 "/dev", "/run", "/boot", "/root", "/snap", "/private/tmp", "/private/var", "/System", "/Library",
-                "/Applications", "/Volumes")
+                "/Applications")  # XLI-419 exposure #15: /Volumes (macOS drives) is no system folder
 
 
 def _temp_roots():
@@ -22124,12 +22731,15 @@ def _roots_real(roots):
 def temp_or_system(here):
     """1.0.21 (M1): a temp folder or a system folder, or inside one (links resolved first). Self-setup never registers
     an agent there. A sandboxed home (the home folder itself inside a temp folder, as in a test computer) keeps its own
-    subfolders."""
+    subfolders. XLI-419 exposure #15: a subfolder of the real home is never a system folder, wherever that home is
+    (root's /root, Fedora's /var/home/NAME); the home folder itself is still refused (linkable)."""
     rp = os.path.realpath(here)
     temps = _roots_real(_temp_roots())
     home = os.path.realpath(HOME)
-    if rp != home and _within(rp, home) and any(_within(home, t) for t in temps):
-        return False
+    if rp != home and home != "/" and _within(rp, home):
+        if any(_within(home, t) for t in temps):
+            return False
+        return any(_within(rp, t) for t in temps)  # only a temp folder inside the home is refused
     return any(_within(rp, r) for r in temps | _roots_real(SYSTEM_ROOTS))
 
 
@@ -22171,8 +22781,8 @@ def auto_setup_wake(inp, project, me):
     """The listener's one wake for a folder with no agent on a signed-in computer: the plugin's own setup steps; None
     otherwise (not signed in: nothing is tried, and the next session start says so plainly)."""
     name = auto_setup_name(project, me, inp)
-    if name is None:
-        return None
+    if name is None or fleet_login() is not None:
+        return None  # XLI-419: a fleet login's folder is set up by the session start's background step, never the model
     if AUTO_SETUP_WAIT > 0:
         time.sleep(AUTO_SETUP_WAIT)
         name = auto_setup_name(project, me, inp)  # the person's typed install may have started meanwhile
@@ -22554,6 +23164,16 @@ def write_setup_row(agent, here):
     if is_err:
         raise ApiError(400, body if isinstance(body, dict) else {})
     rows[row["agent"].strip().casefold()] = row
+    try:  # XLI-419: the rows of this account's signed-out computers' agents say "signed out", when and why
+        gone = signed_out_setup_rows(rows)
+        if gone:
+            is_err, _b = mcp_tool(key, "ledger_rows_upsert", {"workbook_id": agent["workbook_id"], "tab": SETUP_TAB,
+                                                              "rows": gone, "key": "agent"}, timeout=SETUP_ROW_TIMEOUT)
+            if not is_err:
+                for g in gone:
+                    rows[g["agent"].strip().casefold()] = g
+    except Exception:  # noqa: BLE001  an extra; never the own row's result
+        pass
     try:
         write_private(setup_cache_path(agent["workbook_id"]), json.dumps({"at": int(time.time()), "rows": rows}))
     except OSError:
@@ -23106,6 +23726,7 @@ def command_table():
             "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share,
             "remember": cmd_remember, "skills-sync": cmd_skills_sync, "repeat": cmd_repeat, "repeats": cmd_repeat,
             "estimate": cmd_estimate, "estimates": cmd_estimate, "timer": cmd_timer, "timers": cmd_timer, "dds-update": cmd_dds_update,
+            "fleet-key": cmd_fleet_key, "fleet-setup": cmd_fleet_setup,
             "allow": cmd_allow, "disallow": lambda a: cmd_allow(a, disallow=True)}
 
 
