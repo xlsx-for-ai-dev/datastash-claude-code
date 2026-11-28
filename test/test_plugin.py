@@ -1682,10 +1682,11 @@ class SelfRegistration(MainBase):
             self.assertEqual(self.name_in(mine), "name: app-3")
             # datastash refused a name as taken (another connection has it): the next suffix.
             self.assertEqual(self.name_in(mine, after="app-3"), "name: app-4")
-            # Reserved names are never used.
+            # Reserved names are never used. XLI-419: nor as a word ("person-2" is refused by datastash too), so a
+            # folder named "person" takes the computer's user name.
             person_dir = os.path.join(harness.tmpdir(self, dir=TMP), "person")
             os.makedirs(person_dir)
-            self.assertEqual(self.name_in(person_dir), "name: person-2")
+            self.assertEqual(self.name_in(person_dir), "name: " + ds.user_name())
         finally:
             for s in ("app", "app-2"):
                 os.replace(ds.conf_path(s), os.path.join(TMP, f"old-{s}-{time.time()}"))
