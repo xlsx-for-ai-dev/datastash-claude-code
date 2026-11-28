@@ -67,6 +67,11 @@ What it adds:
 
 Requires `python3` (3.8 or later, standard library only) and Claude Code with plugin hooks.
 
+## What's new
+
+One line per release: [plugins/datastash/CHANGELOG.md](plugins/datastash/CHANGELOG.md). `datastash --help` lists every
+command, and `datastash COMMAND --help` shows one command's usage without saving or sending anything.
+
 ## Install
 
 Inside a Claude Code session:
@@ -938,7 +943,7 @@ Common causes:
 - **This computer isn't signed in**: type **datastash sync you@email.com**, then **datastash sync CODE** with the
   code from the email.
 - **New datastash tools not showing**: current versions of datastash tell Claude Code when its tools change; on an older
-  session, reconnect the datastash connector (`/mcp`).
+  session, start a new session (new and resumed sessions connect by themselves).
 
 Until it's fixed, `datastash watch` under a Monitor (below) still delivers messages.
 

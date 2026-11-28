@@ -2443,7 +2443,8 @@ class SignInHint(Base):
             with open(env) as f:
                 line = f.read()
             self.assertIn(os.path.dirname(os.path.realpath(BIN)), line)
-            self.assertTrue(line.startswith("export PATH="))
+            self.assertIn("; export PATH=", line)  # XLI-435 #4: after taking old datastash folders off PATH
+            self.assertEqual(line.count("\n"), 1)
         finally:
             os.environ.pop("CLAUDE_ENV_FILE", None)
 
