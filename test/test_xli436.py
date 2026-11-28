@@ -2,8 +2,7 @@
 """Offline tests for XLI-436 (plugin 1.0.38): coordination gaps from MS's review (#9, #11, #13, #14).
 - #9: with clean sessions on, the main session claims (ledger_agent_job, `datastash api POST /api/v1/agent/job`) the
   same way it hands off and writes its status.
-- #11: a new agent is never named after the computer's OS user (the home folder or "/" asks for a typed name); the status
-  list shows a known project name instead of "?", and one agent's rows with nothing open under the same (or no) project
+- #11: the status list shows a known project name instead of "?", and one agent's rows with nothing open under the same (or no) project
   name collapse into one. Only the view changes: no row's own project is rewritten, nothing is deleted.
 - #13: the GitHub lookups offer says plainly that a yes adds a webhook to the repo (a change to its settings).
 - #14: the Setup tab's "full-DDS missing" column also names the claims, hand-offs, check-backs and remember an agent has
@@ -56,8 +55,8 @@ class ClaimsInCleanSessions(Base):
         self.assertTrue(denied(self.call(DS_MCP + "ledger_agent_result", {"workbook_id": WB})))  # results stay refused
 
 
-class NeverTheOsUser(Base):
-    """#11: no new agent named after the computer's user; the folder's or the person's typed name instead."""
+class HomeNameIsAutomatic(Base):
+    """Owner ruling (setup finishes itself): a home-folder install picks its name itself, as in 1.0.37; never a question."""
     def setUp(self):
         super().setUp()
         self.home_saved = ds.HOME
@@ -69,29 +68,18 @@ class NeverTheOsUser(Base):
         self.user.start()
         self.addCleanup(self.user.stop)
 
-    def test_the_home_folder_and_root_ask_for_a_name(self):
+    def test_the_home_folder_and_root_name_the_agent_without_asking(self):
         for here in (self.home, "/"):
-            self.assertEqual(ds.auto_name(here, None), ("ask", None), here)
-            self.assertIsNone(ds._free_name(here), here)
+            self.assertEqual(ds.auto_name(here, None), ("name", "osuser"), here)
 
-    def test_a_typed_or_session_name_is_used_in_the_home_folder(self):
+    def test_a_session_name_still_wins_in_the_home_folder(self):
         self.assertEqual(ds.auto_name(self.home, None, session_name="spm"), ("name", "spm"))
         self.assertEqual(ds._free_name(self.home, prefer="SPM"), "spm")
 
-    def test_a_folder_takes_its_own_name_and_a_nameless_one_asks(self):
+    def test_a_folder_takes_its_own_name(self):
         web = os.path.join(os.path.dirname(self.folder), "shop-site")
         os.makedirs(web, exist_ok=True)
         self.assertEqual(ds.auto_name(web, None), ("name", "shop-site"))
-        dots = os.path.join(os.path.dirname(self.folder), "d436", "...")
-        os.makedirs(dots, exist_ok=True)
-        self.assertEqual(ds.auto_name(dots, None), ("ask", None))  # never "osuser"
-
-    def test_the_home_install_asks_and_the_sign_in_code_names_no_agent(self):
-        inp = {"session_id": "s436", "cwd": self.home, "hook_event_name": "UserPromptSubmit"}
-        with mock.patch.object(ds, "project_of", return_value=self.home):
-            kind, name = ds.auto_name(ds.project_of(inp), None, session_name=ds._session_name(inp))
-        self.assertEqual((kind, name), ("ask", None))
-        self.assertNotEqual(name, "osuser")
 
 
 def nrow(agent, doing, **kw):

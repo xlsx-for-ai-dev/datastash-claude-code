@@ -469,8 +469,8 @@ computer, the background listener no longer registers waiting agents: a session 
 to type `/datastash:install`; an agent 0.9.x already registered is still waited for as above.
 
 From 1.0.2 (XLI-390 install fix) `/datastash:install` works in any folder, the home folder too. The new agent is named
-after the session's own agent (`claude --agent NAME`), else the folder (1.0.38: never the computer's user name; in the
-home folder or `/` the plugin asks for one: `/datastash:install <name>`; see below). In a folder it can't link (home, `/`), the agent the install made is kept for that
+after the session's own agent (`claude --agent NAME`), else the folder (1.0.16: in the home folder or `/`, the computer's
+user name; see below). In a folder it can't link (home, `/`), the agent the install made is kept for that
 session (`state/session-agent-<session>.json`: its local name and id only), and there (home or `/` only) the one agent
 with no folder of its own is used as the session's agent, so typing `/datastash:install` again reuses it and makes no
 "-2". In any other folder `/datastash:install` makes that folder's own agent (after a home-folder install too). Any refusal is one line
@@ -497,8 +497,8 @@ installed says "Datastash isn't installed on this agent. Nothing was removed." a
 Uninstall keeps a small record of the names it removed, next to the plugin's folder in
 `~/.config/datastash-last-names.json` (mode 600; names, folders and session ids only, never a key). Running
 `/datastash:install` again in that session, or later in that folder, brings the same name back. If there is no record,
-the agent takes the folder's name (1.0.38: never the computer's user name, so in the home folder or `/` the person types
-one). If no name can be made at all, the plugin asks for one: `/datastash:install <name>`. It never falls back to "agent".
+the agent takes the folder's name, or the computer's user name in the home folder or `/`. If no name can be made at all,
+the plugin asks for one: `/datastash:install <name>`. It never falls back to "agent".
 
 **First session, reinstall, local cleanup (1.0.14).** `/datastash:install` and `/datastash:uninstall` work in the
 first session of a folder Claude Code never ran in (before, that session said "datastash did not answer"). Installing
@@ -530,9 +530,9 @@ name, so no name can pass for another one or for "all", "this" or "and". Every n
 1. every character that is not an ASCII letter, digit, "-", "_" or "." becomes "-" (a space, an accent, a look-alike);
 2. the name is lowercased;
 3. runs of "-" become one "-", and "-" is trimmed from both ends; at most 40 characters, as before;
-4. if nothing is left the plugin asks for a name (1.0.38: never the computer's user name; never "agent"); if the result is a reserved word ("person", "datastash", or a
+4. if nothing is left the name is the computer's user name (1.0.16; never "agent"), else the plugin asks; if the result is a reserved word ("person", "datastash", or a
    word below) or another agent here has it, the install suffix rule adds -2, -3 ...
-So "Ꭺll" (a Cherokee A) is agent "ll", "My Project" is "my-project", "ᴀʟʟ" asks for a name and a folder named "all" is
+So "Ꭺll" (a Cherokee A) is agent "ll", "My Project" is "my-project", "ᴀʟʟ" is the computer's user name and a folder named "all" is
 "all-2". A name sent for a new agent (the AI's `ledger_agent_register` call, `datastash api POST
 /api/v1/agent/register` and `/api/v1/agent/join/redeem`) that is not plain is refused, unless an agent on this computer
 already has exactly that name (registering it again answers that agent). `datastash link` and `datastash fetch` name an

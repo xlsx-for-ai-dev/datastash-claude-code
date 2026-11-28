@@ -2125,10 +2125,7 @@ def _free_name(folder, taken=None, prefer=None):
     """The name for folder's new agent: the folder's name (or prefer: the name the person used), -2, -3 ... past any
     agent on this computer (or a name datastash refused as taken)."""
     mine = {a["slug"] for a in all_agents()} | {slug(r["name"]) for r in _enrolled().values()}
-    # 1.0.38 (XLI-436): never the computer's user name (a stray agent named after the OS user): the folder's own name or
-    # the name the person typed; the home folder or "/" gives none
-    name = _next_name(taken) if taken else (_folder_name(prefer) if prefer else
-                                            ("" if _home_or_root(folder) else _folder_name(folder)))
+    name = _next_name(taken) if taken else ((_folder_name(prefer) if prefer else _folder_name(folder)) or user_name())
     if not name:
         return None
     for _ in range(1000):
@@ -5970,10 +5967,9 @@ def _home_or_root(here):
 
 def auto_name(here, me, after=None, session_name=None):
     """("linked", name) when this folder already has its agent (reuse it), ("main", None) for the person's session (never
-    registers), else ("name", the name to register): the session's own agent name (`claude --agent`) or the person's
-    typed one, else the folder's name (1.0.38: never the computer's user name; the home folder or "/" gives none), with
-    -2, -3 when another agent on this machine has it (or datastash refused `after` as taken); ("ask", None) when no name
-    can be made (1.0.16: never "agent")."""
+    registers), else ("name", the name to register): the session's own agent name (`claude --agent`), else the folder's
+    name (the computer's user name for the home folder or "/"), with -2, -3 when another agent on this machine has it
+    (or datastash refused `after` as taken); ("ask", None) when no name can be made (1.0.16: never "agent")."""
     if is_main_session(me) or main_root(here) is not None:
         return "main", None
     sess = session_for(here, me=me)
@@ -5981,14 +5977,13 @@ def auto_name(here, me, after=None, session_name=None):
         return ("main", None) if is_person(sess) else ("linked", sess["name"])
     mine = {a["slug"]: a for a in all_agents()}
     # 1.0.16: never "agent": the session's own name, else the name this session or folder had before an uninstall,
-    # else the folder's name; none of them: ask the person.
+    # else the folder's name (the computer's user name for the home folder or "/"); none of them: ask the person.
     if after:
         name = plain_agent_name(after, 44)
         name = _next_name(name) if name else None
     else:
-        # 1.0.38 (XLI-436, MS's review #11): never the computer's user name. The home folder's or "/"'s name is the OS
-        # user's, never an agent's: there, with no session name and no earlier name, the person types one.
-        name = session_name or last_name(here, me) or ("" if _home_or_root(here) else _folder_name(here))
+        name = session_name or last_name(here, me) or (user_name() if _home_or_root(here) else _folder_name(here)) \
+            or user_name()
     if not name:
         return "ask", None
     for _ in range(1000):
@@ -17183,8 +17178,8 @@ def command_prompt(inp):
         own = _own(inp)
         if own is not None and read_agent_answer(own["slug"]):
             name = own["name"]  # XLI-390 install fix: this session's agent again, never a new "-2"
-        elif kind == "ask":  # 1.0.38: a computer not signed in is asked to sign in first, then for the name
-            return (SIGN_IN_FIRST_LINE if not email_login() and not_signed_in(own) else ASK_NAME_LINE), None, True
+        elif kind == "ask":
+            return ASK_NAME_LINE, None, True
         if email_login():  # card 1: this computer's emailed-code login: the plugin installs on it, no connector
             if own is not None and read_key(own["slug"]):
                 return DONE_LINE, None, True
@@ -21883,8 +21878,6 @@ WHATS_NEW = {
         "/api/v1/agent/job**), as it hands off and writes its status: claim before every card.",
         "Your Setup row's full-DDS missing column now also names the claims, hand-offs, check-backs and remember you "
         "have not used in the last 7 days; it reads none only when you use them all.",
-        "A new agent is never named after the computer's user: in the home folder the person types the name "
-        "(**/datastash:install NAME**).",
     ),
     "1.0.37": (
         "A line Claude Code marks as not typed in this session (another session, a connector, rewritten) never counts "
