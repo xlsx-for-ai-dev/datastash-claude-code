@@ -80,6 +80,45 @@ def framed_inner(text):
     return lines[i + 1:j]
 
 
+DESKTOP_PATCHED = ("_on_mac", "_hook_ppid", "_proc_row", "_codesign_ok", "_codesign_many", "_app_env_bad")
+REAL_DESKTOP = {k: getattr(ds, k) for k in DESKTOP_PATCHED}
+
+
+def desktop_table(test, name, env_bad=False, unsigned=()):
+    """XLI-420 part 2: the hooks run on "macOS" and see this process table (test/fixtures/desktop-process-chains.json,
+    read by pid) and a codesign that passes only the real Anthropic-signed paths and the processes running them. None:
+    a table that can't be read."""
+    with open(os.path.join(HERE, "fixtures", "desktop-process-chains.json")) as f:
+        fx = json.load(f)
+    saved = {k: getattr(ds, k) for k in DESKTOP_PATCHED}
+    test.addCleanup(lambda: [setattr(ds, k, v) for k, v in saved.items()])
+    ds._DESKTOP_SEEN.clear()
+    test.addCleanup(ds._DESKTOP_SEEN.clear)
+    ds._on_mac = lambda: True
+    if name is None:
+        ds._hook_ppid, ds._proc_row = (lambda: 18842), (lambda pid: None)
+        return
+    tb = fx["tables"][name]
+
+    def home(x):
+        return ds.HOME + x[1:] if x.startswith("~") else x
+    rows = {int(k): (v[0], home(v[1]), [home(a) for a in v[2]], True) for k, v in tb["rows"].items()}
+    bad = set(tb.get("unsigned", ())) | set(unsigned)
+    signed = fx["signed"]["paths"]
+
+    def codesign(target, ident=None):
+        if isinstance(target, int):
+            if target in bad or target not in rows:
+                return False
+            target = rows[target][1]
+        return target in signed and (ident is None or signed[target] == ident)
+    ds._hook_ppid = lambda: tb["start"]
+    ds._proc_row = lambda pid: rows.get(pid)
+    ds._codesign_ok = codesign
+    ds._app_env_bad = lambda pid: env_bad
+    return rows
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         ds.ensure_dirs()
@@ -826,53 +865,49 @@ class PersonOnly(Base):
             self.entry(sid, v)
         return write
 
-    def chains(self, chain, app=None):
-        """XLI-420: the prompt hook sees this process chain (test/fixtures/desktop-process-chains.json) and this desktop
-        app part (None: the shipped DESKTOP_APP_CHAIN)."""
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "desktop-process-chains.json")) as f:
-            fx = json.load(f)
-        saved = (ds.process_chain, ds.DESKTOP_APP_CHAIN)
-        self.addCleanup(lambda: (setattr(ds, "process_chain", saved[0]), setattr(ds, "DESKTOP_APP_CHAIN", saved[1])))
-        got = fx[chain] if isinstance(chain, str) else chain
-        ds.process_chain = lambda: got
-        if app is not None:
-            ds.DESKTOP_APP_CHAIN = tuple(tuple(x) for x in fx[app])
+    def chains(self, chain):
+        """XLI-420 part 2: the prompt hook sees this process table (test/fixtures/desktop-process-chains.json)."""
+        desktop_table(self, chain)
 
     def test_desktop_code_tab_typed_line_is_the_person(self):
         """XLI-420: the desktop Code tab's typed line (promptSource "sdk", origin human, entrypoint claude-desktop)
-        passes when the hook's process chain is the desktop app's (stand-in chain until the owner's capture)."""
-        self.chains("desktop_stand_in", app="STAND_IN_APP_CHAIN")
+        passes when the hook's process table is the recorded Code-tab chain with the signed helper and app."""
+        self.chains("code_tab")
         self.prompt(ds.KEEP_PHRASE, writer=self.desktop())
         self.assertEqual(ds.keep_state(), "yes")
         self.assertEqual(self.outcomes(), [])
 
-    def test_review_1_headless_run_and_nested_runs_are_refused(self):
-        """Review 1 HIGH: the exact transcript entry of a desktop line, made by `CLAUDE_CODE_ENTRYPOINT=claude-desktop
-        claude -p --input-format stream-json` with origin human from an agent's shell, without -p, detached from its
-        parent, or with a chain that can't be read, is refused, even with a desktop app part set."""
-        for chain in ("headless_review_1", "nested_no_print", "detached", "terminal", None, []):
-            self.chains(chain, app="STAND_IN_APP_CHAIN")
+    def test_review_attacks_are_refused(self):
+        """Reviews 1 and 2: the exact transcript entry of a desktop line, made by a headless or nested run from an
+        agent's shell, a detached run, a fake Claude.app folder, an unsigned copy at the real paths, a renamed binary,
+        the real helper or a second app started by an agent, the app with options, a terminal, or a table that can't
+        be read, is refused."""
+        for chain in ("headless_p", "nested_no_print", "nested_same_binary", "setsid", "fake_app_folder",
+                      "unsigned_at_real_path", "renamed_binary", "renamed_as_shell", "helper_from_agent", "app_from_shell",
+                      "app_with_options", "terminal", None):
+            self.chains(chain)
             self.prompt(ds.KEEP_PHRASE, writer=self.desktop())
             self.assertIsNone(ds.keep_state(), chain)
             self.assertEqual(self.outcomes(), [ds.NOT_PERSON_LINE], chain)
 
-    def test_shipped_value_refuses_the_desktop_shape(self):
-        """Until the real app's chain is captured, DESKTOP_APP_CHAIN is empty and the desktop shape is refused."""
-        self.assertEqual(ds.DESKTOP_APP_CHAIN, ())
-        self.chains("desktop_stand_in")
+    def test_not_macos_refuses_the_desktop_shape(self):
+        """The real process table of this box (not macOS): the desktop shape is refused (fail closed)."""
+        ds._DESKTOP_SEEN.clear()
+        self.addCleanup(ds._DESKTOP_SEEN.clear)
+        self.assertEqual(ds.desktop_proof(), (False, "not macOS"))
         self.prompt(ds.KEEP_PHRASE, writer=self.desktop())
         self.assertIsNone(ds.keep_state())
 
     def test_terminal_typed_line_unchanged_on_any_chain(self):
         """The terminal's typed line (promptSource "typed") does not look at the process chain."""
-        self.chains("headless_review_1", app="STAND_IN_APP_CHAIN")
+        self.chains("headless_p")
         self.prompt(ds.KEEP_PHRASE)
         self.assertEqual(ds.keep_state(), "yes")
 
     def test_desktop_shape_from_an_agent_or_a_tool_is_refused(self):
         """XLI-420: on the desktop chain, the same shape without the host's human stamp (a `claude -p` or SDK run, an
         agent's text), from another entrypoint, as a side chain or meta entry, or another turn origin, is refused."""
-        self.chains("desktop_stand_in", app="STAND_IN_APP_CHAIN")
+        self.chains("code_tab")
         for change in ({"origin": None}, {"origin": {"kind": "task-notification"}}, {"origin": {"kind": "peer", "from": "x"}},
                        {"entrypoint": "sdk-cli"}, {"entrypoint": "sdk-ts"}, {"entrypoint": None}, {"entrypoint": "cli"},
                        {"turnOrigin": "sdk"}, {"turnOrigin": None}, {"promptSource": "system"}, {"isSidechain": True},
@@ -881,24 +916,82 @@ class PersonOnly(Base):
             self.assertIsNone(ds.keep_state(), change)
             self.assertIn(self.outcomes(), ([ds.NOT_PERSON_LINE], []), change)
 
-    def test_unit_desktop_host_proven(self):
-        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "desktop-process-chains.json")) as f:
-            fx = json.load(f)
-        saved = ds.DESKTOP_APP_CHAIN
-        self.addCleanup(setattr, ds, "DESKTOP_APP_CHAIN", saved)
-        ds.DESKTOP_APP_CHAIN = tuple(tuple(x) for x in fx["STAND_IN_APP_CHAIN"])
-        self.assertTrue(ds.desktop_host_proven(fx["desktop_stand_in"]))
-        for k in ("headless_review_1", "nested_no_print", "detached", "terminal"):
-            self.assertFalse(ds.desktop_host_proven(fx[k]), k)
-        with_print = [dict(c) for c in fx["desktop_stand_in"]]
-        with_print[1]["flags"] = ["--print", "--input-format"]
-        self.assertFalse(ds.desktop_host_proven(with_print))
-        real = ds.process_chain()  # this box's own table: names and option names only
+    def test_unit_desktop_proof_steps(self):
+        """Each attack stops at its own step (the doctor line names it); the real table here is names only."""
+        want = {"code_tab": "pass", "code_tab_shell": "pass", "headless_p": "another process between",
+                "nested_no_print": "another process between", "nested_same_binary": "disclaimer helper",
+                "setsid": "no desktop app above", "fake_app_folder": "disclaimer helper",
+                "unsigned_at_real_path": "disclaimer signature", "renamed_binary": "another process between",
+                "renamed_as_shell": "another process between", "helper_from_agent": "desktop app",
+                "app_from_shell": "desktop app parent", "app_with_options": "desktop app options",
+                "terminal": "another process between"}
+        for name, step in want.items():
+            desktop_table(self, name)
+            self.assertEqual(ds.desktop_proof()[1], step, name)
+            self.assertEqual(ds.desktop_host_proven(), step == "pass", name)
+        desktop_table(self, None)
+        self.assertEqual(ds.desktop_proof(), (False, "process table"))
+        desktop_table(self, "code_tab", env_bad=True)
+        self.assertEqual(ds.desktop_proof(), (False, "desktop app environment"))
+        desktop_table(self, "code_tab", unsigned=(654,))
+        self.assertEqual(ds.desktop_proof(), (False, "desktop app signature"))
+        desktop_table(self, "code_tab", unsigned=(18841,))
+        self.assertEqual(ds.desktop_proof(), (False, "disclaimer signature"))
+        rows = desktop_table(self, "code_tab")
+        rows[18842] = (18841, rows[18842][1], ["claude", "-p"], True)  # the Code tab's own claude started headless
+        self.assertEqual(ds.desktop_proof(), (False, "headless Claude Code"))
+        rows = desktop_table(self, "code_tab")
+        rows[18842] = (18841, "/usr/local/bin/claude", rows[18842][2], True)  # not the app's own Claude Code folder
+        self.assertEqual(ds.desktop_proof(), (False, "Claude Code path"))
+        rows = desktop_table(self, "code_tab")
+        rows[18842] = (18841, rows[18842][1], rows[18842][2], False)  # a path that is not the kernel's own
+        self.assertEqual(ds.desktop_proof(), (False, "another process between"))
+        rows = desktop_table(self, "code_tab")
+        real_many = ds._codesign_many
+
+        def swap(targets):  # the app's pid is reused while the checks run
+            got = real_many(targets)
+            rows[654] = (1, "/Users/Shared/other", [], True)
+            return got
+        ds._codesign_many = swap
+        self.assertEqual(ds.desktop_proof(), (False, "process changed"))
+        desktop_table(self, "code_tab")
+        ds._codesign_ok = lambda target, ident=None: 1 / 0
+        self.assertEqual(ds.desktop_proof()[0], False)
+        ds._DESKTOP_SEEN.clear()
+        ds._on_mac = lambda: False
+        self.assertEqual(ds.desktop_proof(), (False, "not macOS"))
+        self.assertEqual(ds.desktop_proof_line(), "desktop proof: not proven (step: not macOS)")
+        desktop_table(self, "code_tab")
+        self.assertEqual(ds.desktop_proof_line(), "desktop proof: pass")
+
+    def test_env_spoofing_changes_nothing(self):
+        """The entrypoint and desktop version in the environment are read by nothing in the proof."""
+        for k, v in (("CLAUDE_CODE_ENTRYPOINT", "claude-desktop"), ("CLAUDE_CODE_DESKTOP_APP_VERSION", "6.28899.6")):
+            old = os.environ.get(k)
+            os.environ[k] = v
+            self.addCleanup(lambda k=k, old=old: os.environ.pop(k, None) if old is None else os.environ.__setitem__(k, old))
+        for chain in ("headless_p", "terminal", "setsid"):
+            desktop_table(self, chain)
+            self.assertFalse(ds.desktop_host_proven(), chain)
+        ds._DESKTOP_SEEN.clear()
+        for k in DESKTOP_PATCHED:  # the real functions on this box
+            setattr(ds, k, REAL_DESKTOP[k])
+        self.assertFalse(ds.desktop_host_proven())
+
+    def test_unit_real_process_table_and_codesign_fail_closed_here(self):
+        real = ds.process_chain()  # this box's own table: names and option names only in what is shown
         self.assertIsInstance(real, list)
         for c in real:
             self.assertNotIn("/", c["name"])
             self.assertTrue(all(re.fullmatch(ds.FLAG_RE, x) for x in c["flags"]), c)
-        self.assertTrue(ds.chain_line().startswith("process chain (nearest first): "))
+        line = ds.chain_line()
+        self.assertTrue(line.startswith("process chain (nearest first): "))
+        self.assertNotIn(ds.HOME, line)
+        self.assertFalse(ds._codesign_ok(ds.DESKTOP_APP_EXE))  # no codesign here: False, never an error
+        self.assertFalse(ds._codesign_ok(os.getpid()))
+        self.assertFalse(ds._codesign_ok("relative/path"))
+        self.assertEqual(ds._codesign_many([(1, None), ("/nope", None)]), [False, False])
 
     def test_unit_person_origin(self):
         human = {"type": "user", "origin": {"kind": "human"}}

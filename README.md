@@ -75,7 +75,9 @@ Inside a Claude Code session:
 - **Install the plugin:** type **/plugin install datastash@datastash** and pick "for you"
 - **Restart:** quit Claude Code and start it again
 - **Turn it on:** type **/datastash:install**
+- **Desktop app's Code tab:** type **install datastash** (the picker may turn /datastash:install into /install; both work)
 - **Sign in:** type **datastash sync you@email.com** (your own email)
+- **Email blocked in prompts:** type **datastash sync me**; it uses the email this computer already knows
 - **Code:** type **datastash sync CODE**, with the 6-digit code from the email; the plugin shows "Done."
 
 After that:

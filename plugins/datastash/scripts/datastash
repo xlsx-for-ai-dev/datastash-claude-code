@@ -4895,6 +4895,10 @@ def cmd_doctor(_args):
         print("note: " + chain_line())  # XLI-420: the desktop app's process chain, as the process table shows it
     except Exception:  # noqa: BLE001
         pass
+    try:
+        print("note: " + desktop_proof_line())  # XLI-420 part 2: the Code tab's signed-parent proof, or where it stopped
+    except Exception:  # noqa: BLE001
+        pass
     print(_listener_line(project, me))
     try:
         loaded, how = session_loaded_version(me)
@@ -10409,21 +10413,64 @@ DESKTOP_HOSTS = ("claude-desktop",)
 
 # Review 1 HIGH: the entrypoint and the stamp are both set by whoever starts Claude Code
 # (`CLAUDE_CODE_ENTRYPOINT=claude-desktop claude -p --input-format stream-json` with origin human writes the same entry),
-# so the transcript never proves the desktop app. The desktop shape counts only when the real process table also shows
-# it (desktop_host_proven, read in the hook itself): this session's Claude Code was not started with -p/--print, no
-# Claude Code (or node) runs above it, and the processes right above it are the desktop app's own (DESKTOP_APP_CHAIN).
-# Anything that can't be read refuses.
+# so the transcript never proves the desktop app. Review 2: names in the process table can be made by anyone (a copy at
+# <anywhere>/Claude.app, a renamed binary). XLI-420 part 2: the desktop shape counts only when the hook's own process
+# table, read by pid, shows the Code tab's chain, resting on what a local process can't fake (desktop_proof):
+#   this hook  <- (only macOS system shells, by their real path)  <- Claude Code (not -p/--print)
+#              <- /Applications/Claude.app/Contents/Helpers/disclaimer  <- /Applications/Claude.app/Contents/MacOS/Claude
+#              <- launchd (pid 1)
+# each link the real parent pid; the helper and the app each pass `codesign --verify` against Anthropic's Developer ID
+# team (Q6L2SF6YDW, Apple's anchor) both as the running process (its pid) and as the file at the path the kernel gives
+# for that pid (proc_pidpath, never argv or a name); the app started with no options. The Claude Code binary sits in a
+# user-writable folder, so it proves nothing itself: what counts is that the signed helper, started by the signed app
+# that launchd started, is its direct parent. Anything unread, unknown or not macOS refuses.
 CC_PROC_NAMES = ("claude", "claude.exe", "node", "node.exe", "bun", "bun.exe")  # Claude Code itself (exact names)
 HEADLESS_FLAGS = ("-p", "--print")
-# (process name, app bundle or "") of the desktop app's processes right above its Claude Code, nearest first, taken from
-# a capture of the real app (`datastash doctor`, "process chain" line). Empty until that capture: nothing matches, so
-# the desktop shape is refused everywhere (the 1.0.25 behaviour).
-DESKTOP_APP_CHAIN = ()
 FLAG_RE = r"-{1,2}[A-Za-z][A-Za-z0-9\-]{0,40}"
+DESKTOP_TEAM = "Q6L2SF6YDW"  # "Developer ID Application: Anthropic PBC (Q6L2SF6YDW)"
+DESKTOP_APP_ID = "com.anthropic.claudefordesktop"
+DESKTOP_APP_EXE = "/Applications/Claude.app/Contents/MacOS/Claude"
+DESKTOP_HELPER_EXE = "/Applications/Claude.app/Contents/Helpers/disclaimer"
+CODESIGN = "/usr/bin/codesign"
+# what may sit between the hook and the Code tab's Claude Code: macOS's own shells and launchers (system paths, under
+# SIP), matched by the real executable path only
+DESKTOP_SHIMS = ("/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/bin/ksh", "/bin/tcsh", "/bin/csh", "/usr/bin/env",
+                 "/usr/bin/python3", "/usr/bin/xcrun")
+DESKTOP_CC_DIR = os.path.join("Library", "Application Support", "Claude", "claude-code")  # under HOME
+DESKTOP_BAD_ENV = ("ELECTRON_RUN_AS_NODE=", "NODE_OPTIONS=", "DYLD_INSERT_LIBRARIES=")
+
+
+def _on_mac():
+    return sys.platform == "darwin"
+
+
+def _hook_ppid():
+    return os.getppid()
+
+
+def _mac_exe(pid):
+    """The real executable path of a process, from the kernel (libproc proc_pidpath), never argv. None if unread."""
+    import ctypes
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+    lib.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    lib.proc_pidpath.restype = ctypes.c_int
+    buf = ctypes.create_string_buffer(4096)
+    n = lib.proc_pidpath(int(pid), buf, 4096)
+    return buf.value.decode("utf-8", "surrogateescape") if n > 0 and buf.value else None
+
+
+def _sys_env():
+    """The environment for macOS's own ps and codesign: system folders only on PATH, plain C output."""
+    return dict(os.environ, PATH="/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL="C")
+
+
+def _ps(args, timeout=3):
+    return subprocess.run(["/bin/ps"] + args, capture_output=True, text=True, timeout=timeout, env=_sys_env()).stdout
 
 
 def _proc_row(pid):
-    """(parent pid, executable path, argv) of a process from the real process table (/proc, else ps), or None."""
+    """(parent pid, executable path, argv, exact) of a process from the real process table, or None. exact: the path
+    is the kernel's own (/proc/<pid>/exe, or macOS proc_pidpath), not argv[0] or a ps name."""
     if os.path.isdir("/proc/self"):
         try:
             with open(f"/proc/{pid}/stat") as f:
@@ -10431,37 +10478,44 @@ def _proc_row(pid):
             ppid = int(st[st.rindex(")") + 2:].split()[1])
             with open(f"/proc/{pid}/cmdline", "rb") as f:
                 argv = [x.decode("utf-8", "replace") for x in f.read().split(b"\0") if x]
+            exact = True
             try:
                 exe = os.readlink(f"/proc/{pid}/exe")
                 exe = exe[:-len(" (deleted)")] if exe.endswith(" (deleted)") else exe  # a binary updated since
             except OSError:
-                exe = argv[0] if argv else ""
-            return ppid, exe, argv
+                exe, exact = (argv[0] if argv else ""), False
+            return ppid, exe, argv, exact
         except (OSError, ValueError, IndexError):
             return None
     try:
-        a = subprocess.run(["ps", "-ww", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True,
-                           timeout=3).stdout.strip()
-        b = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True, text=True,
-                           timeout=3).stdout.strip()
+        a = _ps(["-ww", "-o", "ppid=,comm=", "-p", str(pid)]).strip()
+        b = _ps(["-ww", "-o", "args=", "-p", str(pid)]).strip()
         ppid, _, comm = a.partition(" ")
-        return (int(ppid), comm.strip(), b.split()) if comm.strip() else None
+        ppid = int(ppid)
+        if not comm.strip():
+            return None
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
+    try:
+        exe = _mac_exe(pid) if _on_mac() else None
+    except Exception:  # noqa: BLE001
+        exe = None
+    return (ppid, exe, b.split(), True) if exe else (ppid, comm.strip(), b.split(), False)
 
 
 def process_chain():
-    """Every process above this one, nearest first, as {"name", "bundle", "flags"}: the executable's file name, the
-    app bundle it sits in ("Claude.app", or ""), and only the option names it was started with (no values, no paths).
-    None when any step can't be read (fail closed)."""
-    chain, pid = [], os.getppid()
+    """Every process above this one, nearest first, as {"name", "bundle", "flags"} (the executable's file name, the app
+    bundle it sits in or "", and only the option names it was started with) plus, for the checks only and never shown,
+    its "pid", "ppid", real "path" ("" when the path is not the kernel's own) and "argv". None when any step can't be
+    read (fail closed)."""
+    chain, pid = [], _hook_ppid()
     for _ in range(40):
         if pid <= 1:
             return chain
         row = _proc_row(pid)
         if row is None:
             return None
-        ppid, exe, argv = row
+        ppid, exe, argv, exact = row
         parts = (exe or "").replace("\\", "/").split("/")
         bundle = next((x for x in reversed(parts[:-1]) if x.endswith(".app")), "")
         flags = []
@@ -10469,30 +10523,137 @@ def process_chain():
             f = x.split("=", 1)[0]
             if re.fullmatch(FLAG_RE, f) and f not in flags:
                 flags.append(f)
-        chain.append({"name": parts[-1][:60], "bundle": bundle[:60], "flags": flags[:16]})
+        chain.append({"name": parts[-1][:60], "bundle": bundle[:60], "flags": flags[:16], "pid": pid, "ppid": ppid,
+                      "path": exe if exact else "", "argv": list(argv)})
         if ppid == pid:
             return None
         pid = ppid
     return None
 
 
-def desktop_host_proven(chain=None):
-    """XLI-420: True only when the process table shows this hook under the desktop app's own Claude Code: the nearest
-    Claude Code above it was not started headless (-p/--print), the processes right above that one are
-    DESKTOP_APP_CHAIN, and no Claude Code (or node) runs anywhere above it. Anything unread or unknown: False."""
-    try:
-        chain = process_chain() if chain is None else chain
-        if not chain or not DESKTOP_APP_CHAIN:
-            return False
-        i = next((n for n, c in enumerate(chain) if c["name"] in CC_PROC_NAMES), None)
-        if i is None or any(f in HEADLESS_FLAGS for f in chain[i]["flags"]):
-            return False
-        above = chain[i + 1:]
-        if [(c["name"], c["bundle"]) for c in above[:len(DESKTOP_APP_CHAIN)]] != [tuple(x) for x in DESKTOP_APP_CHAIN]:
-            return False
-        return not any(c["name"] in CC_PROC_NAMES for c in above)
-    except Exception:  # noqa: BLE001
+def _codesign_ok(target, ident=None):
+    """True when `codesign --verify` passes for target (a running process by its pid, or a file path) against Apple's
+    anchor with Anthropic's Developer ID team as the leaf (and this identifier, when given), and codesign's own display
+    names that team (TeamIdentifier) and identifier. Anything else, a timeout or an error: False."""
+    req = f'anchor apple generic and certificate leaf[subject.OU] = "{DESKTOP_TEAM}"'
+    req += f' and identifier "{ident}"' if ident else ""
+    env = _sys_env()
+    t = str(int(target)) if isinstance(target, int) else target
+    if not isinstance(t, str) or not t or (not isinstance(target, int) and not os.path.isabs(t)):
         return False
+    try:  # a pid is checked as the running code (its dynamic validity); a path as the file, strictly
+        v = subprocess.run([CODESIGN, "--verify"] + ([] if isinstance(target, int) else ["--strict"]) + ["-R", "=" + req, t],
+                           capture_output=True, text=True, timeout=CODESIGN_WAIT, env=env)
+        if v.returncode != 0:
+            return False
+        d = subprocess.run([CODESIGN, "-d", "--verbose=2", t], capture_output=True, text=True, timeout=CODESIGN_WAIT,
+                           env=env)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    out = (d.stdout or "") + "\n" + (d.stderr or "")
+    return (d.returncode == 0 and re.search(r"^TeamIdentifier=" + DESKTOP_TEAM + r"$", out, re.M) is not None
+            and (ident is None or re.search(r"^Identifier=" + re.escape(ident) + r"$", out, re.M) is not None))
+
+
+CODESIGN_WAIT = 7  # the prompt hook has 10 s: the four checks run side by side, and a slow one fails closed
+
+
+def _codesign_many(targets):
+    """_codesign_ok for each (target, identifier) side by side: a list of True/False, False for any not done within
+    CODESIGN_WAIT."""
+    got = [False] * len(targets)
+
+    def one(n, target, ident):
+        try:
+            got[n] = _codesign_ok(target, ident) is True
+        except Exception:  # noqa: BLE001
+            got[n] = False
+    ts = [threading.Thread(target=one, args=(n, t, i), daemon=True) for n, (t, i) in enumerate(targets)]
+    for t in ts:
+        t.start()
+    end = time.time() + CODESIGN_WAIT + 1
+    for t in ts:
+        t.join(max(0.0, end - time.time()))
+    return [g and not t.is_alive() for g, t in zip(got, ts)]
+
+
+def _app_env_bad(pid):
+    """True when the app's own environment, where ps shows it, has a variable that turns it into a script runner."""
+    try:
+        out = _ps(["-E", "-ww", "-o", "command=", "-p", str(pid)])
+    except (OSError, subprocess.SubprocessError):
+        return False  # not shown here: the signed app with no options still has to be the helper's parent
+    return any((" " + k) in out for k in DESKTOP_BAD_ENV)
+
+
+def _cc_path_ok(path):
+    base = os.path.join(HOME, DESKTOP_CC_DIR) + os.sep
+    return (isinstance(path, str) and path.startswith(base) and os.path.basename(path) == "claude"
+            and re.fullmatch(r"[^/]{1,40}/[^/]{1,80}/claude\.app/Contents/MacOS/claude", path[len(base):]) is not None)
+
+
+def desktop_proof(chain=None):
+    """XLI-420 part 2: (True, "pass") when this hook runs under the Claude desktop app's own Code-tab Claude Code (the
+    chain above, each link by pid, the helper and the app signed by Anthropic); else (False, the step that failed, a
+    few plain words). Never raises."""
+    try:
+        if not _on_mac():
+            return False, "not macOS"
+        chain = process_chain() if chain is None else chain
+        if not isinstance(chain, list) or not chain:
+            return False, "process table"
+        i = 0
+        while i < len(chain) and chain[i].get("path") in DESKTOP_SHIMS:
+            i += 1
+        if len(chain) < i + 3:
+            return False, "no desktop app above"
+        cc, helper, app = chain[i], chain[i + 1], chain[i + 2]
+        if not cc.get("path") or cc.get("name") != "claude":
+            return False, "another process between"
+        if any(f in HEADLESS_FLAGS for f in cc.get("flags") or ()):
+            return False, "headless Claude Code"
+        if not _cc_path_ok(cc["path"]):
+            return False, "Claude Code path"
+        if helper.get("path") != DESKTOP_HELPER_EXE or cc.get("ppid") != helper.get("pid"):
+            return False, "disclaimer helper"
+        if app.get("path") != DESKTOP_APP_EXE or helper.get("ppid") != app.get("pid"):
+            return False, "desktop app"
+        if app.get("ppid") != 1 or len(chain) != i + 3:
+            return False, "desktop app parent"
+        if any(not re.fullmatch(r"-psn_\d+_\d+", a) for a in (app.get("argv") or [""])[1:]):
+            return False, "desktop app options"
+        if _app_env_bad(app["pid"]):
+            return False, "desktop app environment"
+        signs = [(helper["pid"], None), (DESKTOP_HELPER_EXE, None), (app["pid"], DESKTOP_APP_ID),
+                 (DESKTOP_APP_EXE, DESKTOP_APP_ID)]
+        ok = _codesign_many(signs)
+        if not (ok[0] and ok[1]):
+            return False, "disclaimer signature"
+        if not (ok[2] and ok[3]):
+            return False, "desktop app signature"
+        for c in (cc, helper, app):  # the same processes after the checks (no pid reused meanwhile)
+            row = _proc_row(c["pid"])
+            if row is None or row[0] != c["ppid"] or row[1] != c["path"] or not row[3]:
+                return False, "process changed"
+        return True, "pass"
+    except Exception:  # noqa: BLE001
+        return False, "error"
+
+
+_DESKTOP_SEEN = {}
+
+
+def desktop_host_proven(chain=None):
+    """True only when desktop_proof passes (read in the hook itself). One hook reads it once."""
+    if chain is not None:
+        return desktop_proof(chain)[0] is True
+    k = _hook_ppid()
+    got = _DESKTOP_SEEN.get(k)
+    if got is None or time.time() - got[1] > 10:
+        got = (desktop_proof()[0] is True, time.time())
+        _DESKTOP_SEEN.clear()
+        _DESKTOP_SEEN[k] = got
+    return got[0]
 
 
 def _is_cc(c):
@@ -10523,8 +10684,13 @@ def chain_line():
         return "process chain: can't be read here"
     show = [_clean(c["name"], 60) + (f" ({_clean(c['bundle'], 60)})" if c["bundle"] else "")
             + (f" [{' '.join(c['flags'])}]" if c["flags"] else "") for c in chain]
-    return ("process chain (nearest first): " + " > ".join(show)
-            + ("; desktop app: yes" if desktop_host_proven(chain) else "; desktop app: not proven"))
+    return "process chain (nearest first): " + " > ".join(show)
+
+
+def desktop_proof_line():
+    """The doctor's "desktop proof" line: pass, or the step that failed (names only)."""
+    ok, step = desktop_proof()
+    return "desktop proof: pass" if ok else f"desktop proof: not proven (step: {step})"
 
 
 def _desktop_typed(v, desktop=False):
@@ -13981,7 +14147,8 @@ def autoupdate_uninstall_line():
 # person's connector: the call carries only the S256 challenge; the plugin collects the key with the verifier. Notes carry
 # a typed proof over agent ids from the list id (EPM MUST 2); install notes come only from one dedicated answer field
 # (MUST 3); an uninstall reaches an agent only as 410 agent_removed, and cleanup touches only the fixed paths (note b).
-INSTALL_RE = re.compile(r"\s*(?:/datastash:install|datastash install)(?:\s+(\S{1,64}))?\s*", re.I)  # 1.0.16: [name]
+INSTALL_RE = re.compile(r"\s*(?:/datastash:install|datastash install|install datastash)(?:\s+(\S{1,64}))?\s*",
+                        re.I)  # 1.0.16: [name]; 1.0.32 (XLI-420): the plain-text "install datastash" too
 UNINSTALL_RE = re.compile(r"\s*(?:/datastash:uninstall|datastash uninstall)(?:\s+(\S.*?))?\s*", re.I | re.S)
 # X6: the person's whole typed prompt "make <name> private" / "make <name> public" (names as the list shows them; "all"
 # and "this" are not names here, so "make this private" stays an ordinary prompt).
@@ -13993,6 +14160,32 @@ VIS_KINDS = ("private", "public")
 # the same promptId) or a side chain, entrypoint "cli".
 CMD_TAG_RE = re.compile(r"<command-message>(datastash:(?:un)?install)</command-message>\n<command-name>/(datastash:"
                         r"(?:un)?install)</command-name>(?:\n<command-args>([^<]*)</command-args>)?")
+# XLI-420 part 2: the desktop app's Code tab: its picker turns /datastash:install into /install, and its transcript may
+# keep the command as a tag block naming /install, or the bare skill name (datastash:install). Only these forms of the
+# datastash install and uninstall commands, only when the hook proved the desktop app (desktop_proof), and only with
+# the same arguments as the hook was given.
+DESKTOP_INSTALL_RE = re.compile(r"\s*(?:/install|/?datastash:install)(?:\s+(\S{1,64}))?\s*", re.I)
+DESKTOP_UNINSTALL_RE = re.compile(r"\s*(?:/uninstall|/?datastash:uninstall)(?:\s+(\S.*?))?\s*", re.I | re.S)
+DESKTOP_FORM_RE = re.compile(r"\s*/?(?:datastash:)?(install|uninstall)(?:\s+(\S.*?))?\s*", re.I | re.S)
+DESKTOP_TAG_RE = re.compile(r"<command-message>((?:datastash:)?(?:un)?install)</command-message>\n<command-name>/("
+                            r"(?:datastash:)?(?:un)?install)</command-name>(?:\n<command-args>([^<]*)</command-args>)?")
+
+
+def desktop_cmd_form(text):
+    """(verb, args) of a Code-tab form of the datastash install or uninstall command (/install, /datastash:install,
+    datastash:install, or the tag block naming one of them), else None. A plain "install" is no form."""
+    if not isinstance(text, str) or len(text) > 4000:
+        return None
+    tag = DESKTOP_TAG_RE.fullmatch(text)
+    if tag:
+        a, b = tag.group(1).split(":")[-1], tag.group(2).split(":")[-1]
+        return (a, " ".join((tag.group(3) or "").split())) if a == b else None
+    if not (DESKTOP_INSTALL_RE.fullmatch(text) or DESKTOP_UNINSTALL_RE.fullmatch(text)):
+        return None
+    m = DESKTOP_FORM_RE.fullmatch(text)
+    return (m.group(1).lower(), " ".join((m.group(2) or "").split())) if m else None
+
+
 CMD_MAX_AGE = 1800  # a command's list and pick are good for this long in the session that showed them
 COLLECT_PATH = "/api/v1/agent/collect"  # X1: {verifier, mint_id} -> {agent_id, name, key, answer_key, workbook_id?}
 UNINSTALL_SELF_PATH = "/api/v1/agent/uninstall"  # X2: {run_id?} on the agent's own key
@@ -14677,6 +14870,13 @@ EMAIL_LOGIN_FILE = os.path.join(CONF, "login.email.json")  # {"at"}: this comput
 EMAIL_RE = r"[^\s@<>\"'`]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}"
 SYNC_EMAIL_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(" + EMAIL_RE + r")\s*", re.I)
 SYNC_CODE_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(\d{6})\s*", re.I)
+# XLI-420 part 2: a privacy hook may block an email in a prompt, so "datastash sync me" signs in with the email this
+# computer already knows: the one it signed in with before (kept, mode 600, in the plugin's own folder), else the email
+# of this computer's Claude login (Claude Code's own ~/.claude.json). With neither, one plain line and nothing tried.
+SYNC_ME_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+me\s*[.!]?\s*", re.I)
+SYNC_ME_UNKNOWN_LINE = ("This computer doesn't know your datastash email yet. Type **datastash sync you@email.com** once; "
+                        "after that **datastash sync me** works.")
+CHECK_EMAIL_ME_LINE = "Check your email ({email}) for a 6-digit code. Then type **datastash sync CODE** here."
 EMAIL_CODE_LIFE = 600  # the emailed code works for 10 minutes
 LOGIN_STEP_KINDS = ("sync_email", "sync_code", "login_install", "login_uninstall")
 LOGIN_STEP_WAIT = 25.0  # the Stop hook (30 s) waits this long at most for the plugin's own step to finish (XLI-427)
@@ -14707,6 +14907,31 @@ def sync_email_of(text):
 def sync_code_of(text):
     m = SYNC_CODE_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 80 else None
     return m.group(1) if m else None
+
+
+def _email_ok(e):
+    return isinstance(e, str) and len(e) <= 254 and re.fullmatch(EMAIL_RE, e) is not None
+
+
+def known_email():
+    """The email this computer already knows for the person, lower case, else None: its own earlier email sign-in,
+    else the Claude login's account email in Claude Code's own config. Read here only, never shown in full."""
+    e = read_json(EMAIL_LOGIN_FILE, {}).get("email")
+    if _email_ok(e):
+        return e.strip().lower()
+    try:
+        with open(CLAUDE_USER_CONFIG) as f:
+            acct = json.load(f).get("oauthAccount")
+        e = acct.get("emailAddress") if isinstance(acct, dict) else None
+    except (OSError, ValueError, AttributeError):
+        e = None
+    return e.strip().lower() if _email_ok(e) else None
+
+
+def masked_email(e):
+    """y***@email.com: enough to tell which inbox, never the whole address."""
+    local, _, dom = e.partition("@")
+    return f"{local[:1]}***@{dom}"
 
 
 def email_login():
@@ -14765,12 +14990,12 @@ def email_sign_in_start(sid, email):
     if not isinstance(dev, str) or not dev.startswith("dsdc_"):
         return [SIGN_IN_FAILED_LINE]
     ensure_dirs()
-    write_private(_code_req_path(sid), json.dumps({"device_code": dev, "waiting": waiting,
+    write_private(_code_req_path(sid), json.dumps({"device_code": dev, "waiting": waiting, "email": email,
                                                    "until": int(time.time()) + EMAIL_CODE_LIFE}))
     return []
 
 
-def _pick_up_login(waiting):
+def _pick_up_login(waiting, email=None):
     """This computer's own grant, once its code was right: a few quick polls of its own request. True when saved."""
     for _ in range(6):
         try:
@@ -14789,7 +15014,8 @@ def _pick_up_login(waiting):
         with _login_lock():
             _save_login(rt, at, got.get("expires_in"), got.get("answer_key"), got.get("grant_id"))
         rt = at = None
-        write_private(EMAIL_LOGIN_FILE, json.dumps({"at": int(time.time())}))
+        write_private(EMAIL_LOGIN_FILE, json.dumps(dict({"at": int(time.time())},
+                                                        **({"email": email} if _email_ok(email) else {}))))
         _change_signin(SIGNIN_DEVICE, "email sign-in")
         return True
     return False
@@ -14828,7 +15054,7 @@ def email_sign_in_code(sid, code, name, here):
     except (ValueError, urllib.error.URLError, httpclient.HTTPException, OSError):
         return [SIGN_IN_FAILED_LINE]
     _drop(_code_req_path(sid))
-    if not _pick_up_login(req["waiting"]):
+    if not _pick_up_login(req["waiting"], req.get("email")):
         return [SIGN_IN_FAILED_LINE]
     login_typed_sync()
     clear_connector_auth_mark(True)  # XLI-434: new and resumed sessions connect with this login, no /mcp step
@@ -14961,8 +15187,16 @@ def login_step_prompt(inp, shape, prompt):
     """UserPromptSubmit: `datastash sync <email>` or `datastash sync <code>` (whole prompt), handed to the checker.
     (line, AI note, block) or None."""
     email, code = sync_email_of(prompt), sync_code_of(prompt)
-    if not email and not code:
+    me = not email and not code and isinstance(prompt, str) and len(prompt) <= 80 and SYNC_ME_RE.fullmatch(prompt)
+    if not email and not code and not me:
         return None
+    if me:  # XLI-420 part 2: the email this computer knows; the same typed proof as `datastash sync <email>`
+        email = known_email()
+        if email is None:
+            return SYNC_ME_UNKNOWN_LINE, None, True
+        line = CHECK_EMAIL_ME_LINE.format(email=masked_email(email))
+        ok = start_check(shape, "sync_email", prompt, {"email": email})
+        return (line, LOGIN_STEP_AI.format(line=line), False) if ok else None
     if email:
         ok = start_check(shape, "sync_email", prompt, {"email": email})
         # XLI-427: the person's line comes from the hook itself (systemMessage), never only from the model
@@ -16110,6 +16344,9 @@ def command_prompt(inp):
         return got
     m = UNINSTALL_RE.fullmatch(prompt)
     im = INSTALL_RE.fullmatch(prompt)
+    if not (m or im) and desktop_cmd_form(prompt) and desktop_host_proven():  # XLI-420 part 2: the Code tab's /install
+        m, im = DESKTOP_UNINSTALL_RE.fullmatch(prompt), DESKTOP_INSTALL_RE.fullmatch(prompt)
+        base["desktop"] = True
     if im:
         _mark_gone(False)  # the person's own install: the plugin may set itself up here again
         me, here = this_session(inp), project_of(inp)
@@ -16213,12 +16450,20 @@ def _command_origin(v, desktop=False):
 def _typed_entry(rec):
     """The person's own typed entry for the command's prompt (its slash-command form too), or "not person", or None."""
     want = rec["prompt"].strip()
+    desk = rec.get("desktop") is True
+    want_form = desktop_cmd_form(want) if desk else None  # XLI-420 part 2: only where the hook proved the desktop app
     deadline = time.time() + 3
     while True:
         for v in reversed(_jsonl_tail(rec["tp"], 1024 * 1024) if _transcript_ok(rec["tp"], rec["sid"]) else []):
             t = _typed_text(v)
             if t is None or v.get("promptId") != rec["pid"]:
                 continue
+            if want_form is not None:
+                if desktop_cmd_form(t) != want_form:
+                    return None
+                if DESKTOP_TAG_RE.fullmatch(t):  # a command's tag block: only as Claude Code writes a typed command
+                    return v if _command_origin(v, True) else "not person"
+                return v if (_command_origin(v, True) or _person_origin(v, True)) else "not person"
             tag = CMD_TAG_RE.fullmatch(t)
             if tag:
                 if tag.group(1) != tag.group(2):
@@ -20823,6 +21068,13 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.32": (
+        "In the Claude desktop app's Code tab the person can type **install datastash** (the picker may turn "
+        "/datastash:install into /install; that works there too). The typed check there rests on the signed desktop app; "
+        "**datastash doctor** shows its \"desktop proof\" line.",
+        "**datastash sync me** signs in with the email this computer already knows; never ask the person to type an email "
+        "when it works.",
+    ),
     "1.0.31": (
         "After the email-code sign-in, new and resumed sessions get the datastash connector by themselves; the "
         "session that signed in uses the datastash command until its next session.",

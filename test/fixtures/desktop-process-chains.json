@@ -1,33 +1,672 @@
 {
-  "note": "XLI-420 process chains above the prompt hook, nearest first, as datastash's process_chain() gives them (names, app bundles, option names only). 'headless_review_1' is the reviewer's exact run on this box (CLAUDE_CODE_ENTRYPOINT=claude-desktop claude -p --input-format stream-json --output-format stream-json --verbose) started from an agent's shell. 'nested_no_print' is the same without -p. 'detached' is a nested run started with setsid so its parent is gone. 'desktop_stand_in' is NOT a capture of the real app: it stands in for one until the owner's `datastash doctor` capture fills DESKTOP_APP_CHAIN, with STAND_IN_APP_CHAIN as its app part.",
-  "headless_review_1": [
-    {"name": "sh", "bundle": "", "flags": ["-c"]},
-    {"name": "claude.exe", "bundle": "", "flags": ["-p", "--input-format", "--output-format", "--verbose"]},
-    {"name": "bash", "bundle": "", "flags": ["-c"]},
-    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]},
-    {"name": "Claude", "bundle": "Claude.app", "flags": []}
-  ],
-  "nested_no_print": [
-    {"name": "sh", "bundle": "", "flags": ["-c"]},
-    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]},
-    {"name": "bash", "bundle": "", "flags": ["-c"]},
-    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]},
-    {"name": "Claude", "bundle": "Claude.app", "flags": []}
-  ],
-  "detached": [
-    {"name": "sh", "bundle": "", "flags": ["-c"]},
-    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]}
-  ],
-  "terminal": [
-    {"name": "sh", "bundle": "", "flags": ["-c"]},
-    {"name": "claude", "bundle": "", "flags": []},
-    {"name": "zsh", "bundle": "", "flags": ["-l"]},
-    {"name": "Terminal", "bundle": "Terminal.app", "flags": []}
-  ],
-  "desktop_stand_in": [
-    {"name": "sh", "bundle": "", "flags": ["-c"]},
-    {"name": "claude", "bundle": "", "flags": ["--input-format", "--output-format", "--verbose"]},
-    {"name": "Claude", "bundle": "Claude.app", "flags": []}
-  ],
-  "STAND_IN_APP_CHAIN": [["Claude", "Claude.app"]]
+ "note": "XLI-420 part 2: process tables above the prompt hook, as datastash's _proc_row reads them by pid ({pid: [parent pid, the kernel's executable path, argv]}; ~ is HOME), built from SPM's recorded Code-tab chain (ops/xli-420-desktop-chain-20261128.md) and the two reviews' attacks. 'signed' lists the paths codesign passes (a running process passes when its kernel path is one of them, unless its table lists its pid as 'unsigned') for Anthropic's team Q6L2SF6YDW (the identifier with them). These are fixtures: only the owner's Mac shows the real table and real codesign.",
+ "signed": {
+  "paths": {
+   "/Applications/Claude.app/Contents/MacOS/Claude": "com.anthropic.claudefordesktop",
+   "/Applications/Claude.app/Contents/Helpers/disclaimer": "com.anthropic.claudefordesktop.disclaimer"
+  }
+ },
+ "tables": {
+  "code_tab": {
+   "note": "The recorded Code-tab chain (SPM, the owner's Mac, 11-28): launchd > Claude.app (654) > Helpers/disclaimer --pgroup (18841) > the Code tab's claude (18842) > this hook.",
+   "start": 18842,
+   "rows": {
+    "18842": [
+     18841,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "18841": [
+     654,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "654": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ]
+   }
+  },
+  "code_tab_shell": {
+   "note": "The same, with the system zsh of the session's own Bash tool between (datastash doctor typed as a command).",
+   "start": 30001,
+   "rows": {
+    "18842": [
+     18841,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "18841": [
+     654,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "654": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ],
+    "30001": [
+     18842,
+     "/bin/zsh",
+     [
+      "/bin/zsh",
+      "-c",
+      "datastash doctor"
+     ]
+    ]
+   }
+  },
+  "headless_p": {
+   "note": "Review 1: an agent in the Code tab runs CLAUDE_CODE_ENTRYPOINT=claude-desktop claude -p --input-format stream-json from its shell.",
+   "start": 40001,
+   "rows": {
+    "18842": [
+     18841,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "18841": [
+     654,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "654": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ],
+    "30001": [
+     18842,
+     "/bin/zsh",
+     [
+      "/bin/zsh",
+      "-c",
+      "datastash doctor"
+     ]
+    ],
+    "40001": [
+     30001,
+     "~/.local/share/claude/versions/2.1.332",
+     [
+      "~/.local/share/claude/versions/2.1.332",
+      "-p",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose"
+     ]
+    ]
+   }
+  },
+  "nested_no_print": {
+   "note": "The same nested run without -p.",
+   "start": 40001,
+   "rows": {
+    "18842": [
+     18841,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "18841": [
+     654,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "654": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ],
+    "30001": [
+     18842,
+     "/bin/zsh",
+     [
+      "/bin/zsh",
+      "-c",
+      "datastash doctor"
+     ]
+    ],
+    "40001": [
+     30001,
+     "~/.local/share/claude/versions/2.1.332",
+     [
+      "~/.local/share/claude/versions/2.1.332",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json"
+     ]
+    ]
+   }
+  },
+  "nested_same_binary": {
+   "note": "A nested run of the Code tab's own claude binary from the agent's shell.",
+   "start": 40001,
+   "rows": {
+    "18842": [
+     18841,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "18841": [
+     654,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "654": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ],
+    "30001": [
+     18842,
+     "/bin/zsh",
+     [
+      "/bin/zsh",
+      "-c",
+      "datastash doctor"
+     ]
+    ],
+    "40001": [
+     30001,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ]
+   }
+  },
+  "setsid": {
+   "note": "A nested run detached with setsid -f: its parent is launchd.",
+   "start": 40001,
+   "rows": {
+    "40001": [
+     1,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ]
+   }
+  },
+  "fake_app_folder": {
+   "note": "Review 2: binaries copied to a fake <folder>/Claude.app and started through launchd.",
+   "start": 40001,
+   "rows": {
+    "40001": [
+     40000,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "40000": [
+     39999,
+     "~/tmp/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "~/tmp/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup"
+     ]
+    ],
+    "39999": [
+     1,
+     "~/tmp/Claude.app/Contents/MacOS/Claude",
+     [
+      "~/tmp/Claude.app/Contents/MacOS/Claude"
+     ]
+    ]
+   }
+  },
+  "unsigned_at_real_path": {
+   "note": "An unsigned copy run from the real /Applications paths (the files put back after): the running processes (pids 39999, 40000) are not signed.",
+   "start": 40001,
+   "rows": {
+    "40001": [
+     40000,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "40000": [
+     39999,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup"
+     ]
+    ],
+    "39999": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ]
+   },
+   "unsigned": [
+    39999,
+    40000
+   ]
+  },
+  "renamed_binary": {
+   "note": "Review 2: the Claude Code binary renamed (mytool) and run headless from the agent's shell.",
+   "start": 40001,
+   "rows": {
+    "18842": [
+     18841,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "18841": [
+     654,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "654": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ],
+    "30001": [
+     18842,
+     "/bin/zsh",
+     [
+      "/bin/zsh",
+      "-c",
+      "datastash doctor"
+     ]
+    ],
+    "40001": [
+     30001,
+     "~/tmp/mytool",
+     [
+      "~/tmp/mytool",
+      "-p"
+     ]
+    ]
+   }
+  },
+  "renamed_as_shell": {
+   "note": "The Claude Code binary renamed to bash, so a name check would take it for a shell.",
+   "start": 40001,
+   "rows": {
+    "18842": [
+     18841,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "18841": [
+     654,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "654": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ],
+    "30001": [
+     18842,
+     "/bin/zsh",
+     [
+      "/bin/zsh",
+      "-c",
+      "datastash doctor"
+     ]
+    ],
+    "40001": [
+     30001,
+     "~/tmp/bin/bash",
+     [
+      "~/tmp/bin/bash",
+      "--input-format",
+      "stream-json"
+     ]
+    ]
+   }
+  },
+  "helper_from_agent": {
+   "note": "The real signed disclaimer helper run by the agent's shell.",
+   "start": 40001,
+   "rows": {
+    "18842": [
+     18841,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "18841": [
+     654,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "654": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ],
+    "30001": [
+     18842,
+     "/bin/zsh",
+     [
+      "/bin/zsh",
+      "-c",
+      "datastash doctor"
+     ]
+    ],
+    "40001": [
+     40000,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "40000": [
+     30001,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ]
+   }
+  },
+  "app_from_shell": {
+   "note": "A second real signed app started from a shell (its parent is not launchd).",
+   "start": 40001,
+   "rows": {
+    "40001": [
+     40000,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "40000": [
+     39999,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "39999": [
+     30002,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude"
+     ]
+    ],
+    "30002": [
+     1,
+     "/bin/zsh",
+     [
+      "/bin/zsh"
+     ]
+    ]
+   }
+  },
+  "app_with_options": {
+   "note": "The real signed app started by launchd with options (an inspector that could make it start anything).",
+   "start": 40001,
+   "rows": {
+    "40001": [
+     40000,
+     "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+     [
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--input-format",
+      "stream-json",
+      "--effort=medium",
+      "--model=claude-opus-5-5",
+      "--permission-prompt-tool=stdio",
+      "--allowedTools=Read"
+     ]
+    ],
+    "40000": [
+     39999,
+     "/Applications/Claude.app/Contents/Helpers/disclaimer",
+     [
+      "/Applications/Claude.app/Contents/Helpers/disclaimer",
+      "--pgroup",
+      "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+     ]
+    ],
+    "39999": [
+     1,
+     "/Applications/Claude.app/Contents/MacOS/Claude",
+     [
+      "/Applications/Claude.app/Contents/MacOS/Claude",
+      "--inspect=9229"
+     ]
+    ]
+   }
+  },
+  "terminal": {
+   "note": "A terminal Claude Code.",
+   "start": 50001,
+   "rows": {
+    "50001": [
+     50000,
+     "~/.local/share/claude/versions/2.1.332",
+     [
+      "~/.local/share/claude/versions/2.1.332"
+     ]
+    ],
+    "50000": [
+     49999,
+     "/bin/zsh",
+     [
+      "/bin/zsh",
+      "-l"
+     ]
+    ],
+    "49999": [
+     1,
+     "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+     [
+      "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+     ]
+    ]
+   }
+  }
+ }
 }

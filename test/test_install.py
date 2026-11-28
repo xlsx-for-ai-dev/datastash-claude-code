@@ -33,7 +33,7 @@ from contextlib import redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from test_status import BIN, ds  # noqa: E402  (the same harness and plugin copy)
+from test_status import BIN, desktop_table, ds  # noqa: E402  (the same harness and plugin copy)
 import harness  # noqa: E402
 
 WB = "11111111-2222-3333-4444-555555555555"
@@ -1507,14 +1507,9 @@ class RealSlashShape(Base):
             self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny", change)
         self.assertTrue(os.path.exists(ds.key_path("web-app")))
 
-    def chains(self, chain, app="STAND_IN_APP_CHAIN"):
-        """XLI-420: the hooks see this process chain (test/fixtures/desktop-process-chains.json) and desktop app part."""
-        with open(os.path.join(FIXTURES, "desktop-process-chains.json")) as f:
-            fx = json.load(f)
-        saved = (ds.process_chain, ds.DESKTOP_APP_CHAIN)
-        self.addCleanup(lambda: (setattr(ds, "process_chain", saved[0]), setattr(ds, "DESKTOP_APP_CHAIN", saved[1])))
-        ds.process_chain = lambda: fx[chain] if isinstance(chain, str) else chain
-        ds.DESKTOP_APP_CHAIN = tuple(tuple(x) for x in fx[app]) if app else ()
+    def chains(self, chain):
+        """XLI-420 part 2: the hooks see this process table (test/fixtures/desktop-process-chains.json)."""
+        desktop_table(self, chain)
 
     def desktop_entry(self):
         with open(os.path.join(FIXTURES, "desktop-code-tab-2.1.332.jsonl")) as f:
@@ -1525,33 +1520,33 @@ class RealSlashShape(Base):
 
     def test_the_desktop_code_tab_entry_passes(self):
         """XLI-420: the real entry the Claude desktop app's Code tab writes for a typed slash command (Claude Code 2.1.332
-        as the desktop host) passes when the hook's process chain is the desktop app's (stand-in until the capture)."""
+        as the desktop host) passes when the hook's process table is the recorded Code-tab chain, signed."""
         keep = self.desktop_entry()
-        self.chains("desktop_stand_in")
+        self.chains("code_tab")
         got = self.note_after(**keep)["hookSpecificOutput"]
         self.assertEqual(got["updatedInput"]["targets"], sorted([OWN, ALPHA, BETA]))
         self.assertFalse(ds._command_origin(dict(keep, origin={"kind": "human"}, isSidechain=False)))  # entry alone: no
 
     def test_review_1_headless_and_nested_slash_commands_are_refused(self):
-        """Review 1 HIGH: the same slash-command entry from a headless or nested run (an agent's shell), a detached run,
-        a terminal chain, an unreadable chain, or the shipped empty desktop part, is refused."""
+        """Reviews 1 and 2: the same slash-command entry from a headless or nested run (an agent's shell), a detached
+        run, a fake Claude.app, an unsigned copy, a renamed binary, a terminal or an unreadable table, is refused."""
         keep = self.desktop_entry()
-        for chain, app in (("headless_review_1", "STAND_IN_APP_CHAIN"), ("nested_no_print", "STAND_IN_APP_CHAIN"),
-                           ("detached", "STAND_IN_APP_CHAIN"), ("terminal", "STAND_IN_APP_CHAIN"),
-                           (None, "STAND_IN_APP_CHAIN"), ("desktop_stand_in", None)):
-            self.chains(chain, app)
+        for chain in ("headless_p", "nested_no_print", "nested_same_binary", "setsid", "fake_app_folder",
+                      "unsigned_at_real_path", "renamed_binary", "renamed_as_shell", "helper_from_agent", "app_from_shell",
+                      "app_with_options", "terminal", None):
+            self.chains(chain)
             out = self.note_after(**keep)
             self.assertEqual(out["hookSpecificOutput"].get("permissionDecision"), "deny", chain)
 
     def test_the_terminal_entry_is_unchanged_on_any_chain(self):
-        self.chains("headless_review_1")
+        self.chains("headless_p")
         got = self.note_after()["hookSpecificOutput"]
         self.assertEqual(got["updatedInput"]["targets"], sorted([OWN, ALPHA, BETA]))
 
     def test_the_desktop_entrypoint_without_the_person_stamp_is_refused(self):
         """XLI-420: on the desktop chain, a desktop-entrypoint entry an agent or tool could make (no human origin, a side
         chain, meta, another turn origin, a promptSource) is still refused."""
-        self.chains("desktop_stand_in")
+        self.chains("code_tab")
         for change in ({"origin": None}, {"origin": {"kind": "task-notification"}}, {"turnOrigin": "sdk"},
                        {"promptSource": "sdk"}, {"isMeta": True}, {"isSidechain": True}):
             out = self.note_after(**dict({"entrypoint": "claude-desktop", "turnOrigin": "human"}, **change))
