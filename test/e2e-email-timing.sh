@@ -178,14 +178,27 @@ PY
   tmux kill-session -t "$T" 2>/dev/null
 }
 
+idle() {  # the session's turns are over: no "esc to interrupt" for 5 s running
+  local i quiet=0
+  for ((i = 0; i < 240; i++)); do
+    if tmux capture-pane -t "$T" -p | grep -qE "esc to interrupt"; then quiet=0; else quiet=$((quiet + 1)); fi
+    ((quiet >= 5)) && return 0
+    sleep 1
+  done
+  return 1
+}
+
 remove_all() {  # the test account back at rest (as test/e2e-real.sh leaves it): the person's typed uninstall of all
   [[ -e "$h/.config/datastash/login.email.json" ]] || return 0
-  wait_until '! pane | grep -qE "esc to interrupt"' 200 >/dev/null; sleep 2
-  type_line "/datastash:uninstall all"
-  local m
-  if wait_until 'pane | grep -qE "type exactly: \"?remove all [0-9]+"' 120 >/dev/null; then
+  local m try
+  for try in 1 2; do
+    idle
+    type_line "/datastash:uninstall all"
+    wait_until 'pane | grep -qE "type exactly: \"?remove all [0-9]+"' 60 >/dev/null && break
+  done
+  if pane | grep -qE "type exactly: \"?remove all [0-9]+"; then
     m="$(pane | tr -s ' \t\n' ' ' | grep -oE 'remove all [0-9]+' | tail -n 1)"
-    wait_until '! pane | grep -qE "esc to interrupt"' 120 >/dev/null; sleep 2
+    idle
     type_line "$m"
     if wait_until 'pane | grep -qiE "uninstalled|removed [0-9]"' 120 >/dev/null; then say "$c cleanup: $m done"
     else say "$c cleanup: no uninstall line seen (a later test/e2e-real.sh clean start removes what is left)"; fi
