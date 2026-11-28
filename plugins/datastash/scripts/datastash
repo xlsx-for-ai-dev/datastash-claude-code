@@ -2125,7 +2125,10 @@ def _free_name(folder, taken=None, prefer=None):
     """The name for folder's new agent: the folder's name (or prefer: the name the person used), -2, -3 ... past any
     agent on this computer (or a name datastash refused as taken)."""
     mine = {a["slug"] for a in all_agents()} | {slug(r["name"]) for r in _enrolled().values()}
-    name = _next_name(taken) if taken else ((_folder_name(prefer) if prefer else _folder_name(folder)) or user_name())
+    # 1.0.38 (XLI-436): never the computer's user name (a stray agent named after the OS user): the folder's own name or
+    # the name the person typed; the home folder or "/" gives none
+    name = _next_name(taken) if taken else (_folder_name(prefer) if prefer else
+                                            ("" if _home_or_root(folder) else _folder_name(folder)))
     if not name:
         return None
     for _ in range(1000):
@@ -5967,9 +5970,10 @@ def _home_or_root(here):
 
 def auto_name(here, me, after=None, session_name=None):
     """("linked", name) when this folder already has its agent (reuse it), ("main", None) for the person's session (never
-    registers), else ("name", the name to register): the session's own agent name (`claude --agent`), else the folder's
-    name (the computer's user name for the home folder or "/"), with -2, -3 when another agent on this machine has it
-    (or datastash refused `after` as taken); ("ask", None) when no name can be made (1.0.16: never "agent")."""
+    registers), else ("name", the name to register): the session's own agent name (`claude --agent`) or the person's
+    typed one, else the folder's name (1.0.38: never the computer's user name; the home folder or "/" gives none), with
+    -2, -3 when another agent on this machine has it (or datastash refused `after` as taken); ("ask", None) when no name
+    can be made (1.0.16: never "agent")."""
     if is_main_session(me) or main_root(here) is not None:
         return "main", None
     sess = session_for(here, me=me)
@@ -5977,13 +5981,14 @@ def auto_name(here, me, after=None, session_name=None):
         return ("main", None) if is_person(sess) else ("linked", sess["name"])
     mine = {a["slug"]: a for a in all_agents()}
     # 1.0.16: never "agent": the session's own name, else the name this session or folder had before an uninstall,
-    # else the folder's name (the computer's user name for the home folder or "/"); none of them: ask the person.
+    # else the folder's name; none of them: ask the person.
     if after:
         name = plain_agent_name(after, 44)
         name = _next_name(name) if name else None
     else:
-        name = session_name or last_name(here, me) or (user_name() if _home_or_root(here) else _folder_name(here)) \
-            or user_name()
+        # 1.0.38 (XLI-436, MS's review #11): never the computer's user name. The home folder's or "/"'s name is the OS
+        # user's, never an agent's: there, with no session name and no earlier name, the person types one.
+        name = session_name or last_name(here, me) or ("" if _home_or_root(here) else _folder_name(here))
     if not name:
         return "ask", None
     for _ in range(1000):
@@ -8894,20 +8899,22 @@ def clean_command_ok(tool, ti, no_code=False, cwd=None):
 
 # 1.0.20 (card 8f, EPM 11-26: with clean sessions on, the main session could not mark its inbox, cancel a timer, send,
 # hand off or write its status; all of it had to go through a helper subagent). The main session also runs datastash's
-# own coordination writes: they change only the agent workbook's inbox, timers, hand-offs, status and presence, never a
-# file, a workbook's data or code. Data writes (rows upsert or delete, tabs, columns, imports, workbooks, jobs, results,
-# undo) stay refused. The person's own answers on ledger_agent_status (answer, undo, undo_default, delete) stay refused:
+# own coordination writes: they change only the agent workbook's inbox, timers, hand-offs, status, presence and (1.0.38,
+# XLI-436) job claims, never a file, a workbook's data or code. Data writes (rows upsert or delete, tabs, columns, imports,
+# workbooks, import jobs, results, undo) stay refused. The person's own answers on ledger_agent_status (answer, undo, undo_default, delete) stay refused:
 # the plugin sends those itself after the person types them.
 CLEAN_DS_COORD_TOOLS = frozenset((
     "ledger_inbox_send", "ledger_inbox_mark",  # send and reply; mark read or handled (ledger_inbox_read is a read)
     "ledger_timer_set", "ledger_timer_cancel", "ledger_agent_checkback",  # timers and the agent's own check-back
     "ledger_agent_handoff",  # send, list, pickup, done, decline
     "ledger_agent_status", "ledger_agent_heartbeat",  # the agent's own status row (CLEAN_STATUS_ACTIONS) and presence
+    "ledger_agent_job",  # 1.0.38 (XLI-436): claim, renew, release, list (claim before every card)
 ))
 CLEAN_STATUS_ACTIONS = frozenset(("set", "list", "clear", "timeline", "default_taken"))
 # The same writes through the REST door (`datastash api POST PATH BODY`): exactly these paths, no query string.
 CLEAN_COORD_PATHS = frozenset(("/api/v1/agent/inbox", "/api/v1/agent/inbox/mark", "/api/v1/agent/timers",
-                               "/api/v1/agent/handoff", "/api/v1/agent/status", "/api/v1/agent/heartbeat"))
+                               "/api/v1/agent/handoff", "/api/v1/agent/status", "/api/v1/agent/heartbeat",
+                               "/api/v1/agent/job"))  # 1.0.38 (XLI-436): job claims, as ledger_agent_job
 CLEAN_OWN_PLUGIN_SKILLS = frozenset(("datastash:datastash-agent", "datastash-agent"))
 # A body or message on stdin, as the plugin's own commands take it: printf with one single-quoted literal (bash keeps
 # everything in single quotes literal), piped into the datastash command.
@@ -8962,7 +8969,7 @@ def _clean_coord_body_ok(path, text):
 
 def _clean_ds_coord(words, piped):
     """Only the datastash command's coordination writes: api POST to a CLEAN_COORD_PATHS path (send, reply, inbox mark,
-    timer set, hand-off, status, presence), status-set, heartbeat (never `heartbeat run`) and timer set, list or delete. A "-" body comes only from
+    timer set, hand-off, status, presence, job claim), status-set, heartbeat (never `heartbeat run`) and timer set, list or delete. A "-" body comes only from
     the printf pipe. `datastash send` and `reply` act as the person and run only in the person's datastash main session,
     which clean sessions never refuses, so they are not here."""
     if not words:
@@ -9833,6 +9840,49 @@ def _doing(r, now, one=False):
     return _dim(text) if r["doing"] and _stale(r.get("updated_at"), TEXT_STALE, now) else text
 
 
+NO_PROJECT_WORDS = "no project name"
+
+
+def _known_project(name, rows):
+    """1.0.38 (XLI-436, MS's review #11): the project a row with no project name is shown under: this computer's agent of
+    that name when it is linked to one folder, else the agent's one named project in the list; "" when neither is known."""
+    try:
+        folders = {os.path.basename(os.path.realpath(p).rstrip("/")) for a in all_agents()
+                   if isinstance(a.get("name"), str) and a["name"].casefold() == name.casefold()
+                   for p in (a.get("projects") or []) if isinstance(p, str) and p}
+    except Exception:  # noqa: BLE001  can't tell: the list's own names
+        folders = set()
+    folders = {f for f in (_clean(x, 64) for x in folders) if f}
+    if len(folders) == 1:
+        return folders.pop()
+    named = {r["project"].casefold(): r["project"] for r in rows if r.get("project")}
+    return next(iter(named.values())) if len(named) == 1 else ""
+
+
+def _tidy_group(rs):
+    """1.0.38 (XLI-436, MS's review #11): one agent's rows as the list shows them. A row with no project name is shown under
+    the project known for it (r["shown_project"]; its own key, r["project"], is never changed, so an answer still goes to
+    that row). Rows shown under the same project (or under none) with nothing open (no ask, no detail line) collapse into
+    the newest one, unless a row there has something open. Only the view changes: nothing is deleted."""
+    known = _known_project(rs[0]["agent"], rs) if any(not r.get("project") for r in rs) else ""
+    for r in rs:
+        r["shown_project"] = r.get("project") or known
+    keep, by = [], {}
+    for r in rs:
+        by.setdefault(r["shown_project"].casefold(), []).append(r)
+    for same in by.values():
+        if len(same) == 1:
+            keep += same
+            continue
+        open_ = [r for r in same if _active(r)]
+        keep += open_ or [max(same, key=lambda r: r.get("updated_at") or 0)]
+    return keep
+
+
+def _shown_project(r):
+    return r.get("shown_project", r.get("project")) or ""
+
+
 def _groups(rows):
     """Rows grouped by agent: agents with asks first, then busy ones, then idle (newest first in each); in an agent,
     projects with asks first."""
@@ -9842,6 +9892,7 @@ def _groups(rows):
     newest = lambda rs: -max((r.get("updated_at") or 0) for r in rs)
     out = []
     for rs in by.values():
+        rs = _tidy_group(rs)  # 1.0.38 (XLI-436)
         rs.sort(key=lambda r: (not r["asks"], not _active(r), -(r.get("updated_at") or 0)))
         out.append(rs)
     return (sorted([g for g in out if any(r["asks"] for r in g)], key=newest)
@@ -9895,12 +9946,12 @@ def _agent_block(group, n, now, screen, item_cap, numbers):
         return n, 0
     head = []
     if len(group) > 1:
-        projects = ", ".join(r.get("project") or "?" for r in group)
+        projects = ", ".join(_shown_project(r) or NO_PROJECT_WORDS for r in group)  # 1.0.38: never "?"
         head = [f"{_b(name)} — on {len(group)} projects: {_clean(projects, 200)}"]
     items_left, hidden = item_cap, 0
     first = True
     for r in group:
-        label = _b(name) + (f" · {r['project']}" if len(group) > 1 and r.get("project") else "")
+        label = _b(name) + (f" · {_shown_project(r)}" if len(group) > 1 and _shown_project(r) else "")
         para = [f"{n + 1}. {label} — {_doing(r, now)}", f"   {context_line(r, now)}"]
         if not screen.fits(head + para):
             if first:
@@ -12000,6 +12051,11 @@ LOOKUP_TOOLS = {"gh": "github", "linear": "linear", "jira": "jira", "sentry-cli"
 LOOKUP_LABEL = {"github": "GitHub", "linear": "Linear", "jira": "Jira", "sentry": "Sentry"}
 LOOKUP_TOPIC = {"github": "where PRs stand", "linear": "where Linear cards stand", "jira": "where Jira issues stand",
                 "sentry": "about Sentry errors"}
+# 1.0.38 (XLI-436, MS's review #13): what a yes changes outside datastash, said plainly in the offer (the feed keeps fresh
+# through the service's own webhook, which is a change to that repo's or workspace's settings).
+LOOKUP_CHANGE = {"github": "Saying yes adds a webhook to the repo, which is a change to that repo's settings.",
+                 "linear": "Saying yes adds a webhook to your Linear workspace, which is a change to its settings.",
+                 "jira": "Saying yes adds a webhook to your Jira site, which is a change to its settings."}
 FEED_TAB = {"github": ("PRs and CI", "owner/repo #123"), "linear": ("Cards", "XLI-12"), "jira": ("Issues", "PROJ-7")}
 _GH_LOOKUPS = {"pr": ("view", "list", "checks", "status"), "run": ("list", "view", "watch")}
 # XLI-323: the second word kept for these tools, from this fixed list only. Any other word in that place (a team,
@@ -12178,7 +12234,8 @@ def lookup_offer_line(numbers):
         n, svc, who = best[0]
         set_offer(svc, state="offered", agent=who, count=n)
         numbers[str(k)] = {"lookup": svc, "agent": who}
-        return f"Your agents asked {LOOKUP_TOPIC[svc]} {n} times today. Want datastash to keep that ready? (do {k})"
+        change = f" {LOOKUP_CHANGE[svc]}" if svc in LOOKUP_CHANGE else ""
+        return f"Your agents asked {LOOKUP_TOPIC[svc]} {n} times today.{change} Want datastash to keep that ready? (do {k})"
     except (OSError, ValueError, TypeError):
         return None
 
@@ -21821,6 +21878,14 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.38": (
+        "With clean sessions on, the main session claims a card itself (ledger_agent_job, or **datastash api POST "
+        "/api/v1/agent/job**), as it hands off and writes its status: claim before every card.",
+        "Your Setup row's full-DDS missing column now also names the claims, hand-offs, check-backs and remember you "
+        "have not used in the last 7 days; it reads none only when you use them all.",
+        "A new agent is never named after the computer's user: in the home folder the person types the name "
+        "(**/datastash:install NAME**).",
+    ),
     "1.0.37": (
         "A line Claude Code marks as not typed in this session (another session, a connector, rewritten) never counts "
         "as the person's typed line. An allowed watcher whose file changed since it was allowed does not run in the "
@@ -22231,7 +22296,77 @@ def _tmux_name():
     return out if re.fullmatch(r"[A-Za-z0-9_.\-]{1,40}", out or "") else None
 
 
-def setup_row_cells(agent, here, checks=None):
+# 1.0.38 (XLI-436, MS's review #14): the habits the "full-DDS missing" column also reports, so it never reads as fully
+# adopted while an agent uses none of them. Claims, hand-offs and check-backs come from the usage counter (checkin's
+# usage.this_agent: this agent's own calls in the last 7 days; a list is counted apart as "<tool> list", so a read is
+# never a use); remember from the Team tab (a fact whose source is this agent). (id, word, tools that count as a use).
+HABITS = (("C12", "claims", ("ledger_agent_job",)), ("C13", "hand-offs", ("ledger_agent_handoff",)),
+          ("C15", "check-backs", ("ledger_agent_checkback",)), ("C16", "remember", ()))
+HABIT_TIMER_SETS = 2  # ledger_timer_set counts as a check-back from this many calls (the plugin sets one 6 AM timer itself)
+
+
+def _habits_path(agent):
+    return os.path.join(STATE, f"habits-{agent['slug']}.json")
+
+
+def habit_check(agent, key, timeout=SETUP_ROW_TIMEOUT):
+    """{"at", "unused": [ids], "unknown": [ids]} for HABITS on this agent's key (network); saved for the Setup row."""
+    unknown, unused = [], []
+    tools = None
+    try:
+        err, out = mcp_tool(key, "checkin", {}, timeout=timeout)
+        mine = (((out.get("usage") or {}).get("this_agent") or {}).get("last_7_days") or {}) if not err and isinstance(out, dict) else {}
+        got = mine.get("tools") if isinstance(mine, dict) else None
+        if isinstance(got, list):
+            tools = {x["tool"]: x.get("calls") for x in got if isinstance(x, dict) and isinstance(x.get("tool"), str)
+                     and _num_ok(x.get("calls"))}
+    except Exception:  # noqa: BLE001  not known this time
+        tools = None
+    facts = None
+    try:
+        facts = load_facts(agent, key, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        facts = None
+    me = agent["name"].strip().casefold()
+    for iid, _word, names in HABITS:
+        if iid == "C16":
+            if facts is None:
+                unknown.append(iid)
+            elif not any(isinstance(src, str) and src.strip().casefold() == me for _f, src, _d in facts):
+                unused.append(iid)
+            continue
+        if tools is None:
+            unknown.append(iid)
+            continue
+        used = any((tools.get(n) or 0) > 0 for n in names)
+        if iid == "C15":
+            used = used or (tools.get("ledger_timer_set") or 0) >= HABIT_TIMER_SETS
+        if not used:
+            unused.append(iid)
+    rec = {"at": int(time.time()), "unused": unused, "unknown": unknown}
+    try:
+        ensure_dirs()
+        write_private(_habits_path(agent), json.dumps(rec))
+    except OSError:
+        pass
+    return rec
+
+
+def habits_missing(agent, habits=None):
+    """The column's habit part: "C12 claims unused", "C16 remember use not known", ... ([] when every habit is used)."""
+    h = habits if isinstance(habits, dict) else (read_json(_habits_path(agent), None) if agent else None)
+    if not isinstance(h, dict):
+        h = {"unused": [], "unknown": [iid for iid, *_r in HABITS]}  # never checked yet: not known, never "none"
+    out = []
+    for iid, word, _n in HABITS:
+        if iid in (h.get("unused") or []):
+            out.append(f"{iid} {word} unused")
+        elif iid in (h.get("unknown") or []):
+            out.append(f"{iid} {word} use not known")
+    return out
+
+
+def setup_row_cells(agent, here, checks=None, habits=None):
     """This agent's own row as the plugin knows it (no secret, no id). Identity first, then setup."""
     checks = self_check(agent, here) if checks is None else checks
     name = agent["name"] if agent else ""
@@ -22264,7 +22399,8 @@ def setup_row_cells(agent, here, checks=None):
         "registered": "yes" if reg else ("no: this computer is not signed in" if signed is False else "no"),
         "typed sync": ("yes" if sync else "no") + ("; computer signed in" if signed else
                                                    "; computer not signed in" if signed is False else ""),
-        "full-DDS missing": ", ".join(f"{iid} {_short(what)}" for iid, what, *_r in miss) or "none",
+        "full-DDS missing": ", ".join([f"{iid} {_short(what)}" for iid, what, *_r in miss]
+                                      + habits_missing(agent, habits)) or "none",  # 1.0.38: the habits too
         "next step": _plain_typed(first[3]) if first else "none",
         "who does it": first[4] if first else "",
         "last checked": _utc_minute(),
@@ -22378,7 +22514,8 @@ def write_setup_row(agent, here):
         _ensure_setup_tab(agent, key)
         rows = read_setup_rows(key, agent["workbook_id"]) or {}
     _share_setup_tab(agent, key)
-    row = merge_setup_row(rows.get(agent["name"].strip().casefold()), setup_row_cells(agent, here))
+    habits = habit_check(agent, key)  # 1.0.38 (XLI-436): which habits this agent has not used
+    row = merge_setup_row(rows.get(agent["name"].strip().casefold()), setup_row_cells(agent, here, habits=habits))
     is_err, body = mcp_tool(key, "ledger_rows_upsert", {"workbook_id": agent["workbook_id"], "tab": SETUP_TAB,
                                                         "rows": [row], "key": "agent"}, timeout=SETUP_ROW_TIMEOUT)
     if is_err:

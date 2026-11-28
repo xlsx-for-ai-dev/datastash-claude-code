@@ -402,7 +402,7 @@ class DenyByDefault(Base):
     def test_an_mcp_tool_that_writes_is_refused(self):
         for tool in (DS_MCP + "ledger_rows_upsert", DS_MCP + "ledger_rows_delete", DS_MCP + "ledger_workbook_delete",
                      DS_MCP + "ledger_workbook_create", DS_MCP + "ledger_agent_status",
-                     DS_MCP + "ledger_agent_job", DS_MCP + "ledger_agent_result", DS_MCP + "ledger_agent_undo",
+                     DS_MCP + "ledger_agent_result", DS_MCP + "ledger_agent_undo",  # 1.0.38: ledger_agent_job runs
                      DS_MCP + "ledger_tab_add", DS_MCP + "ledger_import", DS_MCP + "ledger_column_set",
                      DS_MCP + "ledger_future_tool", DS_MCP + "sync", "mcp__claude_ai_datastash__ledger_rows_upsert",
                      "mcp__claude_ai_Ledger__ledger_import", "mcp__github__create_pull_request",
@@ -518,6 +518,8 @@ COORD_BASH = (
     "datastash api POST /api/v1/agent/handoff '{\"workbook_id\": \"%s\", \"action\": \"done\", \"handoff_id\": 2}'" % WB,
     "datastash api POST /api/v1/agent/status '{\"workbook_id\": \"%s\", \"action\": \"set\"}'" % WB,
     "datastash api POST /api/v1/agent/heartbeat '{\"workbook_id\": \"%s\", \"state\": \"running\"}'" % WB,
+    "datastash api POST /api/v1/agent/job '{\"workbook_id\": \"%s\", \"action\": \"claim\", \"job\": \"XLI-12\"}'" % WB,
+    "datastash api POST /api/v1/agent/job '{\"workbook_id\": \"%s\", \"action\": \"release\", \"job\": \"XLI-12\", \"fence\": 3}'" % WB,
     "printf '%%s' '{\"workbook_id\": \"%s\", \"to\": \"epm\", \"message\": \"done; see #12 & $5!\"}' | datastash api POST /api/v1/agent/inbox -" % WB,
     "printf '%s' '{\"doing\": \"x; y\"}' | datastash status-set -",
     "printf '%s\\n' '{\"doing\": \"x\"}' | datastash --agent epm status-set - --project /x/y",
@@ -529,7 +531,7 @@ COORD_BASH = (
 )
 COORD_BASH_REFUSED = (
     "datastash api POST /api/v1/agent/rows '{\"workbook_id\": \"w\", \"tab\": \"t\", \"row\": {}}'",
-    "datastash api POST /api/v1/agent/rows/handled '{}'", "datastash api POST /api/v1/agent/job '{}'",
+    "datastash api POST /api/v1/agent/rows/handled '{}'", "datastash api POST '/api/v1/agent/job?x=1' '{}'",
     "datastash api POST /api/v1/agent/result '{}'", "datastash api POST /api/v1/agent/tabs '{}'",
     "datastash api POST '/api/v1/agent/inbox?x=1' '{}'", "datastash api POST /api/v1/agent/inbox/ '{}'",
     "datastash api POST /api/v1/agent/inbox @msg.json", "datastash api POST /api/v1/agent/inbox -",
@@ -605,7 +607,11 @@ class Coordination(Base):
                   "ledger_agent_handoff": {"workbook_id": WB, "action": "send", "to": "b"},
                   "ledger_agent_status": {"workbook_id": WB, "action": "set", "doing": "x"},
                   "ledger_agent_heartbeat": {"workbook_id": WB, "state": "running"},
+                  "ledger_agent_job": {"workbook_id": WB, "action": "claim", "job": "XLI-12"},
                   "checkin": {}}
+        for action in ("claim", "renew", "release", "list"):  # 1.0.38 (XLI-436): claims, as hand-offs
+            self.assertFalse(denied(self.call(DS_MCP + "ledger_agent_job", {"workbook_id": WB, "action": action,
+                                                                             "job": "XLI-12", "fence": 1})), action)
         for action in ("pickup", "done", "decline", "list"):
             self.assertFalse(denied(self.call(DS_MCP + "ledger_agent_handoff", {"workbook_id": WB, "action": action})))
         for action in ("list", "clear", "timeline", "default_taken"):

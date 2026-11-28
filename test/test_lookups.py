@@ -209,7 +209,8 @@ class Offer(LookupBase):
         self.lookups("gh api repos/a/b/pulls", 1)
         text = self.status_text()
         k = self.offer_number()
-        self.assertIn(f"Your agents asked where PRs stand 11 times today. Want datastash to keep that ready? (do {k})", text)
+        self.assertIn(f"Your agents asked where PRs stand 11 times today. Saying yes adds a webhook to the repo, which is a "
+                      f"change to that repo's settings. Want datastash to keep that ready? (do {k})", text)  # 1.0.38 (XLI-436)
         self.assertEqual(text.count("Want datastash to keep"), 1)
         numbers = ds.read_view("sess1")["numbers"]
         self.assertEqual(k, max(int(x) for x in numbers))

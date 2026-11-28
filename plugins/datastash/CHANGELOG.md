@@ -2,6 +2,7 @@
 
 One line per release, newest first.
 
+- **1.0.38**: With clean sessions on, the main session can claim a card; the status list shows a project name instead of "?" and one row for an agent's duplicates; in the home folder an install asks you for the agent's name instead of using the computer's user name; the GitHub lookups offer says a yes adds a webhook to the repo; the Setup tab's full-DDS missing column also names unused claims, hand-offs, check-backs and remember.
 - **1.0.37**: Typed lines are checked more strictly: a line Claude Code marks as not typed in this session never counts, and an allowed watcher that changed since you allowed it doesn't run until you type **datastash allow watcher PATH** again.
 - **1.0.36**: Asking any command for help (`--help` or `-h`) only shows help and never saves or sends anything; `datastash --help` lists every command; status and doctor agree on whether the listener runs; old versions no longer pile up on PATH, and unused old version folders are moved to a trash folder instead of piling up; the sign-in guard no longer refuses a plain file just because it names a datastash command; "Check your email" shows once.
 - **1.0.35**: Type **DDS update** (or **morning update**) to see each agent's open list and every agent's together; for the first week it also arrives at 6 AM.

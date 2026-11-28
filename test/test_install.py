@@ -965,14 +965,15 @@ class PlainNames(Base):
     def test_every_folder_and_session_name_becomes_plain(self):
         for raw in LOOKALIKES + ("My Project", "caf\u00e9", "\u65e5\u672c", "UPPER Case"):
             name = ds._free_name(self.mkdir(raw))
-            self.assertTrue(ds.plain_name(name), (raw, name))
-            self.assertEqual(name, name.lower(), raw)
-            self.assertIsNone(ds.pick_word_like(name), (raw, name))
+            if name is not None:  # 1.0.38 (XLI-436): nothing left is no name (the person types one)
+                self.assertTrue(ds.plain_name(name), (raw, name))
+                self.assertEqual(name, name.lower(), raw)
+                self.assertIsNone(ds.pick_word_like(name), (raw, name))
             kind, auto = ds.auto_name(self.mkdir("s-" + raw.replace("/", "-")), None, session_name=ds._session_name({"agent_type": raw}))
             self.assertTrue(ds.plain_name(auto) and ds.pick_word_like(auto) is None, (raw, auto))
         self.assertEqual(ds._free_name(self.mkdir("\u13aall")), "ll")  # the ruling's example
-        with mock.patch("getpass.getuser", return_value="pat"):  # 1.0.16: nothing left: the computer's user, never "agent"
-            self.assertEqual(ds._free_name(self.mkdir("\u1d00\u029f\u029f")), "pat")
+        with mock.patch("getpass.getuser", return_value="pat"):  # 1.0.38 (XLI-436): nothing left: no name (never the
+            self.assertIsNone(ds._free_name(self.mkdir("\u1d00\u029f\u029f")))  # computer's user, never "agent")
         self.assertEqual(ds._free_name(self.mkdir("a\u200bll")), "a-ll-2")  # reads as "all": the -2 rule
         self.assertEqual(ds._free_name(self.mkdir("ALL")), "all-2")
         self.assertEqual(ds.auto_name(self.mkdir("q"), None, after="My Agent")[1], "my-agent-2")
@@ -1295,9 +1296,9 @@ class OldStyleNames(Base):
             d = os.path.join(os.path.dirname(self.folder), "f" + str(len(raw)), raw)
             os.makedirs(d, exist_ok=True)
             self.assertEqual(ds._folder_name(d), "", raw)  # 1.0.16: never "agent"
-            with mock.patch("getpass.getuser", return_value="pat"):
-                self.assertEqual(ds._free_name(d), "pat", raw)  # the computer's user instead
-                self.assertEqual(ds.auto_name(d, None), ("name", "pat"))
+            with mock.patch("getpass.getuser", return_value="pat"):  # 1.0.38 (XLI-436): never the computer's user
+                self.assertIsNone(ds._free_name(d), raw)
+                self.assertEqual(ds.auto_name(d, None), ("ask", None))  # the person types a name
             with mock.patch("getpass.getuser", return_value="..."), mock.patch.object(ds, "HOME", "/"):
                 self.assertEqual(ds.auto_name(d, None), ("ask", None))  # nothing at all: the person is asked
 
@@ -1894,7 +1895,7 @@ class HomeFolderInstall(Base):
         self.folder = os.path.join(os.path.dirname(self.folder), "home-user")  # the person's home folder (its name is the computer's user)
         os.makedirs(self.folder)
         ds.HOME = self.folder
-        self.user = mock.patch("getpass.getuser", return_value="home-user")  # 1.0.16: the home agent is the user's name
+        self.user = mock.patch("getpass.getuser", return_value="home-user")  # 1.0.38: never the home agent's name
         self.user.start()
         self.addCleanup(self.user.stop)
 
@@ -1910,7 +1911,7 @@ class HomeFolderInstall(Base):
         out = self.tool("PostToolUse", "ledger_agent_key", {"name": name}, {"collect": "ready", "mint_id": MINT, "name": name}, sid=sid)
         self.assertEqual(out["systemMessage"], ds.MINT_LINE.format(name=name))
 
-    def list_and_note(self, real_input, pid, sid="s1", own=OWN):
+    def list_and_note(self, real_input, pid, sid="s1", own=OWN, cmd="/datastash:install"):
         self.assertIsNone(self.tool("PostToolUse", "ledger_agents_list", {}, LIST, sid=sid))
         note = self.tool("PreToolUse", "ledger_agents_note", real_input, sid=sid)["hookSpecificOutput"]
         self.assertNotEqual(note.get("permissionDecision"), "deny", note)
@@ -1918,7 +1919,7 @@ class HomeFolderInstall(Base):
         others = sorted({OWN, ALPHA, BETA} - {own})
         self.assertEqual(sorted(got), ["kind", "list_id", "targets", "typed_proof"])  # the model's agent_id is gone
         self.assertEqual((got["kind"], got["list_id"], got["targets"]), ("install", LIST_ID, others))
-        self.assertTrue(proof_ok(got["typed_proof"], "install", others, pid, "/datastash:install", own=own))
+        self.assertTrue(proof_ok(got["typed_proof"], "install", others, pid, cmd, own=own))
         return got
 
     def go(self, name):
@@ -1930,14 +1931,16 @@ class HomeFolderInstall(Base):
     def install(self, sid, register=None, own=OWN, real=REAL_NOTE_1):
         """/datastash:install in this session: `register` is the new agent's name the plugin asks for (None: it reuses
         this session's agent and registers nothing); then the install note goes out signed by `own`."""
-        v, pid = self.slash("/datastash:install", sid=sid)
+        home = os.path.realpath(self.folder) == os.path.realpath(ds.HOME)  # 1.0.38: in home the person types the name
+        cmd = "/datastash:install" + (f" {register}" if home and register else "")
+        v, pid = self.slash(cmd, sid=sid)
         ai = v["hookSpecificOutput"]["additionalContext"]
         if register is None:
             self.assertNotIn("ledger_agent_register", ai)
         else:
             self.assertIn(f'ledger_agent_register with name "{register}"', ai)
             self.mint(register, agent_id=own, sid=sid)
-        self.list_and_note(real, pid, sid=sid, own=own)
+        self.list_and_note(real, pid, sid=sid, own=own, cmd=cmd)
 
     def agents(self):
         return {a["name"]: [os.path.basename(p) for p in a.get("projects") or []] for a in ds.all_agents()}
@@ -2045,11 +2048,14 @@ class HomeFolderInstall(Base):
         self.assertFalse(rec("s2"))
 
     def test_fresh_home_folder_install_sends_the_note_and_a_retry_reuses_the_agent(self):
-        v, pid = self.slash("/datastash:install")
+        v, _ = self.slash("/datastash:install")  # 1.0.38 (XLI-436): never the computer's user name: the person types one
+        self.assertEqual((v["decision"], v["reason"]), ("block", ds._plain_typed(ds.ASK_NAME_LINE)))
+        self.assertEqual(ds.all_agents(), [])
+        v, pid = self.slash("/datastash:install home-user")
         ai = v["hookSpecificOutput"]["additionalContext"]
-        self.assertIn('ledger_agent_register with name "home-user"', ai)  # 1.0.16: the computer's user, never "agent"
+        self.assertIn('ledger_agent_register with name "home-user"', ai)  # the typed name
         self.mint("home-user")
-        self.list_and_note(REAL_NOTE_1, pid)
+        self.list_and_note(REAL_NOTE_1, pid, cmd="/datastash:install home-user")
         # The retry, in the same session: no new agent, and the note goes again (the model's call 2 shape: no list id).
         v2, pid2 = self.slash("/datastash:install")
         ai2 = v2["hookSpecificOutput"]["additionalContext"]
@@ -2084,13 +2090,13 @@ class HomeFolderInstall(Base):
     def test_every_refusal_is_one_line_with_its_reason(self):
         out = self.tool("PreToolUse", "ledger_agents_note", REAL_NOTE_2)  # no command open in this session
         self.assertEqual(out["systemMessage"], ds.NO_STEP_LINE)
-        self.slash("/datastash:install")
+        self.slash("/datastash:install home-user")
         self.tool("PostToolUse", "ledger_agents_list", {}, LIST)
         out = self.tool("PreToolUse", "ledger_agents_note", REAL_NOTE_1)  # no key collected on this computer
         self.assertEqual(out["systemMessage"], ds._plain_typed(ds.NO_OWN_AGENT_LINE))
-        _, pid = self.slash("/datastash:install")
+        _, pid = self.slash("/datastash:install home-user")
         self.mint("home-user")
-        got = self.list_and_note(REAL_NOTE_1, pid)
+        got = self.list_and_note(REAL_NOTE_1, pid, cmd="/datastash:install home-user")
         out = self.tool("PostToolUse", "ledger_agents_note", got, {"code": "not_typed", "message": "Only the person's own "
                         "typed answer, through the datastash plugin, sends agent notes. Nothing changed."})
         self.assertEqual(out["systemMessage"], "Not done: datastash refused it (not_typed: Only the person's own typed "
@@ -2099,7 +2105,7 @@ class HomeFolderInstall(Base):
 
     def test_the_connector_line_is_the_typed_sign_in(self):
         self.assertEqual(ds.NO_CONNECTOR_LINE, "Type **datastash sync you@email.com**, then **/datastash:install** again.")
-        v, _ = self.slash("/datastash:install")
+        v, _ = self.slash("/datastash:install home-user")
         self.assertIn(ds.NO_CONNECTOR_LINE, v["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("Settings, Connectors", v["hookSpecificOutput"]["additionalContext"])
 
