@@ -11072,7 +11072,8 @@ def process_chain():
             f = x.split("=", 1)[0]
             if re.fullmatch(FLAG_RE, f) and f not in flags:
                 flags.append(f)
-        chain.append({"name": parts[-1][:60], "bundle": bundle[:60], "flags": flags[:16]})
+        # XLI-432 (1.0.37 review MEDIUM-A): headless is read over every option; only the doctor's list is capped
+        chain.append({"name": parts[-1][:60], "bundle": bundle[:60], "flags": flags[:16], "headless": _headless(flags)})
         if ppid == pid:
             return None
         pid = ppid
@@ -11088,7 +11089,7 @@ def desktop_host_proven(chain=None):
         if not chain or not DESKTOP_APP_CHAIN:
             return False
         i = next((n for n, c in enumerate(chain) if c["name"] in CC_PROC_NAMES), None)
-        if i is None or _headless(chain[i]["flags"]):
+        if i is None or chain[i].get("headless") or _headless(chain[i]["flags"]):
             return False
         above = chain[i + 1:]
         if [(c["name"], c["bundle"]) for c in above[:len(DESKTOP_APP_CHAIN)]] != [tuple(x) for x in DESKTOP_APP_CHAIN]:
@@ -11112,7 +11113,7 @@ def terminal_host_proven(chain=None):
         if not chain:
             return False
         i = next((n for n, c in enumerate(chain) if _is_cc(c)), None)
-        if i is None or _headless(chain[i]["flags"]):
+        if i is None or chain[i].get("headless") or _headless(chain[i]["flags"]):
             return False
         return not any(_is_cc(c) for c in chain[i + 1:])
     except Exception:  # noqa: BLE001
@@ -11252,6 +11253,8 @@ def find_typed(tp, pid, prompt, at=None, desktop=False, midturn=False):
                 return None
             break  # XLI-430: a busy session gives the hook the running turn's prompt id: look for the queued line below
         if not _person_origin(v, desktop):
+            return "not person"
+        if _marked_not_typed(v):  # XLI-432 (1.0.37 review MEDIUM-B): the marks count on the hook's own prompt id too
             return "not person"
         return v, _said_turns(entries, i)
     if at is None:

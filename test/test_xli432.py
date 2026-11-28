@@ -59,6 +59,34 @@ class Headless(unittest.TestCase):
         finally:
             ds._proc_row = saved
 
+    def test_sixteen_other_options_before_p_are_still_headless(self):
+        """1.0.37 review MEDIUM-A: headless is read over the whole argv; only the doctor's list keeps 16 names."""
+        others = [f"--opt{n}" for n in range(20)]
+        rows = {os.getppid(): (4242, "/usr/local/bin/claude", ["claude"] + others + ["-p", "hi"]),
+                4242: (1, "/bin/bash", ["bash"])}
+        saved = ds._proc_row
+        try:
+            ds._proc_row = lambda pid: rows.get(pid)
+            c = ds.process_chain()
+            self.assertEqual(len(c[0]["flags"]), 16)
+            self.assertNotIn("-p", c[0]["flags"])
+            self.assertTrue(c[0]["headless"])
+            self.assertFalse(ds.terminal_host_proven(c))
+            saved_chain = ds.DESKTOP_APP_CHAIN
+            try:
+                ds.DESKTOP_APP_CHAIN = (("bash", ""),)
+                self.assertFalse(ds.desktop_host_proven(c))
+            finally:
+                ds.DESKTOP_APP_CHAIN = saved_chain
+            rows[os.getppid()] = (4242, "/usr/local/bin/claude", ["claude"] + others + ["--print=json"])
+            self.assertFalse(ds.terminal_host_proven(ds.process_chain()))
+            rows[os.getppid()] = (4242, "/usr/local/bin/claude", ["claude"] + others + ["-c"])
+            c = ds.process_chain()
+            self.assertFalse(c[0]["headless"])
+            self.assertTrue(ds.terminal_host_proven(c))
+        finally:
+            ds._proc_row = saved
+
     def test_desktop_path_stays_closed(self):
         self.assertEqual(ds.DESKTOP_APP_CHAIN, ())
         self.assertFalse(ds.desktop_host_proven(chain(("claude", ()), ("Claude", ()))))
@@ -105,6 +133,42 @@ class NotTypedHere(BusySession):
         self.write(self.queued_user(fromAnotherSession=False))
         self.check(running)
         self.assertTrue(self.code_sent())
+
+
+class MarksOnTheMainPath(unittest.TestCase):
+    """1.0.37 review MEDIUM-B: the user entry under the hook's own prompt id is refused when it carries a mark."""
+    PID = "5b1d0a3e-2c4f-4e8a-9d6b-7f1e2a3c4d5e"
+    TEXT = "datastash sync 482913"
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="xli432-main-")
+        self.tp = os.path.join(self.dir, "s1.jsonl")
+
+    def tearDown(self):
+        import shutil
+        shutil.move(self.dir, self.dir + ".done")  # never rm: the throwaway dir is left beside itself
+
+    def find(self, source="typed", **marks):
+        v = {"type": "user", "promptId": self.PID, "promptSource": source, "origin": {"kind": "human"},
+             "message": {"role": "user", "content": self.TEXT}, "timestamp": now_iso()}
+        v.update(marks)
+        with open(self.tp, "w") as f:
+            f.write(json.dumps(v) + "\n")
+        return [ds.find_typed(self.tp, self.PID, self.TEXT), ds.find_typed(self.tp, self.PID, self.TEXT, at=ds.time.time())]
+
+    def test_plain_typed_line_is_accepted(self):
+        for source in ("typed", "queued"):
+            for got in self.find(source) + self.find(source, fromConnector=False, isMeta=None):
+                self.assertIsInstance(got, tuple, source)
+                self.assertEqual(got[0]["promptId"], self.PID)
+
+    def test_each_mark_is_refused(self):
+        for k in ("fromAnotherSession", "fromConnector", "textNotTyped", "promptRewritten", "verifiedSlackHumanTurn",
+                  "hostsOwnTurn"):
+            for source in ("typed", "queued"):
+                with self.subTest(mark=k, source=source):
+                    self.assertEqual(self.find(source, **{k: True}), ["not person", "not person"])
 
 
 for _name in [n for n in vars(BusySession) if n.startswith("test_")]:
