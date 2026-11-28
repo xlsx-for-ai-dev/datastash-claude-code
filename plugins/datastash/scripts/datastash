@@ -3262,6 +3262,8 @@ def _listen_loop(agent, s, session_id, printer, me=None, mine=None, project=None
     # XLI-375 P2: hello on every listener start (and again after a park, or when this computer's setup changes).
     hello_stop = threading.Event()
     hello = start_hello(agent, project, live, hello_stop, in_hook=printer is None) if not is_person(agent) else None
+    if not is_person(agent) and printer is None:
+        start_dds_week(agent, live, hello_stop)  # XLI-438: the seven 6 AM morning updates, set up once per agent
     net_fails = 0  # polls in a row with no answer at all (the network cause after a few)
     gone = 0
     # First catch up without waiting: anything not yet announced (arrived during the last turn, or not counted by the
@@ -8668,7 +8670,7 @@ def _clean_ds_read(args):
     """Only the datastash command's read subcommands: status (and its list views), check, read INBOX, help, and
     api GET PATH (no body). Every write (api POST, status-set, send, reply, link, off, keep, ...) is refused."""
     if args in ([], ["status"], ["status", "--all"], ["status", "--all", "--install"], ["check"], ["help"],
-                ["allow", "watcher", "--list"]):  # XLI-437: the list of the person's allowed watchers
+                ["allow", "watcher", "--list"], ["dds-update"]):  # XLI-437: the person's allowed watchers; XLI-438
         return True
     if len(args) == 3 and args[0] == "status" and args[1] in ("--details", "--more") and re.fullmatch(r"\d{1,3}", args[2]):
         return True
@@ -14719,6 +14721,10 @@ def onboard_phrase(text):
         return "dds_stats"
     if ASKS_PHRASE_RE.fullmatch(t):
         return "asks"
+    if DDS_UPDATE_PHRASE_RE.fullmatch(t):
+        return "dds_update"  # XLI-438
+    if dds_deliver_phrase(t) is not None:
+        return "dds_deliver"  # XLI-438: the answer to the one where-to-deliver question
     return None
 
 
@@ -14876,6 +14882,277 @@ def asks_text(asks=None):
     elif any(_answerable(i) for i in asks.get("items") or []):
         lines.append(ASKS_ANSWER_LINE)
     return "\n".join(lines)
+
+
+# --- XLI-438 (owner 11-28): the DDS update ("DDS update", "morning update"): each agent's open list and every agent's
+# together, from the server (GET /api/v1/agent/dds-update: rows from datastash's own records and the agents' feeds, ages
+# and overdue flags computed by the engine). The only place the open list shows: one nudge a day. For an agent's first
+# seven days it is posted automatically at 6:00 AM US Central in the agent's own session, woken by a datastash timer
+# (XLI-433, set up once per agent by the listener); each of those posts ends with exactly DDS_UPDATE_ENDING. After that
+# only when the person types it. The one where-to-deliver question comes once in the first week, after a typed update
+# (never inside an automatic post). Slack and email are opt-in only and not sent yet: the answer is kept here.
+DDS_UPDATE_PATH = "/api/v1/agent/dds-update"
+DDS_UPDATE_PHRASE_RE = re.compile(r"(?:show )?(?:dds|datastash|morning) update")
+DDS_UPDATE_HEAD = "**DDS update**"
+DDS_UPDATE_ENDING = "Type **DDS update** to get this any time."
+DDS_UPDATE_SHOWN = 10  # rows shown per agent (a display bound only: the rest is one "and N more" line)
+DDS_UPDATE_TIMEOUT = 8  # seconds for the one read (the prompt hook has 10)
+DDS_WAKE_NOTE = ("DDS update (6 AM): run `datastash dds-update --auto` and show the person its output word for word "
+                 "(keep its bold), nothing before or after it. If it prints nothing, say nothing.")
+DDS_WAKE_ZONE = "America/Chicago"
+DDS_DELIVER_PATH = os.path.join(CONF, "dds-deliver.json")
+DDS_DELIVER_QUESTION = ("Where would you like your DDS update: here only, also in Slack, also by email? Type **DDS update "
+                        "here only**, **DDS update also Slack** or **DDS update also email**.")
+DDS_DELIVER_RE = re.compile(r"(?:dds|datastash|morning) update (here only|here|also (?:in )?slack|also (?:by )?email)")
+DDS_DELIVER_SAVED = {
+    "here": "Saved: your DDS update shows here only.",
+    "slack": "Saved: you'd like your DDS update also in Slack. Slack delivery isn't on yet; until it is, it shows here.",
+    "email": "Saved: you'd like your DDS update also by email. Email delivery isn't on yet; until it is, it shows here.",
+}
+
+
+def _dds_week_path(s):
+    return os.path.join(STATE, f"dds-week-{s}.json")
+
+
+def _dds_update_agent(here=None, me=None):
+    """(agent, key) the update is read with: this folder's own agent, else any agent on this computer with a key (the
+    person's main session reads every agent's lists through one of them); (None, None) when there is none."""
+    try:
+        a = agent_for(here, me=me) if here else None
+    except Exception:  # noqa: BLE001
+        a = None
+    if a is not None:
+        k = read_key(a["slug"])
+        if k:
+            return a, k
+    for a in all_agents():
+        if not is_person(a):
+            k = read_key(a["slug"])
+            if k:
+                return a, k
+    return None, None
+
+
+def dds_update_read(key, timeout=DDS_UPDATE_TIMEOUT):
+    """The server's update (dict), or a short reason it isn't there. Never shown to the model as data to act on."""
+    try:
+        status, _ct, text = http("GET", DDS_UPDATE_PATH, key=key, timeout=timeout)
+        d = json.loads(text)
+    except ApiError as e:
+        return "not on this server yet" if e.status == 404 else "datastash didn't answer just now"
+    except Exception:  # noqa: BLE001  any network or answer problem: say so, never fail the prompt
+        return "datastash didn't answer just now"
+    if status != 200 or not isinstance(d, dict) or not isinstance(d.get("own"), dict):
+        return "datastash didn't answer just now"
+    return d
+
+
+def _dds_row(i):
+    """One open row: "age, overdue: what (who clears it: X, by DATE)"."""
+    age = _clean(i.get("age"), 16) or "age not calculated"
+    tags = age + (", overdue" if i.get("overdue") is True else "")
+    who = _clean(i.get("who"), 64)
+    extra = []
+    if who and i.get("kind") in ("wait", "ask"):
+        extra.append(f"clears: {who}")
+    due = _clean(i.get("due"), 32)
+    if due and i.get("kind") in ("wait", "ask", "handoff", "checkback"):
+        extra.append(f"by {due[:16].replace('T', ' ')} UTC")
+    return f"{tags}: {_clean(i.get('what'), 200)}" + (f" ({', '.join(extra)})" if extra else "")
+
+
+def _dds_list_lines(lst, mine=False):
+    items = [i for i in (lst.get("items") or []) if isinstance(i, dict)]
+    name = _clean(lst.get("agent"), 64) or "an agent"
+    label = f"{name} (this agent)" if mine else name
+    if not items:
+        return [f"  - **{label}:** nothing open."]
+    out = [f"  - **{label}, {len(items)} open:**"]
+    out += [f"    - {_dds_row(i)}" for i in items[:DDS_UPDATE_SHOWN]]
+    if len(items) > DDS_UPDATE_SHOWN:
+        out.append(f"    - and {len(items) - DDS_UPDATE_SHOWN} more, oldest first.")
+    return out
+
+
+def dds_update_text(d, auto=False):
+    """The update in the plugin's own lines: missed 6 AM posts first (each its own line), this agent's list, then every
+    other agent's. An automatic post ends with exactly DDS_UPDATE_ENDING."""
+    if not isinstance(d, dict):
+        lines = [DDS_UPDATE_HEAD, f"  - **Open list:** {d}"]
+        return "\n".join(lines + ([DDS_UPDATE_ENDING] if auto else []))
+    lines = [DDS_UPDATE_HEAD]
+    for m in d.get("missed") or []:
+        if isinstance(m, dict):
+            age = _clean(m.get("age"), 16)
+            lines.append(f"  - **Missed 6 AM post:** {_clean(m.get('what'), 200)}" + (f" ({age} ago)" if age else ""))
+    own = d.get("own") if isinstance(d.get("own"), dict) else {}
+    lines += _dds_list_lines(own, mine=True)
+    others = [x for x in d.get("agents") or [] if isinstance(x, dict) and _fold(str(x.get("agent") or "")) != _fold(str(own.get("agent") or ""))]
+    if isinstance(d.get("agents"), list):
+        for lst in others:
+            lines += _dds_list_lines(lst)
+    else:
+        lines.append("  - **All agents:** type **datastash sync** in this agent's session to see every agent's list here.")
+    if auto:
+        lines.append(DDS_UPDATE_ENDING)
+    return "\n".join(lines)
+
+
+def dds_deliver_choice():
+    d = read_json(DDS_DELIVER_PATH, {})
+    return d if isinstance(d, dict) else {}
+
+
+def dds_deliver_ask(d):
+    """The where-to-deliver question, once, in the first week: only when the update says this agent is in its seven
+    days and it was never asked here. Marks it asked."""
+    if not isinstance(d, dict) or not (d.get("week") or {}).get("auto"):
+        return None
+    if dds_deliver_choice().get("asked_at"):
+        return None
+    try:
+        ensure_dirs()
+        write_private(DDS_DELIVER_PATH, json.dumps(dict(dds_deliver_choice(), asked_at=int(time.time()))))
+    except OSError:
+        return None
+    return DDS_DELIVER_QUESTION
+
+
+def dds_deliver_phrase(text):
+    """"here", "slack" or "email" for the person's whole typed answer to the question, else None."""
+    t = _phrase_text(text)
+    m = DDS_DELIVER_RE.fullmatch(t) if t else None
+    if not m:
+        return None
+    w = m.group(1)
+    return "slack" if "slack" in w else "email" if "email" in w else "here"
+
+
+def dds_deliver_save(choice):
+    """Kept on this computer only (opt-in; never email by default): Slack and email delivery are not sent yet."""
+    try:
+        ensure_dirs()
+        write_private(DDS_DELIVER_PATH, json.dumps(dict(dds_deliver_choice(), answer=choice, answered_at=int(time.time()),
+                                                         asked_at=dds_deliver_choice().get("asked_at") or int(time.time()))))
+    except OSError:
+        return "Not saved: this computer couldn't keep it. Nothing changed."
+    return DDS_DELIVER_SAVED[choice]
+
+
+def dds_prompt_text(inp):
+    """The typed "DDS update" answer: the update, then (once in the first week) the where-to-deliver question."""
+    here = inp.get("cwd") if isinstance(inp, dict) and isinstance(inp.get("cwd"), str) else None
+    _a, key = _dds_update_agent(here, me=this_session(inp) if isinstance(inp, dict) else None)
+    if key is None:
+        return "\n".join([DDS_UPDATE_HEAD, "  - **Open list:** not connected on this computer yet"])
+    d = dds_update_read(key)
+    text = dds_update_text(d)
+    ask = dds_deliver_ask(d)
+    return text + ("\n\n" + ask if ask else "")
+
+
+def _dds_timer_note_ok(note):
+    return isinstance(note, str) and note.startswith("DDS update (6 AM)")
+
+
+def dds_week_setup(agent, key):
+    """Once per agent on this computer: start its seven 6 AM days on the server and set the one daily 6:00 AM Central
+    datastash timer that wakes this agent to post (its id kept here). Never twice: the timer's id is kept, and a timer
+    already set with the same note is found in the agent's own list first. Quiet on any failure (tried again later)."""
+    s = agent["slug"]
+    if read_json(_dds_week_path(s), {}).get("timer_id"):
+        return None
+    wb = agent.get("workbook_id")
+    if not wb:
+        return None
+    _st, _ct, text = http("POST", DDS_UPDATE_PATH + "/start", key=key, body={}, timeout=20)
+    week = (json.loads(text) or {}).get("week") or {}
+    if not week.get("started_on"):
+        return None
+    _st, _ct, text = http("GET", AGENT_TIMERS_PATH + "?" + urllib.parse.urlencode({"workbook_id": wb}), key=key, timeout=20)
+    have = [t for t in (json.loads(text) or {}).get("timers") or [] if isinstance(t, dict) and _dds_timer_note_ok(t.get("note"))]
+    if have:
+        tid = have[0].get("timer_id")
+    else:
+        body = {"workbook_id": wb, "at": "06:00", "tz": DDS_WAKE_ZONE, "repeat": "daily", "note": DDS_WAKE_NOTE,
+                "idempotency_key": "dst_dds_" + hashlib.sha256(f"{s}|{wb}".encode()).hexdigest()[:32]}
+        _st, _ct, text = http("POST", AGENT_TIMERS_PATH, key=key, body=body, timeout=20)
+        tid = (json.loads(text) or {}).get("timer_id")
+    if not tid:
+        return None
+    ensure_dirs()
+    write_private(_dds_week_path(s), json.dumps({"timer_id": tid, "workbook_id": wb, "started_on": week.get("started_on"),
+                                                 "ends_on": week.get("ends_on"), "at": int(time.time())}))
+    return tid
+
+
+def start_dds_week(agent, live, stop):
+    """The listener's one try per start (background, quiet): once its key is live, dds_week_setup."""
+    def run():
+        for _ in range(60):
+            if stop.is_set():
+                return
+            k = live.get("key")
+            if k:
+                try:
+                    dds_week_setup(agent, k)
+                except Exception:  # noqa: BLE001  quiet: the next listener start tries again
+                    pass
+                return
+            time.sleep(5)
+    try:
+        threading.Thread(target=run, daemon=True, name="datastash-dds-week").start()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _dds_stop_timer(agent, key):
+    """After the seven days: the daily wake is removed (once); the update comes only when typed."""
+    rec = read_json(_dds_week_path(agent["slug"]), {})
+    tid, wb = rec.get("timer_id"), rec.get("workbook_id")
+    if not tid or not wb or rec.get("stopped_at"):
+        return
+    try:
+        http("DELETE", f"{AGENT_TIMERS_PATH}/{tid}?" + urllib.parse.urlencode({"workbook_id": wb}), key=key, timeout=20)
+    except ApiError as e:
+        if e.status != 404:
+            return
+    except Exception:  # noqa: BLE001
+        return
+    write_private(_dds_week_path(agent["slug"]), json.dumps(dict(rec, stopped_at=int(time.time()))))
+
+
+def cmd_dds_update(args):
+    """`datastash dds-update` prints this agent's update in the plugin's own lines. `--auto` (the 6 AM wake): only on a
+    day of the agent's seven and not posted today; records the post and ends with the one line; after the seven days
+    it removes the daily wake and prints nothing."""
+    auto = args == ["--auto"]
+    if args and not auto:
+        die("usage: datastash dds-update [--auto]")
+    here = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    me = this_session()
+    agent, key = _dds_update_agent(here, me=me)
+    if key is None:
+        die("no agent with a key on this computer (/datastash:install)")
+    d = dds_update_read(key, timeout=30)
+    if auto:
+        week = d.get("week") if isinstance(d, dict) else None
+        if isinstance(week, dict) and not week.get("auto"):
+            if week.get("ends_on"):
+                _dds_stop_timer(agent, key)
+            return 0
+        if isinstance(week, dict) and week.get("posted_today"):
+            return 0
+        print(dds_update_text(d, auto=True))
+        if isinstance(d, dict):
+            try:
+                http("POST", DDS_UPDATE_PATH + "/posted", key=key, body={}, timeout=20)
+            except Exception:  # noqa: BLE001  not recorded: the next update shows it as missed, nothing else
+                pass
+        return 0
+    print(dds_update_text(d))
+    return 0
 
 
 # --- XLI-415 leftovers: answer from the list, and welcome-back asks (EPM hand-off 5d09d517: tell only, never act).
@@ -15038,6 +15315,10 @@ def onboard_prompt_context(inp):
         sid = inp.get("session_id")
         save_asks_view(sid if isinstance(sid, str) and re.fullmatch(SID_RE, sid) else None, asks)  # "N: answer" next
         return ONBOARD_RELAY_AI.format(text=asks_text(asks))
+    if kind == "dds_update":  # XLI-438: only reads the server's open lists: nothing turns on, so no check
+        return ONBOARD_RELAY_AI.format(text=dds_prompt_text(inp))
+    if kind == "dds_deliver":  # XLI-438: kept on this computer only; nothing is sent anywhere new
+        return ONBOARD_RELAY_AI.format(text=dds_deliver_save(dds_deliver_phrase(inp.get("prompt"))))
     if kind == "chats_off":  # only narrows: saved at once, no check
         try:
             record_sessions(False)
@@ -22256,7 +22537,7 @@ def main():
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
              "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share,
              "remember": cmd_remember, "skills-sync": cmd_skills_sync, "repeat": cmd_repeat, "repeats": cmd_repeat,
-             "estimate": cmd_estimate, "estimates": cmd_estimate, "timer": cmd_timer, "timers": cmd_timer,
+             "estimate": cmd_estimate, "estimates": cmd_estimate, "timer": cmd_timer, "timers": cmd_timer, "dds-update": cmd_dds_update,
              "allow": cmd_allow, "disallow": lambda a: cmd_allow(a, disallow=True)}
     if cmd not in table and repeat_word(cmd) is not None:  # XLI-413: repeat / repeats / a small typo of either
         cmd = "repeat"
