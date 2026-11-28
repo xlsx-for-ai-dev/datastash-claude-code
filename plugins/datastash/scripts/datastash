@@ -17183,8 +17183,8 @@ def command_prompt(inp):
         own = _own(inp)
         if own is not None and read_agent_answer(own["slug"]):
             name = own["name"]  # XLI-390 install fix: this session's agent again, never a new "-2"
-        elif kind == "ask":
-            return ASK_NAME_LINE, None, True
+        elif kind == "ask":  # 1.0.38: a computer not signed in is asked to sign in first, then for the name
+            return (SIGN_IN_FIRST_LINE if not email_login() and not_signed_in(own) else ASK_NAME_LINE), None, True
         if email_login():  # card 1: this computer's emailed-code login: the plugin installs on it, no connector
             if own is not None and read_key(own["slug"]):
                 return DONE_LINE, None, True

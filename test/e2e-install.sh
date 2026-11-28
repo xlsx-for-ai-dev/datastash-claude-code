@@ -135,7 +135,7 @@ run_folder() {  # run_folder home|repo
     mkdir -p "$dir" && git -C "$dir" init -q && git -C "$dir" -c user.name=Test -c user.email=test@example.invalid \
       commit -q --allow-empty -m init
   else
-    dir="$h"; want="sam"  # 1.0.16: the home folder's agent is the computer's user, never "agent"
+    dir="$h"; want=""  # 1.0.38 (XLI-436): never the computer's user ("sam"): in the home folder the person types a name
   fi
   say "== $where folder (claude started in ${dir#"$WORK/"})"
 
@@ -223,8 +223,10 @@ check_install_hook() {  # step 5, the plugin's half: the typed /datastash:instal
   local ds_script
   ds_script="$(ls -d "$h"/.claude/plugins/cache/*/datastash/*/scripts/datastash 2>/dev/null | head -1)"
   got="$( [[ -n "$ds_script" ]] && cd "$dir" && env -i PATH="$PATH" HOME="$h" USER=sam CLAUDE_PROJECT_DIR="$dir" \
-    python3 -I "$ds_script" auto-name 2>/dev/null | grep -m1 -E '^name: ' )"
-  if [[ "$got" == "name: $want" ]]; then
+    python3 -I "$ds_script" auto-name 2>&1 | grep -m1 -E '^name: |ask the person for one' )"
+  if [[ -z "$want" && "$got" == *"ask the person for one"* ]]; then
+    pass "$where step 5: no agent name is picked here (never the computer's user); the person types one"
+  elif [[ -n "$want" && "$got" == "name: $want" ]]; then
     pass "$where step 5: the agent name picked here is \"$want\""
   else
     fail "$where step 5: wanted agent name \"$want\", the plugin picks: ${got:-nothing}"
