@@ -4,7 +4,8 @@
   note, idempotency_key}; a local WHEN takes --tz, else DATASTASH_TZ, else this computer's zone; a delay (90m, 2h, 1d) is
   in_minutes; a time with its zone is sent as written.
 - list is one GET; delete one DELETE /api/v1/agent/timers/<id>; a DELETE is never kept for later.
-- --help (and no arguments) prints the help and makes no call and no write.
+- --help (and no arguments) prints the help and makes no call and no write; help shows only as the first argument
+  (after `timer` or the subcommand). A prompt holding help, -h or --help sets the timer; a late help flag fails.
 - Bad arguments die with the usage line and send nothing.
 - With datastash unreachable, a set is kept in the outbox (with its retry key) and sent later.
 - A clean session lets `datastash timer ...` run in the main session (the agent's own timers, like api POST timers).
@@ -174,6 +175,58 @@ class HelpAndRefusals(TimerBase):
             self.assertIn("datastash timer set WHEN", out, args)
         self.assertEqual(self.calls, [])
         self.assertEqual(ds.outbox_entries(SLUG), [])
+
+    def test_help_words_in_the_prompt_set_the_timer(self):
+        for words in (("help", "the", "person"), ("-h",), ("--help",), ("run", "it", "with", "--help"), ("help",)):
+            self.calls = []
+            code, out, err = self.timer("set", "2h", "--", *words)
+            self.assertEqual(code, 0, (words, err))
+            self.assertNotIn("datastash timer set WHEN", out, words)
+            self.assertEqual(self.set_body(), {"workbook_id": WB, "in_minutes": 120.0, "note": " ".join(words)}, words)
+
+    def test_help_word_as_the_first_prompt_word_without_dashes_sets_the_timer(self):
+        code, _, err = self.timer("set", "2h", "help", "the", "person")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.set_body(), {"workbook_id": WB, "in_minutes": 120.0, "note": "help the person"})
+
+    def test_main_with_a_help_word_in_the_prompt_sets_the_timer(self):
+        saved = sys.argv
+        sys.argv = ["datastash", "timer", "set", "2h", "--", "--help", "the", "person"]
+        try:
+            with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                self.assertEqual(ds.main(), 0)
+        finally:
+            sys.argv = saved
+        self.assertNotIn("datastash timer set WHEN", out.getvalue())
+        self.assertEqual(self.set_body()["note"], "--help the person")
+
+    def test_plain_timer_help_from_main_writes_nothing(self):
+        saved = sys.argv
+        sys.argv = ["datastash", "timer", "--help"]
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ds.main(), 0)
+        finally:
+            sys.argv = saved
+        self.assertIn("datastash timer set WHEN", out.getvalue())
+        self.assertEqual(self.calls, [])
+        self.assertEqual(ds.outbox_entries(SLUG), [])
+
+    def test_a_late_help_flag_before_dashes_fails_and_sends_nothing(self):
+        for args in (("set", "2h", "--help"), ("set", "2h", "-h", "--", "x"), ("set", "2h", "look", "--help"),
+                     ("set", "help", "--", "x"), ("delete", TID, "-h"), ("list", "--workbook", WB, "-h")):
+            code, out, err = self.timer(*args)
+            self.assertNotEqual(code, 0, args)
+            self.assertIn("datastash:", err, args)
+            self.assertNotIn("wake this folder's agent later", out, args)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(ds.outbox_entries(SLUG), [])
+
+    def test_a_refused_set_exits_non_zero(self):
+        self.refuse = (400, {"code": "bad_request", "message": "no"})
+        code, out, _ = self.timer("set", "2h", "--", "help", "the", "person")
+        self.assertNotEqual(code, 0)
+        self.assertIn("HTTP 400", out)
 
     def test_main_help_skips_the_signin_record(self):
         saved, seen = sys.argv, []

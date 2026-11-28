@@ -5517,7 +5517,7 @@ def timer_set_body(args):
             else:
                 wb = v
             continue
-        if a.startswith("--"):
+        if a.startswith("--") or a == "-h":  # a help word past the first place is refused, never a silent help
             die(TIMER_USAGE)
         if when is None:
             when = a.strip()
@@ -5586,8 +5586,14 @@ def _timer_workbook(wb):
 
 
 def timer_help(args):
-    """True when `datastash timer ...` asks for help (answered with no call and no write)."""
-    return not args or any(a in ("-h", "--help", "help") for a in args)
+    """True when `datastash timer ...` asks for help (answered with no call and no write): no arguments, `help`, -h or
+    --help as the first argument, or -h / --help as the first argument after the subcommand. Nothing after `--` (the
+    prompt) is ever read as a help word, so `timer set 2h -- help the person` sets a timer."""
+    if not args:
+        return True
+    if args[0] in ("-h", "--help", "help"):
+        return True
+    return len(args) > 1 and args[0] != "--" and args[1] in ("-h", "--help")
 
 
 def cmd_timer(args):
