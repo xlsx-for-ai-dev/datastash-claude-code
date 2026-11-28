@@ -9,7 +9,9 @@
 # Times, each from the Enter key: "sent" = the server sent the code (the plugin's code request is on disk), "signed in" =
 # the server took the code and this computer holds its login, "shown" = the plugin's line is on screen.
 # PASS when every step finishes and the CODE line is signed in and shown within E2E_CODE_LIMIT seconds (default 5) of
-# the Enter key, or (busy) of the running command's end, when Claude Code writes the line.
+# the Enter key, or (busy) of the running command's end, when Claude Code writes the line. 1.0.30 (XLI-427): "shown"
+# counts only the line a plugin hook shows itself (Claude Code's "<Hook> says: ..."), never the model's own reply, and
+# no line a hook or the model shows may send the person to /mcp or Authenticate.
 # Options: E2E_REF (git ref of this repo to install; default: the working tree), E2E_CASES ("idle busy"),
 #   E2E_CLAUDE_ENV (default /home/xpm/handover/claude-e2e.env, CLAUDE_CODE_OAUTH_TOKEN=...), E2E_SELFTEST_SECRET_FILE
 #   (default /home/xpm/handover/selftest-oauth.secret), E2E_ACCOUNT (default plugin-e2e), E2E_BUSY_SECONDS (default 60).
@@ -149,14 +151,14 @@ PY
   fi
   type_line "datastash sync $EMAIL"
   if t="$(wait_until "$req" 180)"; then say "$c EMAIL: sent ${t}s"; else fail "$c EMAIL: no code sent in 180 s"; show_tail; fi
-  if t="$(wait_until 'pane | grep -qF "Check your email for a 6-digit code"' 180)"; then say "$c EMAIL: shown ${t}s"; else fail "$c EMAIL: line not shown"; fi
+  if t="$(wait_until 'pane | grep -qF "says: Check your email for a 6-digit code"' 180)"; then say "$c EMAIL: shown ${t}s"; else fail "$c EMAIL: line not shown"; fi
   code="$(selftest_code)"
   [[ -n "$code" ]] || { fail "$c: the selftest door gave no code"; return; }
   if [[ "$c" == busy ]]; then
     wait_until '! pane | grep -qE "esc to interrupt"' 200 >/dev/null
     sleep 3; busy 2 || { fail "$c: the second long command did not start"; show_tail; return; }
   fi
-  shown="$(count "Done.")"
+  shown="$(count "says: datastash: Done.")"
   local queued
   queued="$(cat "$h"/.claude/projects/*/*.jsonl 2>/dev/null | grep -c '"type":"queued_command"')"
   type_line "datastash sync $code"; code=""
@@ -170,10 +172,14 @@ PY
     if d="$(within "$t")"; then pass "$c CODE: signed in ${t}s after Enter (${d}s after the line was written)"
     else fail "$c CODE: signed in ${t}s after Enter (${d}s, over ${LIMIT}s)"; fi
   else fail "$c CODE: not signed in within 180 s"; show_tail; fi
-  if t="$(wait_until '[[ "$(count "Done.")" -gt '"$shown"' ]]' 180)"; then
+  if t="$(wait_until '[[ "$(count "says: datastash: Done.")" -gt '"$shown"' ]]' 180)"; then
     if d="$(within "$t")"; then pass "$c CODE: Done. shown ${t}s after Enter (${d}s after the line was written)"
     else fail "$c CODE: Done. shown ${t}s after Enter (${d}s, over ${LIMIT}s)"; fi
   else fail "$c CODE: Done. not shown within 180 s"; show_tail; fi
+  sleep 5  # the model's reply after the line (Claude Code's own "MCP server needs authentication" status is not ours)
+  if pane | grep -E "says:|^[[:space:]]*●" | grep -qiE "/mcp|Authenticate"; then
+    fail "$c: a hook or the model sent the person to /mcp or Authenticate"; pane | grep -E "says:|^[[:space:]]*●" | grep -iE "/mcp|Authenticate" | sed 's/^/    | /'
+  else pass "$c: no line sends the person to /mcp or Authenticate"; fi
   remove_all
   tmux kill-session -t "$T" 2>/dev/null
 }

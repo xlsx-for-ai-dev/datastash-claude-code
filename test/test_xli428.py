@@ -109,8 +109,10 @@ class LocalTime(unittest.TestCase):
             os.environ["DATASTASH_TZ"] = ds_tz
         time.tzset()
 
-    def test_a_utc_computer_shows_us_central(self):
+    def test_a_utc_computer_shows_utc_labelled(self):  # XLI-427: was US Central
         self.zone("UTC")
+        self.assertEqual(ds.est_when(self.T), "Sat 1:16 am UTC")
+        self.zone("Etc/UTC", ds_tz="America/Chicago")  # the person's own DATASTASH_TZ still wins
         self.assertEqual(ds.est_when(self.T), "Fri 7:16 pm CST")
 
     def test_the_computers_own_zone_and_the_named_one(self):
@@ -136,7 +138,7 @@ class LocalTime(unittest.TestCase):
             lines = out.getvalue()
         finally:
             ds.est_lookback, ds.est_spans = saved
-        m = re.search(r"done around (\w{3} \d{1,2}:\d\d (?:am|pm) C[SD]T)$", lines, re.M)
+        m = re.search(r"done around (\w{3} \d{1,2}:\d\d (?:am|pm) UTC)$", lines, re.M)
         self.assertIsNotNone(m, lines)
 
 

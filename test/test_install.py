@@ -2097,8 +2097,8 @@ class HomeFolderInstall(Base):
                          "answer, through the datastash plugin, sends agent notes). Nothing changed.")
         self.assertEqual(out["systemMessage"].count("\n"), 0)
 
-    def test_the_connector_line_is_the_mcp_authenticate_step(self):
-        self.assertEqual(ds.NO_CONNECTOR_LINE, "Type **/mcp**, pick datastash, choose Authenticate, then run **/datastash:install** again.")
+    def test_the_connector_line_is_the_typed_sign_in(self):
+        self.assertEqual(ds.NO_CONNECTOR_LINE, "Type **datastash sync you@email.com**, then **/datastash:install** again.")
         v, _ = self.slash("/datastash:install")
         self.assertIn(ds.NO_CONNECTOR_LINE, v["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn("Settings, Connectors", v["hookSpecificOutput"]["additionalContext"])

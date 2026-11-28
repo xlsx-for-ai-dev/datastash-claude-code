@@ -3753,14 +3753,19 @@ LOGIN_HINT = "A datastash page opened in your browser. Type the code shown there
 # 0.2.0: the plugin starts the sign-in itself and shows the person the link and code (SessionStart systemMessage); once
 # approved, a session that started signed out needs one reconnect of the connector (Claude Code 2.1.329 never redials a
 # connector that failed at its start on its own; /mcp reconnect re-runs the headersHelper). New sessions connect alone.
-RESTART_LINE = "datastash is signed in. Type /mcp reconnect all to connect it in this session; new sessions connect by themselves."
+# XLI-427 (owner 11-28, no /mcp step ever): after a sign-in the person sees only "Done."; the AI is told the datastash
+# command works now and new sessions connect by themselves, and never to send the person to /mcp.
+RESTART_LINE = "Done."
 CONNECT_LINE = RESTART_LINE
+NO_MCP_AI = ("The datastash command works now, and new sessions connect the datastash connector by themselves. Never ask "
+             "the person for /mcp, Authenticate or a reconnect; until the connector's tools are here, use the datastash "
+             "command.")
 AI_SHOWN_NOTE = (f"{SIGN_IN_NOTE}: this computer is not signed in to datastash yet, so the datastash connector is not "
                  "connected. The plugin itself has shown the person a sign-in link and code; there is nothing for you to "
                  "start. Run datastash login only if the person asks for the code again (it shows the same code, never a "
                  "second sign-in). Never ask the person for the code or any token. Once they approve, the datastash "
-                 "command works at once; the connector connects in new sessions, or in this one after the person types "
-                 "/mcp reconnect all.")
+                 "command works at once and new sessions connect the datastash connector by themselves. Never ask the "
+                 "person for /mcp, Authenticate or a reconnect.")
 AI_FALLBACK_NOTE = (f"{SIGN_IN_NOTE}: this computer is not signed in to datastash and the plugin could not start the "
                     "sign-in just now. Before the first datastash use, run datastash login and tell the person, in plain "
                     "words, what it says to do. Never ask the person for the code or any token.")
@@ -3768,9 +3773,7 @@ AI_LEGACY_NOTE = (f"{SIGN_IN_NOTE}: this computer's datastash connector still us
                   "working for now. The plugin itself has shown the person a link and code for the new sign-in; there is "
                   "nothing for you to start or repeat. Never ask the person for the code or any token, and never open or "
                   "approve the sign-in page yourself.")
-AI_CONNECT_NOTE = (f"{SIGN_IN_NOTE}: this computer is now signed in to datastash. The plugin told the person to type "
-                   "/mcp reconnect all so the datastash connector connects in this session; until then use the datastash "
-                   "command.")
+AI_CONNECT_NOTE = f"{SIGN_IN_NOTE}: this computer is now signed in to datastash. {NO_MCP_AI}"
 HOOK_START_SECONDS = 4  # a session-start or first-use hook waits at most this long for datastash to start a sign-in
 START_FAIL_GAP = 60  # after a failed start, hooks wait this long before trying again (a typed datastash login doesn't)
 BROWSER_EVERY = 24 * 3600  # hooks open the browser by themselves at most once a day; the link is always shown
@@ -4287,7 +4290,7 @@ def sign_in_followup(inp, uses_datastash):
         return None, None
     if _login_recorded():
         _drop(_signed_out_mark(sid))
-        return CONNECT_LINE, AI_CONNECT_NOTE
+        return (None if email_login() else CONNECT_LINE), AI_CONNECT_NOTE  # the emailed code already said "Done."
     if not uses_datastash or effective_signin() != SIGNIN_DEVICE:
         return None, None  # the legacy mode's connector still works: the session start's one line is enough
     mark = os.path.join(STATE, f"sign-in-use-sid-{sid}")
@@ -4318,12 +4321,12 @@ def _safe_followup(inp, uses, budget=HOOK_START_SECONDS + 1):
 
 
 IMPORTED_HINT_MARK = "imported-connector-hint"
-IMPORTED_HINT = "/mcp, pick datastash, choose Authenticate"
+IMPORTED_HINT = "ignore it"  # XLI-427: never send the person to /mcp; the plugin's own connector and command are the way
 
 
 def imported_connector_hint():
-    """Owner add-on (11-20): once per computer, ever: if Claude Code shows the datastash connector imported from claude.ai
-    as needing authentication, the AI tells the person how to sign it in. Never again after the first session."""
+    """Owner add-on (11-20), XLI-427: once per computer, ever: if Claude Code shows the datastash connector imported from
+    claude.ai as needing authentication, the AI ignores it and never sends the person there. Never again after that."""
     try:
         mark = os.path.join(STATE, IMPORTED_HINT_MARK)
         if os.path.exists(mark):
@@ -4331,7 +4334,9 @@ def imported_connector_hint():
         ensure_dirs()
         write_private(mark, json.dumps({"at": int(time.time())}))
         return (f'{SIGN_IN_NOTE} (said once): if /mcp shows a "claude.ai datastash" connector as needing authentication, '
-                f'tell the person once, in plain words: "{IMPORTED_HINT}". Otherwise say nothing about it.')
+                f'{IMPORTED_HINT}: it is not needed, and the plugin\'s own datastash connector and the datastash command '
+                "are the way in. Never tell the person about it and never ask them for /mcp, Authenticate or a "
+                "reconnect.")
     except Exception:
         return None
 
@@ -4749,6 +4754,7 @@ def cmd_doctor(_args):
         print("note: " + signin_doctor_line())
     except Exception:
         pass
+    print("note: time zone: " + EST_TZ_LINE)  # XLI-427
     try:
         print("note: " + chain_line())  # XLI-420: the desktop app's process chain, as the process table shows it
     except Exception:  # noqa: BLE001
@@ -6929,8 +6935,7 @@ def cmd_login(args):
     if args == ["--check"]:
         if signed_in():
             print("signed in: yes (this computer is signed in to datastash)")
-            print('if the datastash connector\'s tools are not in this session, tell the person in plain words: '
-                  f'"{RESTART_LINE}" (Claude Code connects a connector when a session starts, or on /mcp reconnect)')
+            print(f"if the datastash connector's tools are not in this session: {NO_MCP_AI}")
         elif _pending_live():
             print("signed in: waiting (the person has not approved the code yet)")
         else:
@@ -13850,7 +13855,7 @@ NOTE_FIELD = "datastash_note"  # the one field of a datastash tool answer an ins
 AGENT_ANSWER_RE = r"[A-Za-z0-9_\-]{43}"
 CMD_TOOL_RE = re.compile(r"mcp__.+__(ledger_agent_register|ledger_agent_key|ledger_agents_list|ledger_agents_note)")
 CMD_NOTE = "datastash note (install and uninstall; the plugin's own steps)"
-NO_CONNECTOR_LINE = "Type **/mcp**, pick datastash, choose Authenticate, then run **/datastash:install** again."  # XLI-390: one line
+NO_CONNECTOR_LINE = "Type **datastash sync you@email.com**, then **/datastash:install** again."  # XLI-427: no /mcp step
 MINT_LINE = 'datastash made a key for "{name}" (this session). datastash is on for "{name}".'
 ON_HEAD = "datastash is on for your agents:"
 REMOVE_LINE = "To remove one or many: **/datastash:uninstall** and we'll show you the list of agents."
@@ -14527,7 +14532,7 @@ SYNC_EMAIL_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(" + EMAIL_R
 SYNC_CODE_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(\d{6})\s*", re.I)
 EMAIL_CODE_LIFE = 600  # the emailed code works for 10 minutes
 LOGIN_STEP_KINDS = ("sync_email", "sync_code", "login_install", "login_uninstall")
-LOGIN_STEP_WAIT = 8.0  # the Stop hook (10 s) waits this long at most for the plugin's own step to finish
+LOGIN_STEP_WAIT = 25.0  # the Stop hook (30 s) waits this long at most for the plugin's own step to finish (XLI-427)
 SIGN_IN_FIRST_LINE = "Type **datastash sync you@email.com**"
 CHECK_EMAIL_LINE = "Check your email for a 6-digit code. Then type **datastash sync CODE** here."
 DONE_LINE = "Done."
@@ -14536,9 +14541,12 @@ NO_CODE_ASKED_LINE = "Not done: no code was asked for in this session. Type **da
 BAD_CODE_LINE = "Not done: that code is wrong or expired. Type **datastash sync you@email.com** for a new one."
 SIGN_IN_FAILED_LINE = "Not done: datastash could not be reached. Type **datastash sync you@email.com** again in a minute."
 LOGIN_STEP_AI = (f"{ONBOARD_NOTE}: the plugin does this step itself once it has checked the person typed it, and shows "
-                 "the person its own lines. Make no datastash calls and run no command for it; never repeat an email or a "
-                 "code. If you were in the middle of other work, carry on with it and say nothing about this line. "
-                 "Otherwise your whole reply is exactly this line, word for word (keep its bold): \"{line}\"")
+                 "the person its own lines itself, the result included (\"Done.\" or what went wrong). Make no datastash "
+                 "calls and run no command for it; never repeat an email or a code. Never ask the person for /mcp, "
+                 "Authenticate or a reconnect, and never say the connector needs signing in: the datastash command works "
+                 "as soon as the plugin says Done., and new sessions connect by themselves. If you were in the middle of "
+                 "other work, carry on with it and say nothing about this line. Otherwise your whole reply is exactly "
+                 "this line, word for word (keep its bold): \"{line}\"")
 CHECKING_CODE_LINE = "Checking the code."
 
 
@@ -14806,7 +14814,8 @@ def login_step_prompt(inp, shape, prompt):
         return None
     if email:
         ok = start_check(shape, "sync_email", prompt, {"email": email})
-        return (None, LOGIN_STEP_AI.format(line=CHECK_EMAIL_LINE), False) if ok else None
+        # XLI-427: the person's line comes from the hook itself (systemMessage), never only from the model
+        return (CHECK_EMAIL_LINE, LOGIN_STEP_AI.format(line=CHECK_EMAIL_LINE), False) if ok else None
     name, here = None, project_of(inp)
     try:
         kind, got = auto_name(here, this_session(inp), session_name=_session_name(inp))
@@ -14814,7 +14823,7 @@ def login_step_prompt(inp, shape, prompt):
     except SystemExit:
         name = None
     ok = start_check(shape, "sync_code", prompt, {"code": code, "name": name, "here": here})
-    return (None, LOGIN_STEP_AI.format(line=CHECKING_CODE_LINE), False) if ok else None
+    return (CHECKING_CODE_LINE, LOGIN_STEP_AI.format(line=CHECKING_CODE_LINE), False) if ok else None
 
 
 def login_step_verify(rec, pending=None):
@@ -19246,11 +19255,12 @@ def _step_bg(args):
 # The person's cards: only after their own typed **DDS estimates on** (kept for the whole account on datastash), each
 # estimated card gets ONE comment titled "DDS Development Time Estimate", edited in place, with this computer's own tracker
 # login (gh, LINEAR_API_KEY, JIRA_*); the actual and difference are added once the card is done.
+EST_TZ_LINE = "Times show in this computer's time zone; set DATASTASH_TZ (like America/New_York) to use another."
 EST_USAGE = ("usage: datastash estimate [CARD[=server|plugin|both] ...] [--parts server|plugin|both] [--lists] [--local] | "
              "estimate done CARD ...   (one best estimate per card from your own finished cards; several cards: a total and "
              "a done-around time in your own time; no card: the cards in progress; CARD=parts or --parts: what a new card "
              "will change, so it rests on cards like it, kept for the card; --lists: your tracker's build lists; done: "
-             "record a finished card's actual)")
+             "record a finished card's actual). " + EST_TZ_LINE)
 EST_HALF_LIFE_DAYS = 3.0  # how a team builds changes fast: newer cards weigh more
 EST_STAGE_GAP_HOURS = 3.0  # a card's work this far apart is a new stage
 EST_MIN_STAGE_MINUTES = 20.0  # less than this was only a look at the card, not work on it
@@ -19307,7 +19317,7 @@ EST_RECALC_BAD_DATE = ("Not done: that date is not one I can use. Type **DDS est
 EST_RECALC_FAILED = "Not done: this computer could not save it just now. Type it again in a minute."
 EST_SETUP_CHANGED = "Your setup changed. Type **DDS estimate recalc** to start estimates fresh."
 EST_SETUP_KEYS = ("claude_code", "model", "plugins", "subagents")
-EST_DEFAULT_ZONE = "America/Chicago"  # a computer on UTC (a server) shows US Central, as datastash's own days do
+EST_DEFAULT_ZONE = "UTC"  # XLI-427: a computer on UTC shows UTC, labelled (datastash keeps no account time zone)
 EST_UTC_NAMES = ("UTC", "UCT", "Universal", "Zulu", "Etc/UTC", "Etc/UCT", "Etc/Universal", "Etc/Zulu")
 
 
@@ -19648,13 +19658,14 @@ def est_card_parts(cards, named=None, every=None):
 
 def est_zone():
     """The person's time zone: DATASTASH_TZ when set, else this computer's own, except a computer on UTC (a server the
-    person reaches from elsewhere), which shows US Central as datastash's own days do. None: this computer's local."""
+    person reaches from elsewhere), which shows UTC with its label (XLI-427: never US Central; datastash keeps no time
+    zone for the account to use instead). None: this computer's local."""
     try:
         import zoneinfo
     except ImportError:
         return None
     for name in (os.environ.get("DATASTASH_TZ"),):
-        if isinstance(name, str) and name.strip():
+        if isinstance(name, str) and name.strip():  # the person's own override, kept
             try:
                 return zoneinfo.ZoneInfo(name.strip())
             except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
@@ -19830,6 +19841,33 @@ def est_setup(transcript=None, project=None):
     here = _est_names(os.path.join(project, ".claude", "agents"), ".md") if project else []
     out["subagents"] = sorted(set(subs or []) | set(here or []))  # no folder: none
     return out
+
+
+def est_setup_root(project, agent=None):
+    """XLI-427: the one folder whose .claude/agents both the prompt hook and `datastash estimate` read: the agent's own
+    linked folder that holds `project` (the deepest), else the nearest folder at or above `project` with .claude/agents
+    (never the home folder or "/"), else `project` itself. So a session's subfolder and its project root agree."""
+    if not project:
+        return project
+    here = os.path.realpath(project)
+    best = None
+    for p in (agent or {}).get("projects") or []:
+        rp = os.path.realpath(p) if isinstance(p, str) else None
+        if rp and _within(here, rp) and (best is None or len(rp) > len(best)):
+            best = rp
+    if best:
+        return best
+    d = here
+    while True:
+        if _home_or_root(d):
+            break
+        if os.path.isdir(os.path.join(d, ".claude", "agents")):
+            return d
+        up = os.path.dirname(d)
+        if up == d:
+            break
+        d = up
+    return here
 
 
 def est_setup_changed(aid, setup):
@@ -20302,7 +20340,7 @@ def _est_setup_note(inp):
             return ""
         tp = inp.get("transcript_path")
         tp = tp if isinstance(tp, str) and _transcript_ok(tp, inp.get("session_id"), cwd=inp.get("cwd")) else None
-        if est_setup_changed(agent["agent_id"], est_setup(tp, project_of(inp))):
+        if est_setup_changed(agent["agent_id"], est_setup(tp, est_setup_root(project_of(inp), agent))):
             return f" Also tell the person once, in these words: \"{EST_SETUP_CHANGED}\""
     except Exception as e:  # noqa: BLE001  never in the person's way
         log("status", f"estimate setup: {type(e).__name__}")
@@ -20450,7 +20488,7 @@ def cmd_estimate(args):
         for line in left:
             print(line)
     try:  # XLI-428: what this command can see of the setup (plugins, subagents); the prompt hook sees the rest
-        if aid and est_setup_changed(aid, est_setup(None, project_of({}))):
+        if aid and est_setup_changed(aid, est_setup(None, est_setup_root(project_of({}), agent or _own_agent({})))):
             print(f"Tell the person once, in these words: \"{EST_SETUP_CHANGED}\"")
     except Exception as e:  # noqa: BLE001
         log("status", f"estimate setup: {type(e).__name__}")
@@ -20611,6 +20649,11 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.30": (
+        "Never send the person to a connector sign-in or a reconnect: **datastash sync you@email.com** signs this "
+        "computer in, the plugin itself shows \"Done.\", and new sessions connect by themselves.",
+        "On a computer set to UTC, done-around times show UTC; DATASTASH_TZ sets another zone.",
+    ),
     "1.0.29": (
         "For a build list, name each new card's parts in the one call: **datastash estimate XLI-1=both XLI-2=plugin**; "
         "each card gets the same figure as alone (the parts a card was named with are kept for it).",
