@@ -31,8 +31,10 @@ FILES = ("LOGIN_FILE", "LOGIN_REFRESH_FILE", "LOGIN_ACCESS_FILE", "LOGIN_LOCK_FI
 class FleetKey(Base):
     def setUp(self):
         super().setUp()
-        self.saved = {k: getattr(ds, k) for k in FILES + ("VERIFY_WAIT", "_keychain_set", "setup_row_kick",
-                                                            "computer_signed_in")}
+        # XLI-441: added to Base's saved setup (never in place of it), so Base.tearDown still puts back _temp_roots,
+        # CONF and STATE for the test files run after this one (test_setup.py's TempAndSystem)
+        for k in FILES + ("VERIFY_WAIT", "_keychain_set", "setup_row_kick", "computer_signed_in"):
+            self.saved.setdefault(k, getattr(ds, k))
         for k in FILES:
             setattr(ds, k, os.path.join(ds.CONF, os.path.basename(getattr(ds, k))))
         ds.VERIFY_WAIT = 3

@@ -92,6 +92,17 @@ class Typed(DdsBase):
             self.assertEqual(ctx.count("web-app (this agent)"), 1)  # its own list once, not again under all agents
             self.assertNotIn(ds.DDS_UPDATE_ENDING, ctx)  # the ending line is for the automatic posts only
 
+    def test_xli441_new_fleet_joins_are_named_before_the_lists(self):
+        joins = ["New computer: **build-1 / agent** joined with fleet key **ci-fleet** on 2026-11-28 09:14 UTC.",
+                 "Not yours? Type **datastash fleet-key revoke ci-fleet** to stop that key and sign out every computer that joined with it."]
+        self.server["fleet_joins"] = joins + [{"bad": 1}, ""]
+        ctx = self.prompt("DDS update")
+        for j in joins:
+            self.assertIn(f"  - {j}", ctx)
+        self.assertLess(ctx.index("New computer: **build-1"), ctx.index("**web-app (this agent), 2 open:**"))
+        self.server["fleet_joins"] = []
+        self.assertNotIn("New computer:", self.prompt("DDS update"))
+
     def test_a_typed_update_never_asks_where_to_deliver(self):  # XLI-439: the question comes in a morning post only
         self.server["delivery"] = {"answer": None, "asked": False, "ask_now": False, "sent_to": ["session"]}
         self.assertNotIn(ds.DDS_DELIVER_QUESTION, self.prompt("DDS update"))

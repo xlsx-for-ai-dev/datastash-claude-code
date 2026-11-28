@@ -2873,6 +2873,10 @@ def cmd_check(_args):
             joined = " ".join(x for x in (joined, signed_out_self_line(inp)) if x) or None
         except Exception:  # noqa: BLE001
             pass
+        try:  # XLI-441: an encrypted sign-in systemd-creds can no longer open: one typed sign-in fixes it
+            joined = " ".join(x for x in (joined, creds_locked_line(inp)) if x) or None
+        except Exception:  # noqa: BLE001
+            pass
         try:
             got = session_sign_in(inp)
         except Exception:
@@ -6796,40 +6800,100 @@ KEY_PARENT_FLAG_RE = {
 }
 
 
+# XLI-441 (1.0.40 review LOW #4): the same guard also follows the forms the review found: a cd into the home folder (or
+# ~/.config) before a search of "." or of a relative path (`cd ~ && find .`); a folder above the home (`grep -r x /home`,
+# never "/" itself); the command inside `bash -c '...'`, `sh -c "..."` or `eval '...'`; and a variable set in the same
+# command line (`H=~; find $H`). The 1.0.36 rules stay: only words of the command line count.
+KEY_CMD_POS = r"(?:^|[;&|(\n{]|\bthen\b|\bdo\b|\belse\b)\s*"
+KEY_SHELL_C_RE = re.compile(
+    KEY_CMD_POS + r"(?:(?:sudo|command|nice|nohup|time|env|exec|xargs)\s+(?:-\S+\s+)*)*"
+    r"(?:(?:\S*/)?(?:ba|z|da|k|fi)?sh\s+(?:-[a-zA-Z]+\s+)*-[a-zA-Z]*c|eval)\s+('[^']*'|\"(?:[^\"\\\\]|\\\\.)*\")")
+KEY_ASSIGN_RE = re.compile(r"(?:^|[;&|(\n{\s])(?:(?:export|local|readonly|declare(?:\s+-\S+)*)\s+)?([A-Za-z_]\w*)="
+                           r"('[^']*'|\"[^\"]*\"|[^\s;&|()]*)")
+KEY_CD_RE = re.compile(r"^\s*(?:builtin\s+)?(?:cd|pushd)(?:\s+(?:-[LPe@]+\s+)*(\S+))?\s*$")
+KEY_DEFAULT_DOT = ("find", "ls", "tree", "grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "ugrep")
+
+
 def _key_parent_folders():
-    """The real home and its .config (each as written and real, lowercased): the folders that hold the key folder."""
-    out = set()
-    for d in (HOME, os.path.join(HOME, ".config"), os.environ.get("XDG_CONFIG_HOME") or ""):
+    """The folders that hold the key folder, each as written and real, lowercased, with how many levels below each the
+    key files are: the real home (3), its .config (2), and every folder above the home but "/" (3 and more)."""
+    out = {}
+
+    def put(d, need):
+        for f in (os.path.normpath(d), os.path.realpath(d)):
+            f = f.lower().rstrip("/") or "/"
+            if f != "/":
+                out[f] = max(out.get(f, 0), need)
+    for d, need in ((os.path.join(HOME, ".config"), 2), (os.environ.get("XDG_CONFIG_HOME") or "", 2)):
         if d and os.path.isabs(d):
-            for f in (os.path.normpath(d), os.path.realpath(d)):
-                out.add(f.lower().rstrip("/") or "/")
-    out.discard("/")
+            put(d, need)
+    if os.path.isabs(HOME):
+        up, need = os.path.normpath(HOME), 3
+        while up and up != "/":
+            put(up, need)
+            up, need = os.path.dirname(up), need + 1
     return out
 
 
-def _key_parent_search(command):
+def _key_assigned(t):
+    """The variables a command line sets for itself (NAME=value), as the shell would fill them in (a leading ~ too)."""
+    out = {}
+    for m in KEY_ASSIGN_RE.finditer(t):
+        v = m.group(2)
+        v = v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"" else v
+        v = re.sub(r"\$\{(\w+)\}|\$(\w+)", lambda x: out.get(x.group(1) or x.group(2), x.group(0)), v)
+        out[m.group(1)] = _key_expand(v)
+    return out
+
+
+def _key_parent_search(command, cwd=None, _depth=0):
     """True when a Bash or Monitor command copies or searches the home folder or ~/.config by name (exposure #4)."""
-    if not isinstance(command, str) or not command:
+    if not isinstance(command, str) or not command or _depth > 3:
         return False
     t = re.sub(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?(?:\n\s*\2\s*(?:\n|$)|$)", "\n", command, flags=re.S)  # here-docs
-    t = re.sub(r"'[^']*\s[^']*'|\"[^\"]*\s[^\"]*\"", " ", t)  # quoted sentences (a message, a pattern with spaces)
+    for m in KEY_SHELL_C_RE.finditer(t):  # XLI-441: the command a shell -c or an eval runs is a command line too
+        inner = m.group(1)[1:-1]
+        if m.group(1)[0] == '"':
+            inner = re.sub(r"\\(.)", r"\1", inner)
+        if _key_parent_search(inner, cwd, _depth + 1):
+            return True
+    t = re.sub(r"'[^']*\s[^']*'|\"[^\"]*\s[^\"]*\"", " _quoted_ ", t)  # quoted sentences (a message, a pattern with spaces)
+    own = _key_assigned(t)
+    if own:  # XLI-441: `H=~; find $H`
+        t = re.sub(r"\$\{(\w+)\}|\$(\w+)", lambda x: own.get(x.group(1) or x.group(2), x.group(0)), t)
     parents = _key_parent_folders()
-    for m in KEY_PARENT_CMD_RE.finditer(t):
-        cmd, rest = m.group(1).lower(), " " + m.group(2)
-        flag = KEY_PARENT_FLAG_RE.get("grep" if cmd.endswith("grep") else cmd)
-        if flag and not re.search(flag, rest):
+    here = None  # XLI-441: the folder a cd in this command line moved to (relative words count from there)
+    for seg in re.split(r"[;&|\n]+", t):
+        cd = KEY_CD_RE.match(re.sub(r"^[\s(){}]*(?:(?:then|do|else)\s+)?", "", seg).rstrip(" \t(){}"))
+        if cd:
+            to = cd.group(1)
+            if to is None or to == "~":
+                here = HOME
+            elif to != "-":
+                to = _key_expand(_key_norm(to))
+                base = here or (cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None)
+                here = to if os.path.isabs(to) else (os.path.join(base, to) if base else None)
             continue
-        depth = re.search(r"\s-maxdepth\s+(\d+)", rest) if cmd == "find" else None
-        for w in _key_words(_key_norm(rest)):
-            w = _key_expand(w)
-            if not os.path.isabs(w):
+        for m in KEY_PARENT_CMD_RE.finditer(seg + " "):
+            cmd, rest = m.group(1).lower(), " " + m.group(2)
+            flag = KEY_PARENT_FLAG_RE.get("grep" if cmd.endswith("grep") else cmd)
+            if flag and not re.search(flag, rest):
                 continue
-            for f in (os.path.normpath(w), os.path.realpath(w)):
-                f = f.lower().rstrip("/")
-                if f in parents:
+            depth = re.search(r"\s-maxdepth\s+(\d+)", rest) if cmd == "find" else None
+            words = [_key_expand(w) for w in _key_words(_key_norm(rest))]
+            if here is not None:
+                plain = [w for w in words if not w.startswith("-")]
+                if cmd in KEY_DEFAULT_DOT and (len(plain) <= (1 if cmd not in ("find", "ls", "tree") else 0)
+                                               or (cmd == "find" and words and words[0].startswith("-"))):
+                    words.append(".")  # these search "." when no folder is given
+                words = [w if os.path.isabs(w) else os.path.join(here, w) for w in words]
+            for w in words:
+                if not os.path.isabs(w):
+                    continue
+                for f in (os.path.normpath(w), os.path.realpath(w)):
+                    need = parents.get(f.lower().rstrip("/"))
                     # a shallow find never reaches the key files (3 levels below the home, 2 below ~/.config)
-                    need = 3 if f in (os.path.normpath(HOME).lower(), os.path.realpath(HOME).lower()) else 2
-                    if depth is None or int(depth.group(1)) >= need:
+                    if need is not None and (depth is None or int(depth.group(1)) >= need):
                         return True
     return False
 
@@ -6873,7 +6937,7 @@ def key_path_deny(inp):
         ancestors = name not in ("Bash", "Monitor")  # those two: a literal name only (see _key_text_deny)
         hit = any(_key_text_deny(x, cwd, roots, ancestors=ancestors) for x in _strings(args, []))
         if not ancestors and not hit:  # XLI-419 exposure #4: a search or copy of the home folder or ~/.config by name
-            hit = _key_parent_search(args.get("command"))
+            hit = _key_parent_search(args.get("command"), cwd)
     if not hit:
         return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
@@ -15542,6 +15606,12 @@ def dds_update_text(d, auto=False):
         if isinstance(m, dict):
             age = _clean(m.get("age"), 16)
             lines.append(f"  - **Missed 6 AM post:** {_clean(m.get('what'), 200)}" + (f" ({age} ago)" if age else ""))
+    # XLI-441: every computer that joined with a fleet key since the last DDS update (the server's lines: its name, when,
+    # the key's name, never the key), each its own line, before the lists
+    for j in d.get("fleet_joins") or [] if isinstance(d.get("fleet_joins"), list) else []:
+        j = _clean(j, 300) if isinstance(j, str) else ""
+        if j:
+            lines.append(f"  - {j}")
     own = d.get("own") if isinstance(d.get("own"), dict) else {}
     lines += _dds_list_lines(own, mine=True)
     others = [x for x in d.get("agents") or [] if isinstance(x, dict) and _fold(str(x.get("agent") or "")) != _fold(str(own.get("agent") or ""))]
@@ -16860,6 +16930,37 @@ def signed_out_self_line(inp):
         ensure_dirs()
         write_private(mark, json.dumps({"at": int(time.time())}))
     return SIGNED_OUT_SELF_LINE.format(why=got[0], day=got[1])
+
+
+# --- XLI-441 (1.0.40 review LOW #2): systemd-creds worked when the login was saved encrypted, and does not any more (the
+# tool removed, DATASTASH_NO_CREDS=1 set later, or the user's credential key lost). The file is still there, so the
+# login looks present, but no token comes back: say plainly, once per session, that one typed sign-in fixes it.
+CREDS_LOCKED_LINE = ("This computer's datastash sign-in is saved encrypted, and systemd-creds can't open it here any more. "
+                     "Type **datastash sync you@email.com** once to sign this computer in again.")
+
+
+def creds_locked():
+    """True when the login's refresh token is kept encrypted by systemd-creds and can't be decrypted here now."""
+    if read_json(LOGIN_FILE, {}).get("store") != "file":
+        return False
+    form = _read_key_file(LOGIN_REFRESH_FILE, REFRESH_RE, PERSON_SLUG, decrypt=False)
+    if not isinstance(form, str) or not form.startswith(CREDS_PREFIX):
+        return False
+    return _creds_decrypt(form) is None
+
+
+def creds_locked_line(inp):
+    """The session start's one line when creds_locked(), once per session."""
+    if not creds_locked():
+        return None
+    sid = _sid(inp)
+    if sid is not None:
+        mark = os.path.join(STATE, f"creds-locked-said-{sid}")
+        if os.path.exists(mark):
+            return None
+        ensure_dirs()
+        write_private(mark, json.dumps({"at": int(time.time())}))
+    return CREDS_LOCKED_LINE
 
 
 def signed_out_setup_rows(rows):
@@ -22629,6 +22730,12 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.41": (
+        "The DDS update names every computer that joined with a fleet key since the last one (its name, when, and the "
+        "key's name): show those lines as they are; only the person revokes a key (**datastash fleet-key revoke NAME**).",
+        "The key-folder guard also refuses a cd into the home folder or ~/.config before a search, a folder above the "
+        "home, the command inside sh -c or eval, and a variable set to the home in the same line.",
+    ),
     "1.0.40": (
         "The person can list this account's computers (**datastash computers**) and remove one for good (**datastash "
         "computer remove NAME**); both are their own typed lines, never yours. A signed-out computer says so at its next "

@@ -245,6 +245,34 @@ class FolderSearches(KeyBase):
                                       "content": "Run find ~ -name x, or grep -r foo ~/.config, or tar czf a.tgz ~.\n"},
                             self.project)
 
+    def test_xli441_wider_forms_are_refused(self):
+        """XLI-441 (1.0.40 review LOW #4): a cd into the home or ~/.config before a search of "." or a relative path, a
+        folder above the home (never "/"), the command inside sh -c or eval, and a variable set in the same line."""
+        above = os.path.dirname(HOME)
+        for cmd in ("cd ~ && find .", "cd && grep -r dsak_", "cd $HOME; grep -rn dsak_ .", "cd ~/.config && ls -R",
+                    "cd ~ && tar czf /tmp/a.tgz .", "cd ~ && cp -r .config /tmp/x", "(cd ~ && rg dsak_)",
+                    "cd /tmp && cd ~ && find . -type f", "if true; then cd ~; fi; find .",
+                    f"grep -r dsak_ {above}", f"find {above} -name '*.key'", f"tar czf /tmp/all.tgz {above}",
+                    "bash -c 'find ~'", "sh -c \"grep -r dsak_ $HOME\"", "/bin/bash -lc 'tar czf /tmp/a.tgz ~/.config'",
+                    "eval 'cp -r ~ /tmp/x'", "sudo bash -c 'find ~ -type f'",
+                    "H=~; find $H", "H=$HOME; grep -r x ${H}", "export D=~/.config; tar czf /tmp/a.tgz $D",
+                    "D=~/.config\nls -R $D"):
+            for name in ("Bash", "Monitor"):
+                with self.subTest(cmd=cmd, tool=name):
+                    self.assert_refused(name, {"command": cmd}, self.project)
+
+    def test_xli441_wider_forms_keep_ordinary_work(self):
+        """XLI-441 keeps 1.0.36's fixes and ordinary work: a cd elsewhere, a shallow find, a message naming the forms."""
+        for cmd in ("cd ~/code && find .", "cd ~/code/web-app && grep -rn foo .", "cd ~ && ls", "cd ~ && ls -la",
+                    "cd ~ && find . -maxdepth 2 -name x", "cd \"my folder\" && find .", "cd - && find .",
+                    "cd ~/code; cd web-app; grep -r foo", "find / -name x", "grep -r dsak_ /",
+                    "bash -c 'find ~/code -name x'", "git commit -m \"never run bash -c 'find ~' or H=~; find $H\"",
+                    "echo \"cd ~ && find .\"", "cat > n.md <<'EOF'\ncd ~ && find .\nbash -c 'find ~'\nEOF",
+                    "H=~/code; find $H -name x", "X=1; grep -r foo .", "grep -r do ~/code"):
+            for name in ("Bash", "Monitor"):
+                with self.subTest(cmd=cmd, tool=name):
+                    self.assert_allowed(name, {"command": cmd}, self.project)
+
     def test_a_search_with_no_folder_where_the_session_runs_above_it(self):
         self.assert_refused("Grep", {"pattern": "dsak_"})  # cwd HOME
         self.assert_refused("Grep", {"pattern": "dsak_"}, cwd=os.path.join(HOME, ".config"))

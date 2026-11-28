@@ -243,6 +243,39 @@ class Creds(FleetKey):
         self.assertEqual(ds.refresh_token(), REFRESH)
         self.assertTrue(ds.login_present())
 
+    def test_xli441_an_encrypted_sign_in_that_stops_opening_says_how_to_fix_it(self):
+        """XLI-441 (1.0.40 review LOW #2): systemd-creds stops working after an encrypted save: the session start says
+        plainly, once per session, that this computer needs datastash sync you@email.com once."""
+        ds._save_login(REFRESH, ACCESS, 900, LOGIN_ANSWER, GRANT)
+        ds._CREDS_SEEN.clear()
+        inp = {"session_id": "sess-creds-1"}
+        self.assertFalse(ds.creds_locked())  # still opens: nothing said
+        self.assertIsNone(ds.creds_locked_line(inp))
+        for how in ("baddecrypt", "gone", "off"):
+            with self.subTest(how=how):
+                ds._CREDS_SEEN.clear()
+                if how == "baddecrypt":
+                    os.environ["FAKE_CREDS_MODE"] = "baddecrypt"
+                elif how == "gone":
+                    os.environ["PATH"] = self.saved_path  # the tool removed
+                else:
+                    os.environ["DATASTASH_NO_CREDS"] = "1"
+                self.assertTrue(ds.login_present())  # the file is still there
+                self.assertTrue(ds.creds_locked())
+                sid = {"session_id": f"sess-creds-{how}"}
+                line = ds.creds_locked_line(sid)
+                self.assertEqual(line, ds.CREDS_LOCKED_LINE)
+                self.assertIn("**datastash sync you@email.com** once", line)
+                self.assertIsNone(ds.creds_locked_line(sid))  # once per session
+                os.environ.pop("FAKE_CREDS_MODE", None)
+                os.environ.pop("DATASTASH_NO_CREDS", None)
+                os.environ["PATH"] = self.bin + os.pathsep + self.saved_path
+        # A plain file, or the keychain, is never "locked".
+        ds.write_private(ds.LOGIN_REFRESH_FILE, REFRESH + "\n")
+        os.environ["DATASTASH_NO_CREDS"] = "1"
+        self.assertFalse(ds.creds_locked())
+        os.environ.pop("DATASTASH_NO_CREDS")
+
     def test_an_encrypted_file_that_no_longer_decrypts_reads_as_no_key(self):
         ds._save_login(REFRESH, ACCESS, 900, LOGIN_ANSWER, GRANT)
         ds._CREDS_SEEN.clear()
