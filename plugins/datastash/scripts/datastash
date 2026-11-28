@@ -726,6 +726,11 @@ def _forget_login():
 LOGIN_REFRESH_TIMEOUT = 5  # with the keychain read (3 s), inside the connector helper's 10 s
 LOGIN_LOCK_FILE = os.path.join(CONF, "login.lock")
 LOGIN_LOCK_WAIT = 2  # seconds another process of this computer may hold the refresh
+# XLI-434: the connector's helper waits longer. At a restart every session's helper, hook and listener wants a fresh
+# token at once (the 15-minute token has run out); the one that holds the lock may take the whole refresh (5 s), and a
+# helper that gave up after 2 s sent no token, so Claude Code marked the connector "needs authentication" and kept that
+# mark for 15 minutes (its mcp-needs-auth-cache.json): every new session in those 15 minutes skipped the connector.
+HELPER_LOCK_WAIT = 6.5
 LOGIN_DEADLINE = 8  # the whole refresh, lock and keychain included, starts its request only with time left to save the answer
 LOGIN_SAVE_RESERVE = 3  # seconds kept for saving the rotated refresh token after the answer
 
@@ -753,7 +758,7 @@ def _store_refresh(refresh):
         return False
 
 
-def login_token(force=False):
+def login_token(force=False, lock_wait=None):
     """A live access token of this computer's datastash login (refreshed within a minute of its end), or None: not
     signed in, signed out at datastash (then the local login is removed), or datastash can't be reached. Never printed
     or logged by this function.
@@ -774,7 +779,7 @@ def login_token(force=False):
     except OSError:
         return None
     try:
-        deadline = time.time() + LOGIN_LOCK_WAIT
+        deadline = time.time() + (LOGIN_LOCK_WAIT if lock_wait is None else lock_wait)
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2772,6 +2777,14 @@ def cmd_check(_args):
 
     waiting = {}  # XLI-408: the person's one short line about kept writes, set below
     me = this_session(inp)
+    try:  # XLI-434: which copy this session loaded (doctor), its connector's stale mark, and an older copy said once
+        record_session_plugin(me)
+        clear_connector_auth_mark()
+        older = new_session_line(inp, me)
+        if older:
+            upd = " ".join(x for x in (upd, older) if x)
+    except Exception:  # noqa: BLE001
+        pass
     project = project_of(inp)
     agent, warn = resolve(project, me=me)
     put_on_path()
@@ -4712,8 +4725,135 @@ def version_report(newest, on_disk, running=None):
                             "in a terminal, then restart Claude Code."),
                 ("fix", UPDATE_CMD)]
     if version_tuple(running) is not None and version_tuple(running) < version_tuple(have):
-        return [("note", first + " Restart Claude Code to finish the update.")]
+        return [("note", first + " " + NEW_SESSION_LINE.format(version=have))]
     return [("ok", first)]
+
+
+# ------------------------------------------------------------------ XLI-434: the connector after a sign-in or restart
+# Claude Code 2.1.332 keeps a "needs authentication" mark per MCP server in <config dir>/mcp-needs-auth-cache.json. For a
+# server with a headersHelper the mark lasts 15 minutes, and while it lasts EVERY new or resumed session skips that server
+# without running its helper ("Skipping connection (cached needs-auth)"), so the connector shows only its Authenticate
+# step although this computer is signed in. A session that started before the email-code sign-in (or a helper that could
+# not get a token in time) leaves that mark. A running session never takes the new header by itself: its connector stays
+# at "needs authentication" until /mcp reconnects it; a new session runs the helper again. So, once this computer is
+# signed in, the plugin removes its own connector's mark (only that one entry, nothing else in the file): at the sign-in,
+# at each session start and at each turn's end. The next session (new or resumed) connects with the computer's login.
+CONNECTOR_SERVER_KEY = "plugin:datastash:datastash"
+NEEDS_AUTH_CACHE = "mcp-needs-auth-cache.json"
+NEXT_SESSION_LINE = "The datastash command works now; the connector's tools come with your next session."
+NEW_SESSION_LINE = "Start a new session to use datastash {version}."
+
+
+def _claude_config_dirs():
+    """Claude Code's config folders this session may use: ~/.claude, and CLAUDE_CONFIG_DIR when Claude Code set it."""
+    dirs = [CLAUDE_DIR]
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if isinstance(env, str) and os.path.isabs(env) and os.path.realpath(env) != os.path.realpath(CLAUDE_DIR):
+        dirs.append(env)
+    return dirs
+
+
+def clear_connector_auth_mark(signed_in_now=None):
+    """Removes this plugin's connector from Claude Code's needs-auth cache, only while this computer has a datastash
+    login (else the mark is right). Touches no other entry; a file that is not this user's plain file is left alone.
+    True when an entry was removed. Never raises."""
+    try:
+        if not (login_present() if signed_in_now is None else signed_in_now):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    removed = False
+    for d in _claude_config_dirs():
+        p = os.path.join(d, NEEDS_AUTH_CACHE)
+        try:
+            st = os.lstat(p)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > (1 << 20):
+                continue
+            with open(p) as f:
+                data = json.loads(f.read())
+            if not isinstance(data, dict) or CONNECTOR_SERVER_KEY not in data:
+                continue
+            data.pop(CONNECTOR_SERVER_KEY, None)
+            tmp = f"{p}.datastash-{os.getpid()}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), stat.S_IMODE(st.st_mode))
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(data))
+            os.replace(tmp, p)
+            removed = True
+        except (OSError, ValueError):
+            _drop(f"{p}.datastash-{os.getpid()}.tmp")
+    return removed
+
+
+def _session_plugin_path(proc):
+    return os.path.join(STATE, f"session-plugin-{int(proc[0])}-{re.sub(r'[^A-Za-z0-9]', '_', str(proc[1]))[:40]}.json")
+
+
+def record_session_plugin(me):
+    """At session start (a hook runs from the plugin copy the session loaded): which version this Claude Code process
+    runs. Records of processes that are gone are dropped."""
+    if me is None or me.get("proc") is None or version_tuple(PLUGIN_VERSION) is None:
+        return
+    try:
+        ensure_dirs()
+        write_private(_session_plugin_path(me["proc"]), json.dumps({"version": PLUGIN_VERSION, "at": int(time.time())}))
+        for n in os.listdir(STATE):
+            m = re.fullmatch(r"session-plugin-(\d+)-.*\.json", n)
+            if m and int(m.group(1)) != int(me["proc"][0]) and not _alive(int(m.group(1))):
+                _drop(os.path.join(STATE, n))
+    except (OSError, ValueError):
+        pass
+
+
+def _in_use_version(pid):
+    """The version folder of datastash that holds Claude Code's in-use marker for this process (.in_use/<pid>), or None."""
+    for d in _claude_config_dirs():
+        base = os.path.join(d, "plugins", "cache", "datastash", "datastash")
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        found = [v for v in names if version_tuple(v) and os.path.lexists(os.path.join(base, v, ".in_use", str(pid)))]
+        if found:
+            return max(found, key=version_tuple)
+    return None
+
+
+def session_loaded_version(me=None):
+    """(version, how) of the plugin this Claude Code session actually loaded: its session start's own record, else
+    Claude Code's in-use marker; (None, None) when neither says (outside a session, or a session that started before
+    1.0.31)."""
+    try:
+        me = me or this_session()
+        if me.get("proc") is None:
+            return None, None
+        rec = read_json(_session_plugin_path(me["proc"]), {})
+        if version_tuple(rec.get("version")):
+            return rec["version"], "session"
+        v = _in_use_version(me["proc"][0])
+        return (v, "marker") if v else (None, None)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def new_session_line(inp, me):
+    """XLI-434: a session (often a resumed one) that runs an older copy than Claude Code has installed: the person's
+    one plain line, once per session, else None."""
+    disk = installed_version()
+    if not (version_tuple(disk) and version_tuple(PLUGIN_VERSION) and version_tuple(disk) > version_tuple(PLUGIN_VERSION)):
+        return None
+    sid = _sid(inp) or (me or {}).get("sid")
+    if not sid:
+        return None
+    mark = os.path.join(STATE, f"new-session-told-{sid}")
+    if os.path.exists(mark):
+        return None
+    try:
+        ensure_dirs()
+        write_private(mark, json.dumps({"at": int(time.time()), "version": disk}))
+    except OSError:
+        return None
+    return NEW_SESSION_LINE.format(version=disk)
 
 
 def cmd_doctor(_args):
@@ -4761,7 +4901,12 @@ def cmd_doctor(_args):
         pass
     print(_listener_line(project, me))
     try:
-        vlines = version_report(published_version(), installed_version())
+        loaded, how = session_loaded_version(me)
+        vlines = version_report(published_version(), installed_version(), loaded)
+        if loaded is None and os.environ.get("CLAUDE_CODE_SESSION_ID"):
+            vlines = [(k, t.replace(f"this session runs datastash {PLUGIN_VERSION or 'unknown'}",
+                                    f"this copy is datastash {PLUGIN_VERSION or 'unknown'} (the session's own version is "
+                                    "not on record)", 1)) for k, t in vlines]
     except Exception:  # noqa: BLE001
         vlines = []
     for kind, text in vlines:
@@ -7129,7 +7274,7 @@ def cmd_token(args):
             except BaseException:
                 head = None if not os.path.exists(PRIVATE_PATH) else {"Authorization": f"Bearer {SIGNED_OUT_BEARER}"}
             if head is None:
-                tok = login_token()
+                tok = login_token(lock_wait=HELPER_LOCK_WAIT)
         else:
             print("datastash token --header gives a token only to the datastash connector (Claude Code's headersHelper), "
                   "never to a terminal or a tool call", file=sys.stderr)
@@ -10109,6 +10254,10 @@ def material_change(agent, here, sid, start, inp):
 
 def cmd_status_check(_args):
     """Stop hook: never breaks the session."""
+    try:
+        clear_connector_auth_mark()  # XLI-434: the next session connects with this computer's login
+    except Exception:  # noqa: BLE001
+        pass
     try:
         return _status_check()
     except Exception as e:
@@ -14546,7 +14695,8 @@ LOGIN_STEP_AI = (f"{ONBOARD_NOTE}: the plugin does this step itself once it has 
                  "the person its own lines itself, the result included (\"Done.\" or what went wrong). Make no datastash "
                  "calls and run no command for it; never repeat an email or a code. Never ask the person for /mcp, "
                  "Authenticate or a reconnect, and never say the connector needs signing in: the datastash command works "
-                 "as soon as the plugin says Done., and new sessions connect by themselves. If you were in the middle of "
+                 "as soon as the plugin says Done., this session's connector tools come with the next session, and new "
+                 "and resumed sessions connect by themselves. If you were in the middle of "
                  "other work, carry on with it and say nothing about this line. Otherwise your whole reply is exactly "
                  "this line, word for word (keep its bold): \"{line}\"")
 CHECKING_CODE_LINE = "Checking the code."
@@ -14685,9 +14835,12 @@ def email_sign_in_code(sid, code, name, here):
     if not _pick_up_login(req["waiting"]):
         return [SIGN_IN_FAILED_LINE]
     login_typed_sync()
+    clear_connector_auth_mark(True)  # XLI-434: new and resumed sessions connect with this login, no /mcp step
     if not name:
-        return [DONE_LINE + " This computer is signed in. Type **/datastash:install** in an agent's folder."]
-    return [login_install(name, here)]
+        return [DONE_LINE + " This computer is signed in. " + NEXT_SESSION_LINE
+                + " Type **/datastash:install** in an agent's folder."]
+    line = login_install(name, here)
+    return [line + " " + NEXT_SESSION_LINE if line == DONE_LINE else line]
 
 
 def login_install(name, here):
@@ -15197,12 +15350,27 @@ _SAY = "The plugin adds every secret and proof itself. Never send a code_challen
 RELAY_AI = (f"{CMD_NOTE}: the plugin's final result. Make no more datastash calls. Your whole reply is exactly the text "
             "between the two lines below, word for word, with nothing before or after it: no step narration, no summary, "
             "no \"the plugin says\".\n----\n{text}\n----")
-INSTALL_AI = (f"{CMD_NOTE}: the person typed the datastash install command. In this turn make exactly these datastash "
-              "connector calls, in order, and nothing else: {steps}ledger_agents_list; then ledger_agents_note with kind "
-              f'"install". {_SAY} If no datastash connector tool is there, tell the person exactly: "{NO_CONNECTOR_LINE}"')
+# XLI-434: in the desktop app's Code tab (and any session with many tools) the connector's tools are deferred: listed by
+# name only until ToolSearch loads them. The install once said "not connected" when they were only deferred.
+CONNECTOR_PREFIX = "mcp__plugin_datastash_datastash__"
+
+
+def load_tools_ai(*tools):
+    """The step that loads the connector's deferred tools (named in full) before anything decides they are missing."""
+    return ("If the datastash connector's tools are not in your tool list yet, load them first with ToolSearch, query "
+            "\"select:" + ",".join(CONNECTOR_PREFIX + t for t in tools) + "\"; the connector is missing only when "
+            "ToolSearch finds none of them.")
+
+
+LOAD_TOOLS_AI = load_tools_ai("ledger_agents_list", "ledger_agents_note")
+INSTALL_AI = (f"{CMD_NOTE}: the person typed the datastash install command. {{load}} In this turn make exactly "
+              "these datastash connector calls, in order, and nothing else: {steps}ledger_agents_list; then "
+              f'ledger_agents_note with kind "install". {_SAY} If no datastash connector tool is there even after '
+              f'ToolSearch, tell the person exactly: "{NO_CONNECTOR_LINE}"')
 INSTALL_KEY_STEPS = ('ledger_agent_register with name "{name}"; then ledger_agent_key with that name, the agent_id it '
                      "answered and only_if_no_key true; then ")
-UNINSTALL_LIST_AI = (f"{CMD_NOTE}: the person typed the datastash uninstall command. Call the datastash connector's "
+UNINSTALL_LIST_AI = (f"{CMD_NOTE}: the person typed the datastash uninstall command. {LOAD_TOOLS_AI} Call the "
+                     "datastash connector's "
                      f"ledger_agents_list once, then stop and wait for the person's answer. {_SAY}")
 UNINSTALL_NOTE_AI = (f"{CMD_NOTE}: the person picked datastash agents to remove. {{list}}Call the datastash connector's "
                      f'ledger_agents_note once with kind "uninstall". {_SAY}')
@@ -15210,7 +15378,8 @@ PICK_REFUSED_AI = (f"{CMD_NOTE}: the plugin refused the person's names and remov
                    "Make no more datastash calls. Say only: \"Nothing was removed.\" Never say an agent is listed, ready, "
                    "picked or about to be removed, and never say datastash did or did not run a step.")
 VIS_AI = (f'{CMD_NOTE}: the person typed "make <name> {{kind}}" (one of their datastash agents\' private or public). '
-          "Call the datastash connector's ledger_agents_list once, then stop: the plugin says the next step. " + _SAY)
+          + LOAD_TOOLS_AI + " Call the datastash connector's ledger_agents_list once, then stop: the plugin says the next "
+          "step. " + _SAY)
 VIS_NOTE_AI = (f"{CMD_NOTE}: the person's agent is on the list. Call the datastash connector's ledger_agents_note once "
                f'with kind "{{kind}}". {_SAY}')
 VIS_NOT_AGENT_AI = (f"{CMD_NOTE}: none of the person's datastash agents has that name, so datastash changed nothing. "
@@ -15976,7 +16145,8 @@ def command_prompt(inp):
         save_cmd(sid, dict(base, kind="install", name=name, here=here))
         hours_kick()  # 1.0.18: the person's own hours, counted here in the background while the install runs
         steps = "" if own is not None and read_agent_answer(own["slug"]) else INSTALL_KEY_STEPS.format(name=name)
-        return None, INSTALL_AI.format(steps=steps), False
+        tools = (("ledger_agent_register", "ledger_agent_key") if steps else ()) + ("ledger_agents_list", "ledger_agents_note")
+        return None, INSTALL_AI.format(steps=steps, load=load_tools_ai(*tools)), False
     if m:
         save_cmd(sid, dict(base, kind="uninstall", picks=m.group(1) or "", rest=email_login()))
         return _login_uninstall_step(shape, prompt) if email_login() else (None, UNINSTALL_LIST_AI, False)
@@ -20657,6 +20827,13 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.31": (
+        "After the email-code sign-in, new and resumed sessions get the datastash connector with no /mcp step; the "
+        "session that signed in uses the datastash command until its next session.",
+        "Before saying the datastash connector is missing, load its tools with ToolSearch (they may only be deferred).",
+        "A session running an older datastash than the one installed says once: \"Start a new session to use datastash "
+        "X.\" doctor names the version this session loaded.",
+    ),
     "1.0.30": (
         "Never send the person to a connector sign-in or a reconnect: **datastash sync you@email.com** signs this "
         "computer in, the plugin itself shows \"Done.\", and new sessions connect by themselves.",

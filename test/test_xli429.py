@@ -81,10 +81,10 @@ class VersionReport(unittest.TestCase):
         self.assertIn("restart Claude Code", got[1][1])
         self.assertEqual(got[2], ("fix", FIX))
 
-    def test_installed_newer_than_running_says_restart(self):
+    def test_installed_newer_than_running_says_restart(self):  # XLI-434: the new session line
         got = ds.version_report("1.0.27", "1.0.27", "1.0.24")
         self.assertEqual(got, [("note", "version: this session runs datastash 1.0.24; installed: 1.0.27; newest: "
-                                        "1.0.27. Restart Claude Code to finish the update.")])
+                                        "1.0.27. Start a new session to use datastash 1.0.27.")])
 
     def test_newest_unknown_is_only_a_note(self):
         got = ds.version_report(None, "1.0.24", "1.0.24")

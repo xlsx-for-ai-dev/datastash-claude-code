@@ -152,7 +152,7 @@ class NoMcpForThePerson(test_email_signin.EmailSignIn):
         self.assertEqual(v["systemMessage"], ds.CHECKING_CODE_LINE)
         self.assertIn("Never ask the person for /mcp", v["hookSpecificOutput"]["additionalContext"])
         self.check(pid)
-        self.assertEqual(self.stop()["systemMessage"], "datastash: Done.")
+        self.assertEqual(self.stop()["systemMessage"], "datastash: Done. " + ds.NEXT_SESSION_LINE)  # XLI-434
 
     def test_the_turns_end_never_waits_on_a_line_typed_while_it_runs(self):
         """The real e2e run (Claude Code 2.1.332): a CODE typed during the EMAIL turn's Stop hook is written only once

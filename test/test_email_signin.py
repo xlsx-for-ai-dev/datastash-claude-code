@@ -127,7 +127,7 @@ class EmailSignIn(Base):
         self.assertEqual(ds.read_key("web-app"), KEY)
         self.assertEqual(ds.read_agent_answer("web-app"), ANSWER)
         self.assertEqual(ds.read_json(ds.conf_path("web-app"), {}).get("workbook_id"), WB)
-        self.assertEqual(self.stop()["systemMessage"], "datastash: Done.")
+        self.assertEqual(self.stop()["systemMessage"], "datastash: Done. " + ds.NEXT_SESSION_LINE)  # XLI-434
         self.assertFalse(os.path.exists(ds._code_req_path("s1")))  # the code request is spent
 
     def test_name_taken_is_one_plain_line(self):

@@ -87,7 +87,7 @@ class BusySession(EmailSignIn):
         self.assertTrue(self.code_sent())
         self.assertEqual(self.calls[2][3], {"device_code": CODE_REQ, "code": "482913"})
         self.assertTrue(ds.email_login())
-        self.assertEqual(self.tool_hook()["systemMessage"], "datastash: Done.")  # at the next tool call
+        self.assertEqual(self.tool_hook()["systemMessage"], "datastash: Done. " + ds.NEXT_SESSION_LINE)  # XLI-434  # at the next tool call
         self.assertNotIn("systemMessage", self.stop() or {})  # shown once
 
     def test_midturn_line_written_after_the_tool_call_ends_signs_in_without_a_model_step(self):
@@ -103,7 +103,7 @@ class BusySession(EmailSignIn):
         self.assertLess(took, 1.6 + 1.5, "the code went out more than 1.5 s after Claude Code wrote the line")
         with open(self.transcript("s1")) as f:
             self.assertFalse(any(json.loads(x).get("type") == "assistant" for x in f))  # no model step anywhere
-        self.assertEqual(self.tool_hook()["systemMessage"], "datastash: Done.")
+        self.assertEqual(self.tool_hook()["systemMessage"], "datastash: Done. " + ds.NEXT_SESSION_LINE)  # XLI-434
 
     def test_one_typed_line_is_used_once(self):
         running = self.email_sent()
