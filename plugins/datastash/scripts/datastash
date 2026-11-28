@@ -4744,13 +4744,9 @@ NEXT_SESSION_LINE = "The datastash command works now; the connector's tools come
 NEW_SESSION_LINE = "Start a new session to use datastash {version}."
 
 
-def _claude_config_dirs():
-    """Claude Code's config folders this session may use: ~/.claude, and CLAUDE_CONFIG_DIR when Claude Code set it."""
-    dirs = [CLAUDE_DIR]
-    env = os.environ.get("CLAUDE_CONFIG_DIR")
-    if isinstance(env, str) and os.path.isabs(env) and os.path.realpath(env) != os.path.realpath(CLAUDE_DIR):
-        dirs.append(env)
-    return dirs
+def _claude_dirs():
+    """Claude Code's config folder: ~/.claude only (the plugin reads no Claude Code env path)."""
+    return [CLAUDE_DIR]
 
 
 def clear_connector_auth_mark(signed_in_now=None):
@@ -4763,7 +4759,7 @@ def clear_connector_auth_mark(signed_in_now=None):
     except Exception:  # noqa: BLE001
         return False
     removed = False
-    for d in _claude_config_dirs():
+    for d in _claude_dirs():
         p = os.path.join(d, NEEDS_AUTH_CACHE)
         try:
             st = os.lstat(p)
@@ -4807,7 +4803,7 @@ def record_session_plugin(me):
 
 def _in_use_version(pid):
     """The version folder of datastash that holds Claude Code's in-use marker for this process (.in_use/<pid>), or None."""
-    for d in _claude_config_dirs():
+    for d in _claude_dirs():
         base = os.path.join(d, "plugins", "cache", "datastash", "datastash")
         try:
             names = os.listdir(base)
@@ -20828,7 +20824,7 @@ FULL_DDS = (
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
     "1.0.31": (
-        "After the email-code sign-in, new and resumed sessions get the datastash connector with no /mcp step; the "
+        "After the email-code sign-in, new and resumed sessions get the datastash connector by themselves; the "
         "session that signed in uses the datastash command until its next session.",
         "Before saying the datastash connector is missing, load its tools with ToolSearch (they may only be deferred).",
         "A session running an older datastash than the one installed says once: \"Start a new session to use datastash "

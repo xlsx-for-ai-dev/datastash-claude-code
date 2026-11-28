@@ -185,23 +185,23 @@ class Recording(PrivateBase):
 
 class TokenHelper(PrivateBase):
     def test_an_ordinary_folder_gets_the_login_token(self):
-        ds.login_token = lambda force=False: "dsat_" + "p" * 40
+        ds.login_token = lambda force=False, lock_wait=None: "dsat_" + "p" * 40
         self.assertEqual(self.token(), {"Authorization": "Bearer dsat_" + "p" * 40})
 
     def test_a_private_folder_gets_the_agents_own_key(self):
-        ds.login_token = lambda force=False: "dsat_" + "p" * 40
+        ds.login_token = lambda force=False, lock_wait=None: "dsat_" + "p" * 40
         self.make_private()
         ds.read_key = lambda s: "ldgr_ag_" + "k" * 40
         self.assertEqual(self.token(), {"Authorization": "Bearer ldgr_ag_" + "k" * 40})
 
     def test_a_private_folder_with_no_key_never_gets_the_login(self):
-        ds.login_token = lambda force=False: "dsat_" + "p" * 40
+        ds.login_token = lambda force=False, lock_wait=None: "dsat_" + "p" * 40
         self.make_private()
         ds.read_key = lambda s: None
         self.assertEqual(self.token(), {"Authorization": f"Bearer {ds.SIGNED_OUT_BEARER}"})
 
     def test_the_hook_denies_the_connector_in_a_private_folder_when_the_helper_had_no_folder(self):
-        ds.login_token = lambda force=False: "dsat_" + "p" * 40
+        ds.login_token = lambda force=False, lock_wait=None: "dsat_" + "p" * 40
         self.make_private()
         self.assertEqual(self.token(folder=None), {"Authorization": "Bearer dsat_" + "p" * 40})  # the plugin's own folder
         os.environ["CLAUDE_PROJECT_DIR"] = self.folder
