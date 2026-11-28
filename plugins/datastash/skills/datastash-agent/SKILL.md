@@ -49,7 +49,7 @@ The person sets datastash up with `/datastash:install` (in the desktop app's Cod
 - When the plugin's note gives the result of an install or uninstall, your whole reply is that text, word for word. Never narrate the steps ("goes last", "will confirm", "the plugin will show the result").
 - You never register yourself, never get your own first key and never install or remove another agent on your own. Never tell the person to run a sign-in command; the one step is `/datastash:install`.
 - "Am I set up?", "is datastash on here?": run `datastash check` and say what it prints. Never answer it with a connector tool.
-- If no datastash connector tool is there, tell the person exactly: "Type **datastash sync you@email.com**, then **/datastash:install** again." If the person says an email can't be typed here, **datastash sync me** uses the email this computer already knows. Never ask the person for /mcp, Authenticate or a reconnect, and ignore a "claude.ai datastash" connector that shows as needing authentication.
+- If no datastash connector tool is there, tell the person exactly: "Type **datastash sync you@email.com**, then **/datastash:install** again." If the person says an email can't be typed here, **datastash sync me** uses the email this computer signed in to datastash with before. Never ask the person for /mcp, Authenticate or a reconnect, and ignore a "claude.ai datastash" connector that shows as needing authentication.
 
 ## A new key on this computer (only when the person says so)
 

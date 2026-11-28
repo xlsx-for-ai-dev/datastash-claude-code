@@ -80,14 +80,17 @@ def framed_inner(text):
     return lines[i + 1:j]
 
 
-DESKTOP_PATCHED = ("_on_mac", "_hook_ppid", "_proc_row", "_codesign_ok", "_codesign_many", "_app_env_bad")
+DESKTOP_PATCHED = ("_on_mac", "_hook_ppid", "_proc_row", "_codesign_ok", "_codesign_many", "_ps")
 REAL_DESKTOP = {k: getattr(ds, k) for k in DESKTOP_PATCHED}
+DESKTOP_APP_VERSION = "6.28899.6"  # SPM's recorded Code-tab environment
 
 
-def desktop_table(test, name, env_bad=False, unsigned=()):
+def desktop_table(test, name, env_bad=False, unsigned=(), env=None, unsigned_paths=()):
     """XLI-420 part 2: the hooks run on "macOS" and see this process table (test/fixtures/desktop-process-chains.json,
-    read by pid) and a codesign that passes only the real Anthropic-signed paths and the processes running them. None:
-    a table that can't be read."""
+    read by pid), a codesign that passes only the real Anthropic-signed paths and the processes running them, and a
+    ps -E that shows each process's arguments then its environment. env: {pid: words, or an exception to raise}
+    replacing a process's environment; env_bad: the app's environment also has ELECTRON_RUN_AS_NODE. None: a table that
+    can't be read."""
     with open(os.path.join(HERE, "fixtures", "desktop-process-chains.json")) as f:
         fx = json.load(f)
     saved = {k: getattr(ds, k) for k in DESKTOP_PATCHED}
@@ -104,18 +107,36 @@ def desktop_table(test, name, env_bad=False, unsigned=()):
         return ds.HOME + x[1:] if x.startswith("~") else x
     rows = {int(k): (v[0], home(v[1]), [home(a) for a in v[2]], True) for k, v in tb["rows"].items()}
     bad = set(tb.get("unsigned", ())) | set(unsigned)
-    signed = fx["signed"]["paths"]
+    signed = {home(k): v for k, v in fx["signed"]["paths"].items()}
+    bad_paths = {home(x) for x in unsigned_paths}
+    envs = {int(k): v for k, v in tb.get("env", {}).items()}
+    envs.update(env or {})
 
     def codesign(target, ident=None):
         if isinstance(target, int):
             if target in bad or target not in rows:
                 return False
             target = rows[target][1]
-        return target in signed and (ident is None or signed[target] == ident)
+        return target in signed and target not in bad_paths and (ident is None or signed[target] == ident)
+
+    def ps(args, timeout=3):
+        pid = int(args[-1])
+        if "-E" not in args or pid not in rows:
+            return ""
+        got = envs.get(pid)
+        if isinstance(got, BaseException):
+            raise got
+        if got is None:
+            got = f"HOME={ds.HOME} USER=tester"
+            if os.path.basename(rows[pid][1]) == "claude":
+                got += f" CLAUDE_CODE_ENTRYPOINT=claude-desktop CLAUDE_CODE_DESKTOP_APP_VERSION={DESKTOP_APP_VERSION}"
+        if env_bad and rows[pid][1] == ds.DESKTOP_APP_EXE:
+            got += " ELECTRON_RUN_AS_NODE=1"
+        return " ".join(rows[pid][2]) + (" " + got if got else "") + "\n"
     ds._hook_ppid = lambda: tb["start"]
     ds._proc_row = lambda pid: rows.get(pid)
     ds._codesign_ok = codesign
-    ds._app_env_bad = lambda pid: env_bad
+    ds._ps = ps
     return rows
 
 

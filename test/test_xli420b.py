@@ -4,8 +4,10 @@
   tag block naming /install, only for the datastash install and uninstall commands, only with the same arguments, and
   only where the hook proved the desktop app from the signed process table (test/fixtures/desktop-process-chains.json).
 - The plain-text trigger "install datastash" (the person's typed line, terminal or Code tab).
-- "datastash sync me": the email this computer already knows (its own earlier email sign-in, else the Claude login's
-  account email), with the same typed proof; with none known, one plain line and nothing tried.
+- "datastash sync me": only the email datastash itself holds (this computer's earlier datastash email sign-in), with
+  the same typed proof; with none known, one plain line and nothing tried. Claude Code's ~/.claude.json is never read.
+- Cycle 2: the claude-code binary's own signature, the Code tab's launch options and environment marker, and an app
+  environment that can't be read all refuse; "install datastash plugin" never names the agent "plugin".
 No network; a throwaway HOME and config folder, enforced by test/harness.py.
 Run: python3 -I test/test_xli420b.py"""
 import io
@@ -177,6 +179,9 @@ class CodeTabEmailLogin(test_email_signin.EmailSignIn):
 
 
 class SyncMe(test_email_signin.EmailSignIn):
+    """"datastash sync me" uses only the email datastash itself holds (login.email.json from an earlier datastash
+    sign-in). Claude Code's own ~/.claude.json (its oauthAccount) is never read for it."""
+
     def setUp(self):
         super().setUp()
         self.saved_cfg = ds.CLAUDE_USER_CONFIG
@@ -188,15 +193,49 @@ class SyncMe(test_email_signin.EmailSignIn):
         with open(ds.CLAUDE_USER_CONFIG, "w") as f:
             json.dump({"oauthAccount": {"emailAddress": email, "accountUuid": "x"}}, f)
 
+    def saved_email(self, email):
+        """The plugin's own record of an earlier datastash email sign-in on this computer."""
+        ds.ensure_dirs()
+        ds.write_private(ds.EMAIL_LOGIN_FILE, json.dumps({"at": int(time.time()), "email": email}))
+
     def test_nothing_known_says_one_line_and_tries_nothing(self):
         v, _pid = self.prompt("datastash sync me")
         self.assertEqual(v["decision"], "block")
-        self.assertIn("datastash sync you@email.com", v["reason"])
-        self.assertIn("datastash sync me", v["reason"])
+        self.assertEqual(ds.SYNC_ME_UNKNOWN_LINE, "This computer needs **datastash sync you@email.com** once.")
+        self.assertEqual(v["reason"], 'This computer needs "datastash sync you@email.com" once.')
         self.assertEqual((self.calls, self.spawned), ([], []))
 
-    def test_the_claude_login_email_is_used_with_the_typed_proof(self):
+    def test_the_claude_login_email_is_never_used(self):
+        """A Claude login email in ~/.claude.json, no datastash email: the plain line, nothing sent, the file unread."""
         self.claude_login("Tester@Example.com")
+        import builtins
+        real_open, opened = builtins.open, []
+
+        def spy(f, *a, **k):
+            opened.append(os.path.abspath(f) if isinstance(f, str) else f)
+            return real_open(f, *a, **k)
+        builtins.open = spy
+        try:
+            self.assertIsNone(ds.known_email())
+            v, _pid = self.prompt("datastash sync me")
+        finally:
+            builtins.open = real_open
+        self.assertNotIn(os.path.abspath(ds.CLAUDE_USER_CONFIG), opened)
+        self.assertEqual(ds.SYNC_ME_UNKNOWN_LINE, "This computer needs **datastash sync you@email.com** once.")
+        self.assertEqual(v["reason"], 'This computer needs "datastash sync you@email.com" once.')
+        self.assertEqual((self.calls, self.spawned), ([], []))
+
+    def test_no_read_of_claude_code_account_remains(self):
+        import inspect
+        src = inspect.getsource(ds.known_email)
+        self.assertNotIn("CLAUDE_USER_CONFIG", src)
+        self.assertNotIn(".claude.json", src)
+        with open(ds.__file__) as f:
+            self.assertNotIn("oauthAccount", f.read())
+
+    def test_the_saved_datastash_email_is_used_with_the_typed_proof(self):
+        self.saved_email("Tester@Example.com")
+        self.claude_login("other@example.org")
         v, pid = self.prompt("datastash sync me")
         ai = v["hookSpecificOutput"]["additionalContext"]
         self.assertIn("t***@example.com", ai)
@@ -206,7 +245,7 @@ class SyncMe(test_email_signin.EmailSignIn):
         self.assertEqual(self.paths(), [ds.EMAIL_WAIT_PATH, ds.EMAIL_START_PATH])
         self.assertEqual(self.calls[1][3]["email"], EMAIL)
 
-    def test_the_earlier_sign_in_email_wins_and_is_kept_after_the_code(self):
+    def test_the_earlier_sign_in_email_is_kept_after_the_code(self):
         self.signed_in_by_code()
         self.assertEqual(ds.read_json(ds.EMAIL_LOGIN_FILE, {}).get("email"), EMAIL)
         self.assertEqual(oct(os.stat(ds.EMAIL_LOGIN_FILE).st_mode & 0o777), "0o600")
@@ -219,14 +258,14 @@ class SyncMe(test_email_signin.EmailSignIn):
         self.assertEqual(self.calls[before + 1][3]["email"], EMAIL)
 
     def test_not_typed_by_the_person_sends_nothing(self):
-        self.claude_login(EMAIL)
+        self.saved_email(EMAIL)
         for source in ("sdk", "system"):
             _v, pid = self.prompt("datastash sync me", source=source)
             self.check(pid)
         self.assertEqual(self.calls, [])
 
     def test_code_tab_line_passes_only_on_the_signed_chain(self):
-        self.claude_login(EMAIL)
+        self.saved_email(EMAIL)
         for chain, ok in (("code_tab", True), ("headless_p", False), ("fake_app_folder", False), ("setsid", False)):
             desktop_table(self, chain)
             before = len(self.calls)
@@ -247,10 +286,128 @@ class SyncMe(test_email_signin.EmailSignIn):
         for p in ("datastash sync meme", "datastash sync me please", "datastash sync"):
             self.assertFalse(ds.SYNC_ME_RE.fullmatch(p), p)
         self.assertEqual(ds.masked_email("you@email.com"), "y***@email.com")
-        os.makedirs(ds.CONF, exist_ok=True)
-        with open(ds.CLAUDE_USER_CONFIG, "w") as f:
-            f.write("{not json")
+        ds.ensure_dirs()
+        ds.write_private(ds.EMAIL_LOGIN_FILE, "{not json")
         self.assertIsNone(ds.known_email())
+        ds.write_private(ds.EMAIL_LOGIN_FILE, json.dumps({"at": 1}))
+        self.assertIsNone(ds.known_email())
+        ds.write_private(ds.EMAIL_LOGIN_FILE, json.dumps(["x@example.com"]))
+        self.assertIsNone(ds.known_email())
+
+
+CC = 18842
+APP = 654
+CC_PATH = "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude"
+
+
+class CodeTabSession(Base):
+    """Cycle 2 (review MEDIUM-1 and MEDIUM-2): the proof is tied to a Code-tab session: the claude-code binary itself is
+    signed by Anthropic's team, it carries the Code tab's own launch options and the app's environment marker, and an
+    environment that can't be read refuses."""
+
+    def with_argv(self, argv):
+        rows = desktop_table(self, "code_tab")
+        rows[CC] = (rows[CC][0], rows[CC][1], [rows[CC][1]] + list(argv), True)
+        return ds.desktop_proof()
+
+    def test_the_recorded_code_tab_passes(self):
+        desktop_table(self, "code_tab")
+        self.assertEqual(ds.desktop_proof(), (True, "pass"))
+        desktop_table(self, "code_tab_shell")
+        self.assertEqual(ds.desktop_proof(), (True, "pass"))
+        self.assertEqual(self.with_argv(["--output-format=stream-json", "--input-format=stream-json", "--verbose",
+                                         "--permission-prompt-tool", "stdio"]), (True, "pass"))
+
+    def test_real_helper_with_agent_chosen_arguments_is_refused(self):
+        """The real app's helper starting the claude binary with arguments an agent picked, or with none."""
+        for argv in ([], ["--input-format", "stream-json", "--output-format", "stream-json", "--settings", "x.json"],
+                     ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json"],
+                     ["--output-format", "json", "--verbose", "--input-format", "stream-json",
+                      "--permission-prompt-tool=stdio"],
+                     ["--output-format", "stream-json", "--verbose", "--input-format", "text",
+                      "--permission-prompt-tool=stdio"],
+                     ["--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
+                      "--permission-prompt-tool=mcp__x__y"],
+                     ["--output-format", "stream-json", "--input-format", "stream-json", "--permission-prompt-tool=stdio"],
+                     ["--verbose", "--permission-prompt-tool", "stdio", "stream-json"],
+                     ["chat", "--resume", "x"]):
+            self.assertEqual(self.with_argv(argv), (False, "Claude Code options"), argv)
+            self.assertFalse(ds.desktop_host_proven(), argv)
+
+    def test_unsigned_claude_code_binary_is_refused(self):
+        desktop_table(self, "code_tab", unsigned=(CC,))
+        self.assertEqual(ds.desktop_proof(), (False, "Claude Code signature"))
+        self.assertFalse(ds.desktop_host_proven())
+        desktop_table(self, "code_tab", unsigned_paths=(CC_PATH,))
+        self.assertEqual(ds.desktop_proof(), (False, "Claude Code signature"))
+        rows = desktop_table(self, "code_tab")
+        other = ds.HOME + "/Library/Application Support/Claude/claude-code/9.9.9/abc/claude.app/Contents/MacOS/claude"
+        rows[CC] = (rows[CC][0], other, [other] + rows[CC][2][1:], True)  # a program put at the user-writable path
+        self.assertEqual(ds.desktop_proof(), (False, "Claude Code signature"))
+        desktop_table(self, "code_tab")
+        real = ds._codesign_ok
+        ds._codesign_ok = lambda t, i=None: False if t == CC else real(t, i)  # the file passes, the running code doesn't
+        self.assertEqual(ds.desktop_proof(), (False, "Claude Code signature"))
+
+    def test_code_tab_env_marker_is_required(self):
+        for words in ("HOME=/x USER=tester", "HOME=/x CLAUDE_CODE_DESKTOP_APP_VERSION=", "HOME=/x CLAUDE_CODE_ENTRYPOINT=claude-desktop",
+                      "HOME=/x XCLAUDE_CODE_DESKTOP_APP_VERSION=6.1", ""):
+            desktop_table(self, "code_tab", env={CC: words})
+            self.assertEqual(ds.desktop_proof(), (False, "Claude Code environment"), words)
+        rows = desktop_table(self, "code_tab", env={CC: "HOME=/x"})  # the marker only as an argument an agent passed
+        rows[CC] = (rows[CC][0], rows[CC][1], rows[CC][2] + ["CLAUDE_CODE_DESKTOP_APP_VERSION=6.1"], True)
+        self.assertEqual(ds.desktop_proof(), (False, "Claude Code environment"))
+        desktop_table(self, "code_tab", env={CC: OSError("ps")})
+        self.assertEqual(ds.desktop_proof(), (False, "Claude Code environment"))
+
+    def test_app_environment_fails_closed(self):
+        """MEDIUM-2: ps -E erroring, timing out, showing nothing, showing other arguments or no environment refuses."""
+        import subprocess
+        for got in (OSError("ps"), subprocess.TimeoutExpired("ps", 3), subprocess.SubprocessError("x"), "", "   "):
+            desktop_table(self, "code_tab", env={APP: got})
+            if isinstance(got, str):
+                ds._ps = (lambda old: lambda args, timeout=3: got if str(APP) == args[-1] else old(args, timeout))(ds._ps)
+            self.assertEqual(ds.desktop_proof(), (False, "desktop app environment"), repr(got))
+        desktop_table(self, "code_tab")
+        old = ds._ps
+        ds._ps = lambda args, timeout=3: "/Applications/Claude.app/Contents/MacOS/Claude\n" if args[-1] == str(APP) \
+            else old(args, timeout)  # arguments only: no environment shown
+        self.assertEqual(ds.desktop_proof(), (False, "desktop app environment"))
+        ds._ps = lambda args, timeout=3: "/other HOME=/x\n" if args[-1] == str(APP) else old(args, timeout)
+        self.assertEqual(ds.desktop_proof(), (False, "desktop app environment"))
+        desktop_table(self, "code_tab", env_bad=True)
+        self.assertEqual(ds.desktop_proof(), (False, "desktop app environment"))
+        for k in ("NODE_OPTIONS=--require=x", "DYLD_INSERT_LIBRARIES=/x.dylib"):
+            desktop_table(self, "code_tab", env={APP: "HOME=/x " + k})
+            self.assertEqual(ds.desktop_proof(), (False, "desktop app environment"), k)
+        self.assertIsNone(ds._proc_env(APP, []))
+
+    def test_unit_flags(self):
+        self.assertTrue(ds._cc_flags_ok(["c", "--output-format", "stream-json", "--verbose", "--input-format=stream-json",
+                                         "--permission-prompt-tool=stdio"]))
+        self.assertFalse(ds._cc_flags_ok(None))
+        self.assertFalse(ds._cc_flags_ok(["--output-format", "stream-json", "--verbose", "--input-format=stream-json",
+                                          "--permission-prompt-tool=stdio"]))  # argv[0] is the program, never a flag
+
+
+class InstallDatastashPlugin(Base):
+    """LOW: "install datastash plugin" never names the agent "plugin"."""
+    CONNECTOR_SIGNED_IN = True
+
+    def test_plugin_is_never_the_name(self):
+        for p, want in (("install datastash", None), ("install datastash plugin", None), ("Install Datastash Plugin", None),
+                        ("install datastash web-app", "web-app"), ("install datastash plugin web-app", "web-app")):
+            m = ds.INSTALL_RE.fullmatch(p)
+            self.assertTrue(m, p)
+            self.assertEqual(m.group(1), want, p)
+
+    def test_install_datastash_plugin_installs_without_the_name(self):
+        self.installed()
+        v, _pid = self.prompt("install datastash plugin")
+        rec = ds.load_cmd("s1")
+        self.assertEqual(rec["kind"], "install")
+        self.assertNotEqual(rec.get("name"), "plugin")
+        self.assertIn("additionalContext", v["hookSpecificOutput"])
 
 
 class Doctor(Base):

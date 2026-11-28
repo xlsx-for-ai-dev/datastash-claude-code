@@ -10421,9 +10421,10 @@ DESKTOP_HOSTS = ("claude-desktop",)
 #              <- launchd (pid 1)
 # each link the real parent pid; the helper and the app each pass `codesign --verify` against Anthropic's Developer ID
 # team (Q6L2SF6YDW, Apple's anchor) both as the running process (its pid) and as the file at the path the kernel gives
-# for that pid (proc_pidpath, never argv or a name); the app started with no options. The Claude Code binary sits in a
-# user-writable folder, so it proves nothing itself: what counts is that the signed helper, started by the signed app
-# that launchd started, is its direct parent. Anything unread, unknown or not macOS refuses.
+# for that pid (proc_pidpath, never argv or a name); the app started with no options and a readable, clean environment.
+# The Claude Code binary itself must pass codesign against the same team (as its pid and as its file), carry the Code
+# tab's own launch options (DESKTOP_CC_FLAGS) and the app's CLAUDE_CODE_DESKTOP_APP_VERSION in its process environment.
+# Anything unread, unknown or not macOS refuses.
 CC_PROC_NAMES = ("claude", "claude.exe", "node", "node.exe", "bun", "bun.exe")  # Claude Code itself (exact names)
 HEADLESS_FLAGS = ("-p", "--print")
 FLAG_RE = r"-{1,2}[A-Za-z][A-Za-z0-9\-]{0,40}"
@@ -10438,6 +10439,12 @@ DESKTOP_SHIMS = ("/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/bin/ksh", "/
                  "/usr/bin/python3", "/usr/bin/xcrun")
 DESKTOP_CC_DIR = os.path.join("Library", "Application Support", "Claude", "claude-code")  # under HOME
 DESKTOP_BAD_ENV = ("ELECTRON_RUN_AS_NODE=", "NODE_OPTIONS=", "DYLD_INSERT_LIBRARIES=")
+# The Code tab's own launch of its Claude Code (SPM's recorded chain, ops/xli-420-desktop-chain-20261128.md): these
+# options with these values are always there, and the app sets this variable in its environment. An argument set an
+# agent picks without all of them is refused.
+DESKTOP_CC_FLAGS = (("--output-format", "stream-json"), ("--input-format", "stream-json"), ("--verbose", None),
+                    ("--permission-prompt-tool", "stdio"))
+DESKTOP_CC_ENV = "CLAUDE_CODE_DESKTOP_APP_VERSION"
 
 
 def _on_mac():
@@ -10555,7 +10562,7 @@ def _codesign_ok(target, ident=None):
             and (ident is None or re.search(r"^Identifier=" + re.escape(ident) + r"$", out, re.M) is not None))
 
 
-CODESIGN_WAIT = 7  # the prompt hook has 10 s: the four checks run side by side, and a slow one fails closed
+CODESIGN_WAIT = 7  # the prompt hook has 10 s: the six checks run side by side, and a slow one fails closed
 
 
 def _codesign_many(targets):
@@ -10577,13 +10584,50 @@ def _codesign_many(targets):
     return [g and not t.is_alive() for g, t in zip(got, ts)]
 
 
-def _app_env_bad(pid):
-    """True when the app's own environment, where ps shows it, has a variable that turns it into a script runner."""
+def _proc_env(pid, argv):
+    """A process's environment as ps -E shows it after its arguments (argv, as _proc_row read them): a list of
+    NAME=value words, or None when ps errors, shows nothing, shows other arguments or shows no environment."""
     try:
-        out = _ps(["-E", "-ww", "-o", "command=", "-p", str(pid)])
-    except (OSError, subprocess.SubprocessError):
-        return False  # not shown here: the signed app with no options still has to be the helper's parent
-    return any((" " + k) in out for k in DESKTOP_BAD_ENV)
+        out = _ps(["-E", "-ww", "-o", "command=", "-p", str(int(pid))])
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+    words = out.split() if isinstance(out, str) else []
+    lead = " ".join(argv or ()).split()
+    if not words or not lead or words[:len(lead)] != lead:
+        return None
+    env = [w for w in words[len(lead):] if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", w)]
+    return env or None
+
+
+def _app_env_bad(pid, argv=None):
+    """True when the app's own environment has a variable that turns it into a script runner, or when its environment
+    can't be read (ps errors, shows nothing or shows no environment): fail closed."""
+    env = _proc_env(pid, argv)
+    return env is None or any(w.startswith(k) for w in env for k in DESKTOP_BAD_ENV)
+
+
+def _cc_flags_ok(argv):
+    """True when the Code tab's own launch options (DESKTOP_CC_FLAGS) are all in argv, as --name value or --name=value."""
+    args = list(argv or ())[1:]
+    for name, val in DESKTOP_CC_FLAGS:
+        hit = False
+        for n, a in enumerate(args):
+            if val is None:
+                hit = a == name
+            elif a == name + "=" + val or (a == name and n + 1 < len(args) and args[n + 1] == val):
+                hit = True
+            if hit:
+                break
+        if not hit:
+            return False
+    return True
+
+
+def _cc_env_ok(pid, argv):
+    """True when the Code tab's Claude Code has the app's own marker (CLAUDE_CODE_DESKTOP_APP_VERSION) in its process
+    environment, read by pid after its arguments. Unread or missing: False."""
+    env = _proc_env(pid, argv)
+    return env is not None and any(re.fullmatch(DESKTOP_CC_ENV + r"=[0-9][0-9A-Za-z.\-]{0,40}", w) for w in env)
 
 
 def _cc_path_ok(path):
@@ -10614,6 +10658,8 @@ def desktop_proof(chain=None):
             return False, "headless Claude Code"
         if not _cc_path_ok(cc["path"]):
             return False, "Claude Code path"
+        if not _cc_flags_ok(cc.get("argv")):
+            return False, "Claude Code options"
         if helper.get("path") != DESKTOP_HELPER_EXE or cc.get("ppid") != helper.get("pid"):
             return False, "disclaimer helper"
         if app.get("path") != DESKTOP_APP_EXE or helper.get("ppid") != app.get("pid"):
@@ -10622,11 +10668,15 @@ def desktop_proof(chain=None):
             return False, "desktop app parent"
         if any(not re.fullmatch(r"-psn_\d+_\d+", a) for a in (app.get("argv") or [""])[1:]):
             return False, "desktop app options"
-        if _app_env_bad(app["pid"]):
+        if _app_env_bad(app["pid"], app.get("argv")):
             return False, "desktop app environment"
+        if not _cc_env_ok(cc["pid"], cc.get("argv")):
+            return False, "Claude Code environment"
         signs = [(helper["pid"], None), (DESKTOP_HELPER_EXE, None), (app["pid"], DESKTOP_APP_ID),
-                 (DESKTOP_APP_EXE, DESKTOP_APP_ID)]
+                 (DESKTOP_APP_EXE, DESKTOP_APP_ID), (cc["pid"], None), (cc["path"], None)]
         ok = _codesign_many(signs)
+        if not (ok[4] and ok[5]):  # the Code tab's Claude Code binary itself: Anthropic's team, or no desktop path
+            return False, "Claude Code signature"
         if not (ok[0] and ok[1]):
             return False, "disclaimer signature"
         if not (ok[2] and ok[3]):
@@ -14147,8 +14197,8 @@ def autoupdate_uninstall_line():
 # person's connector: the call carries only the S256 challenge; the plugin collects the key with the verifier. Notes carry
 # a typed proof over agent ids from the list id (EPM MUST 2); install notes come only from one dedicated answer field
 # (MUST 3); an uninstall reaches an agent only as 410 agent_removed, and cleanup touches only the fixed paths (note b).
-INSTALL_RE = re.compile(r"\s*(?:/datastash:install|datastash install|install datastash)(?:\s+(\S{1,64}))?\s*",
-                        re.I)  # 1.0.16: [name]; 1.0.32 (XLI-420): the plain-text "install datastash" too
+INSTALL_RE = re.compile(r"\s*(?:/datastash:install|datastash install|install datastash(?:\s+plugin)?)(?:\s+(\S{1,64}))?\s*",
+                        re.I)  # 1.0.16: [name]; 1.0.32 (XLI-420): the plain-text "install datastash [plugin]" too
 UNINSTALL_RE = re.compile(r"\s*(?:/datastash:uninstall|datastash uninstall)(?:\s+(\S.*?))?\s*", re.I | re.S)
 # X6: the person's whole typed prompt "make <name> private" / "make <name> public" (names as the list shows them; "all"
 # and "this" are not names here, so "make this private" stays an ordinary prompt).
@@ -14870,12 +14920,11 @@ EMAIL_LOGIN_FILE = os.path.join(CONF, "login.email.json")  # {"at"}: this comput
 EMAIL_RE = r"[^\s@<>\"'`]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}"
 SYNC_EMAIL_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(" + EMAIL_RE + r")\s*", re.I)
 SYNC_CODE_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+(\d{6})\s*", re.I)
-# XLI-420 part 2: a privacy hook may block an email in a prompt, so "datastash sync me" signs in with the email this
-# computer already knows: the one it signed in with before (kept, mode 600, in the plugin's own folder), else the email
-# of this computer's Claude login (Claude Code's own ~/.claude.json). With neither, one plain line and nothing tried.
+# XLI-420 part 2: a privacy hook may block an email in a prompt, so "datastash sync me" signs in with the email datastash
+# itself holds: the one this computer signed in to datastash with before (kept, mode 600, in the plugin's own folder).
+# Never Claude Code's own account or config. With none, one plain line and nothing tried.
 SYNC_ME_RE = re.compile(r"\s*(?:datastash sync|sync datastash)\s+me\s*[.!]?\s*", re.I)
-SYNC_ME_UNKNOWN_LINE = ("This computer doesn't know your datastash email yet. Type **datastash sync you@email.com** once; "
-                        "after that **datastash sync me** works.")
+SYNC_ME_UNKNOWN_LINE = "This computer needs **datastash sync you@email.com** once."
 CHECK_EMAIL_ME_LINE = "Check your email ({email}) for a 6-digit code. Then type **datastash sync CODE** here."
 EMAIL_CODE_LIFE = 600  # the emailed code works for 10 minutes
 LOGIN_STEP_KINDS = ("sync_email", "sync_code", "login_install", "login_uninstall")
@@ -14914,17 +14963,10 @@ def _email_ok(e):
 
 
 def known_email():
-    """The email this computer already knows for the person, lower case, else None: its own earlier email sign-in,
-    else the Claude login's account email in Claude Code's own config. Read here only, never shown in full."""
-    e = read_json(EMAIL_LOGIN_FILE, {}).get("email")
-    if _email_ok(e):
-        return e.strip().lower()
-    try:
-        with open(CLAUDE_USER_CONFIG) as f:
-            acct = json.load(f).get("oauthAccount")
-        e = acct.get("emailAddress") if isinstance(acct, dict) else None
-    except (OSError, ValueError, AttributeError):
-        e = None
+    """The datastash email this computer signed in with before (the plugin's own login.email.json), lower case, else
+    None. Only datastash's own record: never Claude Code's account or config. Read here only, never shown in full."""
+    got = read_json(EMAIL_LOGIN_FILE, {})
+    e = got.get("email") if isinstance(got, dict) else None
     return e.strip().lower() if _email_ok(e) else None
 
 
@@ -16351,6 +16393,8 @@ def command_prompt(inp):
         _mark_gone(False)  # the person's own install: the plugin may set itself up here again
         me, here = this_session(inp), project_of(inp)
         typed = im.group(1)
+        if typed is not None and typed.lower() == "plugin" and re.match(r"\s*install\s", prompt, re.I):
+            typed = None  # "install datastash plugin": the word plugin is never the agent's name
         if typed is not None:  # 1.0.16: the person's own name for this agent (asked for when none can be made)
             if not plain_name(typed):
                 return NOT_PLAIN_NAME_LINE.format(name=show_name(typed)), None, True
@@ -21072,8 +21116,8 @@ WHATS_NEW = {
         "In the Claude desktop app's Code tab the person can type **install datastash** (the picker may turn "
         "/datastash:install into /install; that works there too). The typed check there rests on the signed desktop app; "
         "**datastash doctor** shows its \"desktop proof\" line.",
-        "**datastash sync me** signs in with the email this computer already knows; never ask the person to type an email "
-        "when it works.",
+        "**datastash sync me** signs in with the email this computer signed in to datastash with before; never ask the "
+        "person to type an email when it works.",
     ),
     "1.0.31": (
         "After the email-code sign-in, new and resumed sessions get the datastash connector by themselves; the "

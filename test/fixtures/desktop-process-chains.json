@@ -1,9 +1,10 @@
 {
- "note": "XLI-420 part 2: process tables above the prompt hook, as datastash's _proc_row reads them by pid ({pid: [parent pid, the kernel's executable path, argv]}; ~ is HOME), built from SPM's recorded Code-tab chain (ops/xli-420-desktop-chain-20261128.md) and the two reviews' attacks. 'signed' lists the paths codesign passes (a running process passes when its kernel path is one of them, unless its table lists its pid as 'unsigned') for Anthropic's team Q6L2SF6YDW (the identifier with them). These are fixtures: only the owner's Mac shows the real table and real codesign.",
+ "note": "XLI-420 part 2: process tables above the prompt hook, as datastash's _proc_row reads them by pid ({pid: [parent pid, the kernel's executable path, argv]}; ~ is HOME), built from SPM's recorded Code-tab chain (ops/xli-420-desktop-chain-20261128.md) and the two reviews' attacks. 'signed' lists the paths codesign passes (a running process passes when its kernel path is one of them, unless its table lists its pid as 'unsigned') for Anthropic's team Q6L2SF6YDW (the identifier with them). Cycle 2: the Code tab's Claude Code binary is signed by the same team too, and ps -E shows each process's environment after its arguments (by default HOME and USER, plus CLAUDE_CODE_DESKTOP_APP_VERSION for a process named claude; a table may set 'env': {pid: words}). These are fixtures: only the owner's Mac shows the real table and real codesign.",
  "signed": {
   "paths": {
    "/Applications/Claude.app/Contents/MacOS/Claude": "com.anthropic.claudefordesktop",
-   "/Applications/Claude.app/Contents/Helpers/disclaimer": "com.anthropic.claudefordesktop.disclaimer"
+   "/Applications/Claude.app/Contents/Helpers/disclaimer": "com.anthropic.claudefordesktop.disclaimer",
+   "~/Library/Application Support/Claude/claude-code/2.1.330/4262a1273231/claude.app/Contents/MacOS/claude": "com.anthropic.claude-code"
   }
  },
  "tables": {
