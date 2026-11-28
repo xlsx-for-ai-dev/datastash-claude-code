@@ -6363,6 +6363,13 @@ def cmd_agent_tool(_args):
             why = ""
         person, ai = _safe_followup(inp, why in USE_REASONS)
     out = None
+    try:  # XLI-430: a sign-in line's result is shown at the next tool call of a busy session, not only at the turn's end
+        said = take_step_outcomes(sid) if sid and inp.get("hook_event_name") in ("PreToolUse", "PostToolUse") else []
+    except Exception:  # noqa: BLE001  the Stop hook still shows it
+        said = []
+    if said:
+        shown = _plain_typed("\n".join(said)) if any("\n" in x for x in said) else " ".join(said)  # as the Stop hook
+        person = "datastash: " + shown + (f"\n{person}" if person else "")
     try:
         ctx = login_approval_note(inp)
     except Exception:
@@ -6370,7 +6377,7 @@ def cmd_agent_tool(_args):
     if ctx is not None:
         out = {"hookSpecificOutput": {"hookEventName": inp["hook_event_name"], "additionalContext": ctx}}
     if person or ai:
-        out = out or {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+        out = out or {"hookSpecificOutput": {"hookEventName": inp.get("hook_event_name") or "PreToolUse"}}
         if ai:
             hs = out["hookSpecificOutput"]
             hs["additionalContext"] = (hs.get("additionalContext", "") + " " + ai).strip()
@@ -10335,6 +10342,27 @@ def desktop_host_proven(chain=None):
         return False
 
 
+def _is_cc(c):
+    """A Claude Code process: its exact executable names, or a native install's version-named binary (claude/versions)."""
+    return c["name"] in CC_PROC_NAMES or bool(re.fullmatch(r"\d{1,4}\.\d{1,4}\.\d{1,6}", c["name"]))
+
+
+def terminal_host_proven(chain=None):
+    """XLI-430: True only when the process table shows this hook under a Claude Code the person runs in a terminal: the
+    nearest Claude Code above it was not started headless (-p/--print) and no other Claude Code runs above it (one
+    started by a tool call of another session). Read in the prompt hook itself. Anything unread or unknown: False."""
+    try:
+        chain = process_chain() if chain is None else chain
+        if not chain:
+            return False
+        i = next((n for n, c in enumerate(chain) if _is_cc(c)), None)
+        if i is None or any(f in HEADLESS_FLAGS for f in chain[i]["flags"]):
+            return False
+        return not any(_is_cc(c) for c in chain[i + 1:])
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def chain_line():
     """The doctor's "process chain" line: process names, app bundles and option names only."""
     chain = process_chain()
@@ -10412,7 +10440,32 @@ def _said_turns(entries, end, most=4):
     return turns
 
 
-def find_typed(tp, pid, prompt, at=None, desktop=False):
+def _midturn_typed(v, prompt):
+    """XLI-430: a line the person typed while a tool call was running. Claude Code 2.1.332 gives the prompt hook the
+    RUNNING turn's prompt id and, once that call ends, writes the line as a "queued_command" attachment (no user entry):
+    the person's own only with origin.kind "human", humanTurn, commandMode "prompt", exactly this text, and a terminal
+    host (entrypoint "cli" or "claude-vscode"; the desktop app and `claude -p` never)."""
+    a = v.get("attachment") if v.get("type") == "attachment" and not v.get("isSidechain") else None
+    if not isinstance(a, dict) or a.get("type") != "queued_command" or a.get("commandMode") != "prompt":
+        return False
+    o = a.get("origin")
+    return (isinstance(o, dict) and o.get("kind") == "human" and a.get("humanTurn") is True
+            and isinstance(a.get("prompt"), str) and a["prompt"].strip() == prompt.strip()
+            and v.get("entrypoint") in MIDTURN_HOSTS and isinstance(a.get("source_uuid"), str))
+
+
+MIDTURN_HOSTS = ("cli", "claude-vscode")
+
+
+def typed_id(v):
+    """The id a typed entry is used up under: its own prompt id, or a mid-turn line's own command id."""
+    a = v.get("attachment") if isinstance(v, dict) else None
+    if isinstance(a, dict) and isinstance(a.get("source_uuid"), str):
+        return "q:" + a["source_uuid"]
+    return v.get("promptId") if isinstance(v, dict) and isinstance(v.get("promptId"), str) else None
+
+
+def find_typed(tp, pid, prompt, at=None, desktop=False, midturn=False):
     """(entry, the assistant's last turns before it) when the session transcript holds the person's typed entry for
     this prompt id with exactly this text, else None; "not person" when that entry is there but Claude Code did not mark
     it as typed by a person (N1: `claude -p`, a notification, or no origin fields). Claude Code writes the entry right
@@ -10424,7 +10477,9 @@ def find_typed(tp, pid, prompt, at=None, desktop=False):
         if t is None or v.get("promptId") != pid:
             continue
         if t.strip() != prompt.strip():
-            return None
+            if at is None:
+                return None
+            break  # XLI-430: a busy session gives the hook the running turn's prompt id: look for the queued line below
         if not _person_origin(v, desktop):
             return "not person"
         return v, _said_turns(entries, i)
@@ -10435,6 +10490,11 @@ def find_typed(tp, pid, prompt, at=None, desktop=False):
     # the person's own origin, written within seconds of the hook, and never used before, counts for it.
     for i in range(len(entries) - 1, -1, -1):
         v = entries[i]
+        if midturn and _midturn_typed(v, prompt):  # XLI-430: only where the hook proved a terminal Claude Code
+            w = _when(v.get("timestamp"))  # the time the person pressed Enter (written once the running call ended)
+            if w is not None and -5 <= w - at <= 30:
+                return v, _said_turns(entries, i)
+            continue
         t = _typed_text(v)
         if t is None or t.strip() != prompt.strip() or v.get("promptSource") != "queued" or not _person_origin(v):
             continue
@@ -10462,6 +10522,14 @@ def add_outcome(sid, line):
         pass
 
 
+def take_step_outcomes(sid):
+    """XLI-430: the lines a finished sign-in step left for this session, once (a file check first: cheap on every tool
+    call), and only once no step of this session is still running."""
+    if not os.path.exists(_outcome_path(sid)) or os.path.exists(_step_busy_path(sid)):
+        return []
+    return take_outcomes(sid)
+
+
 def take_outcomes(sid):
     """The lines the checker left for this session (a refused phrase), once."""
     if not sid:
@@ -10481,6 +10549,8 @@ def start_check(shape, kind, prompt, data):
         write_private(_pending_path(pid), json.dumps({"kind": kind, "sid": sid, "tp": tp, "pid": pid, "prompt": prompt,
                                                       "at": time.time(), "data": data,
                                                       "desktop": desktop_host_proven(),  # XLI-420: read in the hook
+                                                      # XLI-430: a sign-in line typed while a tool call runs
+                                                      "midturn": kind in LOGIN_STEP_KINDS[:2] and terminal_host_proven(),
                                                       "cwd": getattr(shape, "cwd", None)}))
         spawn_detached([sys.executable, os.path.abspath(__file__), "status-verify", pid], CONF)
         return True
@@ -14459,9 +14529,11 @@ NAME_TAKEN_LINE = "That name is taken. Type /datastash:install NEWNAME."
 NO_CODE_ASKED_LINE = "Not done: no code was asked for in this session. Type **datastash sync you@email.com** first."
 BAD_CODE_LINE = "Not done: that code is wrong or expired. Type **datastash sync you@email.com** for a new one."
 SIGN_IN_FAILED_LINE = "Not done: datastash could not be reached. Type **datastash sync you@email.com** again in a minute."
-LOGIN_STEP_AI = (f"{ONBOARD_NOTE}: the plugin does this step itself once it has checked the person typed it. Make no "
-                 "datastash calls and run no command for it; never repeat an email or a code. Your whole reply is exactly "
-                 "this line, word for word (keep its bold): \"{line}\"")
+LOGIN_STEP_AI = (f"{ONBOARD_NOTE}: the plugin does this step itself once it has checked the person typed it, and shows "
+                 "the person its own lines. Make no datastash calls and run no command for it; never repeat an email or a "
+                 "code. If you were in the middle of other work, carry on with it and say nothing about this line. "
+                 "Otherwise your whole reply is exactly this line, word for word (keep its bold): \"{line}\"")
+CHECKING_CODE_LINE = "Checking the code."
 
 
 def sync_email_of(text):
@@ -14736,7 +14808,7 @@ def login_step_prompt(inp, shape, prompt):
     except SystemExit:
         name = None
     ok = start_check(shape, "sync_code", prompt, {"code": code, "name": name, "here": here})
-    return (None, LOGIN_STEP_AI.format(line="Checking the code."), False) if ok else None
+    return (None, LOGIN_STEP_AI.format(line=CHECKING_CODE_LINE), False) if ok else None
 
 
 def login_step_verify(rec, pending=None):
@@ -14753,27 +14825,41 @@ def login_step_verify(rec, pending=None):
             _drop(pending)  # the busy mark is up first, so the Stop hook never sees a gap
     try:
         deadline, entry = time.time() + VERIFY_WAIT, None
-        while time.time() < deadline:
+        # XLI-430: a sign-in line typed while a tool call runs is written only once that call ends: keep looking (quietly,
+        # with no busy mark, so no Stop hook waits on it) while the code it asks for or sends could still be used
+        late = rec["kind"] in LOGIN_STEP_KINDS[:2] and rec.get("midturn") is True
+        last = rec["at"] + EMAIL_CODE_LIFE if late else deadline
+        while time.time() < last:
             if rec["kind"] in ("login_install", "login_uninstall"):
                 entry = _typed_entry(rec)
             else:
                 found = find_typed(rec["tp"], rec["pid"], rec["prompt"], at=rec.get("at"),
-                                   desktop=rec.get("desktop") is True) \
+                                   desktop=rec.get("desktop") is True, midturn=rec.get("midturn") is True) \
                     if os.path.exists(rec["tp"]) and _transcript_ok(rec["tp"], sid) else None
                 entry = found[0] if isinstance(found, tuple) else found
             if entry is not None:
                 break
-            time.sleep(0.2)
+            if time.time() >= deadline:
+                _drop(busy)
+                time.sleep(1)
+            else:
+                time.sleep(0.2)
+        if entry is None:
+            log("status", f"verify: no typed entry for {rec['kind']}")
+            return 0
+        write_private(busy, json.dumps({"at": time.time()}))
         if entry == "not person":
             add_outcome(sid, NOT_PERSON_LINE)
             return 0
         t = _when(entry.get("timestamp")) if isinstance(entry, dict) else None
         used = read_json(_typed_used_path(sid), {}).get("ids")
         used = used if isinstance(used, list) else []
-        if t is None or not (-60 <= t - rec["at"] <= TYPED_FRESH) or rec["pid"] in used:
+        own = typed_id(entry) if isinstance(entry, dict) else None
+        own = own or rec["pid"]  # XLI-430: the entry's own id (a busy session's hook has the running turn's id)
+        if t is None or not (-60 <= t - rec["at"] <= TYPED_FRESH) or own in used:
             log("status", f"verify: no fresh typed entry for {rec['kind']}")
             return 0
-        write_private(_typed_used_path(sid), json.dumps({"ids": (used + [rec["pid"]])[-50:]}))
+        write_private(_typed_used_path(sid), json.dumps({"ids": (used + [own])[-50:]}))
         data = rec.get("data") or {}
         if rec["kind"] == "sync_email":
             lines = email_sign_in_start(sid, data.get("email"))
