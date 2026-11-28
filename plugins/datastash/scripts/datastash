@@ -140,6 +140,15 @@ This computer's datastash login (XLI-278; the person approves it once in their b
                             keychain (macOS Keychain, libsecret), or a mode-600 file when there is none. Never printed.
   login --check             signed in: yes, waiting or no
   logout                    sign this computer out at datastash and remove the keychain item
+  computers                 typed by the person in their own session ("datastash computers"): this account's computers,
+                            each with its OS, last seen, agents, how it signed in, and signed in or out (when and why)
+  computer remove NAME      typed by the person ("datastash computer remove NAME"): signs that computer out for good and
+                            frees its agent names. Never this computer (that is datastash logout)
+  fleet-key create NAME [--expires 1d] | list | revoke NAME
+                            typed by the person: a fleet key for automation (a launch template, a managing agent); a
+                            machine holding it (DATASTASH_FLEET_KEY or ~/.config/datastash/fleet.key, mode 600) signs
+                            itself in at session start. The email code stays the way to sign in by hand. A revoke signs
+                            every machine of that key out. Shown once; never printed again
   token --header            for the datastash connector's headersHelper only: prints {"Authorization": "Bearer ..."} (a
                             15-minute token only when run by Claude Code as the connector's helper, never to a terminal
                             or a tool call, which the hooks also deny); when there is none, the fixed placeholder
@@ -616,7 +625,7 @@ def save_answer_key(key, grant_id):
         _drop(_answer_key_file())
         store = "keychain"
     else:
-        write_private(_answer_key_file(), key + "\n")
+        write_private(_answer_key_file(), _key_file_text(key))  # XLI-419 exposure #2
         store = "file"
     write_private(_answer_meta_file(), json.dumps({"store": store, "grant_id": grant_id.lower(), "at": int(time.time())}))
     return True
@@ -679,7 +688,7 @@ def _save_login(refresh, access, expires_in, answer_key=None, grant_id=None):
         _drop(LOGIN_REFRESH_FILE)
         store = "keychain"
     else:
-        write_private(LOGIN_REFRESH_FILE, refresh + "\n")
+        write_private(LOGIN_REFRESH_FILE, _key_file_text(refresh))  # XLI-419 exposure #2
         store = "file"
     # A new login (a new grant at datastash): its own id, so agents registered on an earlier login are dropped here.
     write_private(LOGIN_FILE, json.dumps({"store": store, "at": int(time.time()), "login_id": _new_login_id()}))
@@ -766,7 +775,7 @@ def _store_refresh(refresh):
     if where == "keychain" and _keychain_set(refresh):
         return True
     try:
-        write_private(LOGIN_REFRESH_FILE, refresh + "\n")
+        write_private(LOGIN_REFRESH_FILE, _key_file_text(refresh))  # XLI-419 exposure #2
         if where != "file":
             rec = read_json(LOGIN_FILE, {})
             keep = {"login_id": rec["login_id"]} if isinstance(rec.get("login_id"), str) else {}
@@ -858,7 +867,7 @@ def login_token(force=False, lock_wait=None):
         os.close(lock)
 
 
-def _read_key_file(p, pattern, s):
+def _read_key_file(p, pattern, s, decrypt=True):
     try:
         fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
@@ -870,13 +879,89 @@ def _read_key_file(p, pattern, s):
             return None
         with os.fdopen(fd, "r") as f:
             fd = None
-            k = f.read(4096).strip()
+            k = f.read(16384).strip()
     except OSError:
         return None
     finally:
         if fd is not None:
             os.close(fd)
+    if k.startswith(CREDS_PREFIX):  # XLI-419 exposure #2: kept encrypted by systemd-creds
+        if not decrypt:
+            return k if re.fullmatch(CREDS_FORM_RE, k) else None  # presence only: no decrypt
+        k = _creds_decrypt(k) or ""
     return k if re.fullmatch(pattern, k) else None
+
+
+# --- XLI-419 exposure #2: on Linux, the login's refresh token and answer key are kept encrypted at rest by systemd-creds
+# when it is there and works here (the user's own credential key, systemd 256+, or the host key where this user may use
+# it), in the same mode-600 file as "dscred1:<u|h>:<base64>". Every write is checked by decrypting it again first; on
+# any fault the plain mode-600 file is kept, as before. Both forms are read. The secret only ever goes through stdin.
+CREDS_PREFIX = "dscred1:"
+CREDS_FORM_RE = r"dscred1:[uh]:[A-Za-z0-9+/=]{16,12000}"
+CREDS_NAME = "datastash-login"
+CREDS_VARIANTS = (("u", ["--user"]), ("h", []))
+CREDS_TIMEOUT = 3
+_CREDS_SEEN = {}  # this process's decrypts (blob: secret), so a hook decrypts a file once
+
+
+def _creds_tool():
+    if not sys.platform.startswith("linux") or os.environ.get("DATASTASH_NO_CREDS") == "1":
+        return None
+    return shutil.which("systemd-creds")
+
+
+def _creds_run(tool, verb, extra, data):
+    try:
+        r = subprocess.run([tool, verb, *extra, f"--name={CREDS_NAME}", "-", "-"], input=data, capture_output=True,
+                           timeout=CREDS_TIMEOUT)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return r.stdout if r.returncode == 0 and r.stdout else None
+
+
+def _creds_encrypt(secret):
+    """The encrypted form of secret ("dscred1:..."), checked by decrypting it again, or None (keep the plain file)."""
+    tool = _creds_tool()
+    if tool is None or not isinstance(secret, str) or not secret:
+        return None
+    for tag, extra in CREDS_VARIANTS:
+        blob = _creds_run(tool, "encrypt", extra, secret.encode())
+        if not blob:
+            continue
+        form = f"{CREDS_PREFIX}{tag}:" + base64.b64encode(blob).decode()
+        if re.fullmatch(CREDS_FORM_RE, form) and _creds_decrypt(form) == secret:
+            return form
+    return None
+
+
+def _creds_decrypt(form):
+    if form in _CREDS_SEEN:
+        return _CREDS_SEEN[form]
+    m = re.fullmatch(r"dscred1:([uh]):([A-Za-z0-9+/=]+)", form or "")
+    tool = _creds_tool() if m else None
+    if tool is None:
+        return None
+    try:
+        blob = base64.b64decode(m.group(2), validate=True)
+    except (ValueError, TypeError):
+        return None
+    out = _creds_run(tool, "decrypt", dict(CREDS_VARIANTS)[m.group(1)], blob)
+    try:
+        got = out.decode().strip() if out else None
+    except UnicodeDecodeError:
+        got = None
+    if got:
+        _CREDS_SEEN[form] = got
+    return got
+
+
+def _key_file_text(secret):
+    """What a login key file holds: the encrypted form when systemd-creds works here, else the key itself."""
+    try:
+        form = _creds_encrypt(secret)
+    except Exception:  # noqa: BLE001  never in the way of a sign-in
+        form = None
+    return (form or secret) + "\n"
 
 
 def stat_ok(st):
@@ -4114,7 +4199,7 @@ def login_present():
     if store not in ("keychain", "file"):
         return False
     if store == "file":
-        gone = _read_key_file(LOGIN_REFRESH_FILE, REFRESH_RE, PERSON_SLUG) is None
+        gone = _read_key_file(LOGIN_REFRESH_FILE, REFRESH_RE, PERSON_SLUG, decrypt=False) is None
     else:
         gone = _keychain_state() == "missing"
     if gone:
@@ -5915,8 +6000,28 @@ def ascii_text(v):
 
 def name_reserved(name):
     """True when a new agent may never be named `name`: not a plain name, a reserved name (person, datastash, @feedback)
-    or a pick word."""
-    return not plain_name(name) or name.strip().lower() in RESERVED_NAMES or pick_word_like(name) is not None
+    or one as a whole word (as the server reads it: "datastash-bot", "p.e.r.s.o.n"), or a pick word."""
+    return not plain_name(name) or name.strip().lower() in RESERVED_NAMES or pick_word_like(name) is not None \
+        or reserved_word_in(name)
+
+
+def reserved_word_in(name):
+    """XLI-419 (the quick check's bad_agent_name): the server refuses a name whose words, or whose letters run together,
+    are "person" or "datastash" (src/agents/store.ts reservedNameLike)."""
+    if not isinstance(name, str):
+        return False
+    low = name.strip().lower()
+    return re.sub(r"[^a-z0-9@]", "", low) in RESERVED_NAMES or any(
+        w in ("person", "datastash") for w in re.split(r"[^a-z0-9]+", low))
+
+
+def without_reserved_words(name):
+    """The folder's name with the reserved words dropped ("datastash-claude-code" -> "claude-code"); "" when none is left."""
+    if not reserved_word_in(name):
+        return name
+    keep = [w for w in re.split(r"[-_.]+", name) if w and w.lower() not in ("person", "datastash")]
+    v = plain_agent_name("-".join(keep))
+    return "" if not v or reserved_word_in(v) else v
 
 
 RESERVED_NAME_LINE = ('"{name}" is a word the datastash name commands keep ("all", "this", "and"), so no agent is named '
@@ -5999,6 +6104,7 @@ def auto_name(here, me, after=None, session_name=None):
     else:
         name = session_name or last_name(here, me) or (user_name() if _home_or_root(here) else _folder_name(here)) \
             or user_name()
+        name = (without_reserved_words(name) or without_reserved_words(user_name())) if name else name  # XLI-419
     if not name:
         return "ask", None
     for _ in range(1000):
@@ -16429,6 +16535,14 @@ def cmd_fleet_setup(args):
     return 0 if line == DONE_LINE else 1
 
 
+def cmd_computers(_args):
+    """`datastash computers` / `datastash computer remove NAME` in a terminal: only the person's own typed line in their
+    Claude Code session does this."""
+    print("datastash: type datastash computers, or datastash computer remove NAME, in your own Claude Code session; the "
+          "plugin checks you typed it. Nothing was done.")
+    return 2
+
+
 def cmd_fleet_key(_args):
     """`datastash fleet-key` in a terminal: only the person's own typed line in their Claude Code session does this."""
     print("datastash: type datastash fleet-key create NAME, list or revoke NAME in your own Claude Code session; the "
@@ -16556,7 +16670,7 @@ COMPUTER_REMOVE_PATH = "/api/v1/device/computer/remove"
 COMPUTER_REMOVE_ACTION = "computer_remove"
 COMPUTER_NAME_RE = r"[A-Za-z0-9][A-Za-z0-9._@-]{0,59}"
 COMPUTER_STEP_KINDS = ("computers_list", "computer_remove")
-COMPUTERS_PROMPT_RE = re.compile(r"\s*datastash\s+(?:computers|computer\s+(list|remove)(?:\s+(.*?))?)\s*", re.I | re.S)
+COMPUTERS_PROMPT_RE = re.compile(r"\s*datastash\s+(computers|computer\s+list|computer\s+remove)(?:\s+(.*?))?\s*", re.I | re.S)
 COMPUTER_USAGE_LINE = ("Not done. Type **datastash computers** to see this account's computers, or "
                        "**datastash computer remove NAME** to remove one.")
 COMPUTER_FAILED_LINE = "Not done: datastash could not be reached. Try again in a minute."
@@ -16575,7 +16689,7 @@ def computers_prompt_of(text):
     m = COMPUTERS_PROMPT_RE.fullmatch(text) if isinstance(text, str) and len(text) <= 200 else None
     if not m:
         return None
-    verb, rest = (m.group(1) or "list").lower(), (m.group(2) or "").strip()
+    verb, rest = ("remove" if m.group(1).lower().endswith("remove") else "list"), (m.group(2) or "").strip()
     if verb == "list":
         return ("list",) if not rest else "usage"
     return ("remove", rest) if re.fullmatch(COMPUTER_NAME_RE, rest) else "usage"
@@ -22513,6 +22627,13 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.40": (
+        "The person can list this account's computers (**datastash computers**) and remove one for good (**datastash "
+        "computer remove NAME**); both are their own typed lines, never yours. A signed-out computer says so at its next "
+        "session start, and its agents' Setup rows read \"signed out\" with when and why.",
+        "Search and copy commands over the home folder or ~/.config by name (find, tar, cp -r, grep -r, rsync, zip, ls -R) "
+        "are refused like the key folder itself: search a narrower folder.",
+    ),
     "1.0.39": (
         "The DDS update also lists your deploys no live check proved (a passing CI run named live, prod, smoke, probe or "
         "e2e at that commit), flags datastash can't check, the claims, hand-offs and check-backs you never used, and each "
@@ -23726,7 +23847,7 @@ def command_table():
             "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share,
             "remember": cmd_remember, "skills-sync": cmd_skills_sync, "repeat": cmd_repeat, "repeats": cmd_repeat,
             "estimate": cmd_estimate, "estimates": cmd_estimate, "timer": cmd_timer, "timers": cmd_timer, "dds-update": cmd_dds_update,
-            "fleet-key": cmd_fleet_key, "fleet-setup": cmd_fleet_setup,
+            "fleet-key": cmd_fleet_key, "fleet-setup": cmd_fleet_setup, "computers": cmd_computers, "computer": cmd_computers,
             "allow": cmd_allow, "disallow": lambda a: cmd_allow(a, disallow=True)}
 
 
