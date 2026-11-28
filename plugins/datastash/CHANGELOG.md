@@ -2,6 +2,7 @@
 
 One line per release, newest first.
 
+- **1.0.42**: datastash's notes to your agents (the status reminder, new inbox messages) are no longer shown to you after a turn; the agent gets them quietly at its next step. With clean sessions on, the agent writes its own status without a helper.
 - **1.0.41**: Every computer that joins with a fleet key is named in your next morning update and DDS update (its name, when, and the key's name); a fleet machine can't take another computer's name; more searches of the home folder are refused; if an encrypted sign-in can't be opened any more, the session start says to type **datastash sync you@email.com** once.
 - **1.0.40**: A fleet key lets a person sign a whole fleet in with one typed yes (**datastash fleet-key create NAME**; the email code stays the default); **datastash computers** lists your computers and **datastash computer remove NAME** frees a lost one's agent names; a signed-out computer says so, and why; self-setup works in root's and Fedora's homes and on /Volumes drives; searches of the home folder or ~/.config are refused; on Linux the login is kept encrypted by systemd-creds when it works.
 - **1.0.39**: The DDS update also lists deploys no live check proved, flags it can't check, features an agent hasn't used yet and each card's own done-when; where you want it (**DDS update here only**, **also Slack**, **also email**) is kept for your whole account, asked once at the end of a morning update.

@@ -335,8 +335,11 @@ class Install(Base):
                           {"note_id": str(uuid.UUID(int=0xC3)), "run_id": RUN, "kind": "install", "agent_id": OWN, "sent_by": "person"})
         stop = {"session_id": "s1", "hook_event_name": "Stop", "cwd": self.folder, "transcript_path": self.transcript("s1")}
         out = self.hook(ds.cmd_status_check, stop)
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("ledger_agent_key now", out["reason"])
+        # XLI-443: never a Stop block the person sees; the agent gets it at its next prompt or tool call
+        self.assertNotEqual((out or {}).get("decision"), "block")
+        self.assertNotIn("ledger_agent_key", json.dumps(out or {}))
+        self.assertIn("ledger_agent_key now", ds.nudges_take("s1"))
+        self.assertEqual(ds.nudges_take("s1"), "")
         self.assertIsNone(self.hook(ds.cmd_status_check, dict(stop, stop_hook_active=True)))
 
     def test_a_note_call_without_the_persons_command_is_refused(self):

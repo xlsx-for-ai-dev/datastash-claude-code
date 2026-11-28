@@ -530,6 +530,14 @@ class StopHook(Base):
     def stop(self, active=False, **kw):
         return self.hook(ds.cmd_status_check, dict({"session_id": "sess1", "cwd": self.folder, "stop_hook_active": active}, **kw))
 
+    def reminded(self, active=False, **kw):
+        """XLI-443: the Stop hook never blocks; the reminder is a quiet note the agent gets at its next prompt or tool
+        call. Returns that note ("" for none), taken once."""
+        out = self.stop(active, **kw)
+        self.assertNotEqual((out or {}).get("decision"), "block")
+        self.assertNotIn("datastash status-set", json.dumps(out or {}))  # nothing of it is shown to the person
+        return ds.nudges_take("sess1")
+
     def turn(self):
         ds.turn_started("sess1")
         time.sleep(0.01)
@@ -549,20 +557,20 @@ class StopHook(Base):
 
     def test_asks_once_and_never_loops(self):
         self.turn()
-        self.assertIsNone(self.stop())  # no tool use: a trivial turn
+        self.assertEqual(self.reminded(), "")  # no tool use: a trivial turn
         self.tool()
-        v = self.stop()  # no status yet from this machine: worth one
-        self.assertEqual(v["decision"], "block")
-        self.assertIn("datastash status-set -", v["reason"])
-        # 1.0.18: commands through subagents is on by default, so the session hands the one command to a subagent
-        self.assertTrue(v["reason"].endswith(ds.STATUS_VIA_SUBAGENT) == ds.clean_settings()["commands"])
-        self.assertIsNone(self.stop(active=True))
-        self.assertIsNone(self.stop())  # at most once per turn
+        v = self.reminded()  # no status yet from this machine: worth one
+        self.assertIn("datastash status-set -", v)
+        # XLI-443: with commands through subagents on (the default) the one command runs in the session itself
+        self.assertTrue(v.endswith(ds.STATUS_CLEAN_FORM) == ds.clean_settings()["commands"])
+        self.assertNotIn("subagent (Agent tool)", v)
+        self.assertEqual(self.reminded(active=True), "")
+        self.assertEqual(self.reminded(), "")  # at most once per turn
         self.turn()
         self.tool()
-        self.assertIsNone(self.stop())  # and at most once every 10 minutes per agent
+        self.assertEqual(self.reminded(), "")  # and at most once every 10 minutes per agent
         self.ten_minutes_pass()
-        self.assertEqual(self.stop()["decision"], "block")
+        self.assertIn("datastash status-set -", self.reminded())
 
     def test_never_after_the_persons_install_or_uninstall(self):
         """1.0.18 real e2e step 4: the install's turn ends with the plugin's own line; a status reminder after it showed
@@ -571,11 +579,11 @@ class StopHook(Base):
         ds.save_cmd("sess1", {"sid": "sess1", "prompt": "/datastash:install", "at": time.time(), "kind": "install"})
         ds._drop(ds._cmd_path("sess1"))  # the finished install drops its record before the turn ends
         self.tool()
-        self.assertIsNone(self.stop())
+        self.assertEqual(self.reminded(), "")
         os.utime(ds._turn_path("sess1", ".cmd"), (time.time() - 60, time.time() - 60))
         self.turn()  # the next turn of the session is an ordinary one again
         self.tool()
-        self.assertEqual(self.stop()["decision"], "block")
+        self.assertIn("datastash status-set -", self.reminded())
 
     def test_quiet_without_a_material_change(self):
         self.turn()
@@ -584,9 +592,9 @@ class StopHook(Base):
         self.ten_minutes_pass()
         self.turn()
         self.tool("ls")
-        self.assertIsNone(self.stop())  # nothing changed since the last status: no model turn spent
+        self.assertEqual(self.reminded(), "")  # nothing changed since the last status: no model turn spent
         self.tool("python3 -m pytest -q")  # a test run is a material change
-        self.assertEqual(self.stop()["decision"], "block")
+        self.assertIn("datastash status-set -", self.reminded())
 
     def edit(self):
         ds.hook_input = lambda: {"session_id": "sess1", "hook_event_name": "PostToolUse", "tool_name": "Edit",
@@ -601,40 +609,40 @@ class StopHook(Base):
         self.ten_minutes_pass()
         self.turn()
         self.tool()
-        self.assertIsNone(self.stop())
+        self.assertEqual(self.reminded(), "")
         self.edit()
-        self.assertEqual(self.stop()["decision"], "block")
+        self.assertIn("datastash status-set -", self.reminded())
         self.write()
         self.ten_minutes_pass()
         self.turn()
         self.tool('git commit -m "x"')
-        self.assertEqual(self.stop()["decision"], "block")
+        self.assertIn("datastash status-set -", self.reminded())
         self.write()
         self.ten_minutes_pass()
         self.turn()
         self.tool()
-        self.assertIsNone(self.stop(last_assistant_message="All done."))
-        self.assertEqual(self.stop(last_assistant_message="Should I delete the old endpoint?")["decision"], "block")
+        self.assertEqual(self.reminded(last_assistant_message="All done."), "")
+        self.assertIn("datastash status-set -", self.reminded(last_assistant_message="Should I delete the old endpoint?"))
 
     def test_never_while_the_door_is_missing(self):
         ds.note_door(False)
         self.turn()
         self.tool()
-        self.assertIsNone(self.stop())
+        self.assertEqual(self.reminded(), "")
         ds.note_door(True)
-        self.assertEqual(self.stop()["decision"], "block")
+        self.assertIn("datastash status-set -", self.reminded())
 
     def test_never_for_a_project_without_the_persons_yes(self):
         ds.write_private(ds.CONSENT_PATH, json.dumps({"keep": {}, "no": {}}))  # keeping off
         self.turn()
         self.tool()
-        self.assertIsNone(self.stop())
+        self.assertEqual(self.reminded(), "")
 
     def test_a_status_written_this_turn_ends_quietly(self):
         self.turn()
         self.tool()
         self.write()
-        self.assertIsNone(self.stop())
+        self.assertEqual(self.reminded(), "")
 
     def test_not_an_agent_session(self):
         os.environ["CLAUDE_PROJECT_DIR"] = harness.tmpdir(self, dir=TMP)

@@ -415,27 +415,24 @@ class Pacing(Base):
         self.assertGreater(ds.sender_pause(2), ds.sender_pause(1))
         self.assertLessEqual(ds.sender_pause(500), ds.WAKE_IDLE_MAX_SECONDS)
 
-    def test_hook_mode_restarts_keep_the_pace(self):
-        """The hook exits 2 on a wake and the Stop hook starts a new listener; last_wake carries the pace over."""
+    def test_hook_mode_keeps_listening_and_leaves_a_quiet_note(self):
+        """XLI-443: the hook listener never exits 2 for an agent's inbox note (Claude Code shows the person every
+        asyncRewake wake); it keeps listening, at the same pace, and leaves the note for the session's next prompt or
+        tool call."""
         ds.WAKE_GATHER_SECONDS, ds.WAKE_MIN_SECONDS = 0.3, 2.0
         inbox = FakeInbox([(0.1 + 0.15 * i, 300 + i) for i in range(5)], end_after=4)
         ds.fetch_page = inbox.fetch_page
-        wakes = 0
         err = io.StringIO()
-        while True:
-            try:
-                with redirect_stderr(err):
-                    rc = ds.cmd_listen([])
-            except Stop:
-                break
-            self.assertEqual(rc, 2)
-            wakes += 1
-            time.sleep(0.2)  # the "turn"
-        self.assertTrue(1 <= wakes <= 2, wakes)
+        with redirect_stderr(err), self.assertRaises(Stop):
+            ds.cmd_listen([])  # one listener for the whole run: no exit, no restart
+        self.assertEqual(err.getvalue(), "")  # nothing for Claude Code to show
         st = ds.load_state(AGENT)
         self.assertEqual(len(st["new"]), 5)
         self.assertEqual(sorted(st["announced"]), sorted(st["new"]))
-        self.assertIn(ds.NOTE, err.getvalue())
+        note = ds.nudges_take("s1")
+        self.assertIn(ds.NOTE, note)
+        self.assertIn("read the inbox now", note)
+        self.assertEqual(ds.nudges_take("s1"), "")  # given once
 
 
 class Check(Base):
@@ -3848,9 +3845,10 @@ class Xli374(Base):
         self.agent("Free", key="ldgr_ag_f")
         ds.read_key = lambda s: "ldgr_ag_f" if s == "free" else None
         ds.WAKE_GATHER_SECONDS, ds.WAKE_MIN_SECONDS = 0, 0
-        ds.fetch_page = FakeInbox([(0.0, 5)], end_after=5).fetch_page
-        rc, err = self.listen()
-        self.assertEqual(rc, 2)
+        ds.fetch_page = FakeInbox([(0.0, 5)], end_after=1).fetch_page
+        with self.assertRaises(Stop):
+            self.listen()  # XLI-443: a quiet note for the session's next prompt or tool call, never an exit-2 wake
+        err = ds.nudges_take("s374")
         self.assertIn("datastash --agent free api GET", err)
         self.assertNotIn("DATASTASH_AGENT=", err)  # 1.0.18 real e2e: an env prefix is outside Bash(datastash:*)
         me = ds.this_session({"session_id": "s374"})
