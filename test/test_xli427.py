@@ -10,6 +10,7 @@ No network, no key; under test/harness.py.
 Run: python3 -I test/test_xli427.py"""
 import datetime
 import io
+import json
 import os
 import re
 import sys
@@ -152,6 +153,22 @@ class NoMcpForThePerson(test_email_signin.EmailSignIn):
         self.assertIn("Never ask the person for /mcp", v["hookSpecificOutput"]["additionalContext"])
         self.check(pid)
         self.assertEqual(self.stop()["systemMessage"], "datastash: Done.")
+
+    def test_the_turns_end_never_waits_on_a_line_typed_while_it_runs(self):
+        """The real e2e run (Claude Code 2.1.332): a CODE typed during the EMAIL turn's Stop hook is written only once
+        that hook ends; its check must not hold that hook for the whole wait."""
+        ds.ensure_dirs()
+        ds.write_private(ds._pending_path("p-later"), json.dumps({"kind": "sync_code", "sid": "s9", "at": time.time() + 1}))
+        ds.write_private(ds._step_busy_path("s9"), json.dumps({"at": time.time() + 1}))
+        t = time.time()
+        ds.login_step_wait("s9", limit=3)
+        self.assertLess(time.time() - t, 1)
+        ds.write_private(ds._pending_path("p-earlier"), json.dumps({"kind": "sync_code", "sid": "s9", "at": time.time() - 1}))
+        t = time.time()
+        ds.login_step_wait("s9", limit=0.6)  # one handed over before the turn's end: waited for
+        self.assertGreaterEqual(time.time() - t, 0.5)
+        for f in (ds._pending_path("p-later"), ds._pending_path("p-earlier"), ds._step_busy_path("s9")):
+            ds._drop(f)
 
     def test_the_skill_and_the_readme_install_steps_have_no_mcp_step(self):
         root = os.path.dirname(HERE)

@@ -11166,11 +11166,13 @@ def _texts(content):
     return []
 
 
-def _checks_pending(sid, kinds):
+def _checks_pending(sid, kinds, before=None):
+    """A check of these kinds is waiting for this session (before: only one handed over before that time)."""
     for n in os.listdir(STATE):
         if n.startswith("status-pending-"):
             r = read_json(os.path.join(STATE, n), {}) or {}
-            if r.get("sid") == sid and r.get("kind") in kinds:
+            if r.get("sid") == sid and r.get("kind") in kinds and \
+                    (before is None or not isinstance(r.get("at"), (int, float)) or r["at"] < before):
                 return True
     return False
 
@@ -14927,10 +14929,16 @@ def take_gone_outcome(sid):
 def login_step_wait(sid, limit=LOGIN_STEP_WAIT):
     """The Stop hook: wait (a few seconds at most) for this session's own sign-in or install step to finish, so its line
     shows at the end of the same turn."""
-    end = time.time() + limit
+    start = time.time()
+    end = start + limit
     while time.time() < end:
         try:
-            if not (os.path.exists(_step_busy_path(sid)) or _checks_pending(sid, LOGIN_STEP_KINDS)):
+            # XLI-427: only a step handed over before this wait began; a line typed while this hook runs (Claude Code
+            # writes it only after the hook ends) shows at its own turn's end, so it never holds this one up
+            busy = read_json(_step_busy_path(sid), None) if os.path.exists(_step_busy_path(sid)) else None
+            busy = busy is not None and not (isinstance(busy, dict) and isinstance(busy.get("at"), (int, float))
+                                             and busy["at"] >= start)
+            if not (busy or _checks_pending(sid, LOGIN_STEP_KINDS, before=start)):
                 return
         except OSError:
             return  # the plugin's folder is gone (an uninstall): nothing more to wait for
