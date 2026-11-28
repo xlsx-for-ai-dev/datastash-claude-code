@@ -41,6 +41,9 @@ Subcommands (run `datastash help`); `datastash --agent NAME COMMAND ...` runs an
                             XLI-433: wake this folder's agent later with PROMPT (an inbox alert), with no connector:
                             WHEN is 06:00, 2026-12-02T06:00, a time with its zone, or 90m / 2h / 1d; --tz defaults to
                             DATASTASH_TZ, else this computer's zone. `timer --help` says more and writes nothing
+  allow watcher --list      the person's allowed watchers (XLI-437): each runs only in the background in their main
+                            session while clean sessions is on; only the person's own typed "datastash allow watcher
+                            PATH [ARGS]" adds one and "datastash disallow watcher PATH" removes one
   repeat[s] [list|add|show|answer|part|remove] ...
                             XLI-413: the person's repeat questions, ONE list for the whole account, shared by every
                             agent: `repeats` lists them (--for AGENT: only that agent's parts), `repeat add QUESTION
@@ -6889,6 +6892,7 @@ def cmd_prompt(_args):
         try:
             ctx = (who_prompt_context(inp)  # 1.0.21 (card 8e): "who are you", from the Setup tab, shown by the plugin
                    or clean_prompt_context(inp) or standing_prompt_context(inp)  # XLI-386: the clean sessions phrases first
+                   or watcher_prompt_context(inp)  # XLI-437: "datastash allow watcher PATH" and its list and removal
                    or timers_prompt_context(inp)  # 1.0.18: "turn off timers" / "turn on timers"
                    or self_update_prompt_context(inp) or onboard_prompt_context(inp) or status_prompt_context(inp))
             ctx = onboard_after_status(inp, ctx)  # 1.0.18: the feature list and the chats ask, after the status
@@ -8663,7 +8667,8 @@ def _clean_words(cmd):
 def _clean_ds_read(args):
     """Only the datastash command's read subcommands: status (and its list views), check, read INBOX, help, and
     api GET PATH (no body). Every write (api POST, status-set, send, reply, link, off, keep, ...) is refused."""
-    if args in ([], ["status"], ["status", "--all"], ["status", "--all", "--install"], ["check"], ["help"]):
+    if args in ([], ["status"], ["status", "--all"], ["status", "--all", "--install"], ["check"], ["help"],
+                ["allow", "watcher", "--list"]):  # XLI-437: the list of the person's allowed watchers
         return True
     if len(args) == 3 and args[0] == "status" and args[1] in ("--details", "--more") and re.fullmatch(r"\d{1,3}", args[2]):
         return True
@@ -8770,6 +8775,8 @@ def clean_command_ok(tool, ti, no_code=False, cwd=None):
     PowerShell and any other tool with a "command" are refused: the check reads bash only."""
     if tool not in CLEAN_COMMAND_TOOLS or not isinstance(ti, dict):
         return False
+    if clean_watcher_ok(tool, ti):
+        return True  # XLI-437: the person's own allowed watcher, in the background only
     if tool == "Bash" and ti.get("run_in_background"):
         return False
     if tool == "Monitor" and ti.get("ws") is not None:
@@ -8986,6 +8993,203 @@ def clean_block(inp):
 
 CLEAN_DENY = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                      "permissionDecisionReason": CLEAN_BLOCK}}
+
+
+# --- XLI-437 (EPM 11-28): a harness of the person's own (not datastash's) may need its wake watcher running as a
+# background task of the MAIN session (a watcher a subagent starts dies with it). The person types once
+# **datastash allow watcher PATH [ARGS]** (the same typed proof as every typed phrase); the plugin records that exact
+# program (its absolute path and the file it resolves to) and those exact arguments for this computer and this user,
+# in the plugin's guarded folder (no tool call can name it, XLI-399). With clean sessions on, the main session may then
+# run exactly that command, and only in the background: a Monitor, or Bash with run_in_background. The command is the
+# path and the declared arguments as plain words, nothing else (no shell operator, quote, redirect, glob or $). Every
+# other command stays exactly as in 1.0.33. **datastash disallow watcher PATH** (typed, same proof) removes it, and
+# `datastash allow watcher --list` lists them.
+WATCHERS_PATH = os.path.join(CONF, "clean-watchers.json")
+WATCHER_ALLOW_KIND, WATCHER_DISALLOW_KIND = "watcher_allow", "watcher_disallow"
+_WATCHER_PHRASE = re.compile(r" *datastash +(allow|disallow) +watcher +(.+?) *", re.I)
+_WATCHER_PATH = re.compile(r"~?/[A-Za-z0-9_.+/-]{1,500}")  # an absolute path, or one in the person's home (~/)
+_WATCHER_ARG = re.compile(r"[A-Za-z0-9_./:=,@%+-]{1,200}")  # a plain word: nothing bash would read as an operator
+WATCHER_MAX_ARGS = 16
+WATCHER_NOTE = "datastash note (clean sessions watcher; the person's own choice)"
+WATCHER_BAD = ("Not done: type **datastash allow watcher PATH** with the watcher's full path (starting with / or ~/) and "
+               "only plain-word arguments, if any.")
+WATCHER_NOT_PROGRAM = "Not done: {path} is not a program on this computer."
+WATCHER_SAYING = "Allowing {path} as a background watcher in your main session; datastash confirms in a few seconds."
+WATCHER_UNSAYING = "Removing {path} from your allowed watchers; datastash confirms in a few seconds."
+WATCHER_DONE = ("Done: {cmd} may run in the background in your main session while clean sessions is on. Every other "
+                "command stays refused there.")
+WATCHER_REMOVED = "Done: {path} no longer runs in your main session while clean sessions is on."
+WATCHER_NONE_TO_REMOVE = "Nothing to remove: {path} is not an allowed watcher."
+WATCHER_FAILED = "Not done: the choice could not be saved (the datastash config folder is not writable)."
+WATCHER_ONLY_TYPED = ("Only the person can allow or remove a watcher: they type datastash allow watcher PATH (or "
+                      "datastash disallow watcher PATH) themselves.")
+
+
+def watcher_parse(rest):
+    """(typed path, [args]) for the words after "allow watcher" / "disallow watcher", or None: the path first (absolute
+    or ~/), then plain-word arguments, single spaces or runs of them only."""
+    if not isinstance(rest, str) or len(rest) > 2000 or not re.fullmatch(r"[\x20-\x7e]+", rest):
+        return None
+    words = [w for w in rest.split(" ") if w]
+    if not words or len(words) > WATCHER_MAX_ARGS + 1 or not _WATCHER_PATH.fullmatch(words[0]):
+        return None
+    if words[0].startswith("~") and not words[0].startswith("~/"):
+        return None
+    if not all(_WATCHER_ARG.fullmatch(a) for a in words[1:]):
+        return None
+    return words[0], words[1:]
+
+
+def watcher_resolve(typed):
+    """(absolute path, the file it resolves to now) for a typed path, ~/ as this user's home; None if not absolute."""
+    p = os.path.join(HOME, typed[2:]) if typed.startswith("~/") else typed
+    if not os.path.isabs(p):
+        return None
+    return os.path.normpath(p), os.path.realpath(p)
+
+
+def watchers():
+    """The person's allowed watchers on this computer: [{"path", "real", "args", "at"}] (only well-formed entries)."""
+    v = read_json(WATCHERS_PATH, {})
+    rows = v.get("watchers") if isinstance(v, dict) else None
+    out = []
+    for w in rows if isinstance(rows, list) else []:
+        if (isinstance(w, dict) and isinstance(w.get("path"), str) and isinstance(w.get("real"), str)
+                and os.path.isabs(w["real"]) and isinstance(w.get("args"), list)
+                and all(isinstance(a, str) and _WATCHER_ARG.fullmatch(a) for a in w["args"])):
+            out.append({"path": w["path"], "real": w["real"], "args": list(w["args"]), "at": w.get("at")})
+    return out
+
+
+def _write_watchers(rows):
+    ensure_dirs()
+    write_private(WATCHERS_PATH, json.dumps({"watchers": rows}))
+
+
+def watcher_cmd_text(w):
+    return " ".join([w["path"]] + w["args"])
+
+
+def watcher_list_text():
+    rows = watchers()
+    if not rows:
+        return ("No watchers are allowed in your main session. To allow one, type: datastash allow watcher PATH")
+    return ("Allowed watchers (each runs only in the background in your main session while clean sessions is on):\n"
+            + "\n".join(f"- {watcher_cmd_text(w)}" for w in rows)
+            + "\nTo remove one, type: datastash disallow watcher PATH")
+
+
+def clean_watcher_ok(tool, ti):
+    """True only for one of the person's allowed watchers, run in the background: a Monitor (a command, never a
+    WebSocket) or Bash with run_in_background, whose command is exactly the allowed path (the same file it resolved to
+    when allowed) and exactly its declared arguments, as plain words. Anything it can't parse is refused."""
+    try:
+        if not isinstance(ti, dict):
+            return False
+        if tool == "Bash":
+            if ti.get("run_in_background") is not True:
+                return False
+        elif tool != "Monitor" or ti.get("ws") is not None:
+            return False
+        cmd = ti.get("command")
+        if not isinstance(cmd, str) or len(cmd) > 2000 or not re.fullmatch(r"[\x20-\x7e]+", cmd):
+            return False
+        got = watcher_parse(cmd)
+        if got is None:
+            return False
+        where = watcher_resolve(got[0])
+        if where is None or not os.path.isfile(where[1]):
+            return False
+        return any(w["real"] == where[1] and w["args"] == got[1] for w in watchers())
+    except Exception:  # noqa: BLE001  can't tell: refused
+        return False
+
+
+def watcher_phrase(text):
+    """("allow" | "disallow" | "list", rest) for the person's whole prompt, or None."""
+    if not isinstance(text, str) or len(text) > 2000:
+        return None
+    m = _WATCHER_PHRASE.fullmatch(text.strip("\n"))
+    if m is None:
+        return None
+    kind, rest = m.group(1).lower(), m.group(2)
+    if kind == "allow" and rest.strip() == "--list":
+        return "list", ""
+    return kind, rest
+
+
+def _watcher_reply(line):
+    return (f"{WATCHER_NOTE}: the plugin itself does this once it has checked the person typed it. Make no datastash "
+            f"calls and run no command for it. Your whole reply is exactly this line: \"{line}\"")
+
+
+def watcher_prompt_context(inp):
+    """UserPromptSubmit: the person's typed **datastash allow watcher PATH [ARGS]**, **datastash disallow watcher PATH**
+    (each handed to the checker, which acts only once the transcript shows the person typed it) or
+    **datastash allow watcher --list** (shown by the plugin itself). None for any other prompt."""
+    got = watcher_phrase(inp.get("prompt") if isinstance(inp, dict) else None)
+    if got is None:
+        return None
+    shape = hook_shape(inp)
+    if shape is None:
+        return None
+    kind, rest = got
+    if kind == "list":
+        return {"show": watcher_list_text()}
+    parsed = watcher_parse(rest)
+    if parsed is None or (kind == "disallow" and parsed[1]):
+        return (f"{WATCHER_NOTE}: nothing changed. Make no datastash calls and run no command for it. Your whole reply is "
+                f"exactly this line: \"{WATCHER_BAD}\"")
+    where = watcher_resolve(parsed[0])
+    if kind == "allow" and (where is None or not os.path.isfile(where[1]) or not os.access(where[1], os.X_OK)):
+        return (f"{WATCHER_NOTE}: nothing changed. Make no datastash calls and run no command for it. Your whole reply is "
+                f"exactly this line: \"{WATCHER_NOT_PROGRAM.format(path=parsed[0])}\"")
+    k = WATCHER_ALLOW_KIND if kind == "allow" else WATCHER_DISALLOW_KIND
+    if not start_check(shape, k, inp.get("prompt"), {}):
+        return None
+    return _watcher_reply((WATCHER_SAYING if kind == "allow" else WATCHER_UNSAYING).format(path=parsed[0]))
+
+
+def watcher_typed(rec):
+    """The checker, after the person's own typed allow or disallow (find_typed: their typed entry, fresh, used once).
+    It reads the command from the verified prompt itself, never from anything else. The line for the person."""
+    got = watcher_phrase(rec.get("prompt"))
+    want = {WATCHER_ALLOW_KIND: "allow", WATCHER_DISALLOW_KIND: "disallow"}.get(rec.get("kind"))
+    if got is None or want is None or got[0] != want:
+        return []
+    parsed = watcher_parse(got[1])
+    if parsed is None or (want == "disallow" and parsed[1]):
+        return [WATCHER_BAD]
+    where = watcher_resolve(parsed[0])
+    if where is None:
+        return [WATCHER_BAD]
+    path, real = where
+    rows = watchers()
+    try:
+        if want == "allow":
+            if not os.path.isfile(real) or not os.access(real, os.X_OK):
+                return [WATCHER_NOT_PROGRAM.format(path=parsed[0])]
+            row = {"path": path, "real": real, "args": parsed[1], "at": int(time.time())}
+            rows = [w for w in rows if not (w["real"] == real and w["args"] == parsed[1])] + [row]
+            _write_watchers(rows)
+            return [WATCHER_DONE.format(cmd=watcher_cmd_text(row))]
+        keep = [w for w in rows if w["path"] != path and w["real"] != real]
+        if len(keep) == len(rows):
+            return [WATCHER_NONE_TO_REMOVE.format(path=parsed[0])]
+        _write_watchers(keep)
+        return [WATCHER_REMOVED.format(path=parsed[0])]
+    except OSError:
+        return [WATCHER_FAILED]
+
+
+def cmd_allow(args, disallow=False):
+    """`datastash allow watcher --list` lists the person's allowed watchers. Allowing or removing one is only ever the
+    person's own typed phrase (the prompt hook and the checker): from a command it is refused."""
+    if not disallow and args == ["watcher", "--list"]:
+        print(watcher_list_text())
+        return 0
+    print(WATCHER_ONLY_TYPED, file=sys.stderr)
+    return 1
 
 
 CLEAN_PHRASES = (
@@ -10971,6 +11175,9 @@ def cmd_status_verify(args):
                 add_outcome(sid, line)
         elif rec.get("kind") == EST_RECALC_KIND:
             for line in est_recalc_typed(rec):  # XLI-428: only the person's own typed DDS estimate recalc [since DATE]
+                add_outcome(sid, line)
+        elif rec.get("kind") in (WATCHER_ALLOW_KIND, WATCHER_DISALLOW_KIND):
+            for line in watcher_typed(rec):  # XLI-437: only the person's own typed allow / disallow watcher
                 add_outcome(sid, line)
     except OSError:
         return 0
@@ -21014,6 +21221,11 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.34": (
+        "With clean sessions on, the person's typed **datastash allow watcher PATH** lets the main session run exactly "
+        "that watcher, and only in the background (a Monitor, or Bash with run_in_background), with no other words. "
+        "Never type it for them; **datastash allow watcher --list** shows the allowed ones.",
+    ),
     "1.0.33": (
         "Timers without the connector: **datastash timer set 06:00 --repeat daily --tz America/Chicago -- PROMPT** "
         "wakes you with PROMPT (repeat hourly, daily, weekdays or weekly; or once: 06:00, 90m, 2h); "
@@ -22044,7 +22256,8 @@ def main():
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
              "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share,
              "remember": cmd_remember, "skills-sync": cmd_skills_sync, "repeat": cmd_repeat, "repeats": cmd_repeat,
-             "estimate": cmd_estimate, "estimates": cmd_estimate, "timer": cmd_timer, "timers": cmd_timer}
+             "estimate": cmd_estimate, "estimates": cmd_estimate, "timer": cmd_timer, "timers": cmd_timer,
+             "allow": cmd_allow, "disallow": lambda a: cmd_allow(a, disallow=True)}
     if cmd not in table and repeat_word(cmd) is not None:  # XLI-413: repeat / repeats / a small typo of either
         cmd = "repeat"
     if cmd not in table:
