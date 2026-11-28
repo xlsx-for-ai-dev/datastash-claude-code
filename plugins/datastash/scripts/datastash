@@ -43,13 +43,16 @@ Subcommands (run `datastash help`); `datastash --agent NAME COMMAND ...` runs an
                             [--answer TEXT]`, `repeat show N|QUESTION`, `repeat answer N TEXT` (the shared answer),
                             `repeat part N TEXT` (this agent's own part, kept current by it), `repeat remove N`.
                             repeat and repeats are the same word; small typos work. The answer is printed as for api
-  estimate [CARD ...] [--parts server|plugin|both] [--lists] [--local] | estimate done CARD ...
+  estimate [CARD[=server|plugin|both] ...] [--parts server|plugin|both] [--lists] [--local] | estimate done CARD ...
                             XLI-426: one best estimate per card from your own finished cards (Time per card, and from
                             day one the sessions already on this computer; newer cards weigh more), with how many cards
                             it rests on; several cards (a build list): a total and a done-around time; no card: the
                             cards in progress; --lists: the build lists this computer's tracker login reaches; done:
                             record a finished card's actual. After the person's typed DDS estimates on, each card's one
-                            "DDS Development Time Estimate" comment is kept with this computer's own tracker login
+                            "DDS Development Time Estimate" comment is kept with this computer's own tracker login.
+                            XLI-428: CARD=parts names each card's own parts in one list call (kept for the card);
+                            done-around is in the person's own time; the person's typed DDS estimate recalc [since
+                            DATE] starts this agent's estimates fresh (and each agent does by itself once a month)
   lookups [steps SERVICE]   today's repeated outside lookups on this computer (shapes and counts only) and what
                             datastash keeps; steps github|linear|jira: that feed's setup steps, after the person's
                             "do N" on the status offer
@@ -10625,6 +10628,9 @@ def cmd_status_verify(args):
         elif rec.get("kind") in EST_ONOFF_KINDS:
             for line in send_estimates_choice(rec, typed):  # XLI-426: only the person's own typed DDS estimates on / off
                 add_outcome(sid, line)
+        elif rec.get("kind") == EST_RECALC_KIND:
+            for line in est_recalc_typed(rec):  # XLI-428: only the person's own typed DDS estimate recalc [since DATE]
+                add_outcome(sid, line)
     except OSError:
         return 0
     return 0
@@ -19240,10 +19246,11 @@ def _step_bg(args):
 # The person's cards: only after their own typed **DDS estimates on** (kept for the whole account on datastash), each
 # estimated card gets ONE comment titled "DDS Development Time Estimate", edited in place, with this computer's own tracker
 # login (gh, LINEAR_API_KEY, JIRA_*); the actual and difference are added once the card is done.
-EST_USAGE = ("usage: datastash estimate [CARD ...] [--parts server|plugin|both] [--lists] [--local] | estimate done CARD ...   "
-             "(one best estimate per card from your own finished cards; several cards: a total and a done-around time; no "
-             "card: the cards in progress; --parts: what a new card will change, so it rests on cards like it; --lists: "
-             "your tracker's build lists; done: record a finished card's actual)")
+EST_USAGE = ("usage: datastash estimate [CARD[=server|plugin|both] ...] [--parts server|plugin|both] [--lists] [--local] | "
+             "estimate done CARD ...   (one best estimate per card from your own finished cards; several cards: a total and "
+             "a done-around time in your own time; no card: the cards in progress; CARD=parts or --parts: what a new card "
+             "will change, so it rests on cards like it, kept for the card; --lists: your tracker's build lists; done: "
+             "record a finished card's actual)")
 EST_HALF_LIFE_DAYS = 3.0  # how a team builds changes fast: newer cards weigh more
 EST_STAGE_GAP_HOURS = 3.0  # a card's work this far apart is a new stage
 EST_MIN_STAGE_MINUTES = 20.0  # less than this was only a look at the card, not work on it
@@ -19284,7 +19291,24 @@ EST_RULE = ("answer every \"how long\" from `datastash estimate <card ids>` (one
             "own finished cards; several cards also give a total and a done-around time; no card: the cards in progress). "
             "Say its lines as printed; never your own guess, never how it was made. Whenever you write or show a build list, "
             "run it on every card id of the list first and show each card's estimate inline, the total and done-around time "
-            "at the end. When a card is done, run `datastash estimate done <card>`.")
+            "at the end. When a card is done, run `datastash estimate done <card>`. Name what each new card will change as "
+            "CARD=server, CARD=plugin or CARD=both (one call for a whole list gives each card the same figure as alone).")
+# --- XLI-428: lists give each card its own figure; done-around in the person's own time; DDS estimate recalc.
+EST_PARTS_PATH = os.path.join(STATE, "estimates-parts.json")  # the parts each card was last named with: {card: parts}
+EST_RECALC_PATH = os.path.join(STATE, "estimates-recalc.json")  # per agent: {"since", "at", "how", "setup"}
+EST_RECALC_DAYS = 30.0  # each agent's own recalc: learning starts fresh this often by itself
+EST_RECALC_OLD_WEIGHT = 0.1  # a card finished before the agent's recalc counts this much (never deleted)
+EST_RECALC_KIND = "estimates_recalc"
+EST_RECALC_RE = re.compile(r"\s*(?:dds|datastash)\s+estimates?\s+recalc(?:\s+since\s+(\S{3,12}))?\s*[.!]?\s*", re.I)
+EST_RECALC_SAYING = "Starting estimates fresh."
+EST_RECALC_DONE = "Estimates start fresh from {day}. Older cards still count, much less."
+EST_RECALC_BAD_DATE = ("Not done: that date is not one I can use. Type **DDS estimate recalc since YYYY-MM-DD** (today or "
+                       "earlier), or **DDS estimate recalc** for today.")
+EST_RECALC_FAILED = "Not done: this computer could not save it just now. Type it again in a minute."
+EST_SETUP_CHANGED = "Your setup changed. Type **DDS estimate recalc** to start estimates fresh."
+EST_SETUP_KEYS = ("claude_code", "model", "plugins", "subagents")
+EST_DEFAULT_ZONE = "America/Chicago"  # a computer on UTC (a server) shows US Central, as datastash's own days do
+EST_UTC_NAMES = ("UTC", "UCT", "Universal", "Zulu", "Etc/UTC", "Etc/UCT", "Etc/Universal", "Etc/Zulu")
 
 
 class _EstReader(TpcReader):
@@ -19528,13 +19552,14 @@ def est_shape(history, card, now=None, parts=None):
     return cur[-1].get("parts") if cur and cur[-1].get("parts") in EST_PARTS else None
 
 
-def est_estimate(history, card, now=None, parts=None):
+def est_estimate(history, card, now=None, parts=None, since=None):
     """(minutes, rests_on): the one best estimate for `card` from the account's finished stages of other cards: each
     stage's minutes on a log scale, newer ones weighing more (half the weight every EST_HALF_LIFE_DAYS); of the card's
     shape (parts) when at least EST_MIN_SAME cards have it, else of all; the card's own earlier finished stages count
     EST_OWN_WEIGHT times; rests_on is how many cards those stages come from. A stage still going (work in the last
     EST_STAGE_GAP_HOURS: the card's own stage at work too), a look (under EST_MIN_STAGE_MINUTES) and work after `now` are
-    never used. Never refuses."""
+    never used. XLI-428: a stage finished before `since` (the agent's recalc) counts EST_RECALC_OLD_WEIGHT as much.
+    Never refuses."""
     now = time.time() if now is None else now
     parts = est_shape(history, card, now, parts)
     pool = []
@@ -19554,6 +19579,8 @@ def est_estimate(history, card, now=None, parts=None):
     num = den = 0.0
     for c, m, end, _p in pool + own:
         w = 0.5 ** (max(0.0, now - end) / 86400.0 / EST_HALF_LIFE_DAYS) * (EST_OWN_WEIGHT if c == card else 1.0)
+        if isinstance(since, (int, float)) and end < since:
+            w *= EST_RECALC_OLD_WEIGHT
         num, den = num + w * math.log(m), den + w
     if den <= 0:
         return EST_DEFAULT_MINUTES, 0
@@ -19588,6 +19615,238 @@ def est_comment_body(minutes, rests_on, actual=None):
         d = actual - minutes
         body += f"\nActual: {est_hours(actual)}\nDifference: {'+' if d >= 0 else '-'}{est_hours(abs(d))}"
     return body
+
+
+# --- XLI-428: each card's own parts, the person's own time, and the recalc.
+
+def est_saved_parts():
+    d = read_json(EST_PARTS_PATH, {})
+    return {k: v for k, v in d.items() if isinstance(k, str) and v in EST_PARTS} if isinstance(d, dict) else {}
+
+
+def est_card_parts(cards, named=None, every=None):
+    """{card: parts} for these cards: the parts named for the card in this call (CARD=parts), else --parts (every card),
+    else the parts the card was last named with on this computer, else none. What was named is kept for next time, so a
+    list call and a single call give a card the same figure."""
+    named = named or {}
+    saved = est_saved_parts()
+    out, keep = {}, {}
+    for c in cards:
+        p = named.get(c) or every
+        if p in EST_PARTS:
+            out[c] = keep[c] = p
+        elif saved.get(c) in EST_PARTS:
+            out[c] = saved[c]
+    if any(saved.get(c) != p for c, p in keep.items()):
+        try:
+            ensure_dirs()
+            write_private(EST_PARTS_PATH, json.dumps({**saved, **keep}))
+        except OSError:
+            pass
+    return out
+
+
+def est_zone():
+    """The person's time zone: DATASTASH_TZ when set, else this computer's own, except a computer on UTC (a server the
+    person reaches from elsewhere), which shows US Central as datastash's own days do. None: this computer's local."""
+    try:
+        import zoneinfo
+    except ImportError:
+        return None
+    for name in (os.environ.get("DATASTASH_TZ"),):
+        if isinstance(name, str) and name.strip():
+            try:
+                return zoneinfo.ZoneInfo(name.strip())
+            except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+                pass
+    tz = os.environ.get("TZ")
+    tz = tz.lstrip(":").strip() if isinstance(tz, str) else None
+    names = {tz} if tz else set(time.tzname)
+    try:
+        utc = time.localtime().tm_gmtoff == 0 and bool(names) and all(n in EST_UTC_NAMES for n in names)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        utc = False
+    if not utc:
+        return None
+    try:
+        return zoneinfo.ZoneInfo(EST_DEFAULT_ZONE)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def _est_local(t):
+    import datetime
+    z = est_zone()
+    return (datetime.datetime.fromtimestamp(t, z) if z is not None else datetime.datetime.fromtimestamp(t).astimezone()), z
+
+
+def est_when(t):
+    """A time as the person reads it: "Fri 7:16 pm CST", in their own time zone (est_zone)."""
+    d, _z = _est_local(t)
+    name = d.tzname() or ""
+    return f"{d.strftime('%a')} {d.hour % 12 or 12}:{d.minute:02d} {'am' if d.hour < 12 else 'pm'}" + \
+        (f" {name}" if name and not re.fullmatch(r"[+-]\d+", name) else "")
+
+
+def est_day_start(t, days_back=0):
+    """The start of the person's day `days_back` before the day of t (their own time zone), as a timestamp."""
+    import datetime
+    d, z = _est_local(t)
+    d = d.replace(hour=0, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days_back)
+    return d.timestamp() if z is not None else datetime.datetime(d.year, d.month, d.day).timestamp()
+
+
+def est_recalc_date(text, now=None):
+    """The start of the person's day for "since DATE" (YYYY-MM-DD, YYYY/MM/DD, M/D, M-D, M/D/YYYY, M/D/YY): a timestamp,
+    or None when it is not a real date or is after today. A date with no year is the latest one not after today."""
+    import datetime
+    now = time.time() if now is None else now
+    text = text.strip() if isinstance(text, str) else ""
+    today = _est_local(now)[0].date()
+    m = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if m:
+        y, mo, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{2}|\d{4}))?", text)
+        if not m:
+            return None
+        mo, dd = int(m.group(1)), int(m.group(2))
+        y = int(m.group(3)) if m.group(3) else today.year
+        y = y + 2000 if y < 100 else y
+        if not m.group(3):
+            try:
+                if datetime.date(y, mo, dd) > today:
+                    y -= 1
+            except ValueError:
+                return None
+    try:
+        day = datetime.date(y, mo, dd)
+    except ValueError:
+        return None
+    if day > today:
+        return None
+    return est_day_start(now, (today - day).days)
+
+
+def est_recalc_kind(prompt, now=None):
+    """(EST_RECALC_KIND, since or None) for the person's whole prompt **DDS estimate recalc** (or "... since DATE";
+    "datastash" works for DDS), None for anything else. since None with a date: a date that can't be used."""
+    m = EST_RECALC_RE.fullmatch(prompt) if isinstance(prompt, str) and len(prompt) <= 60 else None
+    if m is None:
+        return None
+    if m.group(1) is None:
+        return EST_RECALC_KIND, est_day_start(time.time() if now is None else now)
+    return EST_RECALC_KIND, est_recalc_date(m.group(1).rstrip(".!"), now)
+
+
+def _est_recalc_key(aid):
+    return aid.lower() if isinstance(aid, str) and re.fullmatch(GRANT_ID_RE, aid.lower()) else "this computer"
+
+
+def _est_recalc_update(aid, fn):
+    """Changes one agent's recalc record under a lock; returns the record after the change."""
+    lock = None
+    try:
+        ensure_dirs()
+        lock = open(EST_RECALC_PATH + ".lock", "a")
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        d = read_json(EST_RECALC_PATH, {})
+        d = d if isinstance(d, dict) else {}
+        k = _est_recalc_key(aid)
+        old = d.get(k) if isinstance(d.get(k), dict) else {}
+        r = fn(dict(old))
+        if r != old:
+            d[k] = r
+            write_private(EST_RECALC_PATH, json.dumps(d))
+        return r
+    except OSError:
+        return {}
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+def est_recalc_since(aid, now=None):
+    """The agent's recalc (a timestamp: learning starts fresh there) or None. Each agent's own monthly recalc: once
+    EST_RECALC_DAYS have passed since its last one (typed or by itself), learning starts fresh from today. The first
+    time an agent is seen, its month starts; nothing changes yet."""
+    now = time.time() if now is None else now
+
+    def fn(r):
+        at = r.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            r["at"] = int(now)
+        elif now - at >= EST_RECALC_DAYS * 86400:
+            r.update({"since": int(est_day_start(now)), "at": int(now), "how": "monthly"})
+        return r
+    since = _est_recalc_update(aid, fn).get("since")
+    return since if isinstance(since, (int, float)) and not isinstance(since, bool) else None
+
+
+def est_recalc_set(aid, since, now=None, setup=None):
+    """The person's typed recalc: learning starts fresh at `since`; the next monthly one is a month from now. The setup
+    as it is now becomes the one compared against."""
+    now = time.time() if now is None else now
+
+    def fn(r):
+        r.update({"since": int(since), "at": int(now), "how": "typed"})
+        if setup:
+            r["setup"] = {**(r.get("setup") if isinstance(r.get("setup"), dict) else {}), **setup}
+        return r
+    return _est_recalc_update(aid, fn)
+
+
+def _est_names(folder, ext):
+    try:
+        return sorted(n[:-len(ext)] for n in os.listdir(folder) if n.endswith(ext) and not n.startswith("."))
+    except OSError:
+        return []
+
+
+def est_setup(transcript=None, project=None):
+    """This agent's setup now, in parts (the release and model only when this session's transcript shows them, the
+    plugins only when Claude Code's plugins file reads): the Claude Code release (major.minor), the model it last answered
+    with, the plugins Claude Code has installed (names) and the subagents it can start (this user's and this folder's;
+    none when there is no such folder). Names and versions only."""
+    out = {}
+    if transcript:
+        for e in reversed(_jsonl_tail(transcript, 256 * 1024)):
+            if "claude_code" not in out and isinstance(e.get("version"), str):
+                m = re.match(r"(\d+\.\d+)\.", e["version"])
+                if m:
+                    out["claude_code"] = m.group(1)
+            msg = e.get("message") if e.get("type") == "assistant" and isinstance(e.get("message"), dict) else {}
+            model = msg.get("model")
+            if "model" not in out and isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9._:@/\-]{1,80}", model) \
+                    and not model.startswith("<"):
+                out["model"] = model
+            if "claude_code" in out and "model" in out:
+                break
+    d = read_json(os.path.join(claude_plugins_dir(), "installed_plugins.json"), {})
+    if isinstance(d, dict) and isinstance(d.get("plugins"), dict):
+        out["plugins"] = sorted(str(k)[:200] for k in d["plugins"])
+    subs = _est_names(os.path.join(CLAUDE_DIR, "agents"), ".md")
+    here = _est_names(os.path.join(project, ".claude", "agents"), ".md") if project else []
+    out["subagents"] = sorted(set(subs or []) | set(here or []))  # no folder: none
+    return out
+
+
+def est_setup_changed(aid, setup):
+    """True once when the agent's setup changed since it was last seen (each part compared only when it can be read
+    both times); the new setup is kept, so each change is told once. The first time: kept, nothing told."""
+    setup = {k: v for k, v in (setup or {}).items() if k in EST_SETUP_KEYS and v is not None}
+    if not setup:
+        return False
+    seen = {}
+
+    def fn(r):
+        old = r.get("setup") if isinstance(r.get("setup"), dict) else None
+        seen["changed"] = old is not None and any(k in old and old[k] != v for k, v in setup.items())
+        r["setup"] = {**(old or {}), **setup}
+        return r
+    _est_recalc_update(aid, fn)
+    return bool(seen.get("changed"))
 
 
 # --- the Estimates tab: only the one burn setup names as ours (estimates_tab); a workbook without one gets no writes.
@@ -19638,10 +19897,12 @@ def est_done_cards():
     return d if isinstance(d, dict) else {}
 
 
-def est_record(client, tab, history, cards, now=None, done=None, actuals=None, parts=None):
+def est_record(client, tab, history, cards, now=None, done=None, actuals=None, parts=None, since=None):
     """For each card: its stored estimate, or a new one written once; once the card is done (done: {card: time}), its
     actual (actuals: its Time per card minutes) and done time, written once. Returns [(card, minutes, rests_on, actual or
-    None)]. tab None: nothing is read or written."""
+    None)]. tab None: nothing is read or written. parts: one for every card, or {card: parts} (XLI-428: each card its
+    own, so a list gives each card the figure it gets alone). since: the agent's recalc; a stored estimate made before
+    it is made again while the card is not done."""
     now = time.time() if now is None else now
     done, actuals = done or {}, actuals or {}
     have = est_rows(client, tab, cards) if tab and cards else {}
@@ -19649,9 +19910,13 @@ def est_record(client, tab, history, cards, now=None, done=None, actuals=None, p
     for c in cards:
         row = have.get(c) or {}
         m, n = _est_num(row.get("estimate_minutes")), _est_num(row.get("rests_on"))
+        made = _week_ts(row.get("estimated_at"))
+        if m is not None and isinstance(since, (int, float)) and made is not None and made < since \
+                and not row.get("done_at") and c not in done:
+            m = None  # made before the recalc and not done yet: made again from the fresh learning
         new = {}
         if m is None:
-            m, n = est_estimate(history, c, now, parts)
+            m, n = est_estimate(history, c, now, parts.get(c) if isinstance(parts, dict) else parts, since)
             new.update({"estimate_minutes": int(m), "rests_on": int(n), "estimated_at": _tpc_iso(now)})
         actual = _est_num(row.get("actual_minutes")) if row.get("done_at") else None
         if actual is None and c in done:
@@ -19727,6 +19992,24 @@ def send_estimates_choice(rec, typed):
     if status != 200 or not isinstance(got, dict) or got.get("estimates_on_cards") is not on:
         return [EST_ONOFF_FAILED]
     return [EST_ON_DONE if on else EST_OFF_DONE]
+
+
+def est_recalc_typed(rec, now=None):
+    """The checker, after the person's own typed **DDS estimate recalc** [since DATE] (find_typed: their typed entry,
+    fresh, used once): this agent's learning starts fresh there. The line for the person."""
+    d = rec.get("data") if isinstance(rec.get("data"), dict) else {}
+    aid = d.get("agent_id")
+    got = est_recalc_kind(rec.get("prompt"), now)
+    if rec.get("kind") != EST_RECALC_KIND or got is None or not isinstance(aid, str) \
+            or not re.fullmatch(GRANT_ID_RE, aid.lower()):
+        return []
+    if got[1] is None:
+        return [EST_RECALC_BAD_DATE]
+    cwd = d.get("cwd") if isinstance(d.get("cwd"), str) else None
+    if not est_recalc_set(aid, got[1], now, est_setup(rec.get("tp"), cwd)):
+        return [EST_RECALC_FAILED]
+    day = _est_local(got[1] + 43200)[0]
+    return [EST_RECALC_DONE.format(day=f"{day.strftime('%b')} {day.day}")]
 
 
 # --- the person's own tracker, with this computer's own login (nothing kept on datastash, no new keys): GitHub with the
@@ -19951,7 +20234,9 @@ def est_after_send(client, cards, agent, now=None):
             return
         acct = est_account(client)
         hist = est_history(est_spans(est_cached_lookback()), acct)
-        rows = est_record(client, tab, hist, new, now)
+        aid = agent.get("agent_id") or next((a.get("agent_id") for a in all_agents() if str(a.get("workbook_id") or "").lower()
+                                             == str(agent.get("workbook_id") or "").lower()), None)
+        rows = est_record(client, tab, hist, new, now, parts=est_card_parts(new), since=est_recalc_since(aid, now))
         if est_choice(client.key) is True:
             for card, m, n, actual in rows:
                 trk_comment(card, m, n, actual)
@@ -19969,6 +20254,21 @@ def estimate_prompt_context(inp):
     prompt = inp.get("prompt") if isinstance(inp, dict) else None
     if not isinstance(prompt, str) or off_here(inp):
         return None
+    recalc = est_recalc_kind(prompt)
+    if recalc is not None:  # XLI-428: the person's typed DDS estimate recalc [since DATE], with the same typed proof
+        agent = _own_agent(inp)
+        shape = hook_shape(inp)
+        if agent is None or shape is None:
+            return ("datastash estimates: this folder has no datastash agent, so nothing changed. Tell the person in one "
+                    "line to type **/datastash:install** first.")
+        if recalc[1] is None:
+            return ("datastash estimates: nothing changed. Make no datastash calls and run no command for it. Your whole "
+                    "reply is exactly this line: \"" + EST_RECALC_BAD_DATE + "\"")
+        if not start_check(shape, EST_RECALC_KIND, prompt, {"agent_id": agent["agent_id"].lower(), "cwd": project_of(inp)}):
+            return None
+        return ("datastash estimates: the plugin itself does this once it has checked the person typed it. Make no "
+                "datastash calls and run no command for it. Your whole reply is exactly this line: \""
+                + EST_RECALC_SAYING + "\"")
     kind = est_onoff_kind(prompt)
     if kind is not None:
         agent = _own_agent(inp)
@@ -19986,11 +20286,27 @@ def estimate_prompt_context(inp):
         ids = [x for x in re.split(r"[\s,]+", typed.group(1).strip()) if x]
         return ("datastash estimates: the person asked for an estimate. Run `datastash estimate " + " ".join(ids) +
                 "` now and give its lines exactly as printed (never refuse, never explain how), then follow its last "
-                "lines, if any.")
+                "lines, if any." + _est_setup_note(inp))
     head = prompt[:2000]
     if EST_LIST_RE.search(head) or EST_HOW_LONG_RE.search(head):
-        return "datastash estimates: " + EST_RULE
+        return "datastash estimates: " + EST_RULE + _est_setup_note(inp)
     return None
+
+
+def _est_setup_note(inp):
+    """XLI-428: once after this agent's setup changed (Claude Code release, model, plugins, subagents), the line for the
+    person; else ""."""
+    try:
+        agent = _own_agent(inp)
+        if agent is None:
+            return ""
+        tp = inp.get("transcript_path")
+        tp = tp if isinstance(tp, str) and _transcript_ok(tp, inp.get("session_id"), cwd=inp.get("cwd")) else None
+        if est_setup_changed(agent["agent_id"], est_setup(tp, project_of(inp))):
+            return f" Also tell the person once, in these words: \"{EST_SETUP_CHANGED}\""
+    except Exception as e:  # noqa: BLE001  never in the person's way
+        log("status", f"estimate setup: {type(e).__name__}")
+    return ""
 
 
 def _est_prompt_note(inp):
@@ -20015,7 +20331,7 @@ def cmd_estimate(args):
     done_mode = bool(args) and args[0] == "done"
     if done_mode:
         args = args[1:]
-    cards, local, lists, parts = [], False, False, None
+    cards, local, lists, parts, named = [], False, False, None, {}
     i = 0
     while i < len(args):
         a = args[i]
@@ -20032,6 +20348,10 @@ def cmd_estimate(args):
             lists = True
         elif _est_card_arg(a):
             cards.append(_est_card_arg(a))
+        elif re.fullmatch(r"(.+)[=:](server|plugin|both)", a, re.I) and _est_card_arg(a.rsplit("=" if "=" in a else ":", 1)[0]):
+            c, p = a.rsplit("=" if "=" in a else ":", 1)  # XLI-428: this card's own parts (CARD=server|plugin|both)
+            cards.append(_est_card_arg(c))
+            named[cards[-1]] = p.lower()
         else:
             die(EST_USAGE)
     cards = list(dict.fromkeys(cards))
@@ -20062,6 +20382,8 @@ def cmd_estimate(args):
             client, tab = None, None
     key = None
     hist = est_history(spans, acct)
+    aid = (agent or _own_agent({}) or {}).get("agent_id")
+    since = est_recalc_since(aid, now)  # XLI-428: the agent's own recalc (typed, or monthly by itself)
     groups = []
     if lists:
         groups = [(name, [x for x in (_est_card_arg(i) for i in ids) if x]) for name, ids in trk_lists()]
@@ -20085,21 +20407,22 @@ def cmd_estimate(args):
     for name, ids in groups:
         if name:
             print(f"{name}:")
+        each = est_card_parts(ids, named, parts)  # XLI-428: each card its own parts, as when it is estimated alone
         try:
-            rows = est_record(client, tab, hist, ids, now, done, actuals, parts) if client is not None else None
+            rows = est_record(client, tab, hist, ids, now, done, actuals, each, since) if client is not None else None
         except CiProblem:
             rows = None
         if rows is None:
             rows = []
             for c in ids:
-                m, n = est_estimate(hist, c, now, parts)
+                m, n = est_estimate(hist, c, now, each.get(c), since)
                 rows.append((c, m, n, float((hist.get(c) or {}).get("minutes") or 0) or None if c in done else None))
         for c, m, n, actual in rows:
             print(est_line(c, m, n, actual))
         if len(rows) > 1:
             left_min = sum(m for _c, m, _n, actual in rows if not actual)
-            at = time.strftime("%a %H:%M", time.localtime(now + left_min * 60))
-            print(f"All {len(rows)} cards: about {est_hours(sum(m for _c, m, _n, _a in rows))}; done around {at}")
+            print(f"All {len(rows)} cards: about {est_hours(sum(m for _c, m, _n, _a in rows))}; done around "
+                  f"{est_when(now + left_min * 60)}")
         if on is True:
             for c, m, n, actual in rows:
                 found = trk_card(c)
@@ -20111,7 +20434,7 @@ def cmd_estimate(args):
                     except OSError:
                         pass
                     if client is not None and tab:
-                        got = est_record(client, tab, hist, [c], now, marks, actuals)
+                        got = est_record(client, tab, hist, [c], now, marks, actuals, each, since)
                         actual = got[0][3] if got else None
                 where = trk_comment(c, m, n, actual)
                 if where:
@@ -20126,6 +20449,11 @@ def cmd_estimate(args):
               "this text; in Jira also set the card's original estimate (never Linear's points):")
         for line in left:
             print(line)
+    try:  # XLI-428: what this command can see of the setup (plugins, subagents); the prompt hook sees the rest
+        if aid and est_setup_changed(aid, est_setup(None, project_of({}))):
+            print(f"Tell the person once, in these words: \"{EST_SETUP_CHANGED}\"")
+    except Exception as e:  # noqa: BLE001
+        log("status", f"estimate setup: {type(e).__name__}")
     if on is None and est_ask_once(os.environ.get("CLAUDE_CODE_SESSION_ID")):
         print(f"Ask the person once, in these words: \"{EST_ASK}\" Only their own typed words turn it on or off, for the "
               "whole account; never type, answer or turn it on for them. Until then nothing is written on their cards.")
@@ -20283,6 +20611,14 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.29": (
+        "For a build list, name each new card's parts in the one call: **datastash estimate XLI-1=both XLI-2=plugin**; "
+        "each card gets the same figure as alone (the parts a card was named with are kept for it).",
+        "The done-around time is in the person's own time.",
+        "The person's typed **DDS estimate recalc** (or **DDS estimate recalc since DATE**) starts this agent's estimates "
+        "fresh; older cards still count, much less. Each agent also starts fresh by itself once a month. When the plugin "
+        "says the setup changed, pass its line on to the person once; never type it for them.",
+    ),
     "1.0.25": (
         "**datastash estimate <cards>** (or the person's typed **DDS estimate <card>**) gives one best estimate per card "
         "from your own finished cards, with how many cards it rests on; a build list also gets a total and a "
