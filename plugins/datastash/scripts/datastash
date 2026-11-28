@@ -4424,9 +4424,11 @@ def put_on_path():
         pass
 
 
-# XLI-435 #4: a cli folder of a datastash plugin copy on PATH (<plugins>/cache/<marketplace>/datastash/<version>/scripts
-# or scripts/cli): taken off before this copy's folder goes on, so PATH holds one datastash and no old versions
-OLD_CLI_GLOBS = ("*/datastash/[0-9]*.[0-9]*/scripts/cli", "*/datastash/[0-9]*.[0-9]*/scripts")
+# XLI-435 #4: a cli folder of a datastash plugin copy on PATH (<plugins>/cache/datastash/datastash/<version>/scripts
+# or scripts/cli): taken off before this copy's folder goes on, so PATH holds one datastash and no old versions. Only
+# Claude Code's own cache folder of this plugin: any other folder shaped datastash/<version>/scripts stays.
+OLD_CLI_GLOBS = ("*/plugins/cache/datastash/datastash/[0-9]*.[0-9]*/scripts/cli",
+                 "*/plugins/cache/datastash/datastash/[0-9]*.[0-9]*/scripts")
 
 
 def _old_cli_entry(entry):
@@ -14005,7 +14007,9 @@ def cmd_self_update(args):
 # XLI-435 #4: old version folders of the plugin in Claude Code's cache (<plugins>/cache/datastash/datastash/<version>)
 # are moved aside, never deleted: into the datastash folder's trash (a folder of this user, on the same disk, else left
 # where it is). Kept: the newest two, the copy this process runs, and any folder a running Claude Code still uses (a
-# .in_use/<pid> marker of a live process; a marker that can't be read counts as in use).
+# .in_use/<pid> marker of a live process; a marker that can't be read counts as in use), and every version Claude Code's
+# installed_plugins.json lists for datastash in any scope (user, project or local, for any project path; read only). When
+# that file is missing, can't be read or has a shape this does not know, nothing is moved.
 VERSIONS_KEPT = 2
 VERSIONS_TRASH = os.path.join(CONF, "trash", "plugin-versions")
 
@@ -14024,6 +14028,30 @@ def _folder_in_use(folder):
     return False
 
 
+def _installed_versions(plugins):
+    """Every datastash version installed_plugins.json in the plugins folder lists, in any scope (a set of version names),
+    or None when the file is missing, can't be read or has a shape not known here (then nothing may be moved)."""
+    try:
+        with open(os.path.join(plugins, "installed_plugins.json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    rows = d.get("plugins") if isinstance(d, dict) else None
+    rows = rows.get(PLUGIN_ID) if isinstance(rows, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return None
+    out = set()
+    for r in rows:
+        v = r.get("version") if isinstance(r, dict) else None
+        if not isinstance(v, str) or not version_tuple(v):
+            return None
+        out.add(v)
+        p = r.get("installPath")
+        if isinstance(p, str) and p:
+            out.add(os.path.basename(os.path.normpath(p)))
+    return out
+
+
 def tidy_old_versions(base=None):
     """Moves this plugin's unused old version folders to VERSIONS_TRASH. The list of versions moved; never raises."""
     moved = []
@@ -14036,7 +14064,10 @@ def tidy_old_versions(base=None):
         names = [n for n in os.listdir(base) if version_tuple(n) and os.path.isdir(os.path.join(base, n))
                  and not os.path.islink(os.path.join(base, n))]
         names.sort(key=version_tuple)
-        keep = set(names[-VERSIONS_KEPT:]) | {os.path.basename(root)}
+        installed = _installed_versions(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(base)))))
+        if installed is None:
+            return moved  # Claude Code's list of installed versions can't be read: keep every folder
+        keep = set(names[-VERSIONS_KEPT:]) | {os.path.basename(root)} | installed
         for n in names:
             folder = os.path.join(base, n)
             if n in keep or _folder_in_use(folder):

@@ -231,13 +231,71 @@ class CleanPath(Base):
         here = os.path.join(os.path.dirname(os.path.realpath(ds.__file__)), "cli")
         env_file = self.env_line(f"{here}:/usr/bin:/bin")
         self.assertFalse(os.path.exists(env_file))
-        env_file = self.env_line(f"{here}:/x/datastash/datastash/1.0.20/scripts/cli:/bin")
+        env_file = self.env_line(f"{here}:/x/.claude/plugins/cache/datastash/datastash/1.0.20/scripts/cli:/bin")
         self.assertTrue(os.path.exists(env_file))
+
+    def test_only_the_plugins_own_cache_folder_leaves_path(self):
+        here = os.path.join(os.path.dirname(os.path.realpath(ds.__file__)), "cli")
+        others = ["/home/me/src/datastash/2.0/scripts", "/home/me/datastash/1.0.20/scripts/cli",
+                  "/x/cache/other/datastash/1.0.20/scripts"]
+        self.assertFalse(any(ds._old_cli_entry(e) for e in others))
+        self.assertFalse(os.path.exists(self.env_line(":".join([here] + others + ["/bin"]))))
+        old = "/h/.claude/plugins/cache/datastash/datastash/1.0.20/scripts"
+        path = ":".join([here, others[0], old, "/bin"])
+        env_file = self.env_line(path)
+        got = subprocess.run([shutil.which("sh"), "-c", '. "$1"; printf %s "$PATH"', "sh", env_file],
+                             env=dict(os.environ, PATH=path), capture_output=True, text=True, cwd=TMP, timeout=20).stdout
+        self.assertEqual(got.split(":"), [here, others[0], "/bin"])
+
+
+def installed_plugins(plugins, rows):
+    with open(os.path.join(plugins, "installed_plugins.json"), "w") as f:
+        json.dump({"version": 2, "plugins": {"datastash@datastash": rows}}, f)
 
 
 class OldFolders(Base):
+    def cache(self, versions):
+        plugins = harness.tmpdir(self, dir=TMP)
+        base = os.path.join(plugins, "cache", "datastash", "datastash")
+        for v in versions:
+            os.makedirs(os.path.join(base, v, "scripts"))
+        self.addCleanup(setattr, ds, "VERSIONS_TRASH", ds.VERSIONS_TRASH)
+        ds.VERSIONS_TRASH = os.path.join(harness.tmpdir(self, dir=TMP), "trash", "plugin-versions")
+        return plugins, base
+
+    def test_a_version_installed_for_a_project_with_no_live_session_is_kept(self):
+        plugins, base = self.cache(("1.0.20", "1.0.26", "1.0.30", "1.0.35", "1.0.36"))
+        installed_plugins(plugins, [
+            {"scope": "user", "version": "1.0.36", "installPath": os.path.join(base, "1.0.36")},
+            {"scope": "project", "projectPath": "/home/me/proj-a", "version": "1.0.26",
+             "installPath": os.path.join(base, "1.0.26")},
+            {"scope": "local", "projectPath": "/srv/other", "version": "1.0.20",
+             "installPath": os.path.join(base, "1.0.20")}])
+        self.assertEqual(ds.tidy_old_versions(base), ["1.0.30"])
+        self.assertEqual(sorted(os.listdir(base)), ["1.0.20", "1.0.26", "1.0.35", "1.0.36"])
+
+    def test_an_unreadable_or_unknown_installed_list_moves_nothing(self):
+        plugins, base = self.cache(("0.1.0", "1.0.18", "1.0.35", "1.0.36"))
+        listed = os.path.join(plugins, "installed_plugins.json")
+        self.assertEqual(ds.tidy_old_versions(base), [])  # missing
+        for text in ("{not json", '{"plugins": []}', '{"plugins": {"other@x": []}}',
+                     '{"plugins": {"datastash@datastash": [{"scope": "user"}]}}'):
+            with self.subTest(text=text):
+                with open(listed, "w") as f:
+                    f.write(text)
+                self.assertEqual(ds.tidy_old_versions(base), [])
+        installed_plugins(plugins, [{"scope": "user", "version": "1.0.36"}])
+        if os.geteuid() != 0:
+            os.chmod(listed, 0)
+            self.addCleanup(os.chmod, listed, 0o600)
+            self.assertEqual(ds.tidy_old_versions(base), [])  # unreadable
+        self.assertEqual(sorted(os.listdir(base)), ["0.1.0", "1.0.18", "1.0.35", "1.0.36"])
+        self.assertFalse(os.path.exists(ds.VERSIONS_TRASH))
+
     def test_unused_old_versions_are_moved_to_the_trash_never_deleted(self):
-        base = os.path.join(harness.tmpdir(self, dir=TMP), "cache", "datastash", "datastash")
+        plugins = harness.tmpdir(self, dir=TMP)
+        base = os.path.join(plugins, "cache", "datastash", "datastash")
+        installed_plugins(plugins, [{"scope": "user", "version": "1.0.36"}])
         for v in ("0.1.0", "1.0.18", "1.0.26", "1.0.34", "1.0.35", "1.0.36"):
             os.makedirs(os.path.join(base, v, "scripts"))
             with open(os.path.join(base, v, "scripts", "datastash"), "w") as f:
