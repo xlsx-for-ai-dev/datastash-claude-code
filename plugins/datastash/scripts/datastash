@@ -25,7 +25,7 @@ Subcommands (run `datastash help`); `datastash --agent NAME COMMAND ...` runs an
                             --project only for another folder of this folder's own agent
   keep [--on]               keeping agents' status in datastash: this computer's answer; --on after the person typed
                             the keep phrase (checked by the plugin, never taken from the AI): sign in if needed, next steps
-  api METHOD PATH [JSON | - | @FILE]
+  api METHOD PATH [JSON | - | @FILE]   (METHOD: GET, POST or DELETE)
                             one call to the datastash REST door (/api/v1/agent/...) as the linked agent; the body
                             inline, from stdin (-) or from a file (@FILE): a big body always from stdin or a file.
                             The answer is printed between two marker lines as untrusted data
@@ -37,6 +37,10 @@ Subcommands (run `datastash help`); `datastash --agent NAME COMMAND ...` runs an
                             read and write with --write (XLI-425: POST /api/v1/agent/tabs/share, the connector's own share
                             rules: only the tab's maker or the person shares it). The workbook is the agent's own unless
                             --workbook names one. The answer is printed as for api
+  timer set WHEN [--repeat hourly|daily|weekdays|weekly] [--tz ZONE] -- PROMPT | timer list | timer delete ID
+                            XLI-433: wake this folder's agent later with PROMPT (an inbox alert), with no connector:
+                            WHEN is 06:00, 2026-12-02T06:00, a time with its zone, or 90m / 2h / 1d; --tz defaults to
+                            DATASTASH_TZ, else this computer's zone. `timer --help` says more and writes nothing
   repeat[s] [list|add|show|answer|part|remove] ...
                             XLI-413: the person's repeat questions, ONE list for the whole account, shared by every
                             agent: `repeats` lists them (--for AGENT: only that agent's parts), `repeat add QUESTION
@@ -5257,8 +5261,8 @@ def cmd_api(args):
     if len(args) < 2:
         die(API_USAGE)
     method, path = args[0].upper(), args[1]
-    if method not in ("GET", "POST"):
-        die("METHOD is GET or POST")
+    if method not in ("GET", "POST", "DELETE"):  # XLI-433: DELETE (datastash timer delete); a DELETE is never kept
+        die("METHOD is GET, POST or DELETE")
     if not path_ok(path):
         die(f"PATH must start with {API_PREFIX} (no \"..\" segments, no fragment)")
     body = api_body(args[2]) if len(args) > 2 else None
@@ -5435,6 +5439,183 @@ def cmd_repeat(args):
     return cmd_api(["POST", AGENT_REPEATS_PATH + "/" + action, json.dumps(body)])
 
 
+# XLI-433 (MS @feedback 11-28, owner rule: no MCP requirement): timers through the REST door with the agent's own key, so
+# they work while the connector is offline. The server's ledger_timer_set / _list / _cancel rules (x-live #545): a timer
+# wakes this folder's own agent with the prompt as an inbox alert; repeat hourly | daily | weekdays | weekly keeps a local
+# clock in a time zone.
+AGENT_TIMERS_PATH = "/api/v1/agent/timers"
+TIMER_REPEATS = ("hourly", "daily", "weekdays", "weekly")
+TIMER_USAGE = ("usage: datastash timer set WHEN [--repeat hourly|daily|weekdays|weekly] [--tz ZONE] -- PROMPT | "
+               "datastash timer list | datastash timer delete ID   (each takes --workbook ID; --help for more)")
+TIMER_HELP = """datastash timer: wake this folder's agent later with a prompt (datastash keeps it; no connector needed).
+
+  datastash timer set WHEN [--repeat hourly|daily|weekdays|weekly] [--tz ZONE] -- PROMPT
+      WHEN: 06:00 (the next 6:00), 2026-12-02T06:00 (local), 2026-12-02T06:00:00-06:00 (with its zone),
+            or a delay: 90m, 2h, 1d.
+      --tz: a zone like America/Chicago; default DATASTASH_TZ, else this computer's zone.
+      Example: datastash timer set 06:00 --repeat daily --tz America/Chicago -- Read the inbox and plan the day
+  datastash timer list            this agent's pending timers (id, when, repeat, prompt)
+  datastash timer delete ID       remove one, so it never fires
+
+At the time, the prompt arrives in this agent's inbox (kind "alert"), which wakes it."""
+_TIMER_DELAY = re.compile(r"\+?(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?)", re.I)
+_TIMER_ZONED = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}(:?\d{2})?)", re.I)
+_TIMER_LOCAL = re.compile(r"(\d{4}-\d{2}-\d{2}[T ])?\d{1,2}:\d{2}(:\d{2})?")
+_TIMER_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
+
+
+def local_zone_name():
+    """This computer's IANA zone name for a timer: DATASTASH_TZ, else TZ, else /etc/localtime's target; None when unknown."""
+    try:
+        import zoneinfo
+    except ImportError:
+        zoneinfo = None
+
+    def ok(name):
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_+\-/]{1,64}", name.strip()):
+            return None
+        if zoneinfo is None:
+            return name.strip()
+        try:
+            zoneinfo.ZoneInfo(name.strip())
+            return name.strip()
+        except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+            return None
+    for name in (os.environ.get("DATASTASH_TZ"), (os.environ.get("TZ") or "").lstrip(":")):
+        if ok(name):
+            return ok(name)
+    try:
+        target = os.path.realpath("/etc/localtime")
+    except OSError:
+        return None
+    return ok(target.split("zoneinfo/", 1)[1]) if "zoneinfo/" in target else None
+
+
+def timer_set_body(args):
+    """`timer set` arguments as the POST body; dies with the usage line on anything else."""
+    when, repeat, tz, wb, words, i = None, None, None, None, [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            words += args[i + 1:]
+            break
+        if a in ("--repeat", "--tz", "--workbook") or a.startswith(("--repeat=", "--tz=", "--workbook=")):
+            if "=" in a:
+                a, v = a.split("=", 1)
+                i += 1
+            elif i + 1 < len(args) and not args[i + 1].startswith("--"):
+                v, i = args[i + 1], i + 2
+            else:
+                die(TIMER_USAGE)
+            v = v.strip()
+            if not v:
+                die(TIMER_USAGE)
+            if a == "--repeat":
+                repeat = v.lower()
+            elif a == "--tz":
+                tz = v
+            else:
+                wb = v
+            continue
+        if a.startswith("--"):
+            die(TIMER_USAGE)
+        if when is None:
+            when = a.strip()
+        else:
+            words.append(a)
+        i += 1
+    prompt = " ".join(words).strip()
+    if not when or not prompt:
+        die(TIMER_USAGE)
+    if repeat is not None and repeat not in TIMER_REPEATS:
+        die(f"--repeat is one of {', '.join(TIMER_REPEATS)}")
+    body = {}
+    m = _TIMER_DELAY.fullmatch(when)
+    if m:
+        unit = m.group(2).lower()[0]
+        body["in_minutes"] = round(float(m.group(1)) * {"m": 1, "h": 60, "d": 1440}[unit], 4)
+    elif _TIMER_ZONED.fullmatch(when):
+        body["at"] = when
+    elif _TIMER_LOCAL.fullmatch(when):
+        body["at"] = when
+        if tz is None:
+            tz = local_zone_name()
+            if tz is None:
+                die("this computer's time zone is unknown: add --tz ZONE (like America/Chicago)")
+    else:
+        die(f"WHEN is a time (06:00, 2026-12-02T06:00), a time with its zone, or a delay (90m, 2h, 1d)\n{TIMER_USAGE}")
+    if repeat is not None and repeat != "hourly" and tz is None:
+        tz = local_zone_name()
+        if tz is None:
+            die(f"--repeat {repeat} keeps a local clock: add --tz ZONE (like America/Chicago)")
+    if tz is not None:
+        body["tz"] = tz
+    if repeat is not None:
+        body["repeat"] = repeat
+    body["note"] = prompt
+    # One retry key, so a set kept while datastash can't be reached is made once when it is sent later.
+    body["idempotency_key"] = "dst_" + uuid.uuid4().hex
+    return body, wb
+
+
+def _timer_flags(args):
+    """--workbook ID and the plain words of `timer list` / `timer delete`."""
+    wb, words, i = None, [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--workbook" and i + 1 < len(args) and args[i + 1].strip() and not args[i + 1].startswith("--"):
+            wb, i = args[i + 1].strip(), i + 2
+        elif a.startswith("--workbook=") and a.split("=", 1)[1].strip():
+            wb, i = a.split("=", 1)[1].strip(), i + 1
+        elif a.startswith("--"):
+            die(TIMER_USAGE)
+        else:
+            words.append(a)
+            i += 1
+    return wb, words
+
+
+def _timer_workbook(wb):
+    if wb is not None:
+        return wb
+    agent = agent_for(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(), me=this_session())
+    wb = (agent or {}).get("workbook_id")
+    if not wb:
+        die("no agent workbook is linked to this folder (datastash link NAME --workbook ID, or --workbook ID)")
+    return wb
+
+
+def timer_help(args):
+    """True when `datastash timer ...` asks for help (answered with no call and no write)."""
+    return not args or any(a in ("-h", "--help", "help") for a in args)
+
+
+def cmd_timer(args):
+    """XLI-433: `datastash timer set|list|delete`, as this folder's agent over the REST door (every guard of `datastash
+    api` applies: never in the person's main, the agent's own key). The answer is printed as for api."""
+    if timer_help(args):
+        print(TIMER_HELP)
+        return 0
+    action, rest = args[0].lower(), args[1:]
+    if action in ("set", "add", "new"):
+        body, wb = timer_set_body(rest)
+        body = dict({"workbook_id": _timer_workbook(wb)}, **body)
+        return cmd_api(["POST", AGENT_TIMERS_PATH, json.dumps(body)])
+    if action in ("list", "ls"):
+        wb, words = _timer_flags(rest)
+        if words:
+            die(TIMER_USAGE)
+        return cmd_api(["GET", AGENT_TIMERS_PATH + "?" + urllib.parse.urlencode({"workbook_id": _timer_workbook(wb)})])
+    if action in ("delete", "remove", "rm", "cancel"):
+        wb, words = _timer_flags(rest)
+        if len(words) != 1 or not _TIMER_ID.fullmatch(words[0].strip()):
+            die("datastash timer delete ID: the timer_id from `datastash timer list`\n" + TIMER_USAGE)
+        wb = _timer_workbook(wb)
+        return cmd_api(["DELETE", AGENT_TIMERS_PATH + "/" + words[0].strip().lower() + "?"
+                        + urllib.parse.urlencode({"workbook_id": wb})])
+    die(TIMER_USAGE)
+
+
 def plain_call(method, path, key, body):
     """One call that is never kept (a read, a sign-in step, a claim or a beat): printed framed; when datastash can't be
     reached it says so plainly (XLI-408: a read is never kept)."""
@@ -5451,6 +5632,8 @@ def plain_call(method, path, key, body):
         why = unreachable(e)
     if method == "GET":
         die(READ_UNREACHABLE.format(why=why))
+    if method == "DELETE":  # XLI-433: a delete is never kept for later
+        die(f"datastash can't be reached right now ({why}). Nothing was deleted: try again shortly.")
     if fcntl is None:
         die(f"datastash can't be reached right now ({why}). This computer can't keep writes (no file locking), so "
             "nothing was sent: try again shortly.")
@@ -8662,7 +8845,7 @@ def _clean_coord_body_ok(path, text):
 
 def _clean_ds_coord(words, piped):
     """Only the datastash command's coordination writes: api POST to a CLEAN_COORD_PATHS path (send, reply, inbox mark,
-    timer set, hand-off, status, presence), status-set and heartbeat (never `heartbeat run`). A "-" body comes only from
+    timer set, hand-off, status, presence), status-set, heartbeat (never `heartbeat run`) and timer set, list or delete. A "-" body comes only from
     the printf pipe. `datastash send` and `reply` act as the person and run only in the person's datastash main session,
     which clean sessions never refuses, so they are not here."""
     if not words:
@@ -8698,6 +8881,8 @@ def _clean_ds_coord(words, piped):
             else:
                 return False
         return True
+    if c in ("timer", "timers"):  # XLI-433: the agent's own timers, as api POST /api/v1/agent/timers is
+        return piped is None and bool(a) and a[0] in ("set", "list", "delete", "-h", "--help")
     return False
 
 
@@ -20823,6 +21008,11 @@ FULL_DDS = (
 )
 # What's new for every agent, per version (shown with the checklist at the first session start of that version).
 WHATS_NEW = {
+    "1.0.33": (
+        "Timers without the connector: **datastash timer set 06:00 --repeat daily --tz America/Chicago -- PROMPT** "
+        "wakes you with PROMPT (repeat hourly, daily, weekdays or weekly; or once: 06:00, 90m, 2h); "
+        "**datastash timer list** and **datastash timer delete ID**.",
+    ),
     "1.0.31": (
         "After the email-code sign-in, new and resumed sessions get the datastash connector by themselves; the "
         "session that signed in uses the datastash command until its next session.",
@@ -21848,12 +22038,15 @@ def main():
              "time-per-card": cmd_time_per_card, "heartbeat": cmd_heartbeat, "outbox-send": cmd_outbox_send,
              "chat-save": cmd_chat_save, "setup-row": cmd_setup_row, "self-check": cmd_self_check, "share": cmd_share,
              "remember": cmd_remember, "skills-sync": cmd_skills_sync, "repeat": cmd_repeat, "repeats": cmd_repeat,
-             "estimate": cmd_estimate, "estimates": cmd_estimate}
+             "estimate": cmd_estimate, "estimates": cmd_estimate, "timer": cmd_timer, "timers": cmd_timer}
     if cmd not in table and repeat_word(cmd) is not None:  # XLI-413: repeat / repeats / a small typo of either
         cmd = "repeat"
     if cmd not in table:
         print(__doc__)
         return 0 if cmd in ("help", "-h", "--help") else 1
+    if cmd in ("timer", "timers") and timer_help(args):  # XLI-433: help writes nothing, not even the sign-in record
+        print(TIMER_HELP)
+        return 0
     try:
         # Decided before anything of this run writes into the plugin's folder (fresh vs updated); the connector's
         # helper waits only briefly on the decision's lock.

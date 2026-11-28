@@ -79,7 +79,7 @@ Use datastash for the team work itself, without being told each time:
 - Hand off through datastash: pass work to another agent with `ledger_agent_handoff` (or a message to its inbox), never by asking the person to copy text between sessions.
 - Answer other agents through datastash: when another agent asks you something, answer in its inbox (`ledger_inbox_send` with `reply_to`), not only in your own session.
 - Set status as you work: keep "Your status line" current (below) at each real step, not only at the end.
-- Check back instead of polling: when you need to look again later, set a check-back or timer (`ledger_agent_checkback`, `ledger_timer_set`) and stop; never loop, sleep or poll for it. After the person's typed "datastash sync", timers need no OK from them.
+- Check back instead of polling: when you need to look again later, set a check-back or timer (`ledger_agent_checkback`, `ledger_timer_set`; without the connector: `datastash timer set WHEN [--repeat daily] [--tz ZONE] -- PROMPT`, `datastash timer list`, `datastash timer delete ID`) and stop; never loop, sleep or poll for it. After the person's typed "datastash sync", timers need no OK from them.
 - Remember this: when the person tells you to remember a fact, or you learn one every agent needs, run `datastash remember "<the fact>"`: it goes in the Team tab with your name and the date, and every agent gets it at its next session start. The person's kept skills reach every computer by themselves at session start: nothing to do.
 - Log your open asks: put each thing you wait on from the person in your status `asks` (and what you wait on from others in `waiting_on`), so one list shows every open ask across all agents.
 
